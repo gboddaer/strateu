@@ -90,6 +90,7 @@
 #include "strata/core/family_layout.hpp"
 #if defined(STRATA_HAVE_QWEN35)
 #include "strata/qwen35/engine.hpp"
+#include "strata/kolibri/engine.hpp"
 #endif
 #if defined(_WIN32)
 #include <windows.h>
@@ -1810,10 +1811,14 @@ int main(int argc, char** argv) {
         // `strata --families`: the GGUF architectures this build runs (setup asks before it installs one)
         if (std::strcmp(argv[i], "--families") == 0) {
 #if defined(STRATA_HAVE_QWEN35)
-            std::printf("qwen4exp qwen35moe\n");
+            std::printf("qwen4exp qwen35moe");
 #else
-            std::printf("qwen4exp\n");
+            std::printf("qwen4exp");
 #endif
+#if defined(STRATA_HAVE_KOLIBRI)
+            std::printf(" kolibri1");
+#endif
+            std::printf("\n");
             return 0;
         }
     }
@@ -1863,20 +1868,26 @@ int main(int argc, char** argv) {
 #endif
         break;
     }
-#if defined(STRATA_HAVE_QWEN35)
-    // **THE FAMILY SWITCH.**  A Qwen3.6-35B-A3B file (GGUF architecture qwen35moe) runs on its own engine path
-    // (src/qwen35), decided here from the file's header before any of this engine's state exists; every other file
-    // goes on below exactly as before.  Only the architecture string is read (the header of --native's shard).
+#if defined(STRATA_HAVE_QWEN35) || defined(STRATA_HAVE_KOLIBRI)
+    // **THE FAMILY SWITCH.**  A file of a family with an engine path of its own (Qwen3.6-35B-A3B `qwen35moe`,
+    // Kolibri 1 `kolibri1`) runs there, decided here from the file's header before any of this engine's state
+    // exists; every other file goes on below exactly as before.  Only the architecture string is read (the header
+    // of --native's shard).
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--native") != 0 && std::strcmp(argv[i], "--model") != 0) continue;
-        bool qwen35 = false;
+        strata::ModelFamily fam = strata::ModelFamily::Unknown;
         try {
             const strata::GgufFile meta(strata::gguf_split_paths(argv[i + 1]).front());
-            qwen35 = strata::model_family(meta) == strata::ModelFamily::Qwen35Moe;
+            fam = strata::model_family(meta);
         } catch (const std::exception&) {
             // not readable here: the normal path below reports it
         }
-        if (qwen35) return strata::qwen35::run(argc, argv);
+#if defined(STRATA_HAVE_QWEN35)
+        if (fam == strata::ModelFamily::Qwen35Moe) return strata::qwen35::run(argc, argv);
+#endif
+#if defined(STRATA_HAVE_KOLIBRI)
+        if (fam == strata::ModelFamily::Kolibri1) return strata::kolibri::run(argc, argv);
+#endif
         break;
     }
 #endif

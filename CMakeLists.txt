@@ -644,6 +644,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata PRIVATE strata_qwen35)
   target_compile_definitions(strata PRIVATE STRATA_HAVE_QWEN35=1)
 
+  # Kolibri 1 (kolibri1): an engine path of its own (src/kolibri), the same family-switch pattern as qwen35
+  # (plan docs/superpowers/plans/2026-10-16-kolibri1.md).  Q6_K experts (the Q4_K_M files' mixed Q4_K/Q6_K
+  # down projections) need STRATA_Q6K_EXPERTS; setup builds with it on.
+  add_library(strata_kolibri STATIC src/kolibri/kolibri_engine.cu)
+  target_include_directories(strata_kolibri PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(strata_kolibri PRIVATE strata_prefill strata_kernels strata_warnings ${_strata_gpu_runtime_target})
+  add_executable(strata-kolibri src/kolibri/kolibri_main.cpp)
+  target_link_libraries(strata-kolibri PRIVATE strata_kolibri ${_strata_gpu_runtime_target})
+  target_link_libraries(strata PRIVATE strata_kolibri)
+  target_compile_definitions(strata PRIVATE STRATA_HAVE_KOLIBRI=1)
+
   if(STRATA_ENABLE_HIP)
     enable_testing()
     set(_strata_hip_tests)
