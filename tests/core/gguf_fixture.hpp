@@ -46,6 +46,7 @@ inline Kv strs(const std::string& k, std::vector<std::string> v) {
     return r;
 }
 inline Kv str_array(const std::string& k, std::vector<std::string> v) { return strs(k, std::move(v)); }
+inline Kv bools(const std::string& k, std::vector<uint64_t> v) { Kv r = make_kv(k, 9); r.elem = 7; r.arr = std::move(v); return r; }
 
 struct Tensor {
     std::string name;
@@ -94,6 +95,10 @@ inline Written write(const std::filesystem::path& path, const std::vector<Kv>& k
             put32(8);
             put64(k.sarr.size());
             for (const auto& x : k.sarr) puts(x);
+        } else if (k.type == 9 && k.elem == 7) {
+            put32(7);
+            put64(k.arr.size());
+            for (uint64_t x : k.arr) { const uint8_t b = (uint8_t) (x ? 1 : 0); put(&b, 1); }
         } else throw std::runtime_error("fixture: unsupported metadata type");
     }
     Written w;

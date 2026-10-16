@@ -64,6 +64,16 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
         num("nextn_predict_layers", g.n_mtp_layers);
         g.hc = g.hc_lr = 0;                 // a plain pre-norm residual
         g.idx_q_heads = g.idx_key_dim = 0;  // dense attention, no sparse indexer
+    } else if (family == strata::ModelFamily::Kolibri1) {
+        // plain pre-norm residual + sandwich norms; dense GQA (no indexer), no GDN, no MTP, no PLE
+        g.hc = g.hc_lr = 0;
+        g.idx_q_heads = g.idx_key_dim = 0;
+        g.n_mtp_layers = 0;
+        g.qsa_interval = 0;
+        g.sandwich = 1;
+        num("attention.sliding_window", g.n_swa);
+        num("expert_gating_func", g.gating);
+        g.swa_full_interval = 5;   // four sliding (RoPE) to one full (NoPE); the pattern array is checked below
     } else {
         num("hyper_connection.count", g.hc);
         num("hyper_connection.low_rank", g.hc_lr);
@@ -83,13 +93,26 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
     };
     if (g.n_layers <= 0 || g.n_embd <= 0 || g.n_head <= 0 || g.n_head_kv <= 0 || g.head_dim <= 0 || g.n_expert <= 0 ||
         top_k <= 0 || top_k > g.n_expert || g.n_ff <= 0 || g.ssm_state_size <= 0 || g.ssm_k_heads <= 0 ||
-        g.ssm_v_heads <= 0 || g.ssm_d_conv <= 0 || g.qsa_interval < 2)
+        g.ssm_v_heads <= 0 || g.ssm_d_conv <= 0)
         return bad("a geometry key is zero or out of range");
+    if (g.family != strata::ModelFamily::Kolibri1 && g.qsa_interval < 2)
+        return bad("full_attention_interval is less than 2");
     if (value_length >= 0 && value_length != key_length) return bad("attention.key_length != attention.value_length");
     if (g.ssm_value_dim != g.ssm_state_size * g.ssm_v_heads) return bad("ssm.inner_size != ssm.state_size * ssm.time_step_rank");
     if (g.ssm_v_heads % g.ssm_k_heads) return bad("ssm.time_step_rank is not a multiple of ssm.group_count");
     if (g.n_head % g.n_head_kv) return bad("attention.head_count is not a multiple of attention.head_count_kv");
-    if (g.n_layers % g.qsa_interval) return bad("the layer count is not a multiple of full_attention_interval");
+    if (g.family != strata::ModelFamily::Kolibri1 && g.n_layers % g.qsa_interval)
+        return bad("the layer count is not a multiple of full_attention_interval");
+    if (g.family == strata::ModelFamily::Kolibri1) {
+        if (g.n_swa <= 0) return bad("attention.sliding_window must be positive");
+        if (g.gating != 5) return bad("expert_gating_func must be 5 (sigmoid_logit_add)");
+        const strata::MetaValue* pat = meta.get(p + "attention.sliding_window_pattern");
+        if (!pat || pat->type != strata::MetaType::ARRAY || pat->count != (uint64_t) g.n_layers)
+            return bad("attention.sliding_window_pattern must list one entry per layer");
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            if ((pat->items[(size_t) l].u != 0) != (l % 5 != 4))
+                return bad("attention.sliding_window_pattern is not the four-sliding-to-one-full pattern");
+    }
     return true;
 }
 
@@ -139,6 +162,7 @@ inline std::string compiled_geometry_mismatch(const ModelGeometry& g) {
 enum class LayerKind { Gdn, Attention, Mtp };
 
 inline LayerKind layer_kind(const ModelGeometry& g, int64_t layer) {
+    if (g.family == strata::ModelFamily::Kolibri1) return LayerKind::Attention;   // every layer: GQA + MoE
     if (layer >= g.n_layers) return LayerKind::Mtp;
     return is_qsa_layer(g, layer) ? LayerKind::Attention : LayerKind::Gdn;
 }
@@ -156,6 +180,29 @@ inline std::vector<TensorWant> layer_tensors(const ModelGeometry& g, int64_t lay
     const int64_t N = g.n_embd, NE = g.n_expert, FF = g.n_ff, FS = g.n_ff_shexp;
     std::vector<TensorWant> t;
     auto add = [&](const char* s, std::vector<int64_t> shape) { t.push_back({s, std::move(shape)}); };
+    if (g.family == strata::ModelFamily::Kolibri1) {
+        // 18 tensors a layer (50 layers: the 903 of a Q4_K_M file).  GQA with q/k norm and no output gate; MoE
+        // with exp_probs_b and one UNGATED shared expert (no ffn_gate_inp_shexp); sandwich norms around both.
+        add("attn_norm.weight", {N});
+        add("post_attention_norm.weight", {N});
+        add("attn_q.weight", {N, g.n_head * g.head_dim});
+        add("attn_k.weight", {N, g.n_head_kv * g.head_dim});
+        add("attn_v.weight", {N, g.n_head_kv * g.head_dim});
+        add("attn_output.weight", {g.n_head * g.head_dim, N});
+        add("attn_q_norm.weight", {g.head_dim});
+        add("attn_k_norm.weight", {g.head_dim});
+        add("ffn_norm.weight", {N});
+        add("post_ffw_norm.weight", {N});
+        add("ffn_gate_inp.weight", {N, NE});
+        add("exp_probs_b.bias", {NE});
+        add("ffn_gate_exps.weight", {N, FF, NE});
+        add("ffn_up_exps.weight", {N, FF, NE});
+        add("ffn_down_exps.weight", {FF, N, NE});
+        add("ffn_gate_shexp.weight", {N, FS});
+        add("ffn_up_shexp.weight", {N, FS});
+        add("ffn_down_shexp.weight", {FS, N});
+        return t;
+    }
     // MoE, every layer (the MTP block's too)
     add("ffn_gate_inp.weight", {N, NE});
     add("ffn_gate_inp_shexp.weight", {N});
@@ -234,7 +281,9 @@ inline std::vector<TensorWant> global_tensors(const ModelGeometry& g) {
 }
 
 /// Whether the family's table names every blk.* tensor its files carry (then an unnamed one is an error).
-inline bool layout_table_complete(const ModelGeometry& g) { return g.family == strata::ModelFamily::Qwen35Moe; }
+inline bool layout_table_complete(const ModelGeometry& g) {
+    return g.family == strata::ModelFamily::Qwen35Moe || g.family == strata::ModelFamily::Kolibri1;
+}
 
 /// Checks the model `m` (all shards) against the layout table of `g`.  `checked` counts the tensors found.
 inline bool check_gguf_layout(const strata::GgufModel& m, const ModelGeometry& g, std::string& err,

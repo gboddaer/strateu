@@ -59,6 +59,12 @@ struct ModelGeometry {
     ModelFamily family = ModelFamily::Qwen4Exp;
     int64_t n_mtp_layers = 0;       ///< MTP blocks inside the model file, after the trunk (qwen35moe: blk.40)
 
+    // appended for Kolibri 1 (kolibri1); the defaults keep Flash-Next's values (0: not a sliding-window family)
+    int64_t n_swa = 0;              ///< attention.sliding_window: the window of the sliding layers (RoPE)
+    int64_t swa_full_interval = 0;  ///< the layer pattern's period: layer % interval == interval-1 is full attention (NoPE)
+    int64_t gating = 0;             ///< expert_gating_func (5: sigmoid_logit_add)
+    int64_t sandwich = 0;           ///< 1: post_attention_norm and post_ffw_norm around both branches
+
     constexpr bool has_indexer() const { return idx_q_heads > 0; }              ///< false: dense attention only
     constexpr bool has_hyper_connections() const { return hc > 0; }             ///< false: plain pre-norm residual
     constexpr int64_t hc_dim() const { return hc * n_embd; }
@@ -74,6 +80,12 @@ inline constexpr ModelGeometry kCompiledGeometry{};
 /// = 4` and an explicit `attention.compress_ratios` array - and `read_geometry` checks that the two agree.
 inline bool is_qsa_layer(const ModelGeometry& g, int64_t layer) {
     return layer % g.qsa_interval == g.qsa_interval - 1;
+}
+
+/// Kolibri 1: the sliding-window layers (RoPE); the full-attention layers (NoPE) are every `swa_full_interval`-th
+/// (layer % interval == interval-1).  False for the families without a sliding window.
+inline bool is_swa_layer(const ModelGeometry& g, int64_t layer) {
+    return g.n_swa > 0 && (g.swa_full_interval == 0 || layer % g.swa_full_interval != g.swa_full_interval - 1);
 }
 
 }  // namespace strata::core

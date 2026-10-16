@@ -16,11 +16,13 @@ enum class ModelFamily {
     Unknown = 0,
     Qwen4Exp,    ///< Qwen3.8-Flash-Next and its fine-tunes / pruned variants (Swift 1.5, the Coder)
     Qwen35Moe,   ///< Qwen3.6-35B-A3B (Unsloth's MTP GGUFs): plain pre-norm residual, dense attention, nextn MTP block
+    Kolibri1,    ///< Aleph Alpha Kolibri 1: plain pre-norm + sandwich norms, GQA with 4:1 sliding-window(RoPE)/full(NoPE), MoE with sigmoid_logit_add routing
 };
 
 inline ModelFamily model_family_from_arch(const std::string& arch) {
     if (arch == "qwen4exp") return ModelFamily::Qwen4Exp;
     if (arch == "qwen35moe") return ModelFamily::Qwen35Moe;
+    if (arch == "kolibri1") return ModelFamily::Kolibri1;
     return ModelFamily::Unknown;
 }
 
@@ -31,6 +33,8 @@ inline const char* model_family_arch(ModelFamily f) {
         return "qwen4exp";
     case ModelFamily::Qwen35Moe:
         return "qwen35moe";
+    case ModelFamily::Kolibri1:
+        return "kolibri1";
     default:
         return "";
     }
@@ -43,6 +47,8 @@ inline const char* model_family_title(ModelFamily f) {
         return "Qwen3.8-Flash-Next";
     case ModelFamily::Qwen35Moe:
         return "Qwen3.6-35B-A3B";
+    case ModelFamily::Kolibri1:
+        return "Kolibri 1";
     default:
         return "an unknown model";
     }
@@ -57,9 +63,12 @@ inline bool model_family_runs(ModelFamily f) { return f == ModelFamily::Qwen4Exp
 inline std::string model_family_not_supported(ModelFamily f) {
     if (model_family_runs(f)) return {};
     if (f == ModelFamily::Unknown) return "this is not a model family Strata knows";
+    const char* tail = f == ModelFamily::Kolibri1
+                           ? ". Use a CUDA or HIP build"
+                           : ". Use a CUDA or HIP build, or a Qwen3.8-Flash-Next model file";
     return std::string(model_family_title(f)) + " (architecture '" + model_family_arch(f) +
            "') runs on the NVIDIA (CUDA) and AMD (HIP) builds of Strata; this build does not run it yet (the Intel "
-           "Arc / SYCL port is in development). Use a CUDA or HIP build, or a Qwen3.8-Flash-Next model file";
+           "Arc / SYCL port is in development)" + tail;
 }
 
 }  // namespace strata

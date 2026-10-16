@@ -13,6 +13,7 @@
 
 #include "strata/core/family_layout.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
@@ -55,6 +56,9 @@ const Dims kFlashNext = {48, 2560, 24, 2, 256, 512, 10, 640, 640, 4, 128, 16, 48
 // tiny models of each family for the layout checks (every tensor F32, a few KB)
 const Dims kTiny36 = {5, 64, 2, 1, 16, 4, 2, 32, 32, 4, 8, 2, 4, 32, 4, 1, 0, 0, 0, 0};
 const Dims kTinyFlash = {8, 64, 2, 1, 16, 4, 2, 32, 32, 4, 8, 2, 4, 32, 4, 0, 2, 8, 2, 8};
+// Kolibri 1 (Seraphiel102/Kolibri-1-GGUF, every quant) and a tiny file of the family for the layout checks
+const Dims kKolibri = {50, 2560, 48, 4, 128, 384, 6, 512, 512, 4, 128, 16, 48, 6144, 0, 0, 0, 0, 0, 0};
+const Dims kTinyKolibri = {5, 64, 2, 1, 16, 4, 2, 32, 32, 4, 8, 2, 4, 32, 0, 0, 0, 0, 0, 0};
 
 std::vector<Kv> metadata(const char* arch, const Dims& d, uint64_t vocab) {
     const std::string p = std::string(arch) + ".";
@@ -83,6 +87,35 @@ std::vector<Kv> metadata(const char* arch, const Dims& d, uint64_t vocab) {
         kv.push_back(fixture::u32(p + "attention.indexer.head_count", d.idx_heads));
         kv.push_back(fixture::u32(p + "attention.indexer.key_length", d.idx_key));
     }
+    std::vector<std::string> tokens;
+    for (uint64_t i = 0; i < vocab; ++i) tokens.push_back("t" + std::to_string(i));
+    kv.push_back(fixture::str_array("tokenizer.ggml.tokens", tokens));
+    return kv;
+}
+
+/// Kolibri 1's metadata, as the converter writes it: no ssm / hc / indexer / interval keys; gating 5, one shared
+/// expert, the four-sliding-to-one-full pattern as a per-layer BOOL array.
+std::vector<Kv> kolibri_metadata(const Dims& d, uint64_t vocab) {
+    const std::string p = "kolibri1.";
+    std::vector<Kv> kv = {fixture::str("general.architecture", "kolibri1"),
+                          fixture::u32(p + "block_count", d.block_count),
+                          fixture::u32(p + "embedding_length", d.embd),
+                          fixture::u32(p + "attention.head_count", d.heads),
+                          fixture::u32(p + "attention.head_count_kv", d.heads_kv),
+                          fixture::u32(p + "attention.key_length", d.key_len),
+                          fixture::u32(p + "attention.value_length", d.key_len),
+                          fixture::u32(p + "expert_count", d.experts),
+                          fixture::u32(p + "expert_used_count", d.used),
+                          fixture::u32(p + "expert_feed_forward_length", d.ff),
+                          fixture::u32(p + "expert_shared_feed_forward_length", d.ff_sh),
+                          fixture::u32(p + "expert_shared_count", 1),
+                          fixture::u32(p + "expert_gating_func", 5),
+                          fixture::u32(p + "attention.sliding_window", 513),
+                          fixture::f32(p + "attention.layer_norm_rms_epsilon", 1e-6f),
+                          fixture::f32(p + "rope.freq_base", 10000.f)};
+    std::vector<uint64_t> pat;
+    for (uint64_t l = 0; l < d.block_count; ++l) pat.push_back(l % 5 != 4);
+    kv.push_back(fixture::bools(p + "attention.sliding_window_pattern", pat));
     std::vector<std::string> tokens;
     for (uint64_t i = 0; i < vocab; ++i) tokens.push_back("t" + std::to_string(i));
     kv.push_back(fixture::str_array("tokenizer.ggml.tokens", tokens));
@@ -185,12 +218,92 @@ int real_model(const std::string& any) {
         return 1;
     }
 }
+
+void kl_drop_expb(std::vector<Tensor>& ts) {
+    ts.erase(std::remove_if(ts.begin(), ts.end(),
+                            [](const Tensor& t) { return t.name == "blk.0.exp_probs_b.bias"; }),
+             ts.end());
+}
+void kl_wrong_down(std::vector<Tensor>& ts) {
+    for (auto& t : ts)
+        if (t.name == "blk.0.ffn_down_exps.weight") t.shape[0] += 16;
+}
+void kl_add_bogus(std::vector<Tensor>& ts) { ts.push_back({"blk.0.bogus.weight", {8, 8}, F32, 9}); }
+
+std::string kolibri_layout_error(const fs::path& dir, void (*mutate)(std::vector<Tensor>&)) {
+    fs::create_directories(dir);
+    const fs::path meta = dir / "meta.gguf";
+    fixture::write(meta, kolibri_metadata(kTinyKolibri, 8), {});
+    strata::core::ModelGeometry g;
+    int64_t k = 0;
+    std::string err;
+    if (!geometry_of(meta, g, k, err)) return "geometry: " + err;
+    std::vector<Tensor> ts = tensors_of(g);
+    if (mutate) mutate(ts);
+    const fs::path model = dir / "kolibri1-tiny.gguf";
+    fixture::write(model, kolibri_metadata(kTinyKolibri, 8), ts);
+    const strata::GgufModel m({model.string()});
+    if (!strata::core::check_gguf_layout(m, g, err)) return err;
+    return {};
+}
+
+void kolibri_checks(TempDir& d) {
+    const fs::path kb = d.path / "kolibri";
+    fs::create_directories(kb);
+    const fs::path meta = kb / "meta.gguf";
+    fixture::write(meta, kolibri_metadata(kKolibri, 8), {});
+    {
+        const strata::GgufFile f(meta.string());
+        check(strata::check_architecture(f).empty(), "the guard accepts kolibri1");
+        strata::core::ModelGeometry g;
+        int64_t k = 0;
+        std::string err;
+        const bool ok = strata::core::geometry_from_gguf(f, g, k, err);
+        check(ok, "kolibri1 geometry reads");
+        check(g.n_layers == 50 && g.n_embd == 2560 && g.n_head == 48 && g.n_head_kv == 4 && g.head_dim == 128 &&
+              g.n_expert == 384 && k == 6 && g.n_ff == 512 && g.n_ff_shexp == 512 && g.n_swa == 513 &&
+              g.gating == 5 && g.sandwich == 1 && g.hc == 0 && g.idx_q_heads == 0 && g.swa_full_interval == 5,
+              "kolibri1 geometry: 50 layers, 2560, 48/4 x 128, 384 top-6 FF 512, swa 513, gating 5, sandwich");
+        using strata::core::is_swa_layer;
+        check(is_swa_layer(g, 0) && is_swa_layer(g, 3) && !is_swa_layer(g, 4) && is_swa_layer(g, 5) &&
+              is_swa_layer(g, 48) && !is_swa_layer(g, 49),
+              "is_swa_layer: sliding 0-3, full 4, sliding 5 and 48, full 49");
+    }
+    {
+        std::vector<Kv> kv = kolibri_metadata(kKolibri, 8);
+        for (auto& e : kv)
+            if (e.key == "kolibri1.expert_gating_func") e.u = 2;
+        const fs::path p = kb / "gate2.gguf";
+        fixture::write(p, kv, {});
+        const strata::GgufFile f(p.string());
+        check(!strata::check_architecture(f).empty(), "the guard refuses expert_gating_func != 5");
+    }
+    {
+        std::vector<Kv> kv = kolibri_metadata(kKolibri, 8);
+        for (auto& e : kv)
+            if (e.key == "kolibri1.attention.sliding_window_pattern") e.arr[4] = 1;   // layer 4 is a full layer
+        const fs::path p = kb / "pat.gguf";
+        fixture::write(p, kv, {});
+        strata::core::ModelGeometry g;
+        int64_t k = 0;
+        std::string err;
+        check(!geometry_of(p, g, k, err), "an irregular sliding-window pattern is refused");
+    }
+    check(kolibri_layout_error(kb / "ok", nullptr).empty(), "the kolibri1 layout table passes on a complete tiny file");
+    check(kolibri_layout_error(kb / "noexpb", kl_drop_expb).find("exp_probs_b") != std::string::npos,
+          "a missing blk.0.exp_probs_b.bias is refused, naming it");
+    check(kolibri_layout_error(kb / "baddown", kl_wrong_down).find("ffn_down_exps") != std::string::npos,
+          "a wrong ffn_down_exps shape is refused, naming it");
+    check(kolibri_layout_error(kb / "bogus", kl_add_bogus).find("bogus") != std::string::npos,
+          "a tensor the kolibri1 layout table does not name is refused");
+}
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc == 3 && std::string(argv[1]) == "--real") return real_model(argv[2]);
     std::printf("model_family_test\n");
     TempDir d;
+    kolibri_checks(d);
     {
         // the guards
         const fs::path q36 = d.path / "q36.gguf", fn = d.path / "fn.gguf", other = d.path / "other.gguf";

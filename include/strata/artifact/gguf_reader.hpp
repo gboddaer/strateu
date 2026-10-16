@@ -618,6 +618,40 @@ inline std::string check_architecture_qwen35moe(const GgufFile& g) {
     return {};
 }
 
+/// Kolibri 1 (Aleph Alpha): every layer MoE (384 routed top-6 + 1 ungated shared) with the sigmoid_logit_add
+/// router (gating 5: select on logits + expert_bias, weight by the unbiased sigmoid, no renorm), GQA with q/k
+/// norm, and a per-layer sliding-window(513, RoPE) / full(NoPE) pattern.  The keys the converter always writes.
+inline std::string check_architecture_kolibri1(const GgufFile& g) {
+    static const char* const keys[] = {
+        "kolibri1.block_count", "kolibri1.embedding_length", "kolibri1.attention.head_count",
+        "kolibri1.attention.head_count_kv", "kolibri1.attention.key_length", "kolibri1.attention.value_length",
+        "kolibri1.expert_count", "kolibri1.expert_used_count", "kolibri1.expert_feed_forward_length",
+        "kolibri1.expert_shared_feed_forward_length", "kolibri1.expert_shared_count",
+        "kolibri1.expert_gating_func", "kolibri1.attention.sliding_window",
+        "kolibri1.attention.sliding_window_pattern",
+    };
+    for (const char* k : keys) {
+        const MetaValue* v = g.get(k);
+        if (!v) return std::string("missing ") + k;
+    }
+    const MetaValue* gate = g.get("kolibri1.expert_gating_func");
+    if (!gate->is_num() || gate->u != 5) return "kolibri1.expert_gating_func must be 5 (sigmoid_logit_add)";
+    const MetaValue* sh = g.get("kolibri1.expert_shared_count");
+    if (!sh->is_num() || sh->u != 1) return "kolibri1.expert_shared_count must be 1 (the ungated shared expert)";
+    const MetaValue* sw = g.get("kolibri1.attention.sliding_window");
+    if (!sw->is_num() || sw->u < 1) return "kolibri1.attention.sliding_window must be positive";
+    const MetaValue* ne = g.get("kolibri1.expert_count"), *nu = g.get("kolibri1.expert_used_count");
+    if (!ne->is_num() || !nu->is_num() || nu->u == 0 || nu->u > ne->u)
+        return "kolibri1.expert_used_count is zero or exceeds kolibri1.expert_count";
+    const MetaValue* nl = g.get("kolibri1.block_count");
+    const MetaValue* pat = g.get("kolibri1.attention.sliding_window_pattern");
+    if (pat->type != MetaType::ARRAY || pat->count != nl->u)
+        return "kolibri1.attention.sliding_window_pattern must list one entry per layer";
+    if (const MetaValue* w = g.get("kolibri1.expert_weights_norm"))
+        if (w->type == MetaType::BOOL && w->u) return "kolibri1.expert_weights_norm (router weight renormalization) is not supported";
+    return {};
+}
+
 // ---- the model's geometry from its metadata, and the architecture guard (P1.S2).  The engine runs ONE
 // architecture, qwen4exp.  Its dimensions are read from the file (llama.cpp's key names under the arch prefix)
 // and then checked against the shape the kernels are compiled for (core/geometry.hpp), so a file of another
@@ -790,6 +824,7 @@ inline std::string check_architecture(const GgufFile& f) {
     if (!arch) return "missing general.architecture";
     const ModelFamily family = model_family_from_arch(arch->s);
     if (family == ModelFamily::Qwen35Moe) return check_architecture_qwen35moe(f);
+    if (family == ModelFamily::Kolibri1) return check_architecture_kolibri1(f);
     core::ModelGeometry g;   // anything else is refused by name by read_geometry
     std::string err = read_geometry(f, g);
     if (err.empty()) err = geometry_unsupported(g);
