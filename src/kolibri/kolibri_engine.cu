@@ -25,12 +25,21 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <functional>
+#include <iostream>
 #include <map>
+#include <mutex>
+#include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #define KC(x)                                                                                                             \
@@ -389,6 +398,207 @@ void init_scratch(const Engine& e, Scratch& s) {
     }
 }
 
+/// Drop the held state: position 0 and empty KV caches (the serve protocol's fresh-request path).
+void reset_state(Engine& e, Scratch& s) {
+    s.pos = 0;
+    for (size_t l = 0; l < s.kc.size(); ++l) {
+        const int64_t rows = strata::core::is_swa_layer(e.g, (int64_t) l) ? e.g.n_swa : s.ctx;
+        const size_t bytes = (size_t) e.g.n_head_kv * rows * e.g.head_dim * 4;
+        KC(cudaMemset(s.kc[l], 0, bytes));
+        KC(cudaMemset(s.vc[l], 0, bytes));
+    }
+}
+
+using Clock = std::chrono::steady_clock;
+double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+
+// --------------------------------------------------------------------------- sampling (q36's, verbatim semantics)
+struct Sampling {
+    float temperature = 0.f, top_p = 1.f, min_p = 0.f, repeat = 1.f, freq = 0.f, present = 0.f;
+    int top_k = 20, last_n = 0;
+    unsigned long long seed = 0;
+    bool needs_logits() const { return temperature > 0.f || repeat != 1.f || freq != 0.f || present != 0.f; }
+};
+
+int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
+    if (s.last_n != 0 && (s.repeat != 1.f || s.freq != 0.f || s.present != 0.f)) {
+        std::map<int, int> cnt;
+        const size_t from = s.last_n < 0 || (size_t) s.last_n >= hist.size() ? 0 : hist.size() - (size_t) s.last_n;
+        for (size_t i = from; i < hist.size(); ++i) ++cnt[hist[i]];
+        for (const auto& [id, c] : cnt) {
+            float& v = lg[(size_t) id];
+            if (s.repeat != 1.f) v = v > 0 ? v / s.repeat : v * s.repeat;
+            v -= (float) c * s.freq + s.present;
+        }
+    }
+    if (s.temperature <= 0.f) return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+    const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
+    std::vector<int> idx(lg.size());
+    for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
+    std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
+    idx.resize((size_t) kk);
+    std::vector<double> p(idx.size());
+    const double mx = lg[(size_t) idx[0]];
+    double sum = 0;
+    for (size_t i = 0; i < idx.size(); ++i) sum += (p[i] = std::exp((lg[(size_t) idx[i]] - mx) / s.temperature));
+    size_t keep = idx.size();
+    double cum = 0;
+    for (size_t i = 0; i < idx.size(); ++i) {
+        if (p[i] / sum < s.min_p * (p[0] / sum)) { keep = i; break; }
+        cum += p[i] / sum;
+        if (cum >= s.top_p) { keep = i + 1; break; }
+    }
+    keep = std::max<size_t>(1, keep);
+    double tot = 0;
+    for (size_t i = 0; i < keep; ++i) tot += p[i];
+    std::uniform_real_distribution<double> u(0.0, tot);
+    double r = u(rng);
+    for (size_t i = 0; i < keep; ++i) {
+        if ((r -= p[i]) <= 0) return idx[i];
+    }
+    return idx[keep - 1];
+}
+
+std::vector<int32_t> parse_ids(const char* s) {
+    std::vector<int32_t> v;
+    while (*s) {
+        while (*s == ',' || *s == ' ' || *s == '\n') ++s;
+        if (!*s) break;
+        char* e = nullptr;
+        const long x = std::strtol(s, &e, 10);
+        if (e == s) break;
+        v.push_back((int32_t) x);
+        s = e;
+    }
+    return v;
+}
+
+bool is_eos(int t) { return t == 127906; }   // kolibri1: im_end
+
+/// The serve protocol (serve/server.py's engine lines, q36's shape): READY, then per request GEN <max_new>
+/// [key=value ...] <ids>; PP lines as the prompt is consumed; T <id> per token; DONE at the end.  STOP cancels
+/// the running request.  A request whose ids extend the held prefix continues it (the serve `live` logic).
+int serve(Engine& e, Scratch& s) {
+    std::printf("READY %d stop\n", s.ctx);
+    std::fflush(stdout);
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::string> lines;
+    bool eof = false;
+    std::atomic<bool> stop{false};
+    std::thread reader([&] {
+        std::string l;
+        while (std::getline(std::cin, l)) {
+            if (!l.empty() && l.back() == '\r') l.pop_back();
+            if (l == "STOP") { stop.store(true); continue; }
+            std::lock_guard<std::mutex> lk(mu);
+            lines.push_back(l);
+            cv.notify_one();
+        }
+        std::lock_guard<std::mutex> lk(mu);
+        eof = true;
+        cv.notify_one();
+    });
+    reader.detach();
+    std::vector<int32_t> live;   // the tokens whose state the engine holds
+    std::vector<float> lg((size_t) e.g.n_vocab);
+    for (;;) {
+        std::string line;
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait(lk, [&] { return eof || !lines.empty(); });
+            if (lines.empty()) return 0;
+            line = lines.front();
+            lines.pop_front();
+        }
+        if (line.empty()) continue;
+        if (line.rfind("GEN ", 0) != 0) {
+            std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...>\n");
+            std::fflush(stdout);
+            continue;
+        }
+        char* p = nullptr;
+        const long long max_new = std::strtoll(line.c_str() + 4, &p, 10);
+        Sampling smp;
+        for (;;) {
+            while (*p == ' ') ++p;
+            const char* st0 = p;
+            while (*p && *p != ' ') ++p;
+            const std::string tk(st0, (size_t) (p - st0));
+            const size_t eq = tk.find('=');
+            if (tk.empty() || eq == std::string::npos) { p = const_cast<char*>(st0); break; }
+            const std::string key = tk.substr(0, eq);
+            const char* v = tk.c_str() + eq + 1;
+            if (key == "temperature") smp.temperature = std::strtof(v, nullptr);
+            else if (key == "top_p") smp.top_p = std::strtof(v, nullptr);
+            else if (key == "top_k") smp.top_k = std::atoi(v);
+            else if (key == "min_p") smp.min_p = std::strtof(v, nullptr);
+            else if (key == "penalty_last_n") smp.last_n = std::atoi(v);
+            else if (key == "penalty_repeat") smp.repeat = std::strtof(v, nullptr);
+            else if (key == "penalty_freq") smp.freq = std::strtof(v, nullptr);
+            else if (key == "penalty_present") smp.present = std::strtof(v, nullptr);
+            else if (key == "seed") smp.seed = std::strtoull(v, nullptr, 10);
+        }
+        const std::vector<int32_t> ids = parse_ids(p);
+        if (max_new < 1 || ids.empty()) {
+            std::printf("ERR bad request: max_new or the ids\n");
+            std::fflush(stdout);
+            continue;
+        }
+        if ((int64_t) ids.size() + max_new > s.ctx) {
+            std::printf("ERR prompt (%zu tokens) + max_new (%lld) exceeds the context (%d)\n", ids.size(), max_new, s.ctx);
+            std::fflush(stdout);
+            continue;
+        }
+        bool bad = false;
+        for (int32_t t : ids) bad |= t < 0 || t >= (int32_t) e.g.n_vocab;
+        if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); std::fflush(stdout); continue; }
+        stop.store(false);
+        // the held state continues when the request extends it (the KV rings cannot step back)
+        size_t reuse = 0;
+        if (live.size() < ids.size() && std::equal(live.begin(), live.end(), ids.begin())) reuse = live.size();
+        else {
+            reset_state(e, s);
+            live.clear();
+        }
+        const auto t0 = Clock::now();
+        const int64_t fresh = (int64_t) (ids.size() - reuse);
+        for (int64_t t = (int64_t) reuse + 1; t < fresh; ++t) {   // the prompt minus its last token
+            forward(e, s, ids[t - 1], nullptr);
+            std::printf("PP %lld %lld %.0f %.1f\n", (long long) (t - reuse), (long long) fresh, ms_since(t0),
+                        (double) (t - reuse) / std::max(1e-9, ms_since(t0) / 1000.0));
+            std::fflush(stdout);
+        }
+        live.insert(live.end(), ids.begin() + (long) reuse, ids.end());
+        const double prompt_ms = ms_since(t0);
+        std::mt19937_64 rng(smp.seed);
+        std::vector<int32_t> hist = ids;
+        const auto d0 = Clock::now();
+        long long produced = 0;
+        const char* finish = "length";
+        int32_t tok = ids.back();   // the last prompt token: the first decode step runs it
+        for (;;) {
+            forward(e, s, tok, nullptr);
+            KC(cudaMemcpy(lg.data(), s.logits, lg.size() * 4, cudaMemcpyDeviceToHost));
+            const int32_t nx = smp.needs_logits() ? sample(lg, smp, hist, rng)
+                                                  : (int32_t) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+            std::printf("T %d\n", nx);
+            std::fflush(stdout);
+            ++produced;
+            hist.push_back(nx);
+            live.push_back(nx);
+            if (is_eos(nx)) { finish = "stop"; break; }
+            if (produced >= max_new) break;
+            if (stop.load()) { finish = "cancel"; break; }
+            tok = nx;
+        }
+        const double decode_ms = ms_since(d0);
+        std::printf("DONE %lld %zu %.1f %.1f %s 0 0 %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
+                    decode_ms, finish, reuse, (long long) fresh);
+        std::fflush(stdout);
+    }
+}
+
 /// Load: geometry + layout from the header; dense tensors to the GPU; routed experts repacked to pinned blob
 /// tables.  Split files: every tensor lives in one shard; the shard's mmap pointer is the source.
 bool load(const std::string& path, Engine& e, std::string& err) {
@@ -486,7 +696,7 @@ bool load(const std::string& path, Engine& e, std::string& err) {
 
 int strata::kolibri::run(int argc, char** argv) {
     std::string model, tokens, dump_layers, dump_logits, dump_full, force;
-    bool load_only = false;
+    bool load_only = false, serve_mode = false;
     int n_gen = 8;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -498,6 +708,7 @@ int strata::kolibri::run(int argc, char** argv) {
         else if (a == "--dump-full-logits" && i + 1 < argc) dump_full = argv[++i];
         else if (a == "--force" && i + 1 < argc) force = argv[++i];
         else if (a == "--load-only") load_only = true;
+        else if (a == "--serve") serve_mode = true;
     }
     if (model.empty()) {
         std::fprintf(stderr, "strata-kolibri: the Kolibri 1 engine path (plan T7); --model GGUF [--load-only] for now\n");
@@ -512,6 +723,11 @@ int strata::kolibri::run(int argc, char** argv) {
         return 1;
     }
     if (load_only) return 0;
+    if (serve_mode) {
+        Scratch s;
+        init_scratch(e, s);
+        return serve(e, s);
+    }
     if (tokens.empty()) {
         std::fprintf(stderr, "strata-kolibri: --tokens ID,ID,... (the layer driver is plain; serve arrives in plan T8)\n");
         return 2;
