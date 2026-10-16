@@ -538,7 +538,7 @@ void forward(const Model& m, State& s, int tok, float* layers) {
             s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding);
         gemv(m.W(L(l, "attn_output.weight")), s.att, s.y);
         CK(cudaGetLastError());
-        k_rms<<<1, kThreads>>>(s.y, m.F(L(l, "attn_post_norm.weight")), s.y, N, m.eps);   // the sandwich norm
+        k_rms<<<1, kThreads>>>(s.y, m.F(L(l, "post_attention_norm.weight")), s.y, N, m.eps);   // the sandwich norm
         k_add<<<(N + B - 1) / B, B>>>(s.x, s.y, N);
         k_rms<<<1, kThreads>>>(s.x, m.F(L(l, "ffn_norm.weight")), s.h, N, m.eps);
         // router: select top-6 of 384 on `logits + exp_probs_b` (ties -> lower index); weights = sigmoid(logits),
@@ -572,7 +572,7 @@ void forward(const Model& m, State& s, int tok, float* layers) {
         gemv(m.W(L(l, "ffn_down_shexp.weight")), s.sh, s.sy);
         k_moe_sum<<<(N + B - 1) / B, B>>>(s.moe, s.ey, s.wts, K, s.sy, N);   // the shared expert is UNGATED
         CK(cudaGetLastError());
-        k_rms<<<1, kThreads>>>(s.moe, m.F(L(l, "ffn_post_norm.weight")), s.moe, N, m.eps);   // the sandwich norm
+        k_rms<<<1, kThreads>>>(s.moe, m.F(L(l, "post_ffw_norm.weight")), s.moe, N, m.eps);   // the sandwich norm
         k_add<<<(N + B - 1) / B, B>>>(s.x, s.moe, N);
         CK(cudaGetLastError());
         if (layers) CK(cudaMemcpy(layers + (size_t) l * N, s.x, (size_t) N * 4, cudaMemcpyDeviceToHost));
