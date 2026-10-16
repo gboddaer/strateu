@@ -652,6 +652,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata_kolibri PRIVATE strata_prefill strata_kernels strata_warnings ${_strata_gpu_runtime_target})
   add_executable(strata-kolibri src/kolibri/kolibri_main.cpp)
   target_link_libraries(strata-kolibri PRIVATE strata_kolibri ${_strata_gpu_runtime_target})
+  # the reference forward pass (plan T6): plain kernels + Strata native MMVQ/router, no graphs, no cache; the
+  # routed experts (3-D tensors) live in managed memory so a 47 GB file runs on a 16 GB card (pages from RAM)
+  add_executable(strata-kolibriref src/kolibri/kolibriref.cu)
+  target_include_directories(strata-kolibriref PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+  target_link_libraries(strata-kolibriref PRIVATE strata_kernels strata_warnings ${_strata_gpu_runtime_target})
   target_link_libraries(strata PRIVATE strata_kolibri)
   target_compile_definitions(strata PRIVATE STRATA_HAVE_KOLIBRI=1)
 
