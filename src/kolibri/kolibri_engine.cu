@@ -307,8 +307,9 @@ std::string L(int64_t l, const char* s) { return "blk." + std::to_string(l) + ".
 /// One token through the engine at position s.pos.  Dense matmuls on the GPU tensors; the routed experts read
 /// their [gate|up|down] blob from the pinned host table over UVA (the plain path: exactness first, the native
 /// grouped path with VRAM slots arrives with the placement work).  Bitwise-equal to strata-kolibriref by
-/// construction: the same kernels, the same order, the same weights.
-void forward(const Engine& e, Scratch& s, int tok) {
+/// construction: the same kernels, the same order, the same weights.  `layers_host` (optional, 50 x n_embd)
+/// receives each layer's output for this position, kolibriref's --dump-layers record.
+void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
     const auto& g = e.g;
     const int N = (int) g.n_embd, K = (int) e.top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
     const int H = (int) g.n_head, HKV = (int) g.n_head_kv, D = (int) g.head_dim;
@@ -360,6 +361,7 @@ void forward(const Engine& e, Scratch& s, int tok) {
         k_moe_sum<<<(N + B - 1) / B, B>>>(s.moe, s.ey, s.wts, K, s.sy, N);
         k_rms<<<1, kThreads>>>(s.moe, e.f32.at(L(l, "post_ffw_norm.weight")), s.moe, N, e.eps);
         k_add<<<(N + B - 1) / B, B>>>(s.x, s.moe, N);
+        if (layers_host) KC(cudaMemcpy(layers_host + (size_t) l * N, s.x, N * 4, cudaMemcpyDeviceToHost));
         KC(cudaGetLastError());
     }
     k_rms<<<1, kThreads>>>(s.x, e.f32.at("output_norm.weight"), s.h, N, e.eps);
@@ -483,7 +485,7 @@ bool load(const std::string& path, Engine& e, std::string& err) {
 }  // namespace
 
 int strata::kolibri::run(int argc, char** argv) {
-    std::string model, tokens;
+    std::string model, tokens, dump_layers, dump_logits, dump_full, force;
     bool load_only = false;
     int n_gen = 8;
     for (int i = 1; i < argc; ++i) {
@@ -491,6 +493,10 @@ int strata::kolibri::run(int argc, char** argv) {
         if ((a == "--model" || a == "--native") && i + 1 < argc) model = argv[++i];
         else if (a == "--tokens" && i + 1 < argc) tokens = argv[++i];
         else if (a == "--n" && i + 1 < argc) n_gen = std::atoi(argv[++i]);
+        else if (a == "--dump-layers" && i + 1 < argc) dump_layers = argv[++i];
+        else if (a == "--dump-logits" && i + 1 < argc) dump_logits = argv[++i];
+        else if (a == "--dump-full-logits" && i + 1 < argc) dump_full = argv[++i];
+        else if (a == "--force" && i + 1 < argc) force = argv[++i];
         else if (a == "--load-only") load_only = true;
     }
     if (model.empty()) {
@@ -512,25 +518,55 @@ int strata::kolibri::run(int argc, char** argv) {
     }
     Scratch s;
     init_scratch(e, s);
-    std::vector<int> ids;
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        while (i < tokens.size() && (tokens[i] == ',' || tokens[i] == ' ')) ++i;
-        if (i >= tokens.size()) break;
-        ids.push_back(std::atoi(tokens.c_str() + i));
-        while (i < tokens.size() && tokens[i] != ',' && tokens[i] != ' ') ++i;
-    }
     std::vector<float> lg((size_t) e.g.n_vocab);
+    std::vector<float> layers((size_t) e.g.n_layers * (size_t) e.g.n_embd);
+    std::FILE* fl = dump_layers.empty() ? nullptr : std::fopen(dump_layers.c_str(), "wb");
+    std::FILE* fg = dump_logits.empty() ? nullptr : std::fopen(dump_logits.c_str(), "wb");
+    std::FILE* ff = dump_full.empty() ? nullptr : std::fopen(dump_full.c_str(), "wb");
+    auto parse_ids = [](const std::string& s) {
+        std::vector<int> v;
+        for (size_t i = 0; i < s.size(); ++i) {
+            while (i < s.size() && (s[i] == ',' || s[i] == ' ' || s[i] == '\n')) ++i;
+            if (i >= s.size()) break;
+            v.push_back(std::atoi(s.c_str() + i));
+            while (i < s.size() && s[i] != ',' && s[i] != ' ' && s[i] != '\n') ++i;
+        }
+        return v;
+    };
+    std::vector<int> ids = parse_ids(tokens);
+    std::vector<int> forced = parse_ids(force);
     int tok = ids[0];
-    for (size_t t = 1; t < ids.size(); ++t) { forward(e, s, ids[t - 1]); tok = ids[t]; }
+    for (size_t t = 1; t < ids.size(); ++t) {
+        forward(e, s, ids[t - 1], fl ? layers.data() : nullptr);
+        if (fl) {
+            for (int64_t l = 0; l < e.g.n_layers; ++l)
+                std::fwrite(layers.data() + (size_t) l * e.g.n_embd, 4, e.g.n_embd, fl);
+        }
+        tok = ids[t];
+    }
+    // the last prompt token and every step after it: run, argmax, feed back (a --force sequence replaces the
+    // greedy picks - kl.py's teacher-forced KL path, kolibriref's semantics)
+    const int n_steps = (int) forced.empty() ? n_gen : (int) forced.size() + 1;
+    std::vector<int> gen;
     std::printf("gen:");
-    for (int i = 0; i < n_gen; ++i) {
-        forward(e, s, tok);
+    for (int i = 0; i < n_steps; ++i) {
+        forward(e, s, tok, fl ? layers.data() : nullptr);
+        if (fl)
+            for (int64_t l = 0; l < e.g.n_layers; ++l)
+                std::fwrite(layers.data() + (size_t) l * e.g.n_embd, 4, e.g.n_embd, fl);
         KC(cudaMemcpy(lg.data(), s.logits, lg.size() * 4, cudaMemcpyDeviceToHost));
-        int a = 0;
+        int a = 0, c = -1;
         for (int j = 1; j < (int) lg.size(); ++j) if (lg[j] > lg[a]) a = j;
+        for (int j = 0; j < (int) lg.size(); ++j) if (j != a && (c < 0 || lg[j] > lg[c])) c = j;
         std::printf(" %d", a);
-        tok = a;
+        if (fg) { const float rec[4] = {(float) a, lg[a], (float) c, lg[c]}; std::fwrite(rec, 4, 4, fg); }
+        if (ff) std::fwrite(lg.data(), 4, lg.size(), ff);
+        gen.push_back(a);
+        tok = i + 1 == n_steps ? a : (i < (int) forced.size() ? forced[i] : a);
     }
     std::printf("\n");
+    if (fl) std::fclose(fl);
+    if (fg) std::fclose(fg);
+    if (ff) std::fclose(ff);
     return 0;
 }

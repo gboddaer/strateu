@@ -66,6 +66,7 @@ def main() -> int:
     ap.add_argument("--lock", default="", help="a command prefix for the GPU runs (the box's flock)")
     ap.add_argument("--prompts", default=str(HERE / "parity_prompts.json"))
     ap.add_argument("--skip-ref", action="store_true", help="reuse strata-kolibriref's outputs in --out")
+    ap.add_argument("--skip-dump", action="store_true", help="reuse the kolibri_llama_dump outputs already in --out")
     ap.add_argument("--past-eos", action="store_true", help="compare all --n tokens, not only up to the answer's end")
     a = ap.parse_args()
     out = Path(a.out)
@@ -74,10 +75,13 @@ def main() -> int:
     summary = []
     for i, p in enumerate(prompts):
         tag = f"p{i:02d}"
-        lo = run([a.dump, "--model", a.model, "--prompt", chat(p), "--n", str(a.n), "--ngl", str(a.ngl),
-                  "--cpu-moe", str(a.cpu_moe),
-                  "--dump-layers", str(out / f"{tag}.llama.layers"), "--dump-logits", str(out / f"{tag}.llama.logits")],
-                 a.lock, out / f"{tag}.llama.log")
+        if a.skip_dump:
+            lo = (out / f"{tag}.llama.log").read_text(encoding="utf-8", errors="replace")
+        else:
+            lo = run([a.dump, "--model", a.model, "--prompt", chat(p), "--n", str(a.n), "--ngl", str(a.ngl),
+                      "--cpu-moe", str(a.cpu_moe),
+                      "--dump-layers", str(out / f"{tag}.llama.layers"), "--dump-logits", str(out / f"{tag}.llama.logits")],
+                     a.lock, out / f"{tag}.llama.log")
         prompt_ids, lgen = ids_of(lo, "prompt"), ids_of(lo, "gen")
         if not a.skip_ref:
             so = run([a.ref, "--model", a.model, "--tokens", ",".join(map(str, prompt_ids)), "--n", str(a.n),
