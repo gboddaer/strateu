@@ -61,3 +61,7 @@ build-vision-cuda12.bat
 
 /.ccache/
 /.rocm-win/
+
+# Kolibri 1 parity: the llama.cpp reference dumps (GBs of f32 layer outputs) stay out of git; the harness
+# regenerates them (tools/kolibri/parity.py --skip-ref reuses them)
+data/kolibri-ref/
