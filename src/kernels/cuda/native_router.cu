@@ -213,6 +213,42 @@ bool overlap(const void* a, size_t an, const void* b, size_t bn) {
     const auto ap = reinterpret_cast<uintptr_t>(a), bp = reinterpret_cast<uintptr_t>(b);
     return ap < bp + bn && bp < ap + an;
 }
+// Kolibri 1's router (kolibri1.expert_gating_func 5, "sigmoid_logit_add"): the SELECTION is the top-K of
+// `logits + bias` (equal scores -> the lower expert index, the same tie rule as route_topk above); the WEIGHTS
+// are the UNBIASED sigmoid(logits) of the picks, NOT renormalised (kolibri1.expert_weights_norm is false).
+// One warp per token, 384 experts in 12 per lane, 6 picks, 8 tokens per block.  Deterministic: fixed pick order.
+template <int NE, int K>
+__launch_bounds__(256, 1)
+__global__ void route_sigmoid_logit_add(const float* __restrict__ logits, const float* __restrict__ bias,
+                                        int32_t* __restrict__ ids, float* __restrict__ weights, int n_tok) {
+    static_assert(NE % 32 == 0 && K <= 32, "experts in whole warps, at most 32 picks");
+    constexpr int V = NE / 32;
+    const int tk = (int) blockIdx.x * 8 + (int) threadIdx.y;
+    if (tk >= n_tok) return;
+    logits += (size_t) tk * NE; ids += (size_t) tk * K; weights += (size_t) tk * K;
+    const int lane = threadIdx.x;
+    float scores[V];
+#pragma unroll
+    for (int i = 0; i < V; ++i) scores[i] = logits[lane + i * 32] + bias[lane + i * 32];
+    for (int rank = 0; rank < K; ++rank) {
+        float best = scores[0];
+        int expert = lane;
+#pragma unroll
+        for (int i = 1; i < V; ++i)
+            if (scores[i] > best) { best = scores[i]; expert = lane + i * 32; }
+#pragma unroll
+        for (int mask = 16; mask; mask >>= 1) {
+            const float other = __shfl_xor_sync(0xffffffffu, best, mask, 32);
+            const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
+            if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
+        }
+        if ((expert & 31) == lane) scores[expert / 32] = -INFINITY;
+        if (rank == lane) {   // lane r writes pick r: its id and its UNBIASED sigmoid weight, no renorm
+            ids[rank] = expert;
+            weights[rank] = 1.0f / (1.0f + expf(-logits[expert]));
+        }
+    }
+}
 }
 void native_router_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
 bool native_router_enabled() { return enabled.load(std::memory_order_relaxed); }
@@ -233,7 +269,7 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
-bool native_router_topk_supported(int n_expert, int k) { return (n_expert == 512 && k == 10) || (n_expert == 256 && k == 8); }
+bool native_router_topk_supported(int n_expert, int k) { return (n_expert == 512 && k == 10) || (n_expert == 256 && k == 8) || (n_expert == 384 && k == 6); }
 void native_router_topk(const float* logits, int32_t* ids, float* weights, int n_expert, int k, int n_tok, void* stream) {
     if (n_expert == 512 && k == 10) {   // Flash-Next: the pinned kernels above, unchanged
         if (n_tok == 1) native_router_top10(logits, ids, weights, stream);
@@ -246,6 +282,18 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
         throw std::invalid_argument("native_router_topk: a stream, a supported (experts, k) and aligned buffers");
     route_topk<256, 8><<<(unsigned) ((n_tok + 7) / 8), dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(
         logits, ids, weights, n_tok);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_router_sigmoid_logit_add(const float* logits, const float* bias, int32_t* ids, float* weights,
+                                     int n_tok, void* stream) {
+    if (!stream || n_tok < 1 ||
+        !valid(logits, (size_t) n_tok * 384 * 4) || !valid(bias, 384 * 4) ||
+        !valid(ids, (size_t) n_tok * 6 * 4) || !valid(weights, (size_t) n_tok * 6 * 4))
+        throw std::invalid_argument(
+            "native_router_sigmoid_logit_add: a stream and aligned [n,384]/[384]/[n,6] buffers");
+    route_sigmoid_logit_add<384, 6><<<(unsigned) ((n_tok + 7) / 8), dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(
+        logits, bias, ids, weights, n_tok);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

@@ -20,6 +20,12 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
 /// 256 / 8 (Qwen3.6-35B-A3B).  logits [n_tok, n_expert], ids / weights [n_tok, k].  CUDA / HIP.
 bool native_router_topk_supported(int n_expert, int k);
 void native_router_topk(const float* logits, int32_t* ids, float* weights, int n_expert, int k, int n_tok, void* stream);
+/// Kolibri 1's router (kolibri1.expert_gating_func 5, "sigmoid_logit_add"): 384 experts, top 6.  The SELECTION is
+/// the top-k of `logits + bias` (equal scores -> the lower expert index); the WEIGHTS are the UNBIASED
+/// `sigmoid(logits)` of the picks, NOT renormalised (kolibri1.expert_weights_norm is false).  logits [n_tok,384],
+/// bias [384] (exp_probs_b), ids / weights [n_tok,6].  F32 in and out, deterministic.  CUDA / HIP.
+void native_router_sigmoid_logit_add(const float* logits, const float* bias, int32_t* ids, float* weights,
+                                     int n_tok, void* stream);
 /// STRATA_ROUTE_RESIDENT: swap non-resident tail-rank experts for resident ones within `margin` logits (see the .cu).
 /// `stats` is nullptr or 4 device uint64 counters: tail entries seen, swaps, non-resident before, non-resident after.
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok, float margin,

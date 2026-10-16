@@ -975,6 +975,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(router_top10_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(router_top10_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME router_top10_parity COMMAND router_top10_parity --selftest)
+  # Kolibri 1's router (sigmoid_logit_add, 384 experts top-6): host reference vs kernel, ids exact, weights bitwise
+  add_executable(kolibri_router_parity src/kernels/kolibri_router_parity.cpp)
+  target_include_directories(kolibri_router_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(kolibri_router_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME kolibri_router_parity COMMAND kolibri_router_parity)
   # #783 PR-c: the multi-token router and the k = 10 float4 combine, bitwise against the single-token contracts
   add_executable(native_multi_parity src/kernels/native_multi_parity.cpp)
   target_include_directories(native_multi_parity PRIVATE ${_strata_gpu_include_directories})
