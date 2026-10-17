@@ -52,6 +52,11 @@ int native_gu_mt_min(int gu_type);
 /// ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t]) for rows r in [r0, r1), `nt` tokens.
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1);
+/// one weight row (d_type, d_row bytes at `row`) dequantized to floats (n_ff values): the ground truth a
+/// vec_dot of the same row must match.
+void native_row_to_float(const NativeFmt& f, const uint8_t* row, float* dst);
+/// the same for one gate/up row (gu_type, gu_row bytes at `row`, n_embd values).
+void native_row_to_float_gu(const NativeFmt& f, const uint8_t* row, float* dst);
 /// out[t][r] = down_r . hq[t] for rows r in [r0, r1).
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1);

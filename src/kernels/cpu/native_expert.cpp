@@ -230,6 +230,14 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     }
 }
 
+void native_row_to_float(const NativeFmt& f, const uint8_t* row, float* dst) {
+    ggml_get_type_traits((ggml_type) f.d_type)->to_float(row, dst, f.n_ff);
+}
+
+void native_row_to_float_gu(const NativeFmt& f, const uint8_t* row, float* dst) {
+    ggml_get_type_traits((ggml_type) f.gu_type)->to_float(row, dst, f.n_embd);
+}
+
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
