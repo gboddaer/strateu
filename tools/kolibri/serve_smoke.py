@@ -10,9 +10,10 @@ ap.add_argument("--model", required=True)
 ap.add_argument("--ids", required=True, help="comma-separated prompt ids")
 ap.add_argument("--expect", required=True, help="the greedy ids --tokens produced, space-separated")
 ap.add_argument("--cancel-after", type=int, default=10, help="T lines to take before STOP")
+ap.add_argument("--extra", default="", help="extra engine flags, space-separated")
 a = ap.parse_args()
 
-p = subprocess.Popen([a.bin, "--model", a.model, "--serve"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+p = subprocess.Popen([a.bin, "--model", a.model, "--serve"] + (a.extra.split() if a.extra else []), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                      text=True, bufsize=1)
 def rd():
     while True:
