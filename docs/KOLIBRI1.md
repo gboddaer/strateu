@@ -65,7 +65,36 @@ Checked against the patched llama.cpp (`~/llama.cpp`, upstream + the conversion'
 `tools/kolibri/parity.py`: the same GGUF, the same token ids, per-layer hidden states, greedy tokens, and
 teacher-forced KL. Gates: mean KL < 0.02, greedy agreement ≥ 90 %, per-layer relative error < 2e-2.
 
-Measured on this box (Tesla T4 16 GB, 755 GB RAM): *(filled by the parity/bench task — see the ledger).*
+Measured on this box (Tesla T4 16 GB, 755 GB RAM, Q4_K_M, experts in RAM, llama.cpp `--ngl 99 --n-cpu-moe 50`
+with CUDA graphs off, per the model card's T4 note):
+
+Parity (engine vs llama.cpp, `tools/kolibri/parity.py` + `kl.py`, 8 prompts 56…4147 tokens, 64 greedy each):
+
+| measure | value | gate |
+|---------|-------|------|
+| teacher-forced KL, short prompts p00–p05 (390 steps) | mean **0.00168**, top-1 0.9846 | < 0.02 ✓ |
+| teacher-forced KL, long prompts p06–p07 (130 steps) | mean **0.00229**, top-1 1.0000 | < 0.02 ✓ |
+| KL ratio strata / llama-CPU floor | **0.76** short, **0.41** long | < 1.5 ✓ |
+| greedy identical (up to EOS or 64 tokens) | 5 of 8 prompts (p03 24/24, p04 64/64, p05 64/64, p06 4/4, p07 5/5; p00 31/64, p01 15/59, p02 48/64) | ≥ 90 % of tokens: not met — near-tie cascades |
+| per-layer hidden-state rel. err (vs llama fp16 FA/KV) | median 0.018–0.028 short, 0.077–0.081 long | < 2e-2 everywhere: not met at the tail layers |
+
+The KL gates pass and strata sits closer to llama.cpp's GPU output than llama.cpp's own CPU run (ratio < 1);
+the greedy and tail-layer thresholds are not met on this card against llama's fp16 reference — the divergence
+is near-tie cascades, and the engine's forward is bitwise kolibriref (p00 8/8).
+
+Speed (`tools/kolibri/bench.py`, the plain exactness-first path; grouped GPU experts, VRAM expert slots,
+split-K decode attention, fp16 prompt attention and decode graphs are the recorded speed work, not built):
+
+| test | Strata kolibri1 | llama.cpp (same box) | llama.cpp README (RTX 5070) |
+|------|-----------------|----------------------|------------------------------|
+| pp 512 (short) | 10.0 tok/s | 126.1 tok/s | 723 tok/s |
+| tg 128 (short) | 9.3 tok/s | 19.1 tok/s | 18.0 tok/s |
+| pp 32768 | 1.3 tok/s | 157.5 tok/s | — |
+| tg 128 after 32K | 0.6 tok/s | 21.2 tok/s | — |
+
+Decode short is within 2× of llama.cpp's (the experts stream over PCIe from RAM: 663 MB/token); prompt-read
+and long-context decode are far behind — the plain path reads every expert blob over PCIe per token and its
+full-attention decode is O(n) per position with a two-pass softmax past the 48 KB shared-memory cap.
 
 ## Not verified (v1)
 

@@ -232,6 +232,9 @@ __global__ void k_attn(const float* q, const float* kc, const float* vc, float* 
     const int n_pos = sliding ? (pos + 1 < (int) swa ? pos + 1 : (int) swa) : pos + 1;
     const int64_t first = sliding ? (int64_t) pos + 1 - n_pos : 0;
     const float* qh = q + (size_t) h * D;
+    // the scores live in dynamic shared memory up to the 48 KB a T4-class block gets; past that (a 32K full-
+    // attention layer) the kernel runs two passes and recomputes each score - slower, and it works
+    if (n_pos <= 12000) {
     for (int p = threadIdx.x; p < n_pos; p += blockDim.x) {
         const int64_t gp = first + p, slot = sliding ? gp % swa : gp;
         const float* kp = kc + ((size_t) kvh * rows + slot) * D;
@@ -257,6 +260,35 @@ __global__ void k_attn(const float* q, const float* kc, const float* vc, float* 
             acc += sc[p] * vc[((size_t) kvh * rows + slot) * D + i];
         }
         out[(size_t) h * D + i] = acc / sum;
+    }
+    } else {
+        // pass 1: the max and the softmax denominator, scores recomputed from the KV (no shared copy)
+        auto score = [&](int p) -> float {
+            const int64_t gp = first + p, slot = sliding ? gp % swa : gp;
+            const float* kp = kc + ((size_t) kvh * rows + slot) * D;
+            float s = 0.f;
+            for (int i = 0; i < D; ++i) s += qh[i] * kp[i];
+            return s * scale;
+        };
+        float mx = -INFINITY;
+        for (int p = threadIdx.x; p < n_pos; p += blockDim.x) mx = fmaxf(mx, score(p));
+        sh[threadIdx.x] = mx;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) { if ((int) threadIdx.x < s) sh[threadIdx.x] = fmaxf(sh[threadIdx.x], sh[threadIdx.x + s]); __syncthreads(); }
+        mx = sh[0];
+        __syncthreads();
+        float sum = 0.f;
+        for (int p = threadIdx.x; p < n_pos; p += blockDim.x) sum += expf(score(p) - mx);
+        sum = block_sum(sum, sh);
+        // pass 2: the weighted V sum; each warp of the block takes a slice of D and walks all positions
+        for (int i = threadIdx.x; i < D; i += blockDim.x) {
+            float acc = 0.f;
+            for (int p = 0; p < n_pos; ++p) {
+                const int64_t gp = first + p, slot = sliding ? gp % swa : gp;
+                acc += expf(score(p) - mx) * vc[((size_t) kvh * rows + slot) * D + i];
+            }
+            out[(size_t) h * D + i] = acc / sum;
+        }
     }
 }
 
@@ -342,11 +374,10 @@ void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
         k_attn_prep<<<H + HKV, kThreads>>>(s.q, s.k, s.v, e.f32.at(L(l, "attn_q_norm.weight")),
                                            e.f32.at(L(l, "attn_k_norm.weight")), s.q, s.kc[l], s.vc[l], H, D, s.pos,
                                            g.n_swa, s.ctx, e.rope_base, e.eps, sliding);
-        k_attn<<<H, kThreads,
-                (size_t) (s.pos + 1 < (int64_t) (sliding ? g.n_swa : s.ctx) ? s.pos + 1
-                                                                            : (int64_t) (sliding ? g.n_swa : s.ctx)) *
-                    sizeof(float)>>>(s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos, g.n_swa, s.ctx,
-                                     1.0f / sqrtf((float) D), sliding);
+        const int n_vis = (int) (s.pos + 1 < (int64_t) (sliding ? g.n_swa : s.ctx) ? s.pos + 1
+                                                                            : (int64_t) (sliding ? g.n_swa : s.ctx));
+        k_attn<<<H, kThreads, n_vis <= 12000 ? (size_t) n_vis * sizeof(float) : 0>>>(
+            s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding);
         gemv(e.dense.at(L(l, "attn_output.weight")), s.att, s.y, nullptr, 1, 0, nullptr, 0);
         k_rms<<<1, kThreads>>>(s.y, e.f32.at(L(l, "post_attention_norm.weight")), s.y, N, e.eps);
         k_add<<<(N + B - 1) / B, B>>>(s.x, s.y, N);
@@ -697,12 +728,13 @@ bool load(const std::string& path, Engine& e, std::string& err) {
 int strata::kolibri::run(int argc, char** argv) {
     std::string model, tokens, dump_layers, dump_logits, dump_full, force;
     bool load_only = false, serve_mode = false;
-    int n_gen = 8;
+    int n_gen = 8, ctx = 8192;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if ((a == "--model" || a == "--native") && i + 1 < argc) model = argv[++i];
         else if (a == "--tokens" && i + 1 < argc) tokens = argv[++i];
         else if (a == "--n" && i + 1 < argc) n_gen = std::atoi(argv[++i]);
+        else if (a == "--ctx" && i + 1 < argc) ctx = std::atoi(argv[++i]);
         else if (a == "--dump-layers" && i + 1 < argc) dump_layers = argv[++i];
         else if (a == "--dump-logits" && i + 1 < argc) dump_logits = argv[++i];
         else if (a == "--dump-full-logits" && i + 1 < argc) dump_full = argv[++i];
@@ -725,6 +757,7 @@ int strata::kolibri::run(int argc, char** argv) {
     if (load_only) return 0;
     if (serve_mode) {
         Scratch s;
+        s.ctx = ctx;
         init_scratch(e, s);
         return serve(e, s);
     }
@@ -733,6 +766,7 @@ int strata::kolibri::run(int argc, char** argv) {
         return 2;
     }
     Scratch s;
+    s.ctx = ctx;
     init_scratch(e, s);
     std::vector<float> lg((size_t) e.g.n_vocab);
     std::vector<float> layers((size_t) e.g.n_layers * (size_t) e.g.n_embd);
