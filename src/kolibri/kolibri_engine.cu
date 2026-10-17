@@ -212,10 +212,18 @@ __global__ void k_gemv(const uint8_t* W, size_t row_bytes, size_t expert_bytes, 
     acc = block_sum(acc, sh);
     if (threadIdx.x == 0) y[(size_t) sel * n_out + o] = acc;
 }
-template <int T> __global__ void k_row(const uint8_t* W, size_t row_bytes, int row, int n, float* out) {
+template <int T> __device__ void k_row_body(const uint8_t* W, size_t row_bytes, int row, int n, float* out) {
     const uint8_t* r = W + (size_t) row * row_bytes;
     for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < n / 32; c += gridDim.x * blockDim.x) deq32<T>(r, c, out + 32 * c);
 }
+template <int T> __global__ void k_row(const uint8_t* W, size_t row_bytes, int row, int n, float* out) {
+    k_row_body<T>(W, row_bytes, row, n, out);
+}
+/// graph decode: the row (token id) from device memory
+template <int T> __global__ void k_row_p(const uint8_t* W, size_t row_bytes, const int* row_p, int n, float* out) {
+    k_row_body<T>(W, row_bytes, *row_p, n, out);
+}
+
 __global__ void k_rms(const float* x, const float* w, float* y, int n, float eps) {
     __shared__ float sh[kThreads];
     const float* xg = x + (size_t) blockIdx.x * n;
@@ -281,7 +289,7 @@ __global__ void k_moe_sum2(float* moe, const float* y, const float* yc, const fl
     for (int s = 0; s < k; ++s) acc += w[s] * (y[(size_t) s * n + i] + yc[(size_t) s * n + i]);
     moe[i] = acc;
 }
-__global__ void k_attn_prep(const float* qx, const float* kx, const float* vx, const float* qw, const float* kw,
+__device__ void k_attn_prep_body(const float* qx, const float* kx, const float* vx, const float* qw, const float* kw,
                             float* q, float* kc, float* vc, int H, int D, int pos, int64_t swa, int ctx, float base,
                             float eps, bool rope) {
     __shared__ float sh[kThreads];
@@ -314,7 +322,19 @@ __global__ void k_attn_prep(const float* qx, const float* kx, const float* vx, c
         for (int i = threadIdx.x; i < D; i += blockDim.x)
             vc[((size_t) kvh * rows + slot) * D + i] = vx[(size_t) kvh * D + i];
 }
-__global__ void k_attn(const float* q, const float* kc, const float* vc, float* out, int H, int HKV, int D, int pos,
+__global__ void k_attn_prep(const float* qx, const float* kx, const float* vx, const float* qw, const float* kw,
+                            float* q, float* kc, float* vc, int H, int D, int pos, int64_t swa, int ctx, float base,
+                            float eps, bool rope) {
+    k_attn_prep_body(qx, kx, vx, qw, kw, q, kc, vc, H, D, pos, swa, ctx, base, eps, rope);
+}
+/// graph decode: the position from device memory
+__global__ void k_attn_prep_p(const float* qx, const float* kx, const float* vx, const float* qw, const float* kw,
+                              float* q, float* kc, float* vc, int H, int D, const int* pos_p, int64_t swa, int ctx,
+                              float base, float eps, bool rope) {
+    k_attn_prep_body(qx, kx, vx, qw, kw, q, kc, vc, H, D, *pos_p, swa, ctx, base, eps, rope);
+}
+
+__device__ void k_attn_body(const float* q, const float* kc, const float* vc, float* out, int H, int HKV, int D, int pos,
                        int64_t swa, int ctx, float scale, bool sliding) {
     extern __shared__ float sc[];
     __shared__ float sh[kThreads];
@@ -382,6 +402,18 @@ __global__ void k_attn(const float* q, const float* kc, const float* vc, float* 
         }
     }
 }
+__global__ void k_attn(const float* q, const float* kc, const float* vc, float* out, int H, int HKV, int D, int pos,
+                       int64_t swa, int ctx, float scale, bool sliding) {
+    const int n_vis = sliding ? (pos + 1 < (int) swa ? pos + 1 : (int) swa) : pos + 1;
+    k_attn_body(q, kc, vc, out, H, HKV, D, pos, swa, ctx, scale, sliding);
+}
+/// graph decode: the position from device memory; the dynamic shared memory is the two-pass size (0) so one
+/// capture serves every position (the smem path bakes n_vis into the launch and cannot be replayed across pos).
+__global__ void k_attn_p(const float* q, const float* kc, const float* vc, float* out, int H, int HKV, int D,
+                         const int* pos_p, int64_t swa, int ctx, float scale, bool sliding) {
+    k_attn_body(q, kc, vc, out, H, HKV, D, *pos_p, swa, ctx, scale, sliding);
+}
+
 
 float* dalloc(size_t n) {
     float* p = nullptr;
@@ -440,6 +472,7 @@ struct Scratch {
     // --grouped: the per-layer grouped-expert call's device side
     unsigned long long* grp_ptr = nullptr; int32_t *grp_start = nullptr, *n_groups = nullptr;
     int32_t *ent_dst = nullptr, *ent_tok = nullptr; char* xq8 = nullptr; char* scratch = nullptr; float* gout = nullptr;
+    int* pos_d = nullptr; int* tok_d = nullptr;   // graph decode: position and token id on the device
 };
 
 
@@ -602,6 +635,8 @@ void init_scratch(const Engine& e, Scratch& s) {
     s.eg = dalloc((size_t) K * FF); s.eu = dalloc((size_t) K * FF); s.eh = dalloc((size_t) K * FF); s.ey = dalloc((size_t) K * N);
     s.sg = dalloc(g.n_ff_shexp); s.su = dalloc(g.n_ff_shexp); s.sh = dalloc(g.n_ff_shexp);
     s.wts = dalloc(K);
+    KC(cudaMalloc((void**) &s.pos_d, 4));
+    KC(cudaMalloc((void**) &s.tok_d, 4));
     if (e.grouped > 0) {   // one grouped launch per layer: K entries, K groups at most, q8_1 acts for one token
         const int64_t cap_g = std::min<int64_t>(K, g.n_expert) + 1, cap_e = K;
         KC(cudaMalloc((void**) &s.grp_ptr, cap_g * sizeof(unsigned long long)));
