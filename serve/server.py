@@ -6612,7 +6612,7 @@ def check_request_sampling(req) -> None:
 
 
 # the API's model name per model family (the GGUF architecture, "arch" in the config) when the config names none
-FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b"}
+FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b", "kolibri1": "kolibri-1"}
 
 
 def default_model_name(cfg: dict) -> str:

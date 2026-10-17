@@ -63,6 +63,26 @@ QWEN35_PATTERN = (
     r"|\s+"
 )
 
+# The `kolibri1` pre-tokenizer: the GGUF declares `tokenizer.ggml.pre = "kolibri1"`, and the patched llama.cpp
+# (src/llama-vocab.cpp:2394) maps it to LLAMA_VOCAB_PRE_TYPE_QWEN2 - the QWEN35 shape WITHOUT the `\p{M}`:
+# a combining mark is not `\p{L}`, so `e\u0301` splits into two pieces here where qwen35 keeps them together.
+# Transcribed from `~/llama.cpp/src/llama-vocab.cpp` L388 (the QWEN2/HUNYUAN/SOLAR case).
+KOLIBRI1_PATTERN = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+# `pre` -> (pattern, where it was transcribed from); the pack ships the pair for its own `pre`.
+PRE_PATTERNS = {
+    "qwen35": (QWEN35_PATTERN, ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
+    "kolibri1": (KOLIBRI1_PATTERN, "~/llama.cpp src/llama-vocab.cpp L388 (LLAMA_VOCAB_PRE_TYPE_QWEN2)"),
+}
+
 
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
@@ -86,7 +106,7 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(QWEN35_PATTERN)
+        self._re = regex.compile(PRE_PATTERNS.get(pre, PRE_PATTERNS["qwen35"])[0])
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -318,8 +338,8 @@ def extract(gguf_path, out_dir) -> dict:
         "add_bos_token": False,
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
-        "pre_pattern": QWEN35_PATTERN,
-        "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
+        "pre_pattern": PRE_PATTERNS.get(tk.pre, PRE_PATTERNS["qwen35"])[0],
+        "pre_pattern_source": PRE_PATTERNS.get(tk.pre, PRE_PATTERNS["qwen35"])[1],
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
