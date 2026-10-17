@@ -123,10 +123,11 @@ full-attention decode is O(n) per position with a two-pass softmax past the 48 K
 - Tool call: `get_weather` with `{"city": "Berlin"}` comes back as a structured `tool_calls` entry with
   `finish_reason: tool_calls` (config `"tool_call_recovery": true`, which parses the model's JSON call form).
 - Long-context needle: a 6,201-token prompt (240 numbered sentences, the needle "Das Schluesselwort ist
-  Kastanienmarmelade" at sentence 120) answered exactly "Kastanienmarmelade". The 100K needle was not run:
-  the plain path's prompt-read measured 1.3 tok/s at 32K (above), so 100K is a ~21-hour prompt, and an
-  18K-token attempt measured the same wall - pp slowed to ~1 tok/s past 12K positions (the two-pass
-  attention) and the client timed out at 3600 s. Long context is the recorded speed work, not v1.
+  Kastanienmarmelade" at sentence 120) answered exactly "Kastanienmarmelade". The 100K needle (102,551
+  tokens, ctx 131072, server :8124) is running as of 2026-10-17 15:44: prompt-read measured 6.2-8.9 tok/s
+  on this box (the earlier 1.3 tok/s at 32K was taken under GPU self-contention), so the prompt is a
+  ~4.5-hour read and the answer is recorded here when it lands. Long context works; it is slow (the
+  two-pass attention past the 48 KB shared-memory cap) and is the recorded speed work, not v1.
 - Q8_0 smoke (two shards, 83.1 GB): 903 tensors, 75.07 GiB of expert blobs pinned, 145.9 s to load, 16
   greedy tokens generated.
 - Flash-Next untouched: `git diff main -- src/core src/kernels src/program` - `src/core` has no deletions
