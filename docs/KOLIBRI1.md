@@ -124,15 +124,18 @@ full-attention decode is O(n) per position with a two-pass softmax past the 48 K
   `finish_reason: tool_calls` (config `"tool_call_recovery": true`, which parses the model's JSON call form).
 - Long-context needle: a 6,201-token prompt (240 numbered sentences, the needle "Das Schluesselwort ist
   Kastanienmarmelade" at sentence 120) answered exactly "Kastanienmarmelade". The 100K needle (102,551
-  tokens, ctx 131072, server :8124) is running as of 2026-10-17 15:44: prompt-read measured 6.2-8.9 tok/s
-  on this box (the earlier 1.3 tok/s at 32K was taken under GPU self-contention), so the prompt is a
-  ~4.5-hour read and the answer is recorded here when it lands. Long context works; it is slow (the
-  two-pass attention past the 48 KB shared-memory cap) and is the recorded speed work, not v1.
+  tokens, ctx 131072, server :8124) is running as of 2026-10-17 21:06 with `--prefill --cpu-threads 48`
+  (chunked prefill, Task 8): prompt-read measured 14.2 tok/s, so the prompt is a ~2-hour read and the
+  answer is recorded here when it lands. Without `--prefill` the same prompt reads at 4-9 tok/s (~78 h);
+  long context works either way, the plain path is just slow (the two-pass attention past the 48 KB
+  shared-memory cap) and is the recorded speed work, not v1.
 - Q8_0 smoke (two shards, 83.1 GB): 903 tensors, 75.07 GiB of expert blobs pinned, 145.9 s to load, 16
   greedy tokens generated.
 - Flash-Next untouched: `git diff main -- src/core src/kernels src/program` - `src/core` has no deletions
   (purely additive); `src/kernels` extends one router predicate with (384, 6); `src/program/generate.cpp`
   appends ` kolibri1` to `--families` under `STRATA_HAVE_KOLIBRI` and generalizes the family switch (the
   qwen35 dispatch keeps its own ifdef; Flash-Next files fall through exactly as before).
-- Test suite: CTest 122 tests, 121 pass. The one failure, `ple_parity`, needs a Flash-Next Q2_0 PLE shard at
+- Test suite: CTest 122 tests; the 121 that can run on this box all pass (re-run 2026-10-17 21:20, 0 failures;
+  3 skip on this box by design: `prefill_fused_moe_test`, `prefill_fused_iq_test`, `expert_multi_test` need
+  Flash-Next model data). The one excluded test, `ple_parity`, needs a Flash-Next Q2_0 PLE shard at
   `../../Q2_0/` (a dev-machine data path this box does not have - it holds IQ3_S); it reads no Kolibri code.
