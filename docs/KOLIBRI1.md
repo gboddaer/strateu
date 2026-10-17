@@ -110,3 +110,28 @@ full-attention decode is O(n) per position with a two-pass softmax past the 48 K
 - Q8_0 beyond a smoke run (parity is at Q4_K_M).
 - Speculative decoding: the model has no MTP layer; prompt-lookup drafting is future work.
 - Multi-GPU, images, the Intel Arc (SYCL) build (refused, like Qwen3.6's).
+
+## End-to-end acceptance (2026-10-17, Tesla T4 16 GB, 755 GB RAM, Q4_K_M)
+
+- Fresh install: `./setup.sh --family kolibri --model Q4_K_M --gguf-dir <folder with the GGUF> --yes` -
+  "All set", 13 ok marks; writes `strata-kolibri-q4_k_m.json` (exe `build/strata-kolibri`, `--model`/`--ctx
+  32768`, tokenizer pack, `arch: kolibri1`) and `run-kolibri-q4_k_m.sh`.
+- Server: ready on `http://127.0.0.1:8080/v1`, context 32768, `/v1/models` -> `kolibri-1-q4_k_m`.
+- Chat: English "What is 27 times 43?" -> "1161"; German "Was ist 27 mal 43?" -> "27 x 43 = 1161."
+- Reasoning effort: `none` answers directly; `low` thinks briefly then "1161."; the default (high) thinks at
+  length (`reasoning_content` carries the `<think>` block).
+- Tool call: `get_weather` with `{"city": "Berlin"}` comes back as a structured `tool_calls` entry with
+  `finish_reason: tool_calls` (config `"tool_call_recovery": true`, which parses the model's JSON call form).
+- Long-context needle: a 6,201-token prompt (240 numbered sentences, the needle "Das Schluesselwort ist
+  Kastanienmarmelade" at sentence 120) answered exactly "Kastanienmarmelade". The 100K needle was not run:
+  the plain path's prompt-read measured 1.3 tok/s at 32K (above), so 100K is a ~21-hour prompt, and an
+  18K-token attempt measured the same wall - pp slowed to ~1 tok/s past 12K positions (the two-pass
+  attention) and the client timed out at 3600 s. Long context is the recorded speed work, not v1.
+- Q8_0 smoke (two shards, 83.1 GB): 903 tensors, 75.07 GiB of expert blobs pinned, 145.9 s to load, 16
+  greedy tokens generated.
+- Flash-Next untouched: `git diff main -- src/core src/kernels src/program` - `src/core` has no deletions
+  (purely additive); `src/kernels` extends one router predicate with (384, 6); `src/program/generate.cpp`
+  appends ` kolibri1` to `--families` under `STRATA_HAVE_KOLIBRI` and generalizes the family switch (the
+  qwen35 dispatch keeps its own ifdef; Flash-Next files fall through exactly as before).
+- Test suite: CTest 122 tests, 121 pass. The one failure, `ple_parity`, needs a Flash-Next Q2_0 PLE shard at
+  `../../Q2_0/` (a dev-machine data path this box does not have - it holds IQ3_S); it reads no Kolibri code.

@@ -1,1 +1,6 @@
 {"type":"goal_created","goalId":"mvbeaadz-ci3ol5","objective":"Execute docs/superpowers/plans/2026-10-16-kolibri1.md on branch kolibri1, task by task in order (tasks 2-14). After every task: run its gate command, update the matching     \n    ledger row (status, evidence, commit hash) in docs/superpowers/plans/2026-10-16-kolibri1-ledger.md, and commit. Do not stop while ledger rows remain todo; do not mark a row done without its  gate command's measured output. Human review happens only after task 14.","sisyphus":true,"autoContinue":true,"at":"2026-10-16T20:03:05.111Z"}
+{"type":"goal_resumed","goalId":"mvbeaadz-ci3ol5","reason":"user","at":"2026-10-17T11:09:05.468Z"}
+{"type":"goal_paused","goalId":"mvbeaadz-ci3ol5","reason":"user","status":"paused","at":"2026-10-17T11:09:19.133Z"}
+{"type":"goal_paused","goalId":"mvbeaadz-ci3ol5","reason":"Scheduling paused","source":"agent","at":"2026-10-17T11:09:19.164Z"}
+{"type":"goal_paused","goalId":"mvbeaadz-ci3ol5","reason":"Scheduling paused","source":"agent","at":"2026-10-17T11:09:46.665Z"}
+{"type":"goal_resumed","goalId":"mvbeaadz-ci3ol5","reason":"user","at":"2026-10-17T11:10:15.302Z"}
