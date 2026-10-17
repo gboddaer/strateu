@@ -130,6 +130,8 @@ struct Engine {
     int cpu_threads = 0;            // --cpu-threads: routed experts on the CPU pool (ggml-cpu vec_dot, no PCIe)
     int slots = 0;                  // --expert-slots: experts per layer resident in VRAM (the GPU expert cache)
     int grouped = 0;                // --grouped: native_expert_grouped for the routed experts (one launch per layer)
+    int graphs = 0;                 // --grouped + graphs (default on with --grouped): per-layer CUDA graphs
+    std::vector<unsigned long long> gexec;   // cudaGraphExec_t per layer (0 = the layer is not capturable)
     mutable Pool pool;              // the worker pool behind the CPU expert path
     std::map<std::string, Dense> dense;
     std::map<std::string, float*> f32;
@@ -243,6 +245,7 @@ __global__ void k_add(float* x, const float* y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] += y[i];
 }
+__global__ void k_pos_add(int* pos) { *pos += 1; }
 /// The routed entries (K picks for one token, entry e = k) grouped per expert on the device: one group per
 /// expert used (ascending id), its blob address, its entries in entry order (q36_engine.cu's k_group).
 __global__ void k_group(const int32_t* ids, int n_ent, int K_, int n_expert, const uint8_t* blobs,
@@ -335,7 +338,7 @@ __global__ void k_attn_prep_p(const float* qx, const float* kx, const float* vx,
 }
 
 __device__ void k_attn_body(const float* q, const float* kc, const float* vc, float* out, int H, int HKV, int D, int pos,
-                       int64_t swa, int ctx, float scale, bool sliding) {
+                       int64_t swa, int ctx, float scale, bool sliding, bool force_2pass = false) {
     extern __shared__ float sc[];
     __shared__ float sh[kThreads];
     const int h = blockIdx.x, kvh = h / (H / HKV);
@@ -345,7 +348,7 @@ __device__ void k_attn_body(const float* q, const float* kc, const float* vc, fl
     const float* qh = q + (size_t) h * D;
     // the scores live in dynamic shared memory up to the 48 KB a T4-class block gets; past that (a 32K full-
     // attention layer) the kernel runs two passes and recomputes each score - slower, and it works
-    if (n_pos <= 12000) {
+    if (!force_2pass && n_pos <= 12000) {
     for (int p = threadIdx.x; p < n_pos; p += blockDim.x) {
         const int64_t gp = first + p, slot = sliding ? gp % swa : gp;
         const float* kp = kc + ((size_t) kvh * rows + slot) * D;
@@ -411,7 +414,7 @@ __global__ void k_attn(const float* q, const float* kc, const float* vc, float* 
 /// capture serves every position (the smem path bakes n_vis into the launch and cannot be replayed across pos).
 __global__ void k_attn_p(const float* q, const float* kc, const float* vc, float* out, int H, int HKV, int D,
                          const int* pos_p, int64_t swa, int ctx, float scale, bool sliding) {
-    k_attn_body(q, kc, vc, out, H, HKV, D, *pos_p, swa, ctx, scale, sliding);
+    k_attn_body(q, kc, vc, out, H, HKV, D, *pos_p, swa, ctx, scale, sliding, true);
 }
 
 
@@ -430,7 +433,7 @@ constexpr size_t kActBuf = 1 << 16;
 /// activation (one call per selection, expert ids[sel] from the host picks); F32/F16/BF16 through plain k_gemv.
 /// `base`/`eb` point at an expert blob table (pinned host, UVA-read); null for the dense GPU tensors.
 void gemv(const Dense& w, const float* x, float* y, const int* ids, int n_sel, size_t x_stride, const uint8_t* base,
-          size_t eb) {
+          size_t eb, cudaStream_t st = 0) {
     const int n_in = (int) w.shape[0], n_out = (int) w.shape[1];
     const uint8_t* W = base ? base : w.d;
     const bool quant = w.type == T_Q8_0 || w.type == T_Q4_K || w.type == T_Q5_K || w.type == T_Q6_K;
@@ -448,9 +451,9 @@ void gemv(const Dense& w, const float* x, float* y, const int* ids, int n_sel, s
     }
     const size_t row_bytes = w.row_bytes;
     switch (w.type) {
-    case T_F32: k_gemv<T_F32><<<dim3(n_out, n_sel), kThreads>>>(W, row_bytes, eb, ids, n_in, x, x_stride, y, n_out); break;
-    case T_F16: k_gemv<T_F16><<<dim3(n_out, n_sel), kThreads>>>(W, row_bytes, eb, ids, n_in, x, x_stride, y, n_out); break;
-    case T_BF16: k_gemv<T_BF16><<<dim3(n_out, n_sel), kThreads>>>(W, row_bytes, eb, ids, n_in, x, x_stride, y, n_out); break;
+    case T_F32: k_gemv<T_F32><<<dim3(n_out, n_sel), kThreads, 0, st>>>(W, row_bytes, eb, ids, n_in, x, x_stride, y, n_out); break;
+    case T_F16: k_gemv<T_F16><<<dim3(n_out, n_sel), kThreads, 0, st>>>(W, row_bytes, eb, ids, n_in, x, x_stride, y, n_out); break;
+    case T_BF16: k_gemv<T_BF16><<<dim3(n_out, n_sel), kThreads, 0, st>>>(W, row_bytes, eb, ids, n_in, x, x_stride, y, n_out); break;
     default:
         std::fprintf(stderr, "strata-kolibri: no kernel for ggml type %d\n", w.type);
         std::exit(1);
@@ -483,50 +486,58 @@ std::string L(int64_t l, const char* s) { return "blk." + std::to_string(l) + ".
 /// grouped path with VRAM slots arrives with the placement work).  Bitwise-equal to strata-kolibriref by
 /// construction: the same kernels, the same order, the same weights.  `layers_host` (optional, 50 x n_embd)
 /// receives each layer's output for this position, kolibriref's --dump-layers record.
-void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
+
+/// One decoder step for layer l.  graph=true: everything device-side (position and token id read from
+/// device pointers, grouped experts, two-pass attention - capturable as a CUDA graph); graph=false: the
+/// plain path (value position, host ids for the mmvq loop, layer dumps).  st = 0 (legacy stream) keeps the
+/// plain launches byte-identical; the graph path runs on g_st.
+void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t st, float* layers_host) {
     const auto& g = e.g;
     const int N = (int) g.n_embd, K = (int) e.top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
     const int H = (int) g.n_head, HKV = (int) g.n_head_kv, D = (int) g.head_dim;
     const int B = 256;
-    const Dense& emb = e.dense.at("token_embd.weight");
-    switch (emb.type) {
-    case T_Q8_0: k_row<T_Q8_0><<<4, 128>>>(emb.d, emb.row_bytes, tok, N, s.x); break;
-    case T_Q4_K: k_row<T_Q4_K><<<4, 128>>>(emb.d, emb.row_bytes, tok, N, s.x); break;
-    case T_Q6_K: k_row<T_Q6_K><<<4, 128>>>(emb.d, emb.row_bytes, tok, N, s.x); break;
-    case T_BF16: k_row<T_BF16><<<4, 128>>>(emb.d, emb.row_bytes, tok, N, s.x); break;
-    case T_F16: k_row<T_F16><<<4, 128>>>(emb.d, emb.row_bytes, tok, N, s.x); break;
-    default: std::fprintf(stderr, "strata-kolibri: token_embd type %d\n", emb.type); std::exit(1);
-    }
-    for (int64_t l = 0; l < g.n_layers; ++l) {
+    (void) layers_host;
+
         const bool sliding = strata::core::is_swa_layer(g, l);
         const LayerBlobs& b = e.blobs[(size_t) l];
-        k_rms<<<1, kThreads>>>(s.x, e.f32.at(L(l, "attn_norm.weight")), s.h, N, e.eps);
-        gemv(e.dense.at(L(l, "attn_q.weight")), s.h, s.q, nullptr, 1, 0, nullptr, 0);
-        gemv(e.dense.at(L(l, "attn_k.weight")), s.h, s.k, nullptr, 1, 0, nullptr, 0);
-        gemv(e.dense.at(L(l, "attn_v.weight")), s.h, s.v, nullptr, 1, 0, nullptr, 0);
-        k_attn_prep<<<H + HKV, kThreads>>>(s.q, s.k, s.v, e.f32.at(L(l, "attn_q_norm.weight")),
+        k_rms<<<1, kThreads, 0, st>>>(s.x, e.f32.at(L(l, "attn_norm.weight")), s.h, N, e.eps);
+        gemv(e.dense.at(L(l, "attn_q.weight")), s.h, s.q, nullptr, 1, 0, nullptr, 0, st);
+        gemv(e.dense.at(L(l, "attn_k.weight")), s.h, s.k, nullptr, 1, 0, nullptr, 0, st);
+        gemv(e.dense.at(L(l, "attn_v.weight")), s.h, s.v, nullptr, 1, 0, nullptr, 0, st);
+        if (graph)
+            k_attn_prep_p<<<H + HKV, kThreads, 0, st>>>(s.q, s.k, s.v, e.f32.at(L(l, "attn_q_norm.weight")),
+                                           e.f32.at(L(l, "attn_k_norm.weight")), s.q, s.kc[l], s.vc[l], H, D, s.pos_d,
+                                           g.n_swa, s.ctx, e.rope_base, e.eps, sliding);
+        else
+            k_attn_prep<<<H + HKV, kThreads, 0, st>>>(s.q, s.k, s.v, e.f32.at(L(l, "attn_q_norm.weight")),
                                            e.f32.at(L(l, "attn_k_norm.weight")), s.q, s.kc[l], s.vc[l], H, D, s.pos,
                                            g.n_swa, s.ctx, e.rope_base, e.eps, sliding);
         const int n_vis = (int) (s.pos + 1 < (int64_t) (sliding ? g.n_swa : s.ctx) ? s.pos + 1
                                                                             : (int64_t) (sliding ? g.n_swa : s.ctx));
-        k_attn<<<H, kThreads, n_vis <= 12000 ? (size_t) n_vis * sizeof(float) : 0>>>(
-            s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding);
-        gemv(e.dense.at(L(l, "attn_output.weight")), s.att, s.y, nullptr, 1, 0, nullptr, 0);
-        k_rms<<<1, kThreads>>>(s.y, e.f32.at(L(l, "post_attention_norm.weight")), s.y, N, e.eps);
-        k_add<<<(N + B - 1) / B, B>>>(s.x, s.y, N);
-        k_rms<<<1, kThreads>>>(s.x, e.f32.at(L(l, "ffn_norm.weight")), s.h, N, e.eps);
-        gemv(e.dense.at(L(l, "ffn_gate_inp.weight")), s.h, s.router, nullptr, 1, 0, nullptr, 0);
+        if (graph)
+            k_attn_p<<<H, kThreads, 0, st>>>(
+                s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos_d, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding);
+        else
+            k_attn<<<H, kThreads, n_vis <= 12000 ? (size_t) n_vis * sizeof(float) : 0, st>>>(
+                s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding);
+        gemv(e.dense.at(L(l, "attn_output.weight")), s.att, s.y, nullptr, 1, 0, nullptr, 0, st);
+        k_rms<<<1, kThreads, 0, st>>>(s.y, e.f32.at(L(l, "post_attention_norm.weight")), s.y, N, e.eps);
+        k_add<<<(N + B - 1) / B, B, 0, st>>>(s.x, s.y, N);
+        k_rms<<<1, kThreads, 0, st>>>(s.x, e.f32.at(L(l, "ffn_norm.weight")), s.h, N, e.eps);
+        gemv(e.dense.at(L(l, "ffn_gate_inp.weight")), s.h, s.router, nullptr, 1, 0, nullptr, 0, st);
         strata::kernels::native_router_sigmoid_logit_add(s.router, e.f32.at(L(l, "exp_probs_b.bias")), s.ids, s.wts, 1,
                                                          g_st);
-        g_ids_host.resize((size_t) K);
-        KC(cudaMemcpy(g_ids_host.data(), s.ids, K * sizeof(int), cudaMemcpyDeviceToHost));
+        if (!graph) {
+            g_ids_host.resize((size_t) K);
+            KC(cudaMemcpy(g_ids_host.data(), s.ids, K * sizeof(int), cudaMemcpyDeviceToHost));
+        }
         Dense gu; gu.type = b.L.gu_type; gu.shape = {g.n_embd, g.n_ff, g.n_expert}; gu.row_bytes = b.L.gu_row;
         Dense dn; dn.type = b.L.d_type; dn.shape = {g.n_ff, g.n_embd, g.n_expert}; dn.row_bytes = b.L.d_row;
         // --grouped: one native_expert_grouped launch per layer reads the blobs from the pinned table over UVA
         // (the per-selection mmvq loop's 18 launches per layer become one; the grouped kernel's rows are ggml's
         // own arithmetic, native_grouped_parity).  Unsupported layers (Q6_K down) keep the mmvq loop.
         if (e.grouped > 0 && b.native_ok) {
-            k_group<<<1, 1024>>>(s.ids, K, K, (int) g.n_expert, b.table, (unsigned long long) b.stride,
+            k_group<<<1, 1024, 0, st>>>(s.ids, K, K, (int) g.n_expert, b.table, (unsigned long long) b.stride,
                                  s.grp_ptr, s.grp_start, s.n_groups, s.ent_dst, s.ent_tok);
             strata::kernels::native_quantize_q8_1(s.h, s.xq8, (int) g.n_embd, 1, g_st);
             strata::kernels::native_expert_grouped(b.L, s.grp_ptr, s.grp_start, s.n_groups, s.ent_dst, s.ent_tok,
@@ -549,7 +560,7 @@ void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
             gemv(gu, s.h, s.eg2, s.ids, K, 0, b.dev, b.stride);
             gemv(gu, s.h, s.eg2, s.ids, K, 0, b.dev, b.stride);
             gemv(gu, s.h, s.eu2, s.ids, K, 0, b.dev + b.L.up_off, b.stride);
-            k_swiglu<<<(K * FF + B - 1) / B, B>>>(s.eg2, s.eu2, s.eh2, K * FF);
+            k_swiglu<<<(K * FF + B - 1) / B, B, 0, st>>>(s.eg2, s.eu2, s.eh2, K * FF);
             gemv(dn, s.eh2, s.ey2, s.ids, K, FF, b.dev + b.L.down_off, b.stride);
             KC(cudaStreamSynchronize(g_st));   // the slot gemv run on g_st; k_moe_sum2 below reads ey2 on the default stream
             float* yc;
@@ -578,7 +589,7 @@ void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
                 g_ids_host = s.ovf_ids;
                 gemv(gu, s.h, s.eg, s.ids, K, 0, b.table, b.stride);
                 gemv(gu, s.h, s.eu, s.ids, K, 0, b.table + b.L.up_off, b.stride);
-                k_swiglu<<<(K * FF + B - 1) / B, B>>>(s.eg, s.eu, s.eh, K * FF);
+                k_swiglu<<<(K * FF + B - 1) / B, B, 0, st>>>(s.eg, s.eu, s.eh, K * FF);
                 gemv(dn, s.eh, s.ey, s.ids, K, FF, b.table + b.L.down_off, b.stride);
                 yc = s.ey;
             }
@@ -603,21 +614,52 @@ void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
         } else {
         gemv(gu, s.h, s.eg, s.ids, K, 0, b.table, b.stride);
         gemv(gu, s.h, s.eu, s.ids, K, 0, b.table + b.L.up_off, b.stride);
-        k_swiglu<<<(K * FF + B - 1) / B, B>>>(s.eg, s.eu, s.eh, K * FF);
+        k_swiglu<<<(K * FF + B - 1) / B, B, 0, st>>>(s.eg, s.eu, s.eh, K * FF);
         gemv(dn, s.eh, s.ey, s.ids, K, FF, b.table + b.L.down_off, b.stride);
         }
         }
-        gemv(e.dense.at(L(l, "ffn_gate_shexp.weight")), s.h, s.sg, nullptr, 1, 0, nullptr, 0);
-        gemv(e.dense.at(L(l, "ffn_up_shexp.weight")), s.h, s.su, nullptr, 1, 0, nullptr, 0);
-        k_swiglu<<<(FS + B - 1) / B, B>>>(s.sg, s.su, s.sh, FS);
-        gemv(e.dense.at(L(l, "ffn_down_shexp.weight")), s.sh, s.sy, nullptr, 1, 0, nullptr, 0);
-        if (e.grouped > 0 && b.native_ok) k_moe_sum<<<(N + B - 1) / B, B>>>(s.moe, s.gout, s.wts, K, s.sy, N);
-        else if (e.slots > 0) k_moe_sum2<<<(N + B - 1) / B, B>>>(s.moe, s.ey2, s.yc, s.wts, K, s.sy, N);
-        else k_moe_sum<<<(N + B - 1) / B, B>>>(s.moe, s.ey, s.wts, K, s.sy, N);
-        k_rms<<<1, kThreads>>>(s.moe, e.f32.at(L(l, "post_ffw_norm.weight")), s.moe, N, e.eps);
-        k_add<<<(N + B - 1) / B, B>>>(s.x, s.moe, N);
-        if (layers_host) KC(cudaMemcpy(layers_host + (size_t) l * N, s.x, N * 4, cudaMemcpyDeviceToHost));
+        gemv(e.dense.at(L(l, "ffn_gate_shexp.weight")), s.h, s.sg, nullptr, 1, 0, nullptr, 0, st);
+        gemv(e.dense.at(L(l, "ffn_up_shexp.weight")), s.h, s.su, nullptr, 1, 0, nullptr, 0, st);
+        k_swiglu<<<(FS + B - 1) / B, B, 0, st>>>(s.sg, s.su, s.sh, FS);
+        gemv(e.dense.at(L(l, "ffn_down_shexp.weight")), s.sh, s.sy, nullptr, 1, 0, nullptr, 0, st);
+        if (e.grouped > 0 && b.native_ok) k_moe_sum<<<(N + B - 1) / B, B, 0, st>>>(s.moe, s.gout, s.wts, K, s.sy, N);
+        else if (e.slots > 0) k_moe_sum2<<<(N + B - 1) / B, B, 0, st>>>(s.moe, s.ey2, s.yc, s.wts, K, s.sy, N);
+        else k_moe_sum<<<(N + B - 1) / B, B, 0, st>>>(s.moe, s.ey, s.wts, K, s.sy, N);
+        k_rms<<<1, kThreads, 0, st>>>(s.moe, e.f32.at(L(l, "post_ffw_norm.weight")), s.moe, N, e.eps);
+        k_add<<<(N + B - 1) / B, B, 0, st>>>(s.x, s.moe, N);
+        if (layers_host && !graph) KC(cudaMemcpy(layers_host + (size_t) l * N, s.x, N * 4, cudaMemcpyDeviceToHost));
         KC(cudaGetLastError());
+    
+}
+
+void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
+    const auto& g = e.g;
+    const int N = (int) g.n_embd, K = (int) e.top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
+    const int H = (int) g.n_head, HKV = (int) g.n_head_kv, D = (int) g.head_dim;
+    const int B = 256;
+    const Dense& emb = e.dense.at("token_embd.weight");
+        if (e.graphs > 0 && layers_host == nullptr) {
+        cudaMemcpyAsync(s.tok_d, &tok, 4, cudaMemcpyHostToDevice, g_st);
+        switch (emb.type) {
+        case T_Q8_0: k_row_p<T_Q8_0><<<4, 128, 0, g_st>>>(emb.d, emb.row_bytes, s.tok_d, N, s.x); break;
+        case T_Q4_K: k_row_p<T_Q4_K><<<4, 128, 0, g_st>>>(emb.d, emb.row_bytes, s.tok_d, N, s.x); break;
+        case T_Q6_K: k_row_p<T_Q6_K><<<4, 128, 0, g_st>>>(emb.d, emb.row_bytes, s.tok_d, N, s.x); break;
+        case T_F16: k_row_p<T_F16><<<4, 128, 0, g_st>>>(emb.d, emb.row_bytes, s.tok_d, N, s.x); break;
+        default: std::fprintf(stderr, "strata-kolibri: token_embd type %d\n", emb.type); std::exit(1);
+        }
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            if (e.gexec[(size_t) l] != 0) cudaGraphLaunch((cudaGraphExec_t) e.gexec[(size_t) l], g_st);
+            else layer_step(e, s, l, false, 0, nullptr);
+        k_pos_add<<<1, 1, 0, g_st>>>(s.pos_d);
+    } else {
+        switch (emb.type) {
+        case T_Q8_0: k_row<T_Q8_0><<<4, 128>>>(emb.d, emb.row_bytes, tok, N, s.x); break;
+        case T_Q4_K: k_row<T_Q4_K><<<4, 128>>>(emb.d, emb.row_bytes, tok, N, s.x); break;
+        case T_Q6_K: k_row<T_Q6_K><<<4, 128>>>(emb.d, emb.row_bytes, tok, N, s.x); break;
+        case T_F16: k_row<T_F16><<<4, 128>>>(emb.d, emb.row_bytes, tok, N, s.x); break;
+        default: std::fprintf(stderr, "strata-kolibri: token_embd type %d\n", emb.type); std::exit(1);
+        }
+        for (int64_t l = 0; l < g.n_layers; ++l) layer_step(e, s, l, false, 0, layers_host);
     }
     k_rms<<<1, kThreads>>>(s.x, e.f32.at("output_norm.weight"), s.h, N, e.eps);
     gemv(e.dense.at("output.weight"), s.h, s.logits, nullptr, 1, 0, nullptr, 0);
@@ -672,6 +714,40 @@ void init_scratch(const Engine& e, Scratch& s) {
         s.kc.push_back(dalloc((size_t) g.n_head_kv * rows * g.head_dim));
         s.vc.push_back(dalloc((size_t) g.n_head_kv * rows * g.head_dim));
     }
+}
+
+/// Per-layer CUDA graphs (--grouped + graphs): a grouped layer's decode step is fully device-side (position and
+/// token id from device pointers, expert blobs from the pinned table over UVA, two-pass attention so the launch
+/// carries no position-dependent shared memory) - one capture per layer, replayed per token.  The Q6_K-down
+/// layers keep the mmvq loop (the blob pointer is host-computed) and are launched normally.  Warmup runs each
+/// layer once (module load, allocations) before capture; the KV rows the warmup touches are pos 0, which the
+/// first real token overwrites.
+void capture_graphs(Engine& e, Scratch& s) {
+    const int zero = 0;
+    cudaMemcpy(s.pos_d, &zero, 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(s.tok_d, &zero, 4, cudaMemcpyHostToDevice);
+    e.gexec.assign((size_t) e.g.n_layers, 0);
+    for (int64_t l = 0; l < e.g.n_layers; ++l)
+        if (e.grouped > 0 && e.blobs[(size_t) l].native_ok)
+            layer_step(e, s, l, true, g_st, nullptr);
+    cudaDeviceSynchronize();
+    for (int64_t l = 0; l < e.g.n_layers; ++l) {
+        if (!(e.grouped > 0 && e.blobs[(size_t) l].native_ok)) continue;
+        cudaGraph_t gr = nullptr; cudaGraphExec_t ex = nullptr;
+        KC(cudaStreamBeginCapture(g_st, cudaStreamCaptureModeRelaxed));
+        layer_step(e, s, l, true, g_st, nullptr);
+        KC(cudaStreamEndCapture(g_st, &gr));
+        KC(cudaGraphInstantiate(&ex, gr, 0));
+        cudaGraphDestroy(gr);
+        e.gexec[(size_t) l] = (unsigned long long) ex;
+    }
+    cudaDeviceSynchronize();
+    s.pos = 0;
+    cudaMemcpy(s.pos_d, &zero, 4, cudaMemcpyHostToDevice);
+    std::printf("kolibri: %d / %d layers captured as CUDA graphs (the rest use the mmvq loop)\n",
+                (int) (std::count(e.gexec.begin(), e.gexec.end(), 0ull) == 0 ? e.g.n_layers
+                    : e.g.n_layers - std::count(e.gexec.begin(), e.gexec.end(), 0ull)), (int) e.g.n_layers);
+    std::fflush(stdout);
 }
 
 /// Drop the held state: position 0 and empty KV caches (the serve protocol's fresh-request path).
@@ -979,7 +1055,7 @@ bool load(const std::string& path, Engine& e, std::string& err) {
 int strata::kolibri::run(int argc, char** argv) {
     std::string model, tokens, dump_layers, dump_logits, dump_full, force;
     bool load_only = false, serve_mode = false;
-    int n_gen = 8, ctx = 8192, cpu_threads = 0, slots = 0, grouped = 0;
+    int n_gen = 8, ctx = 8192, cpu_threads = 0, slots = 0, grouped = 0, no_graph = 0;
     double expert_vram = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -997,6 +1073,7 @@ int strata::kolibri::run(int argc, char** argv) {
         else if (a == "--expert-slots" && i + 1 < argc) slots = std::atoi(argv[++i]);
         else if (a == "--expert-vram" && i + 1 < argc) expert_vram = std::atoi(argv[++i]);
         else if (a == "--grouped") grouped = 1;
+        else if (a == "--no-graph") no_graph = 1;
     }
     if (model.empty()) {
         std::fprintf(stderr, "strata-kolibri: the Kolibri 1 engine path (plan T7); --model GGUF [--load-only] for now\n");
@@ -1012,6 +1089,9 @@ int strata::kolibri::run(int argc, char** argv) {
     }
     e.cpu_threads = cpu_threads;
     e.grouped = grouped;
+    // CUDA-graph decode rides the grouped path (device-side expert pointers); the slots/pool paths read host
+    // ids per layer and are not capturable.  --no-graph keeps the plain launches.
+    e.graphs = grouped && !no_graph && slots == 0 && cpu_threads == 0 ? 1 : 0;
     if (expert_vram > 0 && slots == 0)
         slots = (int) (expert_vram * (1 << 30) / (e.blobs[0].stride * (double) e.g.n_layers));
     e.slots = std::min(slots, (int) e.g.n_expert);
@@ -1030,6 +1110,7 @@ int strata::kolibri::run(int argc, char** argv) {
         Scratch s;
         s.ctx = ctx;
         init_scratch(e, s);
+        if (e.graphs > 0 && e.gexec.empty()) capture_graphs(e, s);
         return serve(e, s);
     }
     if (tokens.empty()) {
@@ -1039,6 +1120,7 @@ int strata::kolibri::run(int argc, char** argv) {
     Scratch s;
     s.ctx = ctx;
     init_scratch(e, s);
+    if (e.graphs > 0 && e.gexec.empty()) capture_graphs(e, s);
     std::vector<float> lg((size_t) e.g.n_vocab);
     std::vector<float> layers((size_t) e.g.n_layers * (size_t) e.g.n_embd);
     std::FILE* fl = dump_layers.empty() ? nullptr : std::fopen(dump_layers.c_str(), "wb");
