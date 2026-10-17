@@ -856,7 +856,11 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                 if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, D, nt, P, &one, Vh, CUDA_R_16F, D, 0,
                                                Ph, CUDA_R_16F, ldp, (long long) nt * ldp, &zero, Oh, CUDA_R_32F,
                                                H * D, D, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
-                    CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "strata-kolibri: PV GEMM failed\n"); std::exit(1); }
+                    CUBLAS_STATUS_SUCCESS) {
+                    std::fprintf(stderr, "strata-kolibri: PV GEMM failed (t0=%d nt=%d P=%d ldp=%d ctx=%d)\n", t0, nt,
+                                 P, ldp, s.ctx);
+                    std::exit(1);
+                }
             }
         }
         k_to_f16<<<grid1((int64_t) T * H * D), kThreads>>>(s.att_m, s.att16, (int64_t) T * H * D);
@@ -1056,10 +1060,11 @@ void init_scratch(const Engine& e, Scratch& s) {
         KC(cudaMalloc((void**) &s.att16, (size_t) T * hd * f16));
         KC(cudaMalloc((void**) &s.k16, (size_t) g.n_head_kv * s.ctx * g.head_dim * f16));
         KC(cudaMalloc((void**) &s.v16, (size_t) g.n_head_kv * s.ctx * g.head_dim * f16));
-        const size_t ldp = (size_t) s.ctx + 8;
-        const size_t tq = std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) ((12u << 20) / ((size_t) g.n_head * ldp))));
-        KC(cudaMalloc((void**) &s.att_s, (size_t) g.n_head * tq * ldp * 4));
-        KC(cudaMalloc((void**) &s.p16, (size_t) g.n_head * tq * ldp * f16));
+        // the scores slice is H * tq * ldp; the runtime tq uses the chunk's ldp (>= 512), so the worst case is
+        // the smallest ldp: tq = 12M / (H * 512), and tq * ldp <= 12M / H always
+        const size_t tq_w = std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) ((12u << 20) / ((size_t) g.n_head * 512))));
+        KC(cudaMalloc((void**) &s.att_s, (size_t) g.n_head * tq_w * 512 * 4 + (size_t) g.n_head * 8 * 4));
+        KC(cudaMalloc((void**) &s.p16, ((size_t) g.n_head * tq_w * 512 + (size_t) g.n_head * 8) * f16));
     }
     if (e.grouped > 0) {   // one grouped launch per layer: K entries, K groups at most, q8_1 acts for one token
         const int64_t cap_g = std::min<int64_t>(K, g.n_expert) + 1, cap_e = K;
