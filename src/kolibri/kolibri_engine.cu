@@ -21,6 +21,12 @@
 #include "strata/core/family_layout.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <functional>
 #include "strata/kernels/native_router.hpp"
 
 #include <cuda_runtime.h>
@@ -73,12 +79,53 @@ struct LayerBlobs {
     size_t stride = 0;              // blob slot bytes, block-aligned (the lcm of the types' super-blocks)
     uint8_t* table = nullptr;       // pinned host: n_expert slots
     bool native_ok = false;         // native_expert_supported for this layer's (gu, d) at these dims
+    strata::kernels::cpu::NativeFmt fmt;  // the CPU pool's view of the same blob (native_fmt at load)
+};
+
+/// A persistent worker pool: run(f, n) splits [0, n) over n shards across the pool (caller runs shard 0) and
+/// returns when all shards are done.  --cpu-threads sizes it; the CPU expert pool is its user.
+struct Pool {
+    int n_threads = 0;
+    std::vector<std::thread> workers;
+    std::mutex mu;
+    std::condition_variable work_cv, done_cv;
+    std::function<void(int)> fn;
+    unsigned long gen = 0;          // one generation per run(): a worker consumes each generation once
+    std::atomic<int> left{0};
+    bool quit = false;
+    void start(int t) {
+        n_threads = t;
+        for (int i = 1; i < t; ++i) workers.emplace_back([this, i] {
+            unsigned long my_gen = 0;
+            for (;;) {
+                std::unique_lock<std::mutex> lk(mu);
+                work_cv.wait(lk, [&] { return quit || gen > my_gen; });
+                if (quit) return;
+                my_gen = gen;
+                lk.unlock();
+                fn(i);
+                lk.lock();
+                if (--left == 0) done_cv.notify_one();
+            }
+        });
+    }
+    ~Pool() { { std::lock_guard<std::mutex> lk(mu); quit = true; } work_cv.notify_all(); for (auto& w : workers) w.join(); }
+    void run(std::function<void(int)> f, int n) {
+        if (n <= 1) { f(0); return; }
+        { std::lock_guard<std::mutex> lk(mu); fn = std::move(f); left = n - 1; ++gen; }
+        work_cv.notify_all();
+        fn(0);
+        std::unique_lock<std::mutex> lk(mu);
+        done_cv.wait(lk, [&] { return left.load() == 0; });
+    }
 };
 
 struct Engine {
     strata::core::ModelGeometry g;
     int64_t top_k = 6;
     float eps = 1e-6f, rope_base = 1e4f;
+    int cpu_threads = 0;            // --cpu-threads: routed experts on the CPU pool (ggml-cpu vec_dot, no PCIe)
+    mutable Pool pool;              // the worker pool behind the CPU expert path
     std::map<std::string, Dense> dense;
     std::map<std::string, float*> f32;
     std::vector<LayerBlobs> blobs;   // per layer
@@ -340,6 +387,8 @@ struct Scratch {
     float *x, *h, *y, *q, *k, *v, *att, *router, *eg, *eu, *eh, *ey, *sg, *su, *sh, *sy, *moe, *wts, *logits;
     int* ids;
     std::vector<float*> kc, vc;
+    // the CPU expert path's pinned host side: the layer's h, its quantized activations, the FF rows, the down rows
+    float* h_host = nullptr; char* act = nullptr; float* ff = nullptr; char* hq = nullptr; float* ey_h = nullptr;
 };
 
 
@@ -387,13 +436,41 @@ void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
                                                          g_st);
         g_ids_host.resize((size_t) K);
         KC(cudaMemcpy(g_ids_host.data(), s.ids, K * sizeof(int), cudaMemcpyDeviceToHost));
-        // the routed experts from the pinned blob table: gate at blob + 0, up at blob + up_off, down at blob + down_off
+        // the routed experts: the plain path reads each [gate|up|down] blob from the pinned host table over UVA
+        // (bitwise kolibriref); --cpu-threads runs them on the CPU pool instead (ggml-cpu's own vec_dot, the
+        // Unsloth Q4_K_XL path: no PCIe stream for experts the GPU does not hold)
+        if (e.cpu_threads > 0 && b.native_ok) {
+            KC(cudaMemcpy(s.h_host, s.h, N * 4, cudaMemcpyDeviceToHost));
+            strata::kernels::cpu::native_quant_act(b.fmt, s.h_host, s.act);
+            const int T = std::min(e.cpu_threads, K);
+            e.pool.run([&](int shard) {
+                for (int sel = shard; sel < K; sel += T) {
+                    const uint8_t* blob = b.table + (size_t) g_ids_host[sel] * b.stride;
+                    float* ff = s.ff + (size_t) sel * FF;
+                    strata::kernels::cpu::native_gu_rows(b.fmt, blob, (const void* const*) &s.act, 1, &ff, 0, FF);
+                    char* hq = s.hq + (size_t) sel * b.fmt.h_bytes;
+                    strata::kernels::cpu::native_quant_h(b.fmt, ff, hq);
+                    if (getenv("KL_DEBUG") && sel == 0) std::fprintf(stderr, "  sel0: h_bytes=%zu d_act=%d hq[0..7]=%d %d %d %d %d %d %d %d ff[1]=%.4f\n",
+                        b.fmt.h_bytes, b.fmt.d_act, (int)hq[0],(int)hq[1],(int)hq[2],(int)hq[3],(int)hq[4],(int)hq[5],(int)hq[6],(int)hq[7], ff[1]);
+                    float* ey = s.ey_h + (size_t) sel * N;
+                    strata::kernels::cpu::native_down_rows(b.fmt, blob + b.fmt.down_off, (const void* const*) &hq, 1,
+                                                           &ey, 0, N);
+                    if (getenv("KL_DEBUG") && sel == 0) std::fprintf(stderr, "  down: down_off fmt=%zu L=%zu blob[0..3]=%d %d %d %d d[0..3]=%d %d %d %d ey[0]=%.4f ey[2559]=%.4f stride=%zu\n",
+                        b.fmt.down_off, b.L.down_off, (int)blob[0],(int)blob[1],(int)blob[2],(int)blob[3],
+                        (int)blob[b.fmt.down_off],(int)blob[b.fmt.down_off+1],(int)blob[b.fmt.down_off+2],(int)blob[b.fmt.down_off+3], ey[0], ey[N-1], b.stride);
+                }
+            }, T);
+            KC(cudaMemcpy(s.ey, s.ey_h, (size_t) K * N * 4, cudaMemcpyHostToDevice));
+            if (getenv("KL_DEBUG")) std::fprintf(stderr, "L%ld cpu: ids %d %d ey[0]=%.4f ey[1]=%.4f ff[0]=%.4f act[0]=%d h[0]=%.4f\n",
+                (long) l, g_ids_host[0], g_ids_host[1], s.ey_h[0], s.ey_h[1], s.ff[0], (int) s.act[0], s.h_host[0]);
+        } else {
         Dense gu; gu.type = b.L.gu_type; gu.shape = {g.n_embd, g.n_ff, g.n_expert}; gu.row_bytes = b.L.gu_row;
         Dense dn; dn.type = b.L.d_type; dn.shape = {g.n_ff, g.n_embd, g.n_expert}; dn.row_bytes = b.L.d_row;
         gemv(gu, s.h, s.eg, s.ids, K, 0, b.table, b.stride);
         gemv(gu, s.h, s.eu, s.ids, K, 0, b.table + b.L.up_off, b.stride);
         k_swiglu<<<(K * FF + B - 1) / B, B>>>(s.eg, s.eu, s.eh, K * FF);
         gemv(dn, s.eh, s.ey, s.ids, K, FF, b.table + b.L.down_off, b.stride);
+        }
         gemv(e.dense.at(L(l, "ffn_gate_shexp.weight")), s.h, s.sg, nullptr, 1, 0, nullptr, 0);
         gemv(e.dense.at(L(l, "ffn_up_shexp.weight")), s.h, s.su, nullptr, 1, 0, nullptr, 0);
         k_swiglu<<<(FS + B - 1) / B, B>>>(s.sg, s.su, s.sh, FS);
@@ -420,6 +497,16 @@ void init_scratch(const Engine& e, Scratch& s) {
     s.eg = dalloc((size_t) K * FF); s.eu = dalloc((size_t) K * FF); s.eh = dalloc((size_t) K * FF); s.ey = dalloc((size_t) K * N);
     s.sg = dalloc(g.n_ff_shexp); s.su = dalloc(g.n_ff_shexp); s.sh = dalloc(g.n_ff_shexp);
     s.wts = dalloc(K);
+    if (e.cpu_threads > 0) {   // the CPU expert path's pinned host side (one layer's working set); the quantized
+                               // activations are sized from the layers' fmt (kolibri's 2560-as-Q8_K is 23,360 B)
+        size_t act_b = 0, h_b = 0;
+        for (const auto& b : e.blobs) if (b.native_ok) { act_b = std::max(act_b, b.fmt.act_bytes); h_b = std::max(h_b, b.fmt.h_bytes); }
+        KC(cudaHostAlloc((void**) &s.h_host, N * 4, cudaHostAllocDefault));
+        KC(cudaHostAlloc((void**) &s.act, act_b, cudaHostAllocDefault));
+        KC(cudaHostAlloc((void**) &s.ff, (size_t) K * FF * 4, cudaHostAllocDefault));
+        KC(cudaHostAlloc((void**) &s.hq, (size_t) K * h_b, cudaHostAllocDefault));
+        KC(cudaHostAlloc((void**) &s.ey_h, (size_t) K * N * 4, cudaHostAllocDefault));
+    }
     s.logits = dalloc(g.n_vocab);
     KC(cudaMalloc(&s.ids, K * sizeof(int)));
     for (int64_t l = 0; l < g.n_layers; ++l) {
@@ -659,6 +746,12 @@ bool load(const std::string& path, Engine& e, std::string& err) {
         LayerBlobs& b = e.blobs[(size_t) l];
         b.L = strata::kernels::native_expert_layout((int) gate->type, (int) down->type, e.g.n_embd, e.g.n_ff);
         b.native_ok = strata::kernels::native_expert_supported((int) gate->type, (int) down->type, e.g.n_embd, e.g.n_ff);
+        {
+            std::string ferr;
+            b.native_ok = b.native_ok && strata::kernels::cpu::native_fmt((int) gate->type, (int) down->type,
+                                                                          e.g.n_embd, e.g.n_ff, b.fmt, ferr);
+            if (getenv("KL_DEBUG")) std::fprintf(stderr, "fmt L%ld: gu=%d d=%d gu_act=%d d_act=%d n_embd=%lld n_ff=%lld gu_row=%zu d_row=%zu act_b=%zu h_b=%zu ok=%d %s\n", (long) l, (int) gate->type, (int) down->type, b.fmt.gu_act, b.fmt.d_act, (long long) e.g.n_embd, (long long) e.g.n_ff, b.fmt.gu_row, b.fmt.d_row, b.fmt.act_bytes, b.fmt.h_bytes, (int) b.native_ok, ferr.c_str());
+        }
         const size_t sb = lcm(lcm((size_t) 144, (size_t) 210), (size_t) 34);   // Q4_K / Q6_K / Q8_0 super-blocks
         b.stride = ((b.L.bytes + sb - 1) / sb) * sb;
         KC(cudaHostAlloc((void**) &b.table, b.stride * (size_t) e.g.n_expert, cudaHostAllocDefault));
@@ -728,7 +821,7 @@ bool load(const std::string& path, Engine& e, std::string& err) {
 int strata::kolibri::run(int argc, char** argv) {
     std::string model, tokens, dump_layers, dump_logits, dump_full, force;
     bool load_only = false, serve_mode = false;
-    int n_gen = 8, ctx = 8192;
+    int n_gen = 8, ctx = 8192, cpu_threads = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if ((a == "--model" || a == "--native") && i + 1 < argc) model = argv[++i];
@@ -741,6 +834,7 @@ int strata::kolibri::run(int argc, char** argv) {
         else if (a == "--force" && i + 1 < argc) force = argv[++i];
         else if (a == "--load-only") load_only = true;
         else if (a == "--serve") serve_mode = true;
+        else if (a == "--cpu-threads" && i + 1 < argc) cpu_threads = std::atoi(argv[++i]);
     }
     if (model.empty()) {
         std::fprintf(stderr, "strata-kolibri: the Kolibri 1 engine path (plan T7); --model GGUF [--load-only] for now\n");
@@ -754,6 +848,8 @@ int strata::kolibri::run(int argc, char** argv) {
         std::fprintf(stderr, "strata-kolibri: %s\n", err.c_str());
         return 1;
     }
+    e.cpu_threads = cpu_threads;
+    if (e.cpu_threads > 1) e.pool.start(e.cpu_threads);
     if (load_only) return 0;
     if (serve_mode) {
         Scratch s;
