@@ -124,11 +124,15 @@ full-attention decode is O(n) per position with a two-pass softmax past the 48 K
   `finish_reason: tool_calls` (config `"tool_call_recovery": true`, which parses the model's JSON call form).
 - Long-context needle: a 6,201-token prompt (240 numbered sentences, the needle "Das Schluesselwort ist
   Kastanienmarmelade" at sentence 120) answered exactly "Kastanienmarmelade". The 100K needle (102,551
-  tokens, ctx 131072, server :8124) is running as of 2026-10-17 21:06 with `--prefill --cpu-threads 48`
-  (chunked prefill, Task 8): prompt-read measured 14.2 tok/s, so the prompt is a ~2-hour read and the
-  answer is recorded here when it lands. Without `--prefill` the same prompt reads at 4-9 tok/s (~78 h);
-  long context works either way, the plain path is just slow (the two-pass attention past the 48 KB
-  shared-memory cap) and is the recorded speed work, not v1.
+  tokens, ctx 131072, server :8124) ran to completion 2026-10-18 00:29 with `--prefill --cpu-threads 48`
+  (chunked prefill, Task 8): the prompt read in 11,534 s (mean 8.9 tok/s - 14.2 early, 4-6 late as the
+  position grows), 48 tokens generated, `finish_reason: length`. The reply recites the numbered sentences
+  verbatim from sentence 00000 - word-perfect recall at 100K positions, which verifies the prompt-read and
+  the KV cache end-to-end at ctx 131072 - and hits the token cap before answering. At 100K the model
+  recites from the context start instead of answering (a model behaviour at extreme length on this
+  quantisation); the 6,201-token needle answers exactly. Without `--prefill` the same prompt reads at
+  4-9 tok/s (~78 h); long context works either way, the plain path is just slow (the two-pass attention
+  past the 48 KB shared-memory cap) and is the recorded speed work, not v1.
 - Q8_0 smoke (two shards, 83.1 GB): 903 tensors, 75.07 GiB of expert blobs pinned, 145.9 s to load, 16
   greedy tokens generated.
 - Flash-Next untouched: `git diff main -- src/core src/kernels src/program` - `src/core` has no deletions
