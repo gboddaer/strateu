@@ -32,6 +32,9 @@
 #include "strata/kernels/native_router.hpp"
 
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include "strata/prefill/gemm.hpp"
+#include <cuda_fp16.h>
 
 #include <algorithm>
 #include <atomic>
@@ -95,6 +98,7 @@ struct Pool {
     std::function<void(int)> fn;
     unsigned long gen = 0;          // one generation per run(): a worker consumes each generation once
     std::atomic<int> left{0};
+    int n_shards = 0;
     bool quit = false;
     void start(int t) {
         n_threads = t;
@@ -105,6 +109,8 @@ struct Pool {
                 work_cv.wait(lk, [&] { return quit || gen > my_gen; });
                 if (quit) return;
                 my_gen = gen;
+                const int n = n_shards;   // a run with fewer shards than workers leaves the idle ones waiting
+                if (i >= n) continue;
                 lk.unlock();
                 fn(i);
                 lk.lock();
@@ -115,7 +121,7 @@ struct Pool {
     ~Pool() { { std::lock_guard<std::mutex> lk(mu); quit = true; } work_cv.notify_all(); for (auto& w : workers) w.join(); }
     void run(std::function<void(int)> f, int n) {
         if (n <= 1) { f(0); return; }
-        { std::lock_guard<std::mutex> lk(mu); fn = std::move(f); left = n - 1; ++gen; }
+        { std::lock_guard<std::mutex> lk(mu); fn = std::move(f); n_shards = n; left = n - 1; ++gen; }
         work_cv.notify_all();
         fn(0);
         std::unique_lock<std::mutex> lk(mu);
@@ -131,6 +137,9 @@ struct Engine {
     int slots = 0;                  // --expert-slots: experts per layer resident in VRAM (the GPU expert cache)
     int grouped = 0;                // --grouped: native_expert_grouped for the routed experts (one launch per layer)
     int graphs = 0;                 // --grouped + graphs (default on with --grouped): per-layer CUDA graphs
+    int prefill = 0;                // --prefill: chunked prompt processing (GEMM projections, FP16 attention)
+    cublasHandle_t blas = nullptr;
+    strata::prefill::Gemm gemm;
     std::vector<unsigned long long> gexec;   // cudaGraphExec_t per layer (0 = the layer is not capturable)
     mutable Pool pool;              // the worker pool behind the CPU expert path
     std::map<std::string, Dense> dense;
@@ -245,7 +254,133 @@ __global__ void k_add(float* x, const float* y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] += y[i];
 }
+static inline dim3 grid1(int64_t n, int block = kThreads) { return dim3((unsigned) ((n + block - 1) / block)); }
+__device__ float block_max(float v, float* sh) {
+    sh[threadIdx.x] = v;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int) threadIdx.x < s) sh[threadIdx.x] = fmaxf(sh[threadIdx.x], sh[threadIdx.x + s]);
+        __syncthreads();
+    }
+    return sh[0];
+}
 __global__ void k_pos_add(int* pos) { *pos += 1; }
+__global__ void k_to_f16(const float* x, __half* y, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __float2half(x[i]);
+}
+/// The prompt attention's KV images: the P cells the chunk reads, FP16.  Full layers: rows = ctx, cells 0..P-1.
+__global__ void k_kv_f16_full(const float* kc, const float* vc, __half* k16, __half* v16, int64_t ctx, int P, int HD,
+                              int HKV) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t per = (int64_t) P * HD;
+    if (i >= (int64_t) HKV * per) return;
+    const int64_t kvh = i / per, rest = i % per;
+    k16[i] = __float2half(kc[(size_t) kvh * ctx * HD + rest]);
+    v16[i] = __float2half(vc[(size_t) kvh * ctx * HD + rest]);
+}
+/// Sliding layers: the ring's last n_vis cells (global first..first+n_vis-1, slot gp % swa).
+__global__ void k_kv_f16_swa(const float* kc, const float* vc, __half* k16, __half* v16, int64_t swa, int n_vis,
+                             int64_t first, int HD, int HKV) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t per = (int64_t) n_vis * HD;
+    if (i >= (int64_t) HKV * per) return;
+    const int64_t kvh = i / per, rest = i % per;
+    const int64_t c = rest / HD, d = rest % HD;
+    const int64_t slot = (first + c) % swa;
+    k16[i] = __float2half(kc[((size_t) kvh * swa + slot) * HD + d]);
+    v16[i] = __float2half(vc[((size_t) kvh * swa + slot) * HD + d]);
+}
+/// The prompt's causal softmax (window-masked for sliding layers: cells before pos0+t+1-swa are zero): row (h, t)
+/// of S (ld floats, P cells) -> softmax(S * scale) over [lo, pos0+t+1), FP16 out.  grid (T, H), block 256.
+__global__ void k_attn_softmax16(const float* S, __half* S16, int ld, int T, int P, int pos0, float scale,
+                                 int64_t swa) {
+    __shared__ float sh[kThreads];
+    const int t = blockIdx.x, h = blockIdx.y;
+    const float* row = S + ((size_t) h * T + t) * ld;
+    __half* out = S16 + ((size_t) h * T + t) * ld;
+    const int n = min(P, pos0 + t + 1);
+    const int lo = swa > 0 ? (pos0 + t + 1 > (int) swa ? pos0 + t + 1 - (int) swa : 0) : 0;
+    float mx = -INFINITY;
+    for (int p = threadIdx.x + lo; p < n; p += blockDim.x) mx = fmaxf(mx, row[p] * scale);
+    mx = block_max(mx, sh);
+    float sum = 0.f;
+    for (int p = threadIdx.x + lo; p < n; p += blockDim.x) sum += expf(row[p] * scale - mx);
+    sum = block_sum(sum, sh);
+    const float inv = 1.0f / sum;
+    for (int p = threadIdx.x; p < P; p += blockDim.x)
+        out[p] = __float2half(p >= lo && p < n ? expf(row[p] * scale - mx) * inv : 0.f);
+}
+/// rms over T rows: row t of x -> row t of out.  grid (T), block kThreads.
+__global__ void k_rms_rows(const float* x, const float* w, float* out, int n, float eps) {
+    __shared__ float sh[kThreads];
+    const float* src = x + (size_t) blockIdx.x * n;
+    float s = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) s += src[i] * src[i];
+    s = block_sum(s, sh);
+    const float r = 1.0f / sqrtf(s / (float) n + eps);
+    float* dst = out + (size_t) blockIdx.x * n;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i] * r * w[i];
+}
+__global__ void k_add_rows(float* x, const float* y, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] += y[i];
+}
+__global__ void k_swiglu_rows(const float* g, const float* u, float* out, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = (g[i] / (1.f + expf(-g[i]))) * u[i];
+}
+/// moe[t] = sy[t] + sum_k wts[t*K+k] * gout[(t*K+k)]: grid (T, ceil(N/B)), block B.
+__global__ void k_moe_sum_rows(float* moe, const float* gout, const float* wts, const float* sy, int K, int N) {
+    const int t = blockIdx.x;
+    const int i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    float acc = sy[(size_t) t * N + i];
+    for (int k = 0; k < K; ++k) acc += wts[(size_t) t * K + k] * gout[((size_t) t * K + k) * (size_t) N + i];
+    moe[(size_t) t * N + i] = acc;
+}
+/// token embedding rows: row toks[t] of W -> row t of out.  grid (T, 4), block 128.
+template <int TY> __global__ void k_row_multi(const uint8_t* W, size_t row_bytes, const int* toks, int n, float* out) {
+    const uint8_t* r = W + (size_t) toks[blockIdx.x] * row_bytes;
+    float* dst = out + (size_t) blockIdx.x * n;
+    for (int c = blockIdx.y * blockDim.x + threadIdx.x; c < n / 32; c += 4 * blockDim.x) deq32<TY>(r, c, dst + 32 * c);
+}
+/// multi-token q/k/v prep: block (head, t); pos = p0 + t.  q rows T x H x D, k/v rows T x HKV x D.
+__global__ void k_attn_prep_multi(const float* qx, const float* kx, const float* vx, const float* qw, const float* kw,
+                                  float* q, float* kc, float* vc, int H, int HKV, int D, int64_t p0, int64_t swa,
+                                  int ctx, float base, float eps, bool rope) {
+    const int t = blockIdx.y;
+    const int head = blockIdx.x;
+    const bool isq = head < H;
+    const int kvh = head - H;
+    const float* src = isq ? qx + ((size_t) t * H + head) * D : kx + ((size_t) t * HKV + kvh) * D;
+    const int pos = (int) (p0 + t);
+    const int64_t rows = rope ? swa : ctx;
+    const int64_t slot = rope ? (int64_t) pos % swa : (int64_t) pos;
+    float s = 0.f;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) s += src[i] * src[i];
+    __shared__ float sh[kThreads];
+    s = block_sum(s, sh);
+    const float r = 1.0f / sqrtf(s / (float) D + eps);
+    __shared__ float buf[512];
+    for (int i = threadIdx.x; i < D; i += blockDim.x) buf[i] = src[i] * r * (isq ? qw[i] : kw[i]);
+    __syncthreads();
+    float* dst = isq ? q + ((size_t) t * H + head) * D : kc + ((size_t) kvh * rows + slot) * D;
+    const int half = D / 2;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        float v = buf[i];
+        if (rope) {
+            const int pp = i < half ? i : i - half;
+            const float theta = (float) pos * powf(base, -2.0f * (float) pp / (float) D);
+            const float cs = cosf(theta), sn = sinf(theta);
+            v = i < half ? buf[i] * cs - buf[i + half] * sn : buf[i - half] * sn + buf[i] * cs;
+        }
+        dst[i] = v;
+    }
+    if (!isq)
+        for (int i = threadIdx.x; i < D; i += blockDim.x)
+            vc[((size_t) kvh * rows + slot) * D + i] = vx[((size_t) t * HKV + kvh) * D + i];
+}
 /// The routed entries (K picks for one token, entry e = k) grouped per expert on the device: one group per
 /// expert used (ascending id), its blob address, its entries in entry order (q36_engine.cu's k_group).
 __global__ void k_group(const int32_t* ids, int n_ent, int K_, int n_expert, const uint8_t* blobs,
@@ -468,6 +603,7 @@ struct Scratch {
     std::vector<float*> kc, vc;
     // the CPU expert path's pinned host side: the layer's h, its quantized activations, the FF rows, the down rows
     float* h_host = nullptr; char* act = nullptr; float* ff = nullptr; char* hq = nullptr; float* ey_h = nullptr;
+    std::vector<int32_t> exp_cnt, exp_ord;   // prefill pool: the per-expert grouping
     // --expert-slots: the GPU-slot experts' rows and the overflow rows (CPU pool or pinned table)
     float *eg2 = nullptr, *eu2 = nullptr, *eh2 = nullptr, *ey2 = nullptr, *ey_cpu = nullptr;
     float* yc = nullptr;            // the slots path's overflow rows: ey_cpu (pool) or ey (pinned table)
@@ -476,6 +612,19 @@ struct Scratch {
     unsigned long long* grp_ptr = nullptr; int32_t *grp_start = nullptr, *n_groups = nullptr;
     int32_t *ent_dst = nullptr, *ent_tok = nullptr; char* xq8 = nullptr; char* scratch = nullptr; float* gout = nullptr;
     int* pos_d = nullptr; int* tok_d = nullptr;   // graph decode: position and token id on the device
+    // --prefill: the chunk's rows (tmax tokens at once)
+    static constexpr int kTmax = 512;
+    int* toks_d = nullptr;
+    float *x_m = nullptr, *h_m = nullptr, *y_m = nullptr, *q_m = nullptr, *k_m = nullptr, *v_m = nullptr;
+    float *att_m = nullptr, *router_m = nullptr, *moe_m = nullptr, *sy_m = nullptr;
+    float *sg_m = nullptr, *su_m = nullptr, *sh_m = nullptr;
+    float *gout_m = nullptr, *eg_m = nullptr, *eu_m = nullptr, *eh_m = nullptr;
+    int *ids_m = nullptr, *grp_start_m = nullptr, *n_groups_m = nullptr, *ent_dst_m = nullptr, *ent_tok_m = nullptr;
+    float* wts_m = nullptr;
+    unsigned long long* grp_ptr_m = nullptr;
+    char *xq8_m = nullptr, *scratch_m = nullptr;
+    __half *x16 = nullptr, *q16 = nullptr, *att16 = nullptr, *k16 = nullptr, *v16 = nullptr, *p16 = nullptr;
+    float* att_s = nullptr;
 };
 
 
@@ -632,6 +781,196 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
     
 }
 
+
+/// Chunked prompt processing (--prefill): T rows at once.  Dense projections run as GEMMs (FP16 activations, the
+/// weights dequantized to FP16 in the Gemm scratch - what llama.cpp's batched CUDA path does), the attention
+/// scores and P.V as batched FP16 GEMMs with the causal (and window) softmax in between, the routed experts as
+/// one grouped launch per layer (T*K entries), the Q6_K-down layers through the mmvq loop with host ids.
+/// Bitwise vs the per-token plain path is not expected (FP16 GEMM scores); the gates are the KL parity and the
+/// serve==tokens agreement.
+void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
+    const auto& g = e.g;
+    const int N = (int) g.n_embd, K = (int) e.top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
+    const int H = (int) g.n_head, HKV = (int) g.n_head_kv, D = (int) g.head_dim;
+    const int B = 256;
+    const int NK = T * K;
+    cublasHandle_t blas = e.blas;
+    const float one = 1.0f, zero = 0.0f;
+    const Dense& emb = e.dense.at("token_embd.weight");
+    switch (emb.type) {
+    case T_Q8_0: k_row_multi<T_Q8_0><<<dim3(T, 4), 128>>>(emb.d, emb.row_bytes, s.toks_d, N, s.x_m); break;
+    case T_Q4_K: k_row_multi<T_Q4_K><<<dim3(T, 4), 128>>>(emb.d, emb.row_bytes, s.toks_d, N, s.x_m); break;
+    case T_Q6_K: k_row_multi<T_Q6_K><<<dim3(T, 4), 128>>>(emb.d, emb.row_bytes, s.toks_d, N, s.x_m); break;
+    case T_F16: k_row_multi<T_F16><<<dim3(T, 4), 128>>>(emb.d, emb.row_bytes, s.toks_d, N, s.x_m); break;
+    default: std::fprintf(stderr, "strata-kolibri: token_embd type %d\n", emb.type); std::exit(1);
+    }
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        const bool sliding = strata::core::is_swa_layer(g, l);
+        const LayerBlobs& b = e.blobs[(size_t) l];
+        k_rms_rows<<<T, kThreads>>>(s.x_m, e.f32.at(L(l, "attn_norm.weight")), s.h_m, N, e.eps);
+        strata::kernels::native_quantize_q8_1(s.h_m, s.xq8_m, N * T, 1, g_st);   // T contiguous rows = one column (q36)
+        k_to_f16<<<grid1((int64_t) T * N), kThreads>>>((const float*) s.h_m, s.x16, (int64_t) T * N);
+        {
+            const Dense& wq = e.dense.at(L(l, "attn_q.weight"));
+            e.gemm.native((const uint16_t*) s.x16, wq.type, wq.d, s.q_m, T, H * D, N);
+            const Dense& wk = e.dense.at(L(l, "attn_k.weight"));
+            e.gemm.native((const uint16_t*) s.x16, wk.type, wk.d, s.k_m, T, HKV * D, N);
+            const Dense& wv = e.dense.at(L(l, "attn_v.weight"));
+            e.gemm.native((const uint16_t*) s.x16, wv.type, wv.d, s.v_m, T, HKV * D, N);
+        }
+        k_attn_prep_multi<<<dim3(H + HKV, T), kThreads>>>(s.q_m, s.k_m, s.v_m, e.f32.at(L(l, "attn_q_norm.weight")),
+                                                          e.f32.at(L(l, "attn_k_norm.weight")), s.q_m, s.kc[l],
+                                                          s.vc[l], H, HKV, D, p0, g.n_swa, s.ctx, e.rope_base,
+                                                          e.eps, sliding);
+        // the chunk reads positions 0..p0+T-1 (full) or the ring's last n_vis (sliding)
+        const int P = sliding ? (int) std::min<int64_t>(p0 + T, g.n_swa) : (int) (p0 + T);
+        const int64_t first = sliding ? p0 + T - P : 0;
+        if (sliding)
+            k_kv_f16_swa<<<grid1((int64_t) HKV * P * D), kThreads>>>(s.kc[l], s.vc[l], s.k16, s.v16, g.n_swa, P,
+                                                                     first, D, HKV);
+        else
+            k_kv_f16_full<<<grid1((int64_t) HKV * P * D), kThreads>>>(s.kc[l], s.vc[l], s.k16, s.v16, s.ctx, P, D,
+                                                                      HKV);
+        k_to_f16<<<grid1((int64_t) T * H * D), kThreads>>>(s.q_m, s.q16, (int64_t) T * H * D);
+        const int ldp = (P + 7) / 8 * 8;
+        const int G = H / HKV;
+        const size_t kAttScoreFloats = 12u << 20;
+        const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (kAttScoreFloats / ((size_t) H * ldp))));
+        for (int t0 = 0; t0 < T; t0 += tq) {
+            const int nt = std::min(tq, T - t0);
+            for (int kvh = 0; kvh < HKV; ++kvh) {
+                const __half* Kh = s.k16 + (size_t) kvh * P * D;
+                const __half* Qh = s.q16 + ((size_t) t0 * H + kvh * G) * D;
+                float* Sh = s.att_s + (size_t) kvh * G * nt * ldp;
+                if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, D, &one, Kh, CUDA_R_16F, D, 0,
+                                               Qh, CUDA_R_16F, H * D, D, &zero, Sh, CUDA_R_32F, ldp,
+                                               (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                    CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "strata-kolibri: scores GEMM failed\n"); std::exit(1); }
+            }
+            k_attn_softmax16<<<dim3(nt, H), kThreads>>>(s.att_s, s.p16, ldp, nt, P, (int) p0 + t0,
+                                                        1.0f / sqrtf((float) D), sliding ? g.n_swa : 0);
+            for (int kvh = 0; kvh < HKV; ++kvh) {
+                const __half* Vh = s.v16 + (size_t) kvh * P * D;
+                const __half* Ph = s.p16 + (size_t) kvh * G * nt * ldp;
+                float* Oh = s.att_m + ((size_t) t0 * H + kvh * G) * D;
+                if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, D, nt, P, &one, Vh, CUDA_R_16F, D, 0,
+                                               Ph, CUDA_R_16F, ldp, (long long) nt * ldp, &zero, Oh, CUDA_R_32F,
+                                               H * D, D, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                    CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "strata-kolibri: PV GEMM failed\n"); std::exit(1); }
+            }
+        }
+        k_to_f16<<<grid1((int64_t) T * H * D), kThreads>>>(s.att_m, s.att16, (int64_t) T * H * D);
+        {
+            const Dense& wo = e.dense.at(L(l, "attn_output.weight"));
+            e.gemm.native((const uint16_t*) s.att16, wo.type, wo.d, s.y_m, T, N, H * D);
+        }
+        k_rms_rows<<<T, kThreads>>>(s.y_m, e.f32.at(L(l, "post_attention_norm.weight")), s.y_m, N, e.eps);
+        k_add_rows<<<grid1((int64_t) T * N), kThreads>>>(s.x_m, s.y_m, (int64_t) T * N);
+        k_rms_rows<<<T, kThreads>>>(s.x_m, e.f32.at(L(l, "ffn_norm.weight")), s.h_m, N, e.eps);
+        {
+            const Dense& wr = e.dense.at(L(l, "ffn_gate_inp.weight"));
+            k_gemv<T_F32><<<dim3(g.n_expert, T), kThreads>>>(wr.d, wr.row_bytes, 0, nullptr, N, s.h_m, (size_t) N,
+                                                             s.router_m, (int) g.n_expert);
+            strata::kernels::native_router_sigmoid_logit_add(s.router_m, e.f32.at(L(l, "exp_probs_b.bias")),
+                                                             s.ids_m, s.wts_m, T, g_st);
+        }
+        strata::kernels::native_quantize_q8_1(s.h_m, s.xq8_m, N * T, 1, g_st);   // T contiguous rows = one column (q36)
+        k_to_f16<<<grid1((int64_t) T * N), kThreads>>>((const float*) s.h_m, s.x16, (int64_t) T * N);
+        static const bool pool_all = std::getenv("STRATA_KOLIBRI_POOL_ALL") != nullptr;   // A/B: the pool for every layer
+        if (b.native_ok && !(pool_all && e.cpu_threads > 0)) {
+            k_group<<<1, 1024>>>(s.ids_m, NK, K, (int) g.n_expert, b.table, (unsigned long long) b.stride,
+                                 s.grp_ptr_m, s.grp_start_m, s.n_groups_m, s.ent_dst_m, s.ent_tok_m);
+            strata::kernels::native_expert_grouped(b.L, s.grp_ptr_m, s.grp_start_m, s.n_groups_m, s.ent_dst_m,
+                                                   s.ent_tok_m, std::min<int64_t>(NK, g.n_expert) + 1, NK, s.xq8_m,
+                                                   s.scratch_m, s.gout_m, g_st);
+        } else {
+            g_ids_host.resize((size_t) NK);
+            KC(cudaMemcpy(g_ids_host.data(), s.ids_m, NK * sizeof(int), cudaMemcpyDeviceToHost));
+            if (e.cpu_threads > 0) {   // pool_all reaches here for the native_ok layers too (the ids are copied above)   // the CPU pool: ggml's own expert arithmetic over the pinned blobs, the
+                                       // chunk's NK entries split over the pool's threads (bandwidth-bound,
+                                       // ~10x the launch-bound mmvq loop on this box)
+                KC(cudaMemcpy(s.h_host, s.h_m, (size_t) T * N * 4, cudaMemcpyDeviceToHost));
+                for (int t = 0; t < T; ++t)
+                    strata::kernels::cpu::native_quant_act(b.fmt, s.h_host + (size_t) t * N,
+                                                           s.act + (size_t) t * b.fmt.act_bytes);
+                // group the chunk's entries by expert: one blob read per expert (the box's RAM bandwidth is the
+                // floor; per-entry reads re-stream 2.2 MB per row), all of an expert's rows in one call
+                std::vector<int32_t>& cnt = s.exp_cnt;
+                std::fill(cnt.begin(), cnt.begin() + g.n_expert + 1, 0);
+                for (int sel = 0; sel < NK; ++sel) cnt[g_ids_host[(size_t) sel] + 1]++;
+                for (int x = 0; x < (int) g.n_expert; ++x) cnt[x + 1] += cnt[x];
+                std::vector<int32_t>& ord = s.exp_ord;
+                {
+                    std::vector<int32_t> cur(cnt.begin(), cnt.begin() + g.n_expert + 1);
+                    for (int sel = 0; sel < NK; ++sel) ord[cur[g_ids_host[(size_t) sel]]++] = sel;
+                }
+                const int NS = std::min((int) g.n_expert, e.cpu_threads);
+                e.pool.run([&](int shard) {
+                    const void* acts[64]; float* ffs[64]; const void* hqs[64]; float* eys[64];
+                    for (int x = shard; x < (int) g.n_expert; x += NS) {
+                        const int lo = cnt[x], hi = cnt[x + 1], m = hi - lo;
+                        if (m <= 0) continue;
+                        const uint8_t* blob = b.table + (size_t) x * b.stride;
+                        for (int a = 0; a < m; a += 64) {
+                            const int mm = std::min(64, m - a);
+                            for (int k = 0; k < mm; ++k) {
+                                const int sel = ord[(size_t) lo + a + k];
+                                acts[k] = s.act + (size_t) (sel / K) * b.fmt.act_bytes;
+                                ffs[k] = s.ff + (size_t) sel * FF;
+                            }
+                            strata::kernels::cpu::native_gu_rows(b.fmt, blob, acts, mm, ffs, 0, FF);
+                            for (int k = 0; k < mm; ++k) {
+                                const int sel = ord[(size_t) lo + a + k];
+                                char* hqp = s.hq + (size_t) sel * b.fmt.h_bytes;
+                                strata::kernels::cpu::native_quant_h(b.fmt, ffs[k], hqp);
+                                hqs[k] = hqp;
+                                eys[k] = s.ey_h + (size_t) sel * N;
+                            }
+                            strata::kernels::cpu::native_down_rows(b.fmt, blob, hqs, mm, eys, 0, N);
+                        }
+                    }
+                }, NS);
+                KC(cudaMemcpy(s.gout_m, s.ey_h, (size_t) NK * N * 4, cudaMemcpyHostToDevice));
+            } else
+            for (int t = 0; t < T; ++t) {
+                strata::kernels::native_quantize_q8_1(s.h_m + (size_t) t * N, g_q8, N, 1, g_st);
+                for (int k = 0; k < K; ++k) {
+                    const int sel = t * K + k;
+                    const uint8_t* blob = b.table + (size_t) g_ids_host[(size_t) sel] * b.stride;
+                    strata::kernels::native_mmvq(b.L.gu_type, blob, (const char*) g_q8, s.eg_m + (size_t) sel * FF,
+                                                 N, FF, 1, g_st);
+                    strata::kernels::native_mmvq(b.L.gu_type, blob + b.L.up_off, (const char*) g_q8,
+                                                 s.eu_m + (size_t) sel * FF, N, FF, 1, g_st);
+                }
+            }
+            k_swiglu_rows<<<grid1((int64_t) NK * FF), kThreads>>>(s.eg_m, s.eu_m, s.eh_m, (int64_t) NK * FF);
+            for (int sel = 0; sel < NK; ++sel) {
+                strata::kernels::native_quantize_q8_1(s.eh_m + (size_t) sel * FF, g_q8, FF, 1, g_st);
+                const uint8_t* blob = b.table + (size_t) g_ids_host[(size_t) sel] * b.stride + b.L.down_off;
+                strata::kernels::native_mmvq(b.L.d_type, blob, (const char*) g_q8, s.gout_m + (size_t) sel * N,
+                                             FF, N, 1, g_st);
+            }
+        }
+        {
+            const Dense& wg = e.dense.at(L(l, "ffn_gate_shexp.weight"));
+            e.gemm.native((const uint16_t*) s.x16, wg.type, wg.d, s.sg_m, T, FS, N);
+            const Dense& wu = e.dense.at(L(l, "ffn_up_shexp.weight"));
+            e.gemm.native((const uint16_t*) s.x16, wu.type, wu.d, s.su_m, T, FS, N);
+            k_swiglu_rows<<<grid1((int64_t) T * FS), kThreads>>>(s.sg_m, s.su_m, s.sh_m, (int64_t) T * FS);
+            k_to_f16<<<grid1((int64_t) T * FS), kThreads>>>(s.sh_m, s.x16, (int64_t) T * FS);
+            const Dense& wd = e.dense.at(L(l, "ffn_down_shexp.weight"));
+            e.gemm.native((const uint16_t*) s.x16, wd.type, wd.d, s.sy_m, T, N, FS);
+        }
+        k_moe_sum_rows<<<dim3(T, (N + B - 1) / B), B>>>(s.moe_m, s.gout_m, s.wts_m, s.sy_m, K, N);
+        k_rms_rows<<<T, kThreads>>>(s.moe_m, e.f32.at(L(l, "post_ffw_norm.weight")), s.moe_m, N, e.eps);
+        k_add_rows<<<grid1((int64_t) T * N), kThreads>>>(s.x_m, s.moe_m, (int64_t) T * N);
+        KC(cudaGetLastError());
+    }
+    k_rms<<<1, kThreads>>>(s.x_m + (size_t) (T - 1) * N, e.f32.at("output_norm.weight"), s.h, N, e.eps);
+    gemv(e.dense.at("output.weight"), s.h, s.logits, nullptr, 1, 0, nullptr, 0);
+    KC(cudaDeviceSynchronize());
+}
+
 void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
     const auto& g = e.g;
     const int N = (int) g.n_embd, K = (int) e.top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
@@ -679,6 +1018,49 @@ void init_scratch(const Engine& e, Scratch& s) {
     s.wts = dalloc(K);
     KC(cudaMalloc((void**) &s.pos_d, 4));
     KC(cudaMalloc((void**) &s.tok_d, 4));
+    if (e.prefill > 0) {   // the chunk's rows: tmax tokens, tmax*K expert entries, the FP16 attention images
+        const int T = Scratch::kTmax, NK = T * K;
+        s.exp_cnt.resize((size_t) g.n_expert + 1);
+        s.exp_ord.resize((size_t) NK);
+        const size_t hd = (size_t) g.n_head * g.head_dim, hkd = (size_t) g.n_head_kv * g.head_dim;
+        KC(cudaMalloc((void**) &s.toks_d, T * 4));
+        KC(cudaMalloc((void**) &s.x_m, (size_t) T * N * 4));
+        KC(cudaMalloc((void**) &s.h_m, (size_t) T * N * 4));
+        KC(cudaMalloc((void**) &s.y_m, (size_t) T * N * 4));
+        KC(cudaMalloc((void**) &s.q_m, (size_t) T * hd * 4));
+        KC(cudaMalloc((void**) &s.k_m, (size_t) T * hkd * 4));
+        KC(cudaMalloc((void**) &s.v_m, (size_t) T * hkd * 4));
+        KC(cudaMalloc((void**) &s.att_m, (size_t) T * hd * 4));
+        KC(cudaMalloc((void**) &s.router_m, (size_t) T * g.n_expert * 4));
+        KC(cudaMalloc((void**) &s.moe_m, (size_t) T * N * 4));
+        KC(cudaMalloc((void**) &s.sy_m, (size_t) T * N * 4));
+        KC(cudaMalloc((void**) &s.sg_m, (size_t) T * g.n_ff_shexp * 4));
+        KC(cudaMalloc((void**) &s.su_m, (size_t) T * g.n_ff_shexp * 4));
+        KC(cudaMalloc((void**) &s.sh_m, (size_t) T * g.n_ff_shexp * 4));
+        KC(cudaMalloc((void**) &s.gout_m, (size_t) NK * N * 4));
+        KC(cudaMalloc((void**) &s.eg_m, (size_t) NK * g.n_ff * 4));
+        KC(cudaMalloc((void**) &s.eu_m, (size_t) NK * g.n_ff * 4));
+        KC(cudaMalloc((void**) &s.eh_m, (size_t) NK * g.n_ff * 4));
+        KC(cudaMalloc((void**) &s.ids_m, NK * 4));
+        KC(cudaMalloc((void**) &s.wts_m, NK * 4));
+        KC(cudaMalloc((void**) &s.grp_ptr_m, ((size_t) std::min<int64_t>(NK, g.n_expert) + 1) * sizeof(unsigned long long)));
+        KC(cudaMalloc((void**) &s.grp_start_m, ((size_t) std::min<int64_t>(NK, g.n_expert) + 1) * 4));
+        KC(cudaMalloc((void**) &s.n_groups_m, 4));
+        KC(cudaMalloc((void**) &s.ent_dst_m, NK * 4));
+        KC(cudaMalloc((void**) &s.ent_tok_m, NK * 4));
+        KC(cudaMalloc((void**) &s.xq8_m, strata::kernels::native_q8_1_bytes((int) g.n_embd, 1) * (size_t) T));
+        KC(cudaMalloc((void**) &s.scratch_m, strata::kernels::native_expert_scratch_bytes(NK, g.n_ff)));
+        const size_t f16 = 2;
+        KC(cudaMalloc((void**) &s.x16, (size_t) T * std::max<int64_t>(N, std::max<int64_t>(g.n_ff, (int64_t) hd)) * f16));
+        KC(cudaMalloc((void**) &s.q16, (size_t) T * hd * f16));
+        KC(cudaMalloc((void**) &s.att16, (size_t) T * hd * f16));
+        KC(cudaMalloc((void**) &s.k16, (size_t) g.n_head_kv * s.ctx * g.head_dim * f16));
+        KC(cudaMalloc((void**) &s.v16, (size_t) g.n_head_kv * s.ctx * g.head_dim * f16));
+        const size_t ldp = (size_t) s.ctx + 8;
+        const size_t tq = std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) ((12u << 20) / ((size_t) g.n_head * ldp))));
+        KC(cudaMalloc((void**) &s.att_s, (size_t) g.n_head * tq * ldp * 4));
+        KC(cudaMalloc((void**) &s.p16, (size_t) g.n_head * tq * ldp * f16));
+    }
     if (e.grouped > 0) {   // one grouped launch per layer: K entries, K groups at most, q8_1 acts for one token
         const int64_t cap_g = std::min<int64_t>(K, g.n_expert) + 1, cap_e = K;
         KC(cudaMalloc((void**) &s.grp_ptr, cap_g * sizeof(unsigned long long)));
@@ -701,11 +1083,13 @@ void init_scratch(const Engine& e, Scratch& s) {
                                // activations are sized from the layers' fmt (kolibri's 2560-as-Q8_K is 23,360 B)
         size_t act_b = 0, h_b = 0;
         for (const auto& b : e.blobs) if (b.native_ok) { act_b = std::max(act_b, b.fmt.act_bytes); h_b = std::max(h_b, b.fmt.h_bytes); }
-        KC(cudaHostAlloc((void**) &s.h_host, N * 4, cudaHostAllocDefault));
-        KC(cudaHostAlloc((void**) &s.act, act_b, cudaHostAllocDefault));
-        KC(cudaHostAlloc((void**) &s.ff, (size_t) K * FF * 4, cudaHostAllocDefault));
-        KC(cudaHostAlloc((void**) &s.hq, (size_t) K * h_b, cudaHostAllocDefault));
-        KC(cudaHostAlloc((void**) &s.ey_h, (size_t) K * N * 4, cudaHostAllocDefault));
+        const int64_t rows = e.prefill > 0 ? Scratch::kTmax : 1;          // prefill: a whole chunk on the host
+        const int64_t ents = e.prefill > 0 ? (int64_t) Scratch::kTmax * K : K;
+        KC(cudaHostAlloc((void**) &s.h_host, (size_t) rows * N * 4, cudaHostAllocDefault));
+        KC(cudaHostAlloc((void**) &s.act, (size_t) rows * act_b, cudaHostAllocDefault));
+        KC(cudaHostAlloc((void**) &s.ff, (size_t) ents * FF * 4, cudaHostAllocDefault));
+        KC(cudaHostAlloc((void**) &s.hq, (size_t) ents * h_b, cudaHostAllocDefault));
+        KC(cudaHostAlloc((void**) &s.ey_h, (size_t) ents * N * 4, cudaHostAllocDefault));
     }
     s.logits = dalloc(g.n_vocab);
     KC(cudaMalloc(&s.ids, K * sizeof(int)));
@@ -915,12 +1299,27 @@ int serve(Engine& e, Scratch& s) {
         }
         const auto t0 = Clock::now();
         const int64_t fresh = (int64_t) (ids.size() - reuse);
+        if (e.prefill > 0) {   // chunked prefill: 512 rows per pass, progress per chunk
+            int64_t i = reuse;
+            const int64_t n = fresh - 1 - reuse;   // the prompt minus its last token
+            while (i - reuse < n) {
+                const int T = (int) std::min<int64_t>(Scratch::kTmax, n - (i - reuse));
+                KC(cudaMemcpy(s.toks_d, ids.data() + i, (size_t) T * 4, cudaMemcpyHostToDevice));
+                forward_multi(e, s, T, s.pos);
+                s.pos += T;
+                i += T;
+                std::printf("PP %lld %lld %.0f %.1f\n", (long long) (i - reuse), (long long) fresh, ms_since(t0),
+                            (double) (i - reuse) / std::max(1e-9, ms_since(t0) / 1000.0));
+                std::fflush(stdout);
+            }
+        } else
         for (int64_t t = (int64_t) reuse + 1; t < fresh; ++t) {   // the prompt minus its last token
             forward(e, s, ids[t - 1], nullptr);
             std::printf("PP %lld %lld %.0f %.1f\n", (long long) (t - reuse), (long long) fresh, ms_since(t0),
                         (double) (t - reuse) / std::max(1e-9, ms_since(t0) / 1000.0));
             std::fflush(stdout);
         }
+        if (e.graphs > 0) KC(cudaMemcpy(s.pos_d, &s.pos, 4, cudaMemcpyHostToDevice));
         live.insert(live.end(), ids.begin() + (long) reuse, ids.end());
         const double prompt_ms = ms_since(t0);
         std::mt19937_64 rng(smp.seed);
@@ -982,8 +1381,11 @@ bool load(const std::string& path, Engine& e, std::string& err) {
         b.native_ok = strata::kernels::native_expert_supported((int) gate->type, (int) down->type, e.g.n_embd, e.g.n_ff);
         {
             std::string ferr;
-            b.native_ok = b.native_ok && strata::kernels::cpu::native_fmt((int) gate->type, (int) down->type,
-                                                                          e.g.n_embd, e.g.n_ff, b.fmt, ferr);
+            // the CPU pool's fmt is needed for every layer (the pool covers the Q6_K-down layers the GPU
+            // grouped kernel cannot); && would short-circuit on the GPU check and leave fmt unfilled
+            const bool fmt_ok = strata::kernels::cpu::native_fmt((int) gate->type, (int) down->type,
+                                                                 e.g.n_embd, e.g.n_ff, b.fmt, ferr);
+            b.native_ok = b.native_ok && fmt_ok;
         }
         const size_t sb = lcm(lcm((size_t) 144, (size_t) 210), (size_t) 34);   // Q4_K / Q6_K / Q8_0 super-blocks
         b.stride = ((b.L.bytes + sb - 1) / sb) * sb;
@@ -1055,7 +1457,7 @@ bool load(const std::string& path, Engine& e, std::string& err) {
 int strata::kolibri::run(int argc, char** argv) {
     std::string model, tokens, dump_layers, dump_logits, dump_full, force;
     bool load_only = false, serve_mode = false;
-    int n_gen = 8, ctx = 8192, cpu_threads = 0, slots = 0, grouped = 0, no_graph = 0;
+    int n_gen = 8, ctx = 8192, cpu_threads = 0, slots = 0, grouped = 0, no_graph = 0, prefill = 0;
     double expert_vram = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1074,6 +1476,7 @@ int strata::kolibri::run(int argc, char** argv) {
         else if (a == "--expert-vram" && i + 1 < argc) expert_vram = std::atoi(argv[++i]);
         else if (a == "--grouped") grouped = 1;
         else if (a == "--no-graph") no_graph = 1;
+        else if (a == "--prefill") prefill = 1;
     }
     if (model.empty()) {
         std::fprintf(stderr, "strata-kolibri: the Kolibri 1 engine path (plan T7); --model GGUF [--load-only] for now\n");
@@ -1092,6 +1495,18 @@ int strata::kolibri::run(int argc, char** argv) {
     // CUDA-graph decode rides the grouped path (device-side expert pointers); the slots/pool paths read host
     // ids per layer and are not capturable.  --no-graph keeps the plain launches.
     e.graphs = grouped && !no_graph && slots == 0 && cpu_threads == 0 ? 1 : 0;
+    e.prefill = prefill;
+    if (e.prefill > 0) {
+        if (cublasCreate(&e.blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(e.blas, g_st) != CUBLAS_STATUS_SUCCESS) {
+            std::fprintf(stderr, "strata-kolibri: cuBLAS init failed\n");
+            return 1;
+        }
+        const int64_t big = std::max(e.g.n_head * e.g.head_dim, e.g.n_embd) * (int64_t) e.g.n_embd;
+        if (!e.gemm.init(g_st, big, err)) {
+            std::fprintf(stderr, "strata-kolibri: prompt GEMM init failed: %s\n", err.c_str());
+            return 1;
+        }
+    }
     if (expert_vram > 0 && slots == 0)
         slots = (int) (expert_vram * (1 << 30) / (e.blobs[0].stride * (double) e.g.n_layers));
     e.slots = std::min(slots, (int) e.g.n_expert);
@@ -1139,6 +1554,21 @@ int strata::kolibri::run(int argc, char** argv) {
     std::vector<int> ids = parse_ids(tokens);
     std::vector<int> forced = parse_ids(force);
     int tok = ids[0];
+    if (e.prefill > 0 && fl == nullptr) {   // chunked prefill: the whole prompt minus its last token (layer dumps stay per-token)
+        int64_t i = 0;
+        const int64_t n = (int64_t) ids.size() - 1;
+        const auto tp0 = Clock::now();
+        while (i < n) {
+            const int T = (int) std::min<int64_t>(Scratch::kTmax, n - i);
+            KC(cudaMemcpy(s.toks_d, ids.data() + i, (size_t) T * 4, cudaMemcpyHostToDevice));
+            forward_multi(e, s, T, s.pos);
+            s.pos += T;
+            i += T;
+            std::printf("PFchunk %lld/%lld %.0fms\n", (long long) i, (long long) n, ms_since(tp0));
+            std::fflush(stdout);
+        }
+        tok = ids.back();
+    } else
     for (size_t t = 1; t < ids.size(); ++t) {
         forward(e, s, ids[t - 1], fl ? layers.data() : nullptr);
         if (fl) {
@@ -1147,6 +1577,7 @@ int strata::kolibri::run(int argc, char** argv) {
         }
         tok = ids[t];
     }
+    if (e.graphs > 0) KC(cudaMemcpy(s.pos_d, &s.pos, 4, cudaMemcpyHostToDevice));
     // the last prompt token and every step after it: run, argmax, feed back (a --force sequence replaces the
     // greedy picks - kl.py's teacher-forced KL path, kolibriref's semantics)
     const int n_steps = (int) forced.empty() ? n_gen : (int) forced.size() + 1;
