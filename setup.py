@@ -69,6 +69,7 @@ HF_REVISIONS = {
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "5348543e0147355ac9cbcb031184a3546350988e",  # 2026-09-29
     "unsloth/Qwen3.8-Flash-Next-GGUF": "38bb39ee97821de2c9009abb7e93950eec396e66",                   # 2026-09-30
     "unsloth/Qwen3.6-35B-A3B-MTP-GGUF": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",                  # 2026-10-12
+    "Hob-forge/Kolibri-1-GGUF": "40eaa5cf6cfca3afaf8b8832bac962652edb0bde",                           # 2026-10-16 (the local files' pinned commit, per their .fetch/)
 }
 
 
@@ -454,6 +455,28 @@ OWN_PATH_FAMILIES = {
                "kv_bytes_per_token": 11 * 2 * 256 * 2 * 4,
                "mtp": 2,                     # drafts per step (greedy requests): measured best on the R9700
                "vision": False},             # the image encoder for this family is not wired up yet
+    # Kolibri 1 (Aleph Alpha, 78B MoE / 3.46B active): its own engine path (src/kolibri), the GGUFs by Hob-forge
+    # (the repo the local files came from, per their .fetch/ script).  No MTP (no speculative decoding, plan D3)
+    # and no image encoder.  RAM: the engine keeps every expert in RAM (the GPU is the expert cache): the Q4_K_M
+    # file is 47.5 GB (42.9 GiB of expert blobs pinned) and the Q8_0 83.1 GB, each plus the OS and the rest.
+    # The KV per token: the 11 full-attention layers (every 5th of 50), 4 KV heads x 128, K and V in fp16; the
+    # 39 sliding layers hold a 513-token ring each, a constant.
+    "kolibri": {"title": "Kolibri 1", "by": "Aleph Alpha; GGUFs by Hob-forge", "arch": "kolibri1",
+                "about": "78B mixture of experts with 3.46B active (384 experts, top-6 + 1 shared): a German and "
+                         "English reasoning model with a thinking mode and tool calling",
+                "hf": hf("Hob-forge/Kolibri-1-GGUF"), "file": "Kolibri-1-{q}.gguf", "tag": "kolibri-",
+                "name": "kolibri-1", "license": "Apache 2.0: https://huggingface.co/AlephAlpha/Kolibri-1",
+                "binary": "strata-kolibri",   # source-build family: its own engine binary (src/kolibri), compiled in build/
+                "models": {"Q4_K_M": {"about": "4-bit (Q4_K experts, Q6_K down-projections every 5th layer)", "ram_gb": 56},
+                           "Q8_0": {"about": "8-bit, the closest to the full model", "ram_gb": 96}},
+                # the Q4_K_M hash is the HF API LFS oid at the pinned commit, from the local files' .fetch/ script;
+                # the Q8_0 hashes are sha256sum over the two local shards (83.1 GB read, 2026-10-17)
+                "sha256": {"Kolibri-1-Q4_K_M.gguf": (47454113472, "c2ac1301424441ef210b6de50ce25e8ccf69f86494df53d6ba52ed558456062e"),
+                           "Kolibri-1-Q8_0-00001-of-00002.gguf": (44679459296, "2cc41e6d39f48533dd354f76883d9a05100bc39d34b84d4c314590f8d6dfeb82"),
+                           "Kolibri-1-Q8_0-00002-of-00002.gguf": (38455934400, "ff900a95fa17625d7e9a36992195b189916e01d224ac3126e0c54c0cb4a58810")},
+                "kv_bytes_per_token": 11 * 4 * 128 * 2 * 2,
+                "mtp": 0,
+                "vision": False},
 }
 PREVIEW_FAMILIES = OWN_PATH_FAMILIES             # the earlier name (tools and tests that import it)
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
@@ -5521,10 +5544,28 @@ def own_path_context(fam: dict, vram_gb: float) -> int:
     return 32768 if vram_gb <= 16.5 else 65536 if vram_gb <= 24.5 else 131072
 
 
+def own_path_files(fam: dict, model: str) -> list[str]:
+    """The published file names of a size: one file normally; a size published in shards (Kolibri 1's Q8_0: two
+    0000i-of-00002 files) gets its shard names, read from the sha256 table (the base name is not a table key then)."""
+    base = fam["file"].format(q=model)
+    if base in fam["sha256"]:
+        return [base]
+    stem = base[: -len(".gguf")]
+    shards = sorted(k for k in fam["sha256"] if k.startswith(stem + "-0000"))
+    if not shards:
+        raise KeyError(f"setup knows no published file for {fam['title']} {model}")
+    return shards
+
+
+def own_path_bytes(fam: dict, model: str) -> int:
+    """Bytes of a size's published file(s): a sharded size sums its shard entries."""
+    return sum(fam["sha256"][k][0] for k in own_path_files(fam, model))
+
+
 def own_path_size(fam: dict, ram: float) -> str:
     """The recommended size: the largest file whose RAM need this PC has (the smallest when none fits)."""
     fits = [m for m, d in fam["models"].items() if ram >= d["ram_gb"]]
-    return max(fits, key=lambda m: fam["sha256"][fam["file"].format(q=m)][0]) if fits else next(iter(fam["models"]))
+    return max(fits, key=lambda m: own_path_bytes(fam, m)) if fits else next(iter(fam["models"]))
 
 
 def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted):
@@ -5546,7 +5587,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     say()
     for i, m in enumerate(names, 1):
         d = fam["models"][m]
-        size = fam["sha256"][fam["file"].format(q=m)][0]
+        size = own_path_bytes(fam, m)
         fit = "" if ram >= d["ram_gb"] else f"   <- needs {d['ram_gb']} GB RAM, you have {ram:.0f}"
         say(f"  {i}) {m:10s} {d['about']}; download {size / 1e9:.1f} GB{fit}")
     rec = own_path_size(fam, ram)
@@ -5596,15 +5637,36 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
                 "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil")
 
     step(4, "the Strata engine")
-    llama, eng, meta, lib_dirs, gpu, _ = engine_step(a, gpu, hip, amd, cuda_tk, "none")
-    if fam["arch"] not in engine_families(eng):
-        fail(f"this engine ({meta.get('version')}) does not run {fam['title']} yet",
-             "update Strata, or compile the engine with --build, and run setup again")
-    ok(f"engine: {eng / EXE}")
+    if fam.get("binary"):
+        # a source-build family (Kolibri 1: its own engine binary, no ready-made engine carries it yet): compile
+        # the family's target in build/ with the cache this checkout already has (a fresh one configures with
+        # nvcc on PATH and this card's architecture)
+        llama = get_llama_cpp()
+        cmake, ninja = find_tool("cmake"), find_tool("ninja")
+        bdir = ROOT / "build"
+        if not (bdir / "CMakeCache.txt").exists():
+            conf = [cmake, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}", "-S", str(ROOT), "-B", str(bdir),
+                    "-DCMAKE_BUILD_TYPE=Release", "-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF",
+                    f"-DCMAKE_CUDA_ARCHITECTURES={gpu.get('arch', 75)}", f"-DSTRATA_GGML_DIR={llama}"]
+            nvcc = shutil.which("nvcc")
+            if nvcc:
+                conf.append(f"-DCMAKE_CUDA_COMPILER={nvcc}")
+            run(conf)
+        say(f"  Compiling {fam['binary']} (once, a few minutes on a first install) ...")
+        run([cmake, "--build", str(bdir), "--target", fam["binary"], "-j", str(max(2, (os.cpu_count() or 4) // 2))])
+        eng, lib_dirs, meta = bdir, [], {}
+        ok(f"engine: {bdir / fam['binary']}")
+    else:
+        llama, eng, meta, lib_dirs, gpu, _ = engine_step(a, gpu, hip, amd, cuda_tk, "none")
+        if fam["arch"] not in engine_families(eng):
+            fail(f"this engine ({meta.get('version')}) does not run {fam['title']} yet",
+                 "update Strata, or compile the engine with --build, and run setup again")
+        ok(f"engine: {eng / EXE}")
 
     step(5, f"downloading {fam['title']} {model}")
-    if gguf.exists() and done(gguf):
-        ok(f"{gguf.name} already downloaded")
+    if gguf.exists() and (done(gguf) or a.gguf_dir):
+        # --gguf-dir: the user's own file has no finish mark; the sha256 check below is what verifies it
+        ok(f"{gguf.name} already there")
     else:
         if a.gguf_dir:
             fail(f"{gguf} is missing", f"put {gguf.name} in {folder}, or drop --gguf-dir to download it")
@@ -5621,13 +5683,16 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     ok(f"tokenizer: {pack / 'tokenizer'}")
 
     step(7, "writing the start script")
-    args = ["--native", str(gguf), "--max-context", str(ctx), "--prefill", "auto", "--mtp", str(fam["mtp"])]
+    if fam.get("binary"):
+        args = ["--model", str(gguf), "--ctx", str(ctx)]      # the family binary's own flags (src/kolibri/kolibri_main.cpp)
+    else:
+        args = ["--native", str(gguf), "--max-context", str(ctx), "--prefill", "auto", "--mtp", str(fam["mtp"])]
     if a.vram_reserve_mib is not None:             # VRAM left free for other programs: the experts take that much less
         vram = gpu.get("vram_gb", 0.0)
         if vram > 0:
             args += ["--expert-vram", f"{max(vram - 3.0 - a.vram_reserve_mib / 1024, 0):.1f}"]
         ok(f"VRAM kept free for other programs: about {a.vram_reserve_mib} MiB (the experts' share is set lower)")
-    cfg = {"exe": str(eng / EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
+    cfg = {"exe": str(eng / (fam.get("binary") or EXE)), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": f"{fam['name']}-{model.lower()}", "arch": fam["arch"],
            "log": str(ROOT / f"strata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
     if cuda_tk == 12:
@@ -5643,7 +5708,8 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         cfg["api_key"] = a.api_key
     if a.browser is not None:
         cfg["open_browser"] = a.browser
-    cfg["args"] = recommend_pool_workers(cfg["args"])   # --pool-workers: this engine path's CPU expert threads too
+    if not fam.get("binary"):                                  # --pool-workers is a Flash-Next engine flag; the family binaries take their own
+        cfg["args"] = recommend_pool_workers(cfg["args"])   # --pool-workers: this engine path's CPU expert threads too
     cfg_path = ROOT / f"strata-{tag.lower()}.json"
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None)
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
@@ -5673,14 +5739,14 @@ def preview_family(a) -> int:
     ram = ram_gb()
     for i, m in enumerate(names, 1):
         d = fam["models"][m]
-        size = fam["sha256"][fam["file"].format(q=m)][0]
+        size = own_path_bytes(fam, m)
         fit = "" if ram >= d["ram_gb"] else f"   <- needs {d['ram_gb']} GB RAM, you have {ram:.0f}"
         say(f"  {i}) {m:10s} {d['about']}; download {size / 1e9:.1f} GB{fit}")
     if a.check:
         return 0
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], "1", a.yes)) - 1]
     say(f"  Its license: {fam['license']}")
-    want = [fam["file"].format(q=model)]
+    want = own_path_files(fam, model)
     if a.vision in ("yes", "gpu", "cpu"):
         want.append(fam["mmproj"])
     folder = Path(a.models_dir) / (fam["tag"] + model)
