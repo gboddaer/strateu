@@ -129,6 +129,7 @@ struct Engine {
     float eps = 1e-6f, rope_base = 1e4f;
     int cpu_threads = 0;            // --cpu-threads: routed experts on the CPU pool (ggml-cpu vec_dot, no PCIe)
     int slots = 0;                  // --expert-slots: experts per layer resident in VRAM (the GPU expert cache)
+    int grouped = 0;                // --grouped: native_expert_grouped for the routed experts (one launch per layer)
     mutable Pool pool;              // the worker pool behind the CPU expert path
     std::map<std::string, Dense> dense;
     std::map<std::string, float*> f32;
@@ -234,6 +235,36 @@ __global__ void k_add(float* x, const float* y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] += y[i];
 }
+/// The routed entries (K picks for one token, entry e = k) grouped per expert on the device: one group per
+/// expert used (ascending id), its blob address, its entries in entry order (q36_engine.cu's k_group).
+__global__ void k_group(const int32_t* ids, int n_ent, int K_, int n_expert, const uint8_t* blobs,
+                        unsigned long long blob, unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups,
+                        int32_t* ent_dst, int32_t* ent_tok) {
+    __shared__ int cnt[512], off[512];
+    for (int x = threadIdx.x; x < n_expert; x += blockDim.x) cnt[x] = 0;
+    __syncthreads();
+    for (int e = threadIdx.x; e < n_ent; e += blockDim.x) atomicAdd(&cnt[ids[e]], 1);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int g = 0, pos = 0;
+        for (int x = 0; x < n_expert; ++x) {
+            off[x] = pos;
+            if (cnt[x] == 0) continue;
+            grp_ptr[g] = (unsigned long long) (blobs + (size_t) x * blob);
+            grp_start[g] = pos;
+            pos += cnt[x];
+            ++g;
+        }
+        grp_start[g] = pos;
+        *n_groups = g;
+        for (int e = 0; e < n_ent; ++e) {
+            const int q = off[ids[e]]++;
+            ent_dst[q] = e;
+            ent_tok[q] = e / K_;
+        }
+    }
+}
+
 __global__ void k_moe_sum(float* moe, const float* y, const float* w, int k, const float* ys, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -406,6 +437,9 @@ struct Scratch {
     float *eg2 = nullptr, *eu2 = nullptr, *eh2 = nullptr, *ey2 = nullptr, *ey_cpu = nullptr;
     float* yc = nullptr;            // the slots path's overflow rows: ey_cpu (pool) or ey (pinned table)
     std::vector<int> slot_ids, ovf_ids;
+    // --grouped: the per-layer grouped-expert call's device side
+    unsigned long long* grp_ptr = nullptr; int32_t *grp_start = nullptr, *n_groups = nullptr;
+    int32_t *ent_dst = nullptr, *ent_tok = nullptr; char* xq8 = nullptr; char* scratch = nullptr; float* gout = nullptr;
 };
 
 
@@ -455,9 +489,21 @@ void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
         KC(cudaMemcpy(g_ids_host.data(), s.ids, K * sizeof(int), cudaMemcpyDeviceToHost));
         Dense gu; gu.type = b.L.gu_type; gu.shape = {g.n_embd, g.n_ff, g.n_expert}; gu.row_bytes = b.L.gu_row;
         Dense dn; dn.type = b.L.d_type; dn.shape = {g.n_ff, g.n_embd, g.n_expert}; dn.row_bytes = b.L.d_row;
+        // --grouped: one native_expert_grouped launch per layer reads the blobs from the pinned table over UVA
+        // (the per-selection mmvq loop's 18 launches per layer become one; the grouped kernel's rows are ggml's
+        // own arithmetic, native_grouped_parity).  Unsupported layers (Q6_K down) keep the mmvq loop.
+        if (e.grouped > 0 && b.native_ok) {
+            k_group<<<1, 1024>>>(s.ids, K, K, (int) g.n_expert, b.table, (unsigned long long) b.stride,
+                                 s.grp_ptr, s.grp_start, s.n_groups, s.ent_dst, s.ent_tok);
+            strata::kernels::native_quantize_q8_1(s.h, s.xq8, (int) g.n_embd, 1, g_st);
+            strata::kernels::native_expert_grouped(b.L, s.grp_ptr, s.grp_start, s.n_groups, s.ent_dst, s.ent_tok,
+                                                   std::min<int64_t>(K, g.n_expert) + 1, K, s.xq8, s.scratch,
+                                                   s.gout, g_st);
+        } else
         // --expert-slots: the hot experts live in VRAM (the GPU expert cache); the rest overflow to the CPU
         // pool (--cpu-threads) or to the pinned table over UVA.  Bitwise: the same native_mmvq kernel reads the
         // same bytes wherever the blob sits; the side that skips a selection leaves its row zero (k_moe_sum2).
+        if (!(e.grouped > 0 && b.native_ok)) {
         if (e.slots > 0) {
             const int S = e.slots;
             s.slot_ids.resize((size_t) K); s.ovf_ids.resize((size_t) K);
@@ -527,11 +573,13 @@ void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
         k_swiglu<<<(K * FF + B - 1) / B, B>>>(s.eg, s.eu, s.eh, K * FF);
         gemv(dn, s.eh, s.ey, s.ids, K, FF, b.table + b.L.down_off, b.stride);
         }
+        }
         gemv(e.dense.at(L(l, "ffn_gate_shexp.weight")), s.h, s.sg, nullptr, 1, 0, nullptr, 0);
         gemv(e.dense.at(L(l, "ffn_up_shexp.weight")), s.h, s.su, nullptr, 1, 0, nullptr, 0);
         k_swiglu<<<(FS + B - 1) / B, B>>>(s.sg, s.su, s.sh, FS);
         gemv(e.dense.at(L(l, "ffn_down_shexp.weight")), s.sh, s.sy, nullptr, 1, 0, nullptr, 0);
-        if (e.slots > 0) k_moe_sum2<<<(N + B - 1) / B, B>>>(s.moe, s.ey2, s.yc, s.wts, K, s.sy, N);
+        if (e.grouped > 0 && b.native_ok) k_moe_sum<<<(N + B - 1) / B, B>>>(s.moe, s.gout, s.wts, K, s.sy, N);
+        else if (e.slots > 0) k_moe_sum2<<<(N + B - 1) / B, B>>>(s.moe, s.ey2, s.yc, s.wts, K, s.sy, N);
         else k_moe_sum<<<(N + B - 1) / B, B>>>(s.moe, s.ey, s.wts, K, s.sy, N);
         k_rms<<<1, kThreads>>>(s.moe, e.f32.at(L(l, "post_ffw_norm.weight")), s.moe, N, e.eps);
         k_add<<<(N + B - 1) / B, B>>>(s.x, s.moe, N);
@@ -554,6 +602,17 @@ void init_scratch(const Engine& e, Scratch& s) {
     s.eg = dalloc((size_t) K * FF); s.eu = dalloc((size_t) K * FF); s.eh = dalloc((size_t) K * FF); s.ey = dalloc((size_t) K * N);
     s.sg = dalloc(g.n_ff_shexp); s.su = dalloc(g.n_ff_shexp); s.sh = dalloc(g.n_ff_shexp);
     s.wts = dalloc(K);
+    if (e.grouped > 0) {   // one grouped launch per layer: K entries, K groups at most, q8_1 acts for one token
+        const int64_t cap_g = std::min<int64_t>(K, g.n_expert) + 1, cap_e = K;
+        KC(cudaMalloc((void**) &s.grp_ptr, cap_g * sizeof(unsigned long long)));
+        KC(cudaMalloc((void**) &s.grp_start, cap_g * sizeof(int32_t)));
+        KC(cudaMalloc((void**) &s.n_groups, sizeof(int32_t)));
+        KC(cudaMalloc((void**) &s.ent_dst, cap_e * sizeof(int32_t)));
+        KC(cudaMalloc((void**) &s.ent_tok, cap_e * sizeof(int32_t)));
+        KC(cudaMalloc((void**) &s.xq8, strata::kernels::native_q8_1_bytes((int) g.n_embd, 1)));
+        KC(cudaMalloc((void**) &s.scratch, strata::kernels::native_expert_scratch_bytes(cap_e, g.n_ff)));
+        KC(cudaMalloc((void**) &s.gout, (size_t) K * N * 4));
+    }
     if (e.slots > 0) {   // the GPU expert cache's rows: the in-slot side and the overflow side
         KC(cudaMalloc((void**) &s.eg2, (size_t) K * FF * 4));
         KC(cudaMalloc((void**) &s.eu2, (size_t) K * FF * 4));
@@ -885,7 +944,7 @@ bool load(const std::string& path, Engine& e, std::string& err) {
 int strata::kolibri::run(int argc, char** argv) {
     std::string model, tokens, dump_layers, dump_logits, dump_full, force;
     bool load_only = false, serve_mode = false;
-    int n_gen = 8, ctx = 8192, cpu_threads = 0, slots = 0;
+    int n_gen = 8, ctx = 8192, cpu_threads = 0, slots = 0, grouped = 0;
     double expert_vram = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -902,6 +961,7 @@ int strata::kolibri::run(int argc, char** argv) {
         else if (a == "--cpu-threads" && i + 1 < argc) cpu_threads = std::atoi(argv[++i]);
         else if (a == "--expert-slots" && i + 1 < argc) slots = std::atoi(argv[++i]);
         else if (a == "--expert-vram" && i + 1 < argc) expert_vram = std::atoi(argv[++i]);
+        else if (a == "--grouped") grouped = 1;
     }
     if (model.empty()) {
         std::fprintf(stderr, "strata-kolibri: the Kolibri 1 engine path (plan T7); --model GGUF [--load-only] for now\n");
@@ -916,6 +976,7 @@ int strata::kolibri::run(int argc, char** argv) {
         return 1;
     }
     e.cpu_threads = cpu_threads;
+    e.grouped = grouped;
     if (expert_vram > 0 && slots == 0)
         slots = (int) (expert_vram * (1 << 30) / (e.blobs[0].stride * (double) e.g.n_layers));
     e.slots = std::min(slots, (int) e.g.n_expert);

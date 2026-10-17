@@ -5,19 +5,19 @@
   "status": "active",
   "autoContinue": true,
   "usage": {
-    "tokensUsed": 7358278,
-    "activeSeconds": 64059
+    "tokensUsed": 7782441,
+    "activeSeconds": 64607
   },
   "sisyphus": true,
   "createdAt": "2026-10-16T20:03:05.111Z",
-  "updatedAt": "2026-10-17T14:10:08.202Z",
+  "updatedAt": "2026-10-17T14:19:20.294Z",
   "activePath": ".pi/goals/active_goal_2026101622030511_mvbeaadz-ci3ol5.md",
-  "revision": 631,
+  "revision": 651,
   "scheduler": {
     "version": 1,
     "owner": "01a14639-671a-745b-b2d5-938ad9a82b79",
-    "generation": "580e8774-ee65-4161-8ab4-ad478c62ecd2",
-    "used": 1,
+    "generation": "3eb4ee9a-0fd8-47a1-8fa4-a06dae0f5e1d",
+    "used": 3,
     "phase": "running",
     "repairUsed": false,
     "decision": {
@@ -25,9 +25,9 @@
       "purpose": "ready"
     },
     "dispatch": {
-      "id": "96de857c-afcc-42ec-a913-465117a08792",
+      "id": "dac06b84-fe43-4731-82b3-d7f600eed00e",
       "kind": "ready",
-      "claimedAt": 1792240432131
+      "claimedAt": 1792246476996
     }
   }
 }
@@ -42,5 +42,5 @@ Execute docs/superpowers/plans/2026-10-16-kolibri1.md on branch kolibri1, task b
 - Status: sisyphus running
 - Auto-continue: on
 - Sisyphus mode: yes (prompt/criteria style)
-- Time spent: 17h47m39s
-- Tokens used: 7.4M (7,358,278) tokens
+- Time spent: 17h56m47s
+- Tokens used: 7.8M (7,782,441) tokens
