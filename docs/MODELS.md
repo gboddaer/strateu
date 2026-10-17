@@ -14,6 +14,7 @@ The installer recommends one for your PC; this page explains the choice. Back to
 | **32 GB** | **Coder** | it fits 32 GB; best at code, weaker at everything else ([why](#coder)). With a 24 GB card, Q2_0 and IQ2_XS run too ([low-RAM mode](#a-big-graphics-card-and-little-ram)) and are the better pick for general use |
 | **48 GB** | **IQ2_XS** (or Q2_0, the fastest) | the larger sizes do not fit |
 | **64 GB** | **IQ2_XS** (recommended), or IQ3_XXS / IQ3_S | every size fits (IQ3_S with little else open) |
+| **64 GB, German & English** | [Kolibri 1](KOLIBRI1.md) Q4_K_M (needs ~56 GB) | a different model: Aleph Alpha's 78B MoE, 3.46B active ([numbers](KOLIBRI1.md#validation)) |
 | **96 GB or more** | **IQ3_S**, or [Unsloth's UD-IQ4_XS or UD-Q4_K_XL](#unsloths-files-ud-iq4_xs-to-q8_0) (~4-bit) | room for the largest sizes |
 | **128-192 GB** | [Unsloth's UD-Q5_K_XL, UD-Q6_K_XL or Q8_0](#unsloths-files-ud-iq4_xs-to-q8_0) | every expert of the 5-8-bit files in RAM |
 
@@ -143,6 +144,23 @@ speed bound and NVIDIA/AMD/Intel details: [QUANTS.md](QUANTS.md); the files: [UD
 ```
 START-HERE.bat --setup --family unsloth --model UD-Q5_K_XL
 ```
+
+### Kolibri 1
+
+**[Kolibri 1](https://huggingface.co/Aleph-Alpha/Kolibri-1)** - Aleph Alpha's 78-billion-parameter mixture-of-
+experts reasoning model for German and English (3.46B active per token, Apache-2.0). It runs on its own engine
+path (`src/kolibri`) beside Flash-Next's, on the same idea: every expert in system RAM, the GPU as the expert
+cache. The GGUFs are [Hob-forge's](https://huggingface.co/Hob-forge/Kolibri-1-GGUF): Q4_K_M is one 47.5 GB file
+(needs ~56 GB of RAM), Q8_0 is 83.1 GB in two shards (~96 GB). It has a thinking mode (`reasoning_effort` per
+request) and tool calling. Measured on a Tesla T4 16 GB: decode 9.3 tokens per second (llama.cpp on the same box:
+19.1), prompt 10.0; parity against llama.cpp: mean KL 0.0017, 5 of 8 greedy prompts identical over 64 tokens.
+The prompt path and long-context decode are far behind llama.cpp - the recorded speed work is in the doc.
+
+```
+./setup.sh --family kolibri --model Q4_K_M --gguf-dir /path/to/the/folder/with/the/gguf --yes
+```
+
+The full story, the gates and what is not verified: [KOLIBRI1.md](KOLIBRI1.md).
 
 ### OrcaRouter Uncensored IQ3_XXS
 

@@ -11,7 +11,8 @@ NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open
 
 Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** on a normal PC. This is a
 large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
-and coding agents. Nothing leaves your PC.
+and coding agents. Nothing leaves your PC. It also runs **[Kolibri 1](docs/KOLIBRI1.md)** (Aleph Alpha's 78B
+German & English MoE, 3.46B active) on 56 GB of RAM: `./setup.sh --family kolibri`.
 
 ## How fast is it?
 

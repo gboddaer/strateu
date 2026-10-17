@@ -23,8 +23,8 @@ GPU computing experts side by side.
 
 ## Files
 
-The GGUFs are the community conversion (Seraphiel102/Kolibri-1-GGUF), quantized from the FP8 checkpoint via
-BF16; every quant is made from that BF16 GGUF, none is a requant.
+The GGUFs are the community conversion ([Hob-forge/Kolibri-1-GGUF](https://huggingface.co/Hob-forge/Kolibri-1-GGUF)),
+quantized from the FP8 checkpoint via BF16; every quant is made from that BF16 GGUF, none is a requant.
 
 | Size | File | Bytes | Needs |
 | --- | --- | ---: | --- |
@@ -37,17 +37,25 @@ Routed experts are 42.4 GB (Q4_K_M) / 75 GB (Q8_0); one decoded token reads 6 ex
 ## Running it
 
 ```
-./setup.sh --family kolibri --model Q4_K_M --gguf-dir /path/to/ggufs --yes
+./setup.sh --family kolibri --model Q4_K_M --gguf-dir /path/to/the/folder/with/the/gguf --yes
 ```
+
+(`--gguf-dir` names the folder that holds the file; setup checks its SHA-256. Setup compiles the family's own
+binary `strata-kolibri` in `build/` - no ready-made engine carries this family yet.)
 
 or directly:
 
 ```
-strata --native Kolibri-1-Q4_K_M.gguf --max-context 32768 --prefill auto
+build/strata-kolibri --model Kolibri-1-Q4_K_M.gguf --ctx 32768
 ```
 
 Sampling defaults (the model card's): temperature 1.0, top-p 0.97, top-k 128. Reasoning effort is per request:
-`"chat_template_kwargs": {"reasoning_effort": "low"}` — `none`, `low`, `medium`, `high`.
+`"chat_template_kwargs": {"reasoning_effort": "low"}` - `none`, `low`, `medium`, `high`; measured on the T4:
+`none` answers directly ("27 x 43 = 1161.", no thinking), the default thinks first. The tokenizer is gpt2 BPE,
+128,000 tokens, `pre = kolibri1` (the Qwen2 pre-tokenizer split). The model writes tool calls as
+`<tool_call>{JSON}</tool_call>` next to the template's XML form: set `"tool_call_recovery": true` in the
+config and the server parses them into structured `tool_calls` (measured: `get_weather {"city": "Berlin"}`,
+`finish_reason: tool_calls`).
 
 ## How the engine path works
 
