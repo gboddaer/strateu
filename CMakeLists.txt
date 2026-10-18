@@ -1412,6 +1412,10 @@ if(STRATA_NATIVE_EXPERTS)
   # MODEL-UPDATE: the pool's expert rows per format on T threads against the RAM bandwidth (a benchmark, no test)
   add_executable(kq_cpu_bench src/kernels/cpu/kq_cpu_bench.cpp)
   target_link_libraries(kq_cpu_bench PRIVATE strata_kernels_cpu)
+  # SPEED PLAN task 6 (2026-10-17-kolibri1-speed.md): the CPU expert pool's measured ceiling on the real
+  # Kolibri-1 geometry, before any pool code changes.  See the file header for what [1]-[4] measure.
+  add_executable(pool_bench src/kernels/cpu/pool_bench.cpp)
+  target_link_libraries(pool_bench PRIVATE strata_kernels_cpu)
   if(STRATA_BUILD_TESTS)
     add_test(NAME iq_avx2_parity COMMAND iq_avx2_parity)
     add_test(NAME iq_avx2_parity_iq3s_mt1 COMMAND ${CMAKE_COMMAND} -E env STRATA_IQ3S_MT1=1 $<TARGET_FILE:iq_avx2_parity>)
