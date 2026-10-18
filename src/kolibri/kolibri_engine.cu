@@ -996,6 +996,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
 }
 
 void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
+    if (e.counters) ++e.cnt.tok;   // every processed token (prompt + decode): the per-token normaliser
     const auto& g = e.g;
     const int N = (int) g.n_embd, K = (int) e.top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
     const int H = (int) g.n_head, HKV = (int) g.n_head_kv, D = (int) g.head_dim;
@@ -1172,7 +1173,8 @@ void reset_state(Engine& e, Scratch& s) {
         KC(cudaMemset(s.kc[l], 0, bytes));
         KC(cudaMemset(s.vc[l], 0, bytes));
     }
-    if (e.counters) { e.cnt.reset_ms += (long long) ms_since(t0); ++e.cnt.reset_n; }
+    // cudaMemset is asynchronous: without this the timer would measure the enqueue, not the clear (K11).
+    if (e.counters) { cudaDeviceSynchronize(); e.cnt.reset_ms += (long long) ms_since(t0); ++e.cnt.reset_n; }
 }
 
 void print_counters(Engine& e, const char* tag) {
@@ -1372,7 +1374,7 @@ int serve(Engine& e, Scratch& s) {
         for (;;) {
             forward(e, s, tok, nullptr);
             KC(cudaMemcpy(lg.data(), s.logits, lg.size() * 4, cudaMemcpyDeviceToHost));
-            if (e.counters) { ++e.cnt.tok; e.cnt.d2h_n += 1; e.cnt.d2h_bytes += (long long) lg.size() * 4; }
+            if (e.counters) { e.cnt.d2h_n += 1; e.cnt.d2h_bytes += (long long) lg.size() * 4; }
             const int32_t nx = smp.needs_logits() ? sample(lg, smp, hist, rng)
                                                   : (int32_t) (std::max_element(lg.begin(), lg.end()) - lg.begin());
             std::printf("T %d\n", nx);
@@ -1640,7 +1642,7 @@ int strata::kolibri::run(int argc, char** argv) {
             for (int64_t l = 0; l < e.g.n_layers; ++l)
                 std::fwrite(layers.data() + (size_t) l * e.g.n_embd, 4, e.g.n_embd, fl);
         KC(cudaMemcpy(lg.data(), s.logits, lg.size() * 4, cudaMemcpyDeviceToHost));
-        if (e.counters) { ++e.cnt.tok; e.cnt.d2h_n += 1; e.cnt.d2h_bytes += (long long) lg.size() * 4; }
+        if (e.counters) { e.cnt.d2h_n += 1; e.cnt.d2h_bytes += (long long) lg.size() * 4; }
         int a = 0, c = -1;
         for (int j = 1; j < (int) lg.size(); ++j) if (lg[j] > lg[a]) a = j;
         for (int j = 0; j < (int) lg.size(); ++j) if (j != a && (c < 0 || lg[j] > lg[c])) c = j;

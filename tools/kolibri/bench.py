@@ -2,7 +2,7 @@
 """tools/kolibri/bench.py - the Task 10 bench (plan docs/superpowers/plans/2026-10-16-kolibri1.md):
 prompt-read (512-token pp) and decode (128-token tg) tokens/s, short and after a 32K context.
 Drives strata-kolibri --serve: the PP lines give the prompt rate, the DONE line the decode rate."""
-import subprocess, argparse
+import subprocess, argparse, shlex
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--bin", required=True)
@@ -11,10 +11,12 @@ ap.add_argument("--ids512", required=True, help="file: 512 prompt ids")
 ap.add_argument("--ids32k", required=True, help="file: 32768 prompt ids")
 ap.add_argument("--ctx", type=int, default=33024)
 ap.add_argument("--tg", type=int, default=128)
+ap.add_argument("--extra", default="", help="extra engine flags, e.g. '--prefill --counters'")
+ap.add_argument("--case", choices=["short", "after", "both"], default="both", help="short = pp512/tg128 only (the plain path needs ~7 h for pp32768)")
 a = ap.parse_args()
 
 def run_case(ids: str, n: int, ctx: int, label: str):
-    p = subprocess.Popen([a.bin, "--model", a.model, "--serve", "--ctx", str(ctx)],
+    p = subprocess.Popen([a.bin, "--model", a.model, "--serve", "--ctx", str(ctx)] + shlex.split(a.extra),
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
     def rd():
         while True:
@@ -40,5 +42,7 @@ def run_case(ids: str, n: int, ctx: int, label: str):
 
 ids512 = open(a.ids512).read().strip()
 ids32k = open(a.ids32k).read().strip()
-run_case(ids512, a.tg, 8192, "short   ")
-run_case(ids32k, a.tg, a.ctx, "after32K")
+if a.case in ("short", "both"):
+    run_case(ids512, a.tg, 8192, "short   ")
+if a.case in ("after", "both"):
+    run_case(ids32k, a.tg, a.ctx, "after32K")
