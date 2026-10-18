@@ -87,6 +87,12 @@ struct LayerBlobs {
     uint8_t* table = nullptr;       // pinned host: n_expert slots + 1 zero slot (the no-pool overflow path)
     uint8_t* dev = nullptr;         // --expert-slots: device table, slots slots + 1 zero slot
     bool native_ok = false;         // native_expert_supported for this layer's (gu, d) at these dims
+    // The CPU pool's OWN capability.  native_ok is ANDed with the GPU's native_expert_supported, so gating the
+    // pool branch on it excludes exactly the layers the GPU path is worst at: measured, the pool ran on 25 of 50
+    // layers per token and the GPU paid PCIe (mmvq, 43 ms/token, 75% of GPU busy) on the other 25.  The pool's
+    // native_fmt supports the Q6_K-down layers the GPU grouped kernel cannot, so the pool branch must key on
+    // this, not on native_ok.
+    bool pool_ok = false;
     strata::kernels::cpu::NativeFmt fmt;  // the CPU pool's view of the same blob (native_fmt at load)
 };
 
@@ -151,6 +157,11 @@ struct Engine {
         long long d2h_n = 0, d2h_bytes = 0;
         long long h2d_n = 0, h2d_bytes = 0;
         long long reset_ms = 0, reset_n = 0;
+        // Which expert branch each layer-step actually took.  The nsys trace showed GPU mmvq at 575 launches/token
+        // (= 48 layers' gate+up for all 6 picks) WHILE the pool branch ran 26x/token - i.e. both sides computing
+        // the routed experts.  The branch counts settle which layers go where; they are the input to task 9's
+        // placement, and they make every future placement change readable from CNT without a profiler.
+        long long br_pool = 0, br_gpu = 0, br_slots = 0, br_grouped = 0;
     };
     mutable Counters cnt;   // layer_step takes the Engine as const (like `mutable Pool pool`)
     bool counters = false;
@@ -730,6 +741,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
         // (the per-selection mmvq loop's 18 launches per layer become one; the grouped kernel's rows are ggml's
         // own arithmetic, native_grouped_parity).  Unsupported layers (Q6_K down) keep the mmvq loop.
         if (e.grouped > 0 && b.native_ok) {
+            if (e.counters) ++e.cnt.br_grouped;
             k_group<<<1, 1024, 0, st>>>(s.ids, K, K, (int) g.n_expert, b.table, (unsigned long long) b.stride,
                                  s.grp_ptr, s.grp_start, s.n_groups, s.ent_dst, s.ent_tok);
             strata::kernels::native_quantize_q8_1(s.h, s.xq8, (int) g.n_embd, 1, g_st);
@@ -742,6 +754,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
         // same bytes wherever the blob sits; the side that skips a selection leaves its row zero (k_moe_sum2).
         if (!(e.grouped > 0 && b.native_ok)) {
         if (e.slots > 0) {
+            if (e.counters) ++e.cnt.br_slots;
             const int S = e.slots;
             s.slot_ids.resize((size_t) K); s.ovf_ids.resize((size_t) K);
             for (int k = 0; k < K; ++k) {
@@ -760,7 +773,8 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
             gemv(dn, s.eh2, s.ey2, s.ids, K, FF, b.dev + b.L.down_off, b.stride);
             KC(cudaStreamSynchronize(g_st));   // the slot gemv run on g_st; k_moe_sum2 below reads ey2 on the default stream
             float* yc;
-            if (e.cpu_threads > 0 && b.native_ok) {
+            if (e.cpu_threads > 0 && b.pool_ok) {   // the pool's own capability, not the GPU's (see LayerBlobs)
+                if (e.counters) ++e.cnt.br_pool;
                 g_ids_host.assign(g_ids_host.size(), 0);   // restored below from the device ids
                 KC(cudaMemcpy(g_ids_host.data(), s.ids, K * sizeof(int), cudaMemcpyDeviceToHost));
                 KC(cudaMemcpy(s.h_host, s.h, N * 4, cudaMemcpyDeviceToHost));
@@ -780,6 +794,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                 yc = s.ey_cpu;
             } else {
                 g_ids_host = s.ovf_ids;
+                if (e.counters) ++e.cnt.br_gpu;   // slots miss served from the pinned table over PCIe
                 gemv(gu, s.h, s.eg, s.ids, K, 0, b.table, b.stride);
                 gemv(gu, s.h, s.eu, s.ids, K, 0, b.table + b.L.up_off, b.stride);
                 k_swiglu<<<(K * FF + B - 1) / B, B, 0, st>>>(s.eg, s.eu, s.eh, K * FF);
@@ -788,15 +803,19 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
             }
             KC(cudaStreamSynchronize(g_st));   // the shared-expert gemv ran on g_st; the sum below reads sy on the default stream
             s.yc = yc;   // the MoE sum runs in the shared code, after the shared-expert gemv
-        } else if (e.cpu_threads > 0 && b.native_ok) {
+        } else if (e.cpu_threads > 0 && b.pool_ok) {   // the pool's own capability, not the GPU's (see LayerBlobs)
+            if (e.counters) ++e.cnt.br_pool;
             KC(cudaMemcpy(s.h_host, s.h, N * 4, cudaMemcpyDeviceToHost));
+            if (e.counters) { ++e.cnt.d2h_n; e.cnt.d2h_bytes += (long long) N * 4; }   // was uncounted: the pool-only leg read as "no pool" from CNT
             strata::kernels::cpu::native_quant_act(b.fmt, s.h_host, s.act);
             std::vector<int> sels((size_t) K);
             for (int k = 0; k < K; ++k) sels[(size_t) k] = k;
             pool_experts(e, b, s, g_ids_host, sels);
             // K15/K18: async on the compute stream (pinned source); see the slots path above for why.
             KC(cudaMemcpyAsync(s.ey, s.ey_h, (size_t) K * N * 4, cudaMemcpyHostToDevice, g_st));
+            if (e.counters) { ++e.cnt.h2d_n; e.cnt.h2d_bytes += (long long) K * N * 4; }   // was uncounted
         } else {
+        if (e.counters) ++e.cnt.br_gpu;   // the plain pinned-table mmvq path
         gemv(gu, s.h, s.eg, s.ids, K, 0, b.table, b.stride);
         gemv(gu, s.h, s.eu, s.ids, K, 0, b.table + b.L.up_off, b.stride);
         k_swiglu<<<(K * FF + B - 1) / B, B, 0, st>>>(s.eg, s.eu, s.eh, K * FF);
@@ -1209,7 +1228,25 @@ void print_counters(Engine& e, const char* tag) {
                  c.slot_bytes / tok / 1e6, c.d2h_n, c.d2h_bytes, c.d2h_bytes / tok / 1e6,
                  c.h2d_n, c.h2d_bytes, c.h2d_bytes / tok / 1e6, c.reset_ms, c.reset_n,
                  c.reset_n ? (double) c.reset_ms / c.reset_n : 0.0);
+    // The pool's OWN per-phase counters (pool.hpp:188-189).  The engine's d2h/h2d counters did not cover the
+    // pool-only branch at all, which is why the P1b "pool" legs were unreadable from CNT alone - the only
+    // in-situ record of what the pool actually streamed, and at what rate.
+    if (e.epool) {
+        const double ms_gu = e.epool->ms_multi_gu, ms_q = e.epool->ms_multi_q, ms_dn = e.epool->ms_multi_down;
+        const double ms = ms_gu + ms_q + ms_dn;
+        std::fprintf(stderr,
+                     "CNT pool workers=%d | streamed %.1f MB/tok (%.2f GB total) | gu %.0f ms q %.0f ms"
+                     " down %.0f ms = %.0f ms (%.2f ms/tok, %.1f GB/s)\n",
+                     e.epool->workers(), c.tok ? e.epool->multi_bytes / tok / 1e6 : 0.0,
+                     e.epool->multi_bytes / 1e9, ms_gu, ms_q, ms_dn, ms, ms / tok,
+                     ms > 0 ? e.epool->multi_bytes / 1e9 / (ms / 1000.0) : 0.0);
+    }
     std::fflush(stderr);
+    if (e.cnt.br_pool + e.cnt.br_gpu + e.cnt.br_slots + e.cnt.br_grouped > 0)
+        std::fprintf(stderr, "CNT branches per tok: pool %.1f gpu-expert %.1f slots-path %.1f grouped %.1f"
+                             " (layers/token total %.1f of %lld)\n",
+                     e.cnt.br_pool / tok, e.cnt.br_gpu / tok, e.cnt.br_slots / tok, e.cnt.br_grouped / tok,
+                     (e.cnt.br_pool + e.cnt.br_gpu) / tok, e.g.n_layers);
 }
 
 // --------------------------------------------------------------------------- sampling (q36's, verbatim semantics)
@@ -1461,6 +1498,7 @@ bool load(const std::string& path, Engine& e, std::string& err) {
             const bool fmt_ok = strata::kernels::cpu::native_fmt((int) gate->type, (int) down->type,
                                                                  e.g.n_embd, e.g.n_ff, b.fmt, ferr);
             b.native_ok = b.native_ok && fmt_ok;
+            b.pool_ok = fmt_ok;   // the pool's capability alone; see the LayerBlobs note
         }
         const size_t sb = lcm(lcm((size_t) 144, (size_t) 210), (size_t) 34);   // Q4_K / Q6_K / Q8_0 super-blocks
         b.stride = ((b.L.bytes + sb - 1) / sb) * sb;
