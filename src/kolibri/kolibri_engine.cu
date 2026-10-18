@@ -1167,10 +1167,16 @@ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std:
 /// Drop the held state: position 0 and empty KV caches (the serve protocol's fresh-request path).
 void reset_state(Engine& e, Scratch& s) {
     const Clock::time_point t0 = Clock::now();
+    // K11: the old clear memset the WHOLE cache (1.35 GB at ctx 33024 = 4 ms per request).  Attention only
+    // reads rows below the position counter, so a fresh request only needs the rows it can reach: full-attention
+    // layers clear 0..pos, and the sliding layers keep their full (cheap, 513-row) ring clear.
+    const int64_t used = (int64_t) s.pos + 1;   // rows the previous request touched (pos is 0-based)
     s.pos = 0;
     for (size_t l = 0; l < s.kc.size(); ++l) {
-        const int64_t rows = strata::core::is_swa_layer(e.g, (int64_t) l) ? e.g.n_swa : s.ctx;
-        const size_t bytes = (size_t) e.g.n_head_kv * rows * e.g.head_dim * 4;
+        const bool sliding = strata::core::is_swa_layer(e.g, (int64_t) l);
+        const int64_t rows = sliding ? e.g.n_swa : s.ctx;
+        const int64_t clear_rows = sliding ? rows : std::min<int64_t>(rows, used);
+        const size_t bytes = (size_t) e.g.n_head_kv * clear_rows * e.g.head_dim * 4;
         KC(cudaMemset(s.kc[l], 0, bytes));
         KC(cudaMemset(s.vc[l], 0, bytes));
     }
