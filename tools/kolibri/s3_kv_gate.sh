@@ -43,13 +43,13 @@ done
 #   pass A: 512 at ctx 8192 (short case) + 32768 at ctx $CTX (the 32K case)
 #   pass B: 2048 at ctx 8192 + 8192 at ctx $CTX
 echo "--- pass A: 512 short, 32768 after-32K"
-timeout 6000 "$PY" "$ROOT/tools/kolibri/bench.py" --bin "$BIN" --model "$M" \
+timeout 6000 "$PY" -u "$ROOT/tools/kolibri/bench.py" --bin "$BIN" --model "$M" \
     --ids512 "$OUT/ids_512.txt" --ids32k "$OUT/ids_32768.txt" --ctx "$CTX" --case both --extra="--prefill" \
-    2>&1 | sed 's/^/  /' | tee "$OUT/passA.txt"
+    > "$OUT/passA.txt" 2>&1; sed 's/^/  /' "$OUT/passA.txt"
 echo "--- pass B: 2048 short, 8192 after-32K"
-timeout 6000 "$PY" "$ROOT/tools/kolibri/bench.py" --bin "$BIN" --model "$M" \
+timeout 6000 "$PY" -u "$ROOT/tools/kolibri/bench.py" --bin "$BIN" --model "$M" \
     --ids512 "$OUT/ids_2048.txt" --ids32k "$OUT/ids_8192.txt" --ctx "$CTX" --case both --extra="--prefill" \
-    2>&1 | sed 's/^/  /' | tee "$OUT/passB.txt"
+    > "$OUT/passB.txt" 2>&1; sed 's/^/  /' "$OUT/passB.txt"
 
 echo "--- per-token prompt cost (flat == the quadratic conversion is gone)"
 python3 - "$OUT" <<'PY'

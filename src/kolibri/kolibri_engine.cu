@@ -1428,6 +1428,15 @@ bool load(const std::string& path, Engine& e, std::string& err) {
                 if (ti.name == L(l, "ffn_down_exps.weight")) down = &ti;
             }
         if (!gate || !up || !down) { err = "layer " + std::to_string(l) + ": expert tensors missing"; return false; }
+        // The repack writes gate and up into ONE gu blob under a single layout (b.L.gu_type, taken from gate), and
+        // native_expert_layout is only told gate/down.  A file with gate->type != up->type would therefore have its
+        // up rows parsed with gate's type - silent numeric corruption, not a failure.  Reject it at load.
+        if (gate->type != up->type) {
+            err = "layer " + std::to_string(l) + ": ffn_gate_exps type " + std::to_string((int) gate->type) +
+                  " != ffn_up_exps type " + std::to_string((int) up->type) +
+                  "; the [gate|up] blob has one layout, so a mixed-type expert file is rejected";
+            return false;
+        }
         LayerBlobs& b = e.blobs[(size_t) l];
         b.L = strata::kernels::native_expert_layout((int) gate->type, (int) down->type, e.g.n_embd, e.g.n_ff);
         b.native_ok = strata::kernels::native_expert_supported((int) gate->type, (int) down->type, e.g.n_embd, e.g.n_ff);
