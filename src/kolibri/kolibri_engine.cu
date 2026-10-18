@@ -1627,6 +1627,7 @@ int strata::kolibri::run(int argc, char** argv) {
     std::string model, tokens, dump_layers, dump_logits, dump_full, force, tokens_file;
     bool load_only = false, serve_mode = false;
     int n_gen = 8, ctx = 8192, cpu_threads = 0, slots = 0, grouped = 0, no_graph = 0, prefill = 0, counters = 0;
+    int attn_bench = 0;             // K25 instrument: --attn-bench N launches the real attention kernel N times
     double expert_vram = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1649,6 +1650,7 @@ int strata::kolibri::run(int argc, char** argv) {
         else if (a == "--grouped") grouped = 1;
         else if (a == "--no-graph") no_graph = 1;
         else if (a == "--prefill") prefill = 1;
+        else if (a == "--attn-bench" && i + 1 < argc) attn_bench = std::atoi(argv[++i]);
         else if (a == "--counters") counters = 1;
     }
     if (model.empty()) {
@@ -1706,6 +1708,41 @@ int strata::kolibri::run(int argc, char** argv) {
         // measured placement rule (pool_bench): ~24 workers on the GPU's socket; 48 on one socket collapse.
         e.epool = std::make_unique<strata::kernels::cpu::ExpertPool>(
             e.cpu_threads, true, true, strata::kernels::cpu::PoolAffinity::All);
+    }
+    // K25 instrument.  The 32K decode term is 12 full-attention layers x one k_attn launch at n_vis = pos+1,
+    // and an end-to-end profiled run needs a ~55 minute prefill before the kernel of interest runs once.  This
+    // launches the REAL kernel at the REAL geometry (H=48, HKV=4, D=128, ctx from --ctx) so a kernel change is
+    // measured in seconds.  The buffers are the kernel's own types; the KV is filled with a nonzero pattern so
+    // the loads are real traffic, not zeros.
+    if (attn_bench > 0) {
+        const int H = (int) e.g.n_head, HKV = (int) e.g.n_head_kv, D = (int) e.g.head_dim;
+        const int64_t rows = ctx;
+        float *q = nullptr, *out = nullptr; __half *kc = nullptr, *vc = nullptr;
+        KC(cudaMalloc((void**) &q, (size_t) H * D * 4));
+        KC(cudaMalloc((void**) &out, (size_t) H * D * 4));
+        KC(cudaMalloc((void**) &kc, (size_t) HKV * rows * D * 2));
+        KC(cudaMalloc((void**) &vc, (size_t) HKV * rows * D * 2));
+        KC(cudaMemset(q, 0, (size_t) H * D * 4));
+        KC(cudaMemset(kc, 0x3c, (size_t) HKV * rows * D * 2));
+        KC(cudaMemset(vc, 0x3c, (size_t) HKV * rows * D * 2));
+        const int pos = (int) (rows - 2);
+        const int n_vis = pos + 1;
+        const size_t smem = n_vis <= 11000 ? (size_t) n_vis * 4 : (size_t) 4096 * 4;
+        const int thr = n_vis <= 11000 ? kThreads : 512;
+        cudaEvent_t ev0, ev1; cudaEventCreate(&ev0); cudaEventCreate(&ev1);
+        for (int r = 0; r < 3; ++r)   // warm the clocks and the TLB
+            k_attn<<<H, thr, smem, g_st>>>(q, kc, vc, out, H, HKV, D, pos, e.g.n_swa, ctx, 1.0f / sqrtf((float) D), false);
+        cudaEventRecord(ev0, g_st);
+        for (int r = 0; r < attn_bench; ++r)
+            k_attn<<<H, thr, smem, g_st>>>(q, kc, vc, out, H, HKV, D, pos, e.g.n_swa, ctx, 1.0f / sqrtf((float) D), false);
+        cudaEventRecord(ev1, g_st);
+        KC(cudaEventSynchronize(ev1));
+        float ms = 0.f; cudaEventElapsedTime(&ms, ev0, ev1);
+        const double per = (double) ms / attn_bench;
+        std::printf("attn-bench: pos=%d n_vis=%d H=%d thr=%d smem=%zu KB | %.3f ms/launch | x12 full layers = %.1f ms/token\n",
+                    pos, n_vis, H, thr, smem / 1024, per, per * 12.0);
+        std::fflush(stdout);
+        return 0;
     }
     if (load_only) return 0;
     if (serve_mode) {
