@@ -502,7 +502,7 @@ __global__ void k_attn_prep_p(const float* qx, const float* kx, const float* vx,
 __device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, float* out, int H, int HKV, int D, int pos,
                        int64_t swa, int ctx, float scale, bool sliding, bool force_2pass = false) {
     extern __shared__ float sc[];
-    __shared__ float sh[kThreads];
+    __shared__ float sh[512];   // sized for the widest block the two-pass path launches (512 = 4 slices x D)
     const int h = blockIdx.x, kvh = h / (H / HKV);
     const int64_t rows = sliding ? swa : ctx;
     const int n_pos = sliding ? (pos + 1 < (int) swa ? pos + 1 : (int) swa) : pos + 1;
@@ -510,7 +510,7 @@ __device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, 
     const float* qh = q + (size_t) h * D;
     // the scores live in dynamic shared memory up to the 48 KB a T4-class block gets; past that (a 32K full-
     // attention layer) the kernel runs two passes and recomputes each score - slower, and it works
-    if (!force_2pass && n_pos <= 12000) {
+    if (!force_2pass && n_pos <= 11000) {   // 11000*4 = 44 KB dynamic + 2 KB static sh[] < the 48 KB T4 cap
     for (int p = threadIdx.x; p < n_pos; p += blockDim.x) {
         const int64_t gp = first + p, slot = sliding ? gp % swa : gp;
         const __half* kp = kc + ((size_t) kvh * rows + slot) * D;
@@ -545,7 +545,14 @@ __device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, 
         // denominator and accumulator are rescaled tile by tile.  Same max, same weights, same result as the
         // two-pass form; the only numerics change is the rescaling order.
         const int TILE = 4096;                    // 16 KB of dynamic shared memory, under the 48 KB T4 cap
-        const int di = threadIdx.x;               // this thread owns output dimension di (D == kThreads == 128)
+        // Split-K over positions: D == 128 dims, and a two-pass block runs 512 threads, so four threads own each
+        // dimension and walk a quarter of the tile's positions each.  The old mapping (one thread per dimension,
+        // 128 threads) left a single serial load-FMA chain of n_pos iterations per thread - 263 ns per position
+        // measured, pure latency, no instruction-level parallelism.  Four slices times four unrolled accumulators
+        // below gives 16 independent load streams per dimension.
+        const int di = threadIdx.x % D;
+        const int slice = threadIdx.x / D;
+        const int nslice = blockDim.x / D;
         float m = -INFINITY, l = 0.f, acc = 0.f;
         for (int64_t t0 = 0; t0 < n_pos; t0 += TILE) {
             const int nt = (int) (n_pos - t0 < TILE ? n_pos - t0 : TILE);
@@ -567,17 +574,37 @@ __device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, 
             float ts = 0.f;
             for (int p = threadIdx.x; p < nt; p += blockDim.x) { sc[p] = expf(sc[p] - m_new); ts += sc[p]; }
             ts = block_sum(ts, sh);
-            float a = 0.f;
-            for (int p = 0; p < nt; ++p) {
+            const __half* vbase = vc + (size_t) kvh * rows * D;
+            auto v_at = [&](int64_t p) -> float {
                 const int64_t gp = first + t0 + p, slot = sliding ? gp % swa : gp;
-                a += sc[p] * __half2float(vc[((size_t) kvh * rows + slot) * D + di]);
+                return __half2float(vbase[slot * D + di]);
+            };
+            float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+            int p = slice;
+            for (; p + 3 * nslice < nt; p += 4 * nslice) {   // four independent chains, then the tail
+                a0 += sc[p] * v_at(p);
+                a1 += sc[p + nslice] * v_at(p + nslice);
+                a2 += sc[p + 2 * nslice] * v_at(p + 2 * nslice);
+                a3 += sc[p + 3 * nslice] * v_at(p + 3 * nslice);
             }
-            acc = acc * resc + a;
+            for (; p < nt; p += nslice) a0 += sc[p] * v_at(p);
+            float a = (a0 + a1) + (a2 + a3);
+            if (nslice > 1) {                       // reduce the slice partials for this dimension
+                sh[threadIdx.x] = a;
+                __syncthreads();
+                if (slice == 0) {
+                    float s = 0.f;
+                    for (int q = 0; q < nslice; ++q) s += sh[q * D + di];
+                    a = s;
+                }
+                __syncthreads();
+            }
+            if (slice == 0) acc = acc * resc + a;
             l = l * resc + ts;
             m = m_new;
             __syncthreads();
         }
-        out[(size_t) h * D + di] = acc / l;
+        if (slice == 0) out[(size_t) h * D + di] = acc / l;
     }
 }
 __global__ void k_attn(const float* q, const __half* kc, const __half* vc, float* out, int H, int HKV, int D, int pos,
@@ -732,10 +759,10 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
         const int n_vis = (int) (s.pos + 1 < (int64_t) (sliding ? g.n_swa : s.ctx) ? s.pos + 1
                                                                             : (int64_t) (sliding ? g.n_swa : s.ctx));
         if (graph)
-            k_attn_p<<<H, kThreads, (size_t) 4096 * sizeof(float), st>>>(
+            k_attn_p<<<H, 512, (size_t) 4096 * sizeof(float), st>>>(
                 s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos_d, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding);
         else
-            k_attn<<<H, kThreads, n_vis <= 12000 ? (size_t) n_vis * sizeof(float) : (size_t) 4096 * sizeof(float), st>>>(
+            k_attn<<<H, n_vis <= 11000 ? kThreads : 512, n_vis <= 11000 ? (size_t) n_vis * sizeof(float) : (size_t) 4096 * sizeof(float), st>>>(
                 s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding);
         gemv(e.dense.at(L(l, "attn_output.weight")), s.att, s.y, nullptr, 1, 0, nullptr, 0, st);
         k_rms<<<1, kThreads, 0, st>>>(s.y, e.f32.at(L(l, "post_attention_norm.weight")), s.y, N, e.eps);
