@@ -165,6 +165,10 @@ struct Engine {
     };
     mutable Counters cnt;   // layer_step takes the Engine as const (like `mutable Pool pool`)
     bool counters = false;
+    // S7: the chunked prefill's pool leg had NO counter at all (the CNT pool line reads e.epool, which the
+    // prefill path does not use), so a 13.9 tok/s pp was unreadable - grouped bytes, achieved rate and the
+    // pool/GPU split were all invisible.  These are that leg's counters.
+    long long pf_pool_ms = 0, pf_pool_bytes = 0, pf_chunks = 0, pf_experts = 0;
     cublasHandle_t blas = nullptr;
     strata::prefill::Gemm gemm;
     std::vector<unsigned long long> gexec;   // cudaGraphExec_t per layer (0 = the layer is not capturable)
@@ -1040,6 +1044,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                     for (int sel = 0; sel < NK; ++sel) ord[cur[g_ids_host[(size_t) sel]]++] = sel;
                 }
                 const int NS = std::min((int) g.n_expert, e.cpu_threads);
+                const auto pf_t0 = std::chrono::steady_clock::now();
                 e.pool.run([&](int shard) {
                     const void* acts[64]; float* ffs[64]; const void* hqs[64]; float* eys[64];
                     for (int x = shard; x < (int) g.n_expert; x += NS) {
@@ -1065,6 +1070,15 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                         }
                     }
                 }, NS);
+                if (e.counters) {
+                    const auto pf_t1 = std::chrono::steady_clock::now();
+                    e.pf_pool_ms += std::chrono::duration_cast<std::chrono::microseconds>(pf_t1 - pf_t0).count() / 1000;
+                    int touched = 0;
+                    for (int x = 0; x < (int) g.n_expert; ++x) if (cnt[x + 1] > cnt[x]) ++touched;
+                    e.pf_pool_bytes += (long long) touched * b.stride;
+                    e.pf_experts += touched;
+                    ++e.pf_chunks;
+                }
                 KC(cudaMemcpy(s.gout_m, s.ey_h, (size_t) NK * N * 4, cudaMemcpyHostToDevice));
             } else
             for (int t = 0; t < T; ++t) {
@@ -1308,6 +1322,16 @@ void print_counters(Engine& e, const char* tag) {
     // The pool's OWN per-phase counters (pool.hpp:188-189).  The engine's d2h/h2d counters did not cover the
     // pool-only branch at all, which is why the P1b "pool" legs were unreadable from CNT alone - the only
     // in-situ record of what the pool actually streamed, and at what rate.
+    // S7: the prefill pool leg's own line - bytes, achieved rate, and ms per chunk, which is what says whether
+    // a slow pp is the pool, the GPU, or the seam between them.
+    if (e.pf_chunks > 0) {
+        const double ms = (double) e.pf_pool_ms, gb = e.pf_pool_bytes / 1e9;
+        std::fprintf(stderr,
+                     "CNT prefill pool: chunks=%lld experts/chunk=%.0f bytes=%.2f GB (%.0f MB/chunk) pool=%.0f ms"
+                     " (%.1f ms/chunk, %.1f GB/s)\n",
+                     e.pf_chunks, (double) e.pf_experts / e.pf_chunks, gb, gb * 1e3 / e.pf_chunks, ms, ms / e.pf_chunks,
+                     ms > 0 ? gb / (ms / 1000.0) : 0.0);
+    }
     if (e.epool) {
         const double ms_gu = e.epool->ms_multi_gu, ms_q = e.epool->ms_multi_q, ms_dn = e.epool->ms_multi_down;
         const double ms = ms_gu + ms_q + ms_dn;
