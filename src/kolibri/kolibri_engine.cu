@@ -237,6 +237,10 @@ __device__ float block_sum(float v, float* sh) {
     return r;
 }
 constexpr int kThreads = 128;
+// K25: the single-pass / two-pass seam, raisable for testing.  The accuracy gate for the tiled online softmax is
+// the SAME prompt at the SAME position through both paths, which needs the threshold to be a knob, not a
+// constant; production default is 11000 (44 KB dynamic + 2.5 KB static, under the 48 KB T4 per-block cap).
+static int g_two_pass_max = 11000;
 cudaStream_t g_st = nullptr;   // the router kernels require a created stream (kolibriref does the same)
 template <int T>
 __global__ void k_gemv(const uint8_t* W, size_t row_bytes, size_t expert_bytes, const int* ids, int n_in, const float* x,
@@ -500,7 +504,8 @@ __global__ void k_attn_prep_p(const float* qx, const float* kx, const float* vx,
 }
 
 __device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, float* out, int H, int HKV, int D, int pos,
-                       int64_t swa, int ctx, float scale, bool sliding, bool force_2pass = false, int bench_mode = 0) {
+                       int64_t swa, int ctx, float scale, bool sliding, bool force_2pass = false, int bench_mode = 0,
+                       int two_pass_max = 11000) {
     extern __shared__ float sc[];
     __shared__ float sh[512];   // sized for the widest block the two-pass path launches (512 = 4 slices x D)
     const int h = blockIdx.x, kvh = h / (H / HKV);
@@ -516,7 +521,7 @@ __device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, 
     __shared__ float qsm[128];
     // the scores live in dynamic shared memory up to the 48 KB a T4-class block gets; past that (a 32K full-
     // attention layer) the kernel runs two passes and recomputes each score - slower, and it works
-    if (!force_2pass && n_pos <= 11000) {   // 11000*4 = 44 KB dynamic + 2 KB static sh[] < the 48 KB T4 cap
+    if (!force_2pass && n_pos <= two_pass_max) {   // 11000*4 = 44 KB dynamic + 2.5 KB static sh[]/qsm[] < the 48 KB T4 cap
     for (int p = threadIdx.x; p < n_pos; p += blockDim.x) {
         const int64_t gp = first + p, slot = sliding ? gp % swa : gp;
         const __half* kp = kc + ((size_t) kvh * rows + slot) * D;
@@ -640,9 +645,9 @@ __device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, 
     }
 }
 __global__ void k_attn(const float* q, const __half* kc, const __half* vc, float* out, int H, int HKV, int D, int pos,
-                       int64_t swa, int ctx, float scale, bool sliding, int bench_mode) {
+                       int64_t swa, int ctx, float scale, bool sliding, int bench_mode, int two_pass_max) {
     const int n_vis = sliding ? (pos + 1 < (int) swa ? pos + 1 : (int) swa) : pos + 1;
-    k_attn_body(q, kc, vc, out, H, HKV, D, pos, swa, ctx, scale, sliding, false, bench_mode);
+    k_attn_body(q, kc, vc, out, H, HKV, D, pos, swa, ctx, scale, sliding, false, bench_mode, two_pass_max);
 }
 /// graph decode: the position from device memory; the dynamic shared memory is the two-pass size (0) so one
 /// capture serves every position (the smem path bakes n_vis into the launch and cannot be replayed across pos).
@@ -794,8 +799,8 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
             k_attn_p<<<H, 512, (size_t) 4096 * sizeof(float), st>>>(
                 s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos_d, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding);
         else
-            k_attn<<<H, n_vis <= 11000 ? kThreads : 512, n_vis <= 11000 ? (size_t) n_vis * sizeof(float) : (size_t) 4096 * sizeof(float), st>>>(
-                s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding, 0);
+            k_attn<<<H, n_vis <= g_two_pass_max ? kThreads : 512, n_vis <= g_two_pass_max ? (size_t) n_vis * sizeof(float) : (size_t) 4096 * sizeof(float), st>>>(
+                s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding, 0, g_two_pass_max);
         gemv(e.dense.at(L(l, "attn_output.weight")), s.att, s.y, nullptr, 1, 0, nullptr, 0, st);
         k_rms<<<1, kThreads, 0, st>>>(s.y, e.f32.at(L(l, "post_attention_norm.weight")), s.y, N, e.eps);
         k_add<<<(N + B - 1) / B, B, 0, st>>>(s.x, s.y, N);
@@ -1685,6 +1690,7 @@ int strata::kolibri::run(int argc, char** argv) {
         else if (a == "--prefill") prefill = 1;
         else if (a == "--attn-bench" && i + 1 < argc) attn_bench = std::atoi(argv[++i]);
         else if (a == "--attn-mode" && i + 1 < argc) attn_mode = std::atoi(argv[++i]);
+        else if (a == "--attn-2pass-max" && i + 1 < argc) g_two_pass_max = std::atoi(argv[++i]);
         else if (a == "--counters") counters = 1;
     }
     if (model.empty()) {
@@ -1765,10 +1771,10 @@ int strata::kolibri::run(int argc, char** argv) {
         const int thr = n_vis <= 11000 ? kThreads : 512;
         cudaEvent_t ev0, ev1; cudaEventCreate(&ev0); cudaEventCreate(&ev1);
         for (int r = 0; r < 3; ++r)   // warm the clocks and the TLB
-            k_attn<<<H, thr, smem, g_st>>>(q, kc, vc, out, H, HKV, D, pos, e.g.n_swa, ctx, 1.0f / sqrtf((float) D), false, attn_mode);
+            k_attn<<<H, thr, smem, g_st>>>(q, kc, vc, out, H, HKV, D, pos, e.g.n_swa, ctx, 1.0f / sqrtf((float) D), false, attn_mode, g_two_pass_max);
         cudaEventRecord(ev0, g_st);
         for (int r = 0; r < attn_bench; ++r)
-            k_attn<<<H, thr, smem, g_st>>>(q, kc, vc, out, H, HKV, D, pos, e.g.n_swa, ctx, 1.0f / sqrtf((float) D), false, attn_mode);
+            k_attn<<<H, thr, smem, g_st>>>(q, kc, vc, out, H, HKV, D, pos, e.g.n_swa, ctx, 1.0f / sqrtf((float) D), false, attn_mode, g_two_pass_max);
         cudaEventRecord(ev1, g_st);
         KC(cudaEventSynchronize(ev1));
         float ms = 0.f; cudaEventElapsedTime(&ms, ev0, ev1);
