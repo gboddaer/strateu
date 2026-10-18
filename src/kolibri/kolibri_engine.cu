@@ -1240,6 +1240,16 @@ void print_counters(Engine& e, const char* tag) {
                      e.epool->workers(), c.tok ? e.epool->multi_bytes / tok / 1e6 : 0.0,
                      e.epool->multi_bytes / 1e9, ms_gu, ms_q, ms_dn, ms, ms / tok,
                      ms > 0 ? e.epool->multi_bytes / 1e9 / (ms / 1000.0) : 0.0);
+        // Where run() spends its time (pool.hpp:202).  Three waits per layer - every worker parked, the drain,
+        // the re-park.  Without the split a slow pool is ambiguous: slow at the WORK is a kernel problem, slow at
+        // the SYNCHRONISATION is a barrier problem, and the fixes are opposites.  The decode token at 22.7 tok/s
+        // has ~17 ms/token unaccounted for by pool work (13.4) + GPU non-expert (~10) + result H2D (3.5); this
+        // says how much of that is the per-layer barrier.
+        double wp = 0, dr = 0, rp = 0;
+        e.epool->phase_ms(wp, dr, rp);
+        std::fprintf(stderr, "CNT pool phases: wait_park %.0f ms drain %.0f ms repark %.0f ms = %.0f ms"
+                             " (%.2f ms/tok) vs work %.2f ms/tok\n",
+                     wp, dr, rp, wp + dr + rp, (wp + dr + rp) / tok, ms / tok);
     }
     std::fflush(stderr);
     if (e.cnt.br_pool + e.cnt.br_gpu + e.cnt.br_slots + e.cnt.br_grouped > 0)
