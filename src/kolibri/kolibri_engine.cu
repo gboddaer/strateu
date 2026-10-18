@@ -538,33 +538,46 @@ __device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, 
         out[(size_t) h * D + i] = acc / sum;
     }
     } else {
-        // pass 1: the max and the softmax denominator, scores recomputed from the KV (no shared copy)
-        auto score = [&](int p) -> float {
-            const int64_t gp = first + p, slot = sliding ? gp % swa : gp;
-            const __half* kp = kc + ((size_t) kvh * rows + slot) * D;
-            float s = 0.f;
-            for (int i = 0; i < D; ++i) s += qh[i] * __half2float(kp[i]);
-            return s * scale;
-        };
-        float mx = -INFINITY;
-        for (int p = threadIdx.x; p < n_pos; p += blockDim.x) mx = fmaxf(mx, score(p));
-        sh[threadIdx.x] = mx;
-        __syncthreads();
-        for (int s = blockDim.x / 2; s > 0; s >>= 1) { if ((int) threadIdx.x < s) sh[threadIdx.x] = fmaxf(sh[threadIdx.x], sh[threadIdx.x + s]); __syncthreads(); }
-        mx = sh[0];
-        __syncthreads();
-        float sum = 0.f;
-        for (int p = threadIdx.x; p < n_pos; p += blockDim.x) sum += expf(score(p) - mx);
-        sum = block_sum(sum, sh);
-        // pass 2: the weighted V sum; each warp of the block takes a slice of D and walks all positions
-        for (int i = threadIdx.x; i < D; i += blockDim.x) {
-            float acc = 0.f;
-            for (int p = 0; p < n_pos; ++p) {
-                const int64_t gp = first + p, slot = sliding ? gp % swa : gp;
-                acc += expf(score(p) - mx) * __half2float(vc[((size_t) kvh * rows + slot) * D + i]);
+        // K25: the old two-pass path recomputed every score INSIDE the per-dimension loop, i.e. D times per
+        // position per block: n_pos * D * D FMAs.  At 32K that is ~50 GFLOP/token of pure recompute, which is
+        // why long-context decode sat at 0.6 tok/s while the KV read alone allows ~400.  Tiled online softmax:
+        // each score is computed EXACTLY once per block, kept in a 4096-entry shared tile, and the running max,
+        // denominator and accumulator are rescaled tile by tile.  Same max, same weights, same result as the
+        // two-pass form; the only numerics change is the rescaling order.
+        const int TILE = 4096;                    // 16 KB of dynamic shared memory, under the 48 KB T4 cap
+        const int di = threadIdx.x;               // this thread owns output dimension di (D == kThreads == 128)
+        float m = -INFINITY, l = 0.f, acc = 0.f;
+        for (int64_t t0 = 0; t0 < n_pos; t0 += TILE) {
+            const int nt = (int) (n_pos - t0 < TILE ? n_pos - t0 : TILE);
+            for (int p = threadIdx.x; p < nt; p += blockDim.x) {
+                const int64_t gp = first + t0 + p, slot = sliding ? gp % swa : gp;
+                const __half* kp = kc + ((size_t) kvh * rows + slot) * D;
+                float s = 0.f;
+                for (int d = 0; d < D; ++d) s += qh[d] * __half2float(kp[d]);
+                sc[p] = s * scale;
             }
-            out[(size_t) h * D + i] = acc / sum;
+            __syncthreads();
+            float tm = -INFINITY;
+            for (int p = threadIdx.x; p < nt; p += blockDim.x) tm = fmaxf(tm, sc[p]);
+            sh[threadIdx.x] = tm;
+            __syncthreads();
+            for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) { if ((int) threadIdx.x < s2) sh[threadIdx.x] = fmaxf(sh[threadIdx.x], sh[threadIdx.x + s2]); __syncthreads(); }
+            const float m_new = fmaxf(m, sh[0]);
+            const float resc = (m == -INFINITY) ? 0.f : expf(m - m_new);   // first tile: no history to rescale
+            float ts = 0.f;
+            for (int p = threadIdx.x; p < nt; p += blockDim.x) { sc[p] = expf(sc[p] - m_new); ts += sc[p]; }
+            ts = block_sum(ts, sh);
+            float a = 0.f;
+            for (int p = 0; p < nt; ++p) {
+                const int64_t gp = first + t0 + p, slot = sliding ? gp % swa : gp;
+                a += sc[p] * __half2float(vc[((size_t) kvh * rows + slot) * D + di]);
+            }
+            acc = acc * resc + a;
+            l = l * resc + ts;
+            m = m_new;
+            __syncthreads();
         }
+        out[(size_t) h * D + di] = acc / l;
     }
 }
 __global__ void k_attn(const float* q, const __half* kc, const __half* vc, float* out, int H, int HKV, int D, int pos,
@@ -719,10 +732,10 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
         const int n_vis = (int) (s.pos + 1 < (int64_t) (sliding ? g.n_swa : s.ctx) ? s.pos + 1
                                                                             : (int64_t) (sliding ? g.n_swa : s.ctx));
         if (graph)
-            k_attn_p<<<H, kThreads, 0, st>>>(
+            k_attn_p<<<H, kThreads, (size_t) 4096 * sizeof(float), st>>>(
                 s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos_d, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding);
         else
-            k_attn<<<H, kThreads, n_vis <= 12000 ? (size_t) n_vis * sizeof(float) : 0, st>>>(
+            k_attn<<<H, kThreads, n_vis <= 12000 ? (size_t) n_vis * sizeof(float) : (size_t) 4096 * sizeof(float), st>>>(
                 s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding);
         gemv(e.dense.at(L(l, "attn_output.weight")), s.att, s.y, nullptr, 1, 0, nullptr, 0, st);
         k_rms<<<1, kThreads, 0, st>>>(s.y, e.f32.at(L(l, "post_attention_norm.weight")), s.y, N, e.eps);
