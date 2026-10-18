@@ -20,6 +20,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/kolibri_window.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "ggml.h"
@@ -308,13 +309,13 @@ __global__ void k_kv_f16_swa(const float* kc, const float* vc, __half* k16, __ha
 /// The prompt's causal softmax (window-masked for sliding layers: cells before pos0+t+1-swa are zero): row (h, t)
 /// of S (ld floats, P cells) -> softmax(S * scale) over [lo, pos0+t+1), FP16 out.  grid (T, H), block 256.
 __global__ void k_attn_softmax16(const float* S, __half* S16, int ld, int T, int P, int pos0, float scale,
-                                 int64_t swa) {
+                                 int64_t swa, int first) {
     __shared__ float sh[kThreads];
     const int t = blockIdx.x, h = blockIdx.y;
     const float* row = S + ((size_t) h * T + t) * ld;
     __half* out = S16 + ((size_t) h * T + t) * ld;
-    const int n = min(P, pos0 + t + 1);
-    const int lo = swa > 0 ? (pos0 + t + 1 > (int) swa ? pos0 + t + 1 - (int) swa : 0) : 0;
+    int n, lo;
+    strata::kolibri::attn_mask_bounds(P, pos0, t, swa, first, &lo, &n);
     float mx = -INFINITY;
     for (int p = threadIdx.x + lo; p < n; p += blockDim.x) mx = fmaxf(mx, row[p] * scale);
     mx = block_max(mx, sh);
@@ -868,7 +869,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                     CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "strata-kolibri: scores GEMM failed\n"); std::exit(1); }
             }
             k_attn_softmax16<<<dim3(nt, H), kThreads>>>(s.att_s, s.p16, ldp, nt, P, (int) p0 + t0,
-                                                        1.0f / sqrtf((float) D), sliding ? g.n_swa : 0);
+                                                        1.0f / sqrtf((float) D), sliding ? g.n_swa : 0, (int) first);
             for (int kvh = 0; kvh < HKV; ++kvh) {
                 const __half* Vh = s.v16 + (size_t) kvh * P * D;
                 const __half* Ph = s.p16 + (size_t) kvh * G * nt * ldp;
@@ -1541,6 +1542,13 @@ int strata::kolibri::run(int argc, char** argv) {
     e.counters = counters != 0;   // before load(): the VRAM report is printed there
     if (!load(model, e, err)) {
         std::fprintf(stderr, "strata-kolibri: %s\n", err.c_str());
+        return 1;
+    }
+    // K3: a 512-token chunk writes 512 of the 513 sliding ring slots, leaving exactly the oldest visible slot.
+    // Safe for n_swa = 513 by ONE slot, so the invariant is asserted, not assumed.
+    if (Scratch::kTmax >= e.g.n_swa) {
+        std::fprintf(stderr, "strata-kolibri: n_swa %lld must exceed the %d-token prompt chunk, else one chunk "
+                             "overwrites the whole sliding ring\n", (long long) e.g.n_swa, Scratch::kTmax);
         return 1;
     }
     e.cpu_threads = cpu_threads;
