@@ -138,6 +138,20 @@ struct Engine {
     int grouped = 0;                // --grouped: native_expert_grouped for the routed experts (one launch per layer)
     int graphs = 0;                 // --grouped + graphs (default on with --grouped): per-layer CUDA graphs
     int prefill = 0;                // --prefill: chunked prompt processing (GEMM projections, FP16 attention)
+    // --counters: measurement only, no numerics effect.  The speed plan's gates need the numbers the engine
+    // actually moves: slot hits/misses (the expert bytes over PCIe per token), the D2H/H2D traffic per layer,
+    // and the per-request KV clear cost.
+    struct Counters {
+        long long tok = 0;            // decode tokens measured (forward() calls)
+        long long slot_hits = 0;      // routed picks served from VRAM
+        long long slot_miss = 0;      // routed picks that read the pinned table / the CPU pool
+        long long slot_bytes = 0;     // expert bytes pulled over PCIe by those misses
+        long long d2h_n = 0, d2h_bytes = 0;
+        long long h2d_n = 0, h2d_bytes = 0;
+        long long reset_ms = 0, reset_n = 0;
+    };
+    mutable Counters cnt;   // layer_step takes the Engine as const (like `mutable Pool pool`)
+    bool counters = false;
     cublasHandle_t blas = nullptr;
     strata::prefill::Gemm gemm;
     std::vector<unsigned long long> gexec;   // cudaGraphExec_t per layer (0 = the layer is not capturable)
@@ -704,6 +718,10 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                 const int id = g_ids_host[(size_t) k];
                 s.slot_ids[k] = id < S ? id : S;                                        // dev zero slot
                 s.ovf_ids[k] = id < S ? (e.cpu_threads > 0 ? id : (int) g.n_expert) : id;  // pinned zero slot
+                if (e.counters) {
+                    if (id < S) ++e.cnt.slot_hits;
+                    else { ++e.cnt.slot_miss; e.cnt.slot_bytes += (long long) b.stride; }  // mmvq reads the blob over PCIe
+                }
             }
             g_ids_host = s.slot_ids;
             gemv(gu, s.h, s.eg2, s.ids, K, 0, b.dev, b.stride);
@@ -717,6 +735,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                 g_ids_host.assign(g_ids_host.size(), 0);   // restored below from the device ids
                 KC(cudaMemcpy(g_ids_host.data(), s.ids, K * sizeof(int), cudaMemcpyDeviceToHost));
                 KC(cudaMemcpy(s.h_host, s.h, N * 4, cudaMemcpyDeviceToHost));
+                if (e.counters) { e.cnt.d2h_n += 2; e.cnt.d2h_bytes += K * sizeof(int) + (long long) N * 4; }
                 strata::kernels::cpu::native_quant_act(b.fmt, s.h_host, s.act);
                 std::memset(s.ey_h, 0, (size_t) K * N * 4);
                 const int T = std::min(e.cpu_threads, K);
@@ -733,6 +752,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                     }
                 }, T);
                 KC(cudaMemcpy(s.ey_cpu, s.ey_h, (size_t) K * N * 4, cudaMemcpyHostToDevice));
+                if (e.counters) { ++e.cnt.h2d_n; e.cnt.h2d_bytes += (long long) K * N * 4; }
                 yc = s.ey_cpu;
             } else {
                 g_ids_host = s.ovf_ids;
@@ -1139,8 +1159,12 @@ void capture_graphs(Engine& e, Scratch& s) {
     std::fflush(stdout);
 }
 
+using Clock = std::chrono::steady_clock;
+double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+
 /// Drop the held state: position 0 and empty KV caches (the serve protocol's fresh-request path).
 void reset_state(Engine& e, Scratch& s) {
+    const Clock::time_point t0 = Clock::now();
     s.pos = 0;
     for (size_t l = 0; l < s.kc.size(); ++l) {
         const int64_t rows = strata::core::is_swa_layer(e.g, (int64_t) l) ? e.g.n_swa : s.ctx;
@@ -1148,10 +1172,22 @@ void reset_state(Engine& e, Scratch& s) {
         KC(cudaMemset(s.kc[l], 0, bytes));
         KC(cudaMemset(s.vc[l], 0, bytes));
     }
+    if (e.counters) { e.cnt.reset_ms += (long long) ms_since(t0); ++e.cnt.reset_n; }
 }
 
-using Clock = std::chrono::steady_clock;
-double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+void print_counters(Engine& e, const char* tag) {
+    if (!e.counters) return;
+    const auto& c = e.cnt;
+    const double tok = c.tok > 0 ? (double) c.tok : 1.0;
+    std::fprintf(stderr,
+                 "CNT %s tok=%lld | slot hits=%lld miss=%lld (%.1f%% hit) expert PCIe=%.1f MB/tok | "
+                 "d2h=%lld/%lld B (%.1f MB/tok) h2d=%lld/%lld B (%.1f MB/tok) | reset=%lld ms / %lld (%.2f ms)\n",
+                 tag, c.tok, c.slot_hits, c.slot_miss, 100.0 * c.slot_hits / (double) (c.slot_hits + c.slot_miss),
+                 c.slot_bytes / tok / 1e6, c.d2h_n, c.d2h_bytes, c.d2h_bytes / tok / 1e6,
+                 c.h2d_n, c.h2d_bytes, c.h2d_bytes / tok / 1e6, c.reset_ms, c.reset_n,
+                 c.reset_n ? (double) c.reset_ms / c.reset_n : 0.0);
+    std::fflush(stderr);
+}
 
 // --------------------------------------------------------------------------- sampling (q36's, verbatim semantics)
 struct Sampling {
@@ -1336,6 +1372,7 @@ int serve(Engine& e, Scratch& s) {
         for (;;) {
             forward(e, s, tok, nullptr);
             KC(cudaMemcpy(lg.data(), s.logits, lg.size() * 4, cudaMemcpyDeviceToHost));
+            if (e.counters) { ++e.cnt.tok; e.cnt.d2h_n += 1; e.cnt.d2h_bytes += (long long) lg.size() * 4; }
             const int32_t nx = smp.needs_logits() ? sample(lg, smp, hist, rng)
                                                   : (int32_t) (std::max_element(lg.begin(), lg.end()) - lg.begin());
             std::printf("T %d\n", nx);
@@ -1352,6 +1389,7 @@ int serve(Engine& e, Scratch& s) {
         std::printf("DONE %lld %zu %.1f %.1f %s 0 0 %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
                     decode_ms, finish, reuse, (long long) fresh);
         std::fflush(stdout);
+        print_counters(e, "serve");
     }
 }
 
@@ -1454,6 +1492,12 @@ bool load(const std::string& path, Engine& e, std::string& err) {
                  "pinned; dense %.2f GiB on the GPU; native expert kernels for %zu / %zu layers; %.1f s\n",
                  path.c_str(), checked, e.blobs.size(), (size_t) e.g.n_expert, (double) expert_bytes / (1 << 30),
                  (double) dense_bytes / (1 << 30), (size_t) native_layers, e.blobs.size(), secs);
+    if (e.counters) {
+        size_t fb = 0, tb = 0;
+        if (cudaMemGetInfo(&fb, &tb) == cudaSuccess)
+            std::fprintf(stderr, "CNT vram free=%.2f GiB total=%.2f GiB (after dense upload)\n",
+                         fb / 1073741824.0, tb / 1073741824.0);
+    }
     return true;
 }
 
@@ -1462,7 +1506,7 @@ bool load(const std::string& path, Engine& e, std::string& err) {
 int strata::kolibri::run(int argc, char** argv) {
     std::string model, tokens, dump_layers, dump_logits, dump_full, force;
     bool load_only = false, serve_mode = false;
-    int n_gen = 8, ctx = 8192, cpu_threads = 0, slots = 0, grouped = 0, no_graph = 0, prefill = 0;
+    int n_gen = 8, ctx = 8192, cpu_threads = 0, slots = 0, grouped = 0, no_graph = 0, prefill = 0, counters = 0;
     double expert_vram = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1482,6 +1526,7 @@ int strata::kolibri::run(int argc, char** argv) {
         else if (a == "--grouped") grouped = 1;
         else if (a == "--no-graph") no_graph = 1;
         else if (a == "--prefill") prefill = 1;
+        else if (a == "--counters") counters = 1;
     }
     if (model.empty()) {
         std::fprintf(stderr, "strata-kolibri: the Kolibri 1 engine path (plan T7); --model GGUF [--load-only] for now\n");
@@ -1491,6 +1536,7 @@ int strata::kolibri::run(int argc, char** argv) {
     std::string err;
     KC(cudaStreamCreate(&g_st));
     KC(cudaMalloc(&g_q8, strata::kernels::native_q8_1_bytes((int) kActBuf, 1)));
+    e.counters = counters != 0;   // before load(): the VRAM report is printed there
     if (!load(model, e, err)) {
         std::fprintf(stderr, "strata-kolibri: %s\n", err.c_str());
         return 1;
@@ -1594,6 +1640,7 @@ int strata::kolibri::run(int argc, char** argv) {
             for (int64_t l = 0; l < e.g.n_layers; ++l)
                 std::fwrite(layers.data() + (size_t) l * e.g.n_embd, 4, e.g.n_embd, fl);
         KC(cudaMemcpy(lg.data(), s.logits, lg.size() * 4, cudaMemcpyDeviceToHost));
+        if (e.counters) { ++e.cnt.tok; e.cnt.d2h_n += 1; e.cnt.d2h_bytes += (long long) lg.size() * 4; }
         int a = 0, c = -1;
         for (int j = 1; j < (int) lg.size(); ++j) if (lg[j] > lg[a]) a = j;
         for (int j = 0; j < (int) lg.size(); ++j) if (j != a && (c < 0 || lg[j] > lg[c])) c = j;
@@ -1604,6 +1651,7 @@ int strata::kolibri::run(int argc, char** argv) {
         tok = i + 1 == n_steps ? a : (i < (int) forced.size() ? forced[i] : a);
     }
     std::printf("\n");
+    print_counters(e, "run");
     if (fl) std::fclose(fl);
     if (fg) std::fclose(fg);
     if (ff) std::fclose(ff);
