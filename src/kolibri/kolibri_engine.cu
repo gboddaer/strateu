@@ -23,6 +23,7 @@
 #include "strata/kernels/kolibri_window.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/cpu/pool.hpp"   // P1b: the library's ExpertPool (row-split, affinity-aware) for the CPU experts
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include <atomic>
@@ -157,6 +158,11 @@ struct Engine {
     strata::prefill::Gemm gemm;
     std::vector<unsigned long long> gexec;   // cudaGraphExec_t per layer (0 = the layer is not capturable)
     mutable Pool pool;              // the worker pool behind the CPU expert path
+    // P1b (plan 2026-10-17-kolibri1-speed.md task 7): the CPU expert path on the library's ExpertPool, which
+    // splits every expert's rows across ALL workers.  The Pool above assigns one expert per shard, so with
+    // K = 6 routed experts it caps at 6 threads (the K7 min(cpu_threads, K)) and streams each 2.21 MB blob at
+    // one core's bandwidth.  Kept as a pointer: ExpertPool is not default-constructible-then-assigned.
+    mutable std::unique_ptr<strata::kernels::cpu::ExpertPool> epool;
     std::map<std::string, Dense> dense;
     std::map<std::string, float*> f32;
     std::vector<LayerBlobs> blobs;   // per layer
@@ -656,6 +662,28 @@ std::string L(int64_t l, const char* s) { return "blk." + std::to_string(l) + ".
 /// device pointers, grouped experts, two-pass attention - capturable as a CUDA graph); graph=false: the
 /// plain path (value position, host ids for the mmvq loop, layer dumps).  st = 0 (legacy stream) keeps the
 /// plain launches byte-identical; the graph path runs on g_st.
+/// P1b: the CPU expert pool for one layer, on the library's ExpertPool.  `sels` are the selection indices whose
+/// expert the pool owns - all K on --cpu-threads without slots, the slot misses with --expert-slots.  Each
+/// expert's gate/up rows, the intermediate quantization and the down rows are split across every worker
+/// (run_split_multi_native), so a blob streams at the pool's aggregate bandwidth instead of one core's.
+/// Measured on this box by pool_bench (cold blobs, past the 60 MB L3): 6 experts/layer at 24 workers pinned to
+/// the GPU's socket = 47.7 GB/s = 71.6 tok/s; one core = 7.3 GB/s; 48 workers on one socket collapse to
+/// 4.5 GB/s, so --cpu-threads belongs near 24 on node 0, not at 56.
+void pool_experts(const Engine& e, const LayerBlobs& b, Scratch& s, const std::vector<int>& ids_host,
+                  const std::vector<int>& sels) {
+    if (sels.empty() || !e.epool) return;
+    const int64_t N = e.g.n_embd;
+    std::vector<strata::kernels::cpu::ExpertJobMulti> jobs(sels.size());
+    for (size_t j = 0; j < sels.size(); ++j) {
+        const int sel = sels[j];
+        jobs[j].blob = b.table + (size_t) ids_host[sel] * b.stride;
+        jobs[j].nt = 1;
+        jobs[j].nact[0] = s.act;                       // the layer's quantized activation, shared read-only
+        jobs[j].out[0] = s.ey_h + (size_t) sel * N;    // unweighted; k_moe_sum2 applies the router weight
+    }
+    e.epool->run_split_multi_native(b.fmt, jobs.data(), (int) sels.size());
+}
+
 void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t st, float* layers_host) {
     const auto& g = e.g;
     const int N = (int) g.n_embd, K = (int) e.top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
@@ -726,8 +754,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                 }
             }
             g_ids_host = s.slot_ids;
-            gemv(gu, s.h, s.eg2, s.ids, K, 0, b.dev, b.stride);
-            gemv(gu, s.h, s.eg2, s.ids, K, 0, b.dev, b.stride);
+            gemv(gu, s.h, s.eg2, s.ids, K, 0, b.dev, b.stride);   // K21: this gate gemv ran twice per layer
             gemv(gu, s.h, s.eu2, s.ids, K, 0, b.dev + b.L.up_off, b.stride);
             k_swiglu<<<(K * FF + B - 1) / B, B, 0, st>>>(s.eg2, s.eu2, s.eh2, K * FF);
             gemv(dn, s.eh2, s.ey2, s.ids, K, FF, b.dev + b.L.down_off, b.stride);
@@ -740,19 +767,9 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                 if (e.counters) { e.cnt.d2h_n += 2; e.cnt.d2h_bytes += K * sizeof(int) + (long long) N * 4; }
                 strata::kernels::cpu::native_quant_act(b.fmt, s.h_host, s.act);
                 std::memset(s.ey_h, 0, (size_t) K * N * 4);
-                const int T = std::min(e.cpu_threads, K);
-                e.pool.run([&](int shard) {
-                    for (int sel = shard; sel < K; sel += T) {
-                        if (g_ids_host[sel] < S) continue;   // in-slot: the GPU computed it
-                        const uint8_t* blob = b.table + (size_t) g_ids_host[sel] * b.stride;
-                        float* ff = s.ff + (size_t) sel * FF;
-                        strata::kernels::cpu::native_gu_rows(b.fmt, blob, (const void* const*) &s.act, 1, &ff, 0, FF);
-                        char* hq = s.hq + (size_t) sel * b.fmt.h_bytes;
-                        strata::kernels::cpu::native_quant_h(b.fmt, ff, hq);
-                        float* ey = s.ey_h + (size_t) sel * N;
-                        strata::kernels::cpu::native_down_rows(b.fmt, blob, (const void* const*) &hq, 1, &ey, 0, N);  // adds fmt.down_off itself
-                    }
-                }, T);
+                std::vector<int> sels;
+                for (int k = 0; k < K; ++k) if (g_ids_host[k] >= S) sels.push_back(k);   // in-slot: the GPU did it
+                pool_experts(e, b, s, g_ids_host, sels);
                 KC(cudaMemcpy(s.ey_cpu, s.ey_h, (size_t) K * N * 4, cudaMemcpyHostToDevice));
                 if (e.counters) { ++e.cnt.h2d_n; e.cnt.h2d_bytes += (long long) K * N * 4; }
                 yc = s.ey_cpu;
@@ -769,18 +786,9 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
         } else if (e.cpu_threads > 0 && b.native_ok) {
             KC(cudaMemcpy(s.h_host, s.h, N * 4, cudaMemcpyDeviceToHost));
             strata::kernels::cpu::native_quant_act(b.fmt, s.h_host, s.act);
-            const int T = std::min(e.cpu_threads, K);
-            e.pool.run([&](int shard) {
-                for (int sel = shard; sel < K; sel += T) {
-                    const uint8_t* blob = b.table + (size_t) g_ids_host[sel] * b.stride;
-                    float* ff = s.ff + (size_t) sel * FF;
-                    strata::kernels::cpu::native_gu_rows(b.fmt, blob, (const void* const*) &s.act, 1, &ff, 0, FF);
-                    char* hq = s.hq + (size_t) sel * b.fmt.h_bytes;
-                    strata::kernels::cpu::native_quant_h(b.fmt, ff, hq);
-                    float* ey = s.ey_h + (size_t) sel * N;
-                    strata::kernels::cpu::native_down_rows(b.fmt, blob, (const void* const*) &hq, 1, &ey, 0, N);  // adds fmt.down_off itself
-                }
-            }, T);
+            std::vector<int> sels((size_t) K);
+            for (int k = 0; k < K; ++k) sels[(size_t) k] = k;
+            pool_experts(e, b, s, g_ids_host, sels);
             KC(cudaMemcpy(s.ey, s.ey_h, (size_t) K * N * 4, cudaMemcpyHostToDevice));
         } else {
         gemv(gu, s.h, s.eg, s.ids, K, 0, b.table, b.stride);
@@ -1598,7 +1606,13 @@ int strata::kolibri::run(int argc, char** argv) {
         std::fprintf(stderr, "strata-kolibri: expert cache: %d slots/layer = %.2f GiB VRAM\n",
                      e.slots, (double) e.slots * e.blobs[0].stride * e.g.n_layers / (1 << 30));
     }
-    if (e.cpu_threads > 1) e.pool.start(e.cpu_threads);
+    if (e.cpu_threads > 1) {
+        e.pool.start(e.cpu_threads);
+        // P1b: the expert rows go to the library's pool (row-split over all workers, affinity-aware).  The
+        // measured placement rule (pool_bench): ~24 workers on the GPU's socket; 48 on one socket collapse.
+        e.epool = std::make_unique<strata::kernels::cpu::ExpertPool>(
+            e.cpu_threads, true, true, strata::kernels::cpu::PoolAffinity::All);
+    }
     if (load_only) return 0;
     if (serve_mode) {
         Scratch s;
