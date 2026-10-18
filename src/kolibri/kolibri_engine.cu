@@ -284,27 +284,20 @@ __global__ void k_to_f16(const float* x, __half* y, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = __float2half(x[i]);
 }
-/// The prompt attention's KV images: the P cells the chunk reads, FP16.  Full layers: rows = ctx, cells 0..P-1.
-__global__ void k_kv_f16_full(const float* kc, const float* vc, __half* k16, __half* v16, int64_t ctx, int P, int HD,
-                              int HKV) {
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    const int64_t per = (int64_t) P * HD;
-    if (i >= (int64_t) HKV * per) return;
-    const int64_t kvh = i / per, rest = i % per;
-    k16[i] = __float2half(kc[(size_t) kvh * ctx * HD + rest]);
-    v16[i] = __float2half(vc[(size_t) kvh * ctx * HD + rest]);
-}
-/// Sliding layers: the ring's last n_vis cells (global first..first+n_vis-1, slot gp % swa).
-__global__ void k_kv_f16_swa(const float* kc, const float* vc, __half* k16, __half* v16, int64_t swa, int n_vis,
-                             int64_t first, int HD, int HKV) {
+/// S3: the KV cache is FP16 at the source, so a full-attention layer feeds the score/PV GEMMs straight from the
+/// cache (rows 0..P-1 of a ctx-row buffer) with NO per-chunk conversion.  Only the sliding ring wraps, and its
+/// gather is a half-to-half copy of at most n_swa cells (2 KB per head-cell, not 4).  The old kernels converted
+/// the WHOLE prefix per chunk -- O(prefix^2) in KV traffic, the dominant prefill term (K19).
+__global__ void k_kv_ring(const __half* kc, const __half* vc, __half* k16, __half* v16, int64_t swa, int n_vis,
+                          int64_t first, int HD, int HKV) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t per = (int64_t) n_vis * HD;
     if (i >= (int64_t) HKV * per) return;
     const int64_t kvh = i / per, rest = i % per;
     const int64_t c = rest / HD, d = rest % HD;
     const int64_t slot = (first + c) % swa;
-    k16[i] = __float2half(kc[((size_t) kvh * swa + slot) * HD + d]);
-    v16[i] = __float2half(vc[((size_t) kvh * swa + slot) * HD + d]);
+    k16[i] = kc[((size_t) kvh * swa + slot) * HD + d];
+    v16[i] = vc[((size_t) kvh * swa + slot) * HD + d];
 }
 /// The prompt's causal softmax (window-masked for sliding layers: cells before pos0+t+1-swa are zero): row (h, t)
 /// of S (ld floats, P cells) -> softmax(S * scale) over [lo, pos0+t+1), FP16 out.  grid (T, H), block 256.
@@ -362,7 +355,7 @@ template <int TY> __global__ void k_row_multi(const uint8_t* W, size_t row_bytes
 }
 /// multi-token q/k/v prep: block (head, t); pos = p0 + t.  q rows T x H x D, k/v rows T x HKV x D.
 __global__ void k_attn_prep_multi(const float* qx, const float* kx, const float* vx, const float* qw, const float* kw,
-                                  float* q, float* kc, float* vc, int H, int HKV, int D, int64_t p0, int64_t swa,
+                                  float* q, __half* kc, __half* vc, int H, int HKV, int D, int64_t p0, int64_t swa,
                                   int ctx, float base, float eps, bool rope) {
     const int t = blockIdx.y;
     const int head = blockIdx.x;
@@ -380,7 +373,8 @@ __global__ void k_attn_prep_multi(const float* qx, const float* kx, const float*
     __shared__ float buf[512];
     for (int i = threadIdx.x; i < D; i += blockDim.x) buf[i] = src[i] * r * (isq ? qw[i] : kw[i]);
     __syncthreads();
-    float* dst = isq ? q + ((size_t) t * H + head) * D : kc + ((size_t) kvh * rows + slot) * D;
+    float* dstq = isq ? q + ((size_t) t * H + head) * D : nullptr;
+    __half* dstk = isq ? nullptr : kc + ((size_t) kvh * rows + slot) * D;
     const int half = D / 2;
     for (int i = threadIdx.x; i < D; i += blockDim.x) {
         float v = buf[i];
@@ -390,7 +384,7 @@ __global__ void k_attn_prep_multi(const float* qx, const float* kx, const float*
             const float cs = cosf(theta), sn = sinf(theta);
             v = i < half ? buf[i] * cs - buf[i + half] * sn : buf[i - half] * sn + buf[i] * cs;
         }
-        dst[i] = v;
+        if (isq) dstq[i] = v; else dstk[i] = v;
     }
     if (!isq)
         for (int i = threadIdx.x; i < D; i += blockDim.x)
@@ -443,7 +437,7 @@ __global__ void k_moe_sum2(float* moe, const float* y, const float* yc, const fl
     moe[i] = acc;
 }
 __device__ void k_attn_prep_body(const float* qx, const float* kx, const float* vx, const float* qw, const float* kw,
-                            float* q, float* kc, float* vc, int H, int D, int pos, int64_t swa, int ctx, float base,
+                            float* q, __half* kc, __half* vc, int H, int D, int pos, int64_t swa, int ctx, float base,
                             float eps, bool rope) {
     __shared__ float sh[kThreads];
     __shared__ float buf[512];
@@ -459,7 +453,8 @@ __device__ void k_attn_prep_body(const float* qx, const float* kx, const float* 
     const float r = 1.0f / sqrtf(s / (float) D + eps);
     for (int i = threadIdx.x; i < D; i += blockDim.x) buf[i] = src[i] * r * (isq ? qw[i] : kw[i]);
     __syncthreads();
-    float* dst = isq ? q + (size_t) head * D : kc + ((size_t) kvh * rows + slot) * D;
+    float* dstq = isq ? q + (size_t) head * D : nullptr;
+    __half* dstk = isq ? nullptr : kc + ((size_t) kvh * rows + slot) * D;
     const int half = D / 2;
     for (int i = threadIdx.x; i < D; i += blockDim.x) {
         float v = buf[i];
@@ -469,25 +464,25 @@ __device__ void k_attn_prep_body(const float* qx, const float* kx, const float* 
             const float cs = cosf(theta), sn = sinf(theta);
             v = i < half ? buf[i] * cs - buf[i + half] * sn : buf[i - half] * sn + buf[i] * cs;
         }
-        dst[i] = v;
+        if (isq) dstq[i] = v; else dstk[i] = v;
     }
     if (!isq)
         for (int i = threadIdx.x; i < D; i += blockDim.x)
             vc[((size_t) kvh * rows + slot) * D + i] = vx[(size_t) kvh * D + i];
 }
 __global__ void k_attn_prep(const float* qx, const float* kx, const float* vx, const float* qw, const float* kw,
-                            float* q, float* kc, float* vc, int H, int D, int pos, int64_t swa, int ctx, float base,
+                            float* q, __half* kc, __half* vc, int H, int D, int pos, int64_t swa, int ctx, float base,
                             float eps, bool rope) {
     k_attn_prep_body(qx, kx, vx, qw, kw, q, kc, vc, H, D, pos, swa, ctx, base, eps, rope);
 }
 /// graph decode: the position from device memory
 __global__ void k_attn_prep_p(const float* qx, const float* kx, const float* vx, const float* qw, const float* kw,
-                              float* q, float* kc, float* vc, int H, int D, const int* pos_p, int64_t swa, int ctx,
+                              float* q, __half* kc, __half* vc, int H, int D, const int* pos_p, int64_t swa, int ctx,
                               float base, float eps, bool rope) {
     k_attn_prep_body(qx, kx, vx, qw, kw, q, kc, vc, H, D, *pos_p, swa, ctx, base, eps, rope);
 }
 
-__device__ void k_attn_body(const float* q, const float* kc, const float* vc, float* out, int H, int HKV, int D, int pos,
+__device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, float* out, int H, int HKV, int D, int pos,
                        int64_t swa, int ctx, float scale, bool sliding, bool force_2pass = false) {
     extern __shared__ float sc[];
     __shared__ float sh[kThreads];
@@ -501,9 +496,9 @@ __device__ void k_attn_body(const float* q, const float* kc, const float* vc, fl
     if (!force_2pass && n_pos <= 12000) {
     for (int p = threadIdx.x; p < n_pos; p += blockDim.x) {
         const int64_t gp = first + p, slot = sliding ? gp % swa : gp;
-        const float* kp = kc + ((size_t) kvh * rows + slot) * D;
+        const __half* kp = kc + ((size_t) kvh * rows + slot) * D;
         float s = 0.f;
-        for (int i = 0; i < D; ++i) s += qh[i] * kp[i];
+        for (int i = 0; i < D; ++i) s += qh[i] * __half2float(kp[i]);
         sc[p] = s * scale;
     }
     __syncthreads();
@@ -521,7 +516,7 @@ __device__ void k_attn_body(const float* q, const float* kc, const float* vc, fl
         float acc = 0.f;
         for (int p = 0; p < n_pos; ++p) {
             const int64_t gp = first + p, slot = sliding ? gp % swa : gp;
-            acc += sc[p] * vc[((size_t) kvh * rows + slot) * D + i];
+            acc += sc[p] * __half2float(vc[((size_t) kvh * rows + slot) * D + i]);
         }
         out[(size_t) h * D + i] = acc / sum;
     }
@@ -529,9 +524,9 @@ __device__ void k_attn_body(const float* q, const float* kc, const float* vc, fl
         // pass 1: the max and the softmax denominator, scores recomputed from the KV (no shared copy)
         auto score = [&](int p) -> float {
             const int64_t gp = first + p, slot = sliding ? gp % swa : gp;
-            const float* kp = kc + ((size_t) kvh * rows + slot) * D;
+            const __half* kp = kc + ((size_t) kvh * rows + slot) * D;
             float s = 0.f;
-            for (int i = 0; i < D; ++i) s += qh[i] * kp[i];
+            for (int i = 0; i < D; ++i) s += qh[i] * __half2float(kp[i]);
             return s * scale;
         };
         float mx = -INFINITY;
@@ -549,25 +544,31 @@ __device__ void k_attn_body(const float* q, const float* kc, const float* vc, fl
             float acc = 0.f;
             for (int p = 0; p < n_pos; ++p) {
                 const int64_t gp = first + p, slot = sliding ? gp % swa : gp;
-                acc += expf(score(p) - mx) * vc[((size_t) kvh * rows + slot) * D + i];
+                acc += expf(score(p) - mx) * __half2float(vc[((size_t) kvh * rows + slot) * D + i]);
             }
             out[(size_t) h * D + i] = acc / sum;
         }
     }
 }
-__global__ void k_attn(const float* q, const float* kc, const float* vc, float* out, int H, int HKV, int D, int pos,
+__global__ void k_attn(const float* q, const __half* kc, const __half* vc, float* out, int H, int HKV, int D, int pos,
                        int64_t swa, int ctx, float scale, bool sliding) {
     const int n_vis = sliding ? (pos + 1 < (int) swa ? pos + 1 : (int) swa) : pos + 1;
     k_attn_body(q, kc, vc, out, H, HKV, D, pos, swa, ctx, scale, sliding);
 }
 /// graph decode: the position from device memory; the dynamic shared memory is the two-pass size (0) so one
 /// capture serves every position (the smem path bakes n_vis into the launch and cannot be replayed across pos).
-__global__ void k_attn_p(const float* q, const float* kc, const float* vc, float* out, int H, int HKV, int D,
+__global__ void k_attn_p(const float* q, const __half* kc, const __half* vc, float* out, int H, int HKV, int D,
                          const int* pos_p, int64_t swa, int ctx, float scale, bool sliding) {
     k_attn_body(q, kc, vc, out, H, HKV, D, *pos_p, swa, ctx, scale, sliding, true);
 }
 
 
+__half* halloc(size_t n) {
+    __half* p = nullptr;
+    KC(cudaMalloc(&p, n * 2));
+    KC(cudaMemset(p, 0, n * 2));
+    return p;
+}
 float* dalloc(size_t n) {
     float* p = nullptr;
     KC(cudaMalloc(&p, n * 4));
@@ -615,7 +616,7 @@ struct Scratch {
     int ctx = 8192, pos = 0;
     float *x, *h, *y, *q, *k, *v, *att, *router, *eg, *eu, *eh, *ey, *sg, *su, *sh, *sy, *moe, *wts, *logits;
     int* ids;
-    std::vector<float*> kc, vc;
+    std::vector<__half*> kc, vc;   // S3: FP16 KV -- half the bytes/token and half the prefill traffic
     // the CPU expert path's pinned host side: the layer's h, its quantized activations, the FF rows, the down rows
     float* h_host = nullptr; char* act = nullptr; float* ff = nullptr; char* hq = nullptr; float* ey_h = nullptr;
     std::vector<int32_t> exp_cnt, exp_ord;   // prefill pool: the per-expert grouping
@@ -847,11 +848,8 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
         const int P = sliding ? (int) std::min<int64_t>(p0 + T, g.n_swa) : (int) (p0 + T);
         const int64_t first = sliding ? p0 + T - P : 0;
         if (sliding)
-            k_kv_f16_swa<<<grid1((int64_t) HKV * P * D), kThreads>>>(s.kc[l], s.vc[l], s.k16, s.v16, g.n_swa, P,
-                                                                     first, D, HKV);
-        else
-            k_kv_f16_full<<<grid1((int64_t) HKV * P * D), kThreads>>>(s.kc[l], s.vc[l], s.k16, s.v16, s.ctx, P, D,
-                                                                      HKV);
+            k_kv_ring<<<grid1((int64_t) HKV * P * D), kThreads>>>(s.kc[l], s.vc[l], s.k16, s.v16, g.n_swa, P,
+                                                                  first, D, HKV);
         k_to_f16<<<grid1((int64_t) T * H * D), kThreads>>>(s.q_m, s.q16, (int64_t) T * H * D);
         const int ldp = (P + 7) / 8 * 8;
         const int G = H / HKV;
@@ -860,7 +858,8 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
         for (int t0 = 0; t0 < T; t0 += tq) {
             const int nt = std::min(tq, T - t0);
             for (int kvh = 0; kvh < HKV; ++kvh) {
-                const __half* Kh = s.k16 + (size_t) kvh * P * D;
+                const __half* Kh = sliding ? s.k16 + (size_t) kvh * P * D
+                                               : s.kc[l] + (size_t) kvh * s.ctx * D;
                 const __half* Qh = s.q16 + ((size_t) t0 * H + kvh * G) * D;
                 float* Sh = s.att_s + (size_t) kvh * G * nt * ldp;
                 if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, D, &one, Kh, CUDA_R_16F, D, 0,
@@ -871,7 +870,8 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
             k_attn_softmax16<<<dim3(nt, H), kThreads>>>(s.att_s, s.p16, ldp, nt, P, (int) p0 + t0,
                                                         1.0f / sqrtf((float) D), sliding ? g.n_swa : 0, (int) first);
             for (int kvh = 0; kvh < HKV; ++kvh) {
-                const __half* Vh = s.v16 + (size_t) kvh * P * D;
+                const __half* Vh = sliding ? s.v16 + (size_t) kvh * P * D
+                                               : s.vc[l] + (size_t) kvh * s.ctx * D;
                 const __half* Ph = s.p16 + (size_t) kvh * G * nt * ldp;
                 float* Oh = s.att_m + ((size_t) t0 * H + kvh * G) * D;
                 if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, D, nt, P, &one, Vh, CUDA_R_16F, D, 0,
@@ -1122,8 +1122,8 @@ void init_scratch(const Engine& e, Scratch& s) {
     KC(cudaMalloc(&s.ids, K * sizeof(int)));
     for (int64_t l = 0; l < g.n_layers; ++l) {
         const int64_t rows = strata::core::is_swa_layer(g, l) ? g.n_swa : s.ctx;
-        s.kc.push_back(dalloc((size_t) g.n_head_kv * rows * g.head_dim));
-        s.vc.push_back(dalloc((size_t) g.n_head_kv * rows * g.head_dim));
+        s.kc.push_back(halloc((size_t) g.n_head_kv * rows * g.head_dim));
+        s.vc.push_back(halloc((size_t) g.n_head_kv * rows * g.head_dim));
     }
 }
 
@@ -1176,7 +1176,7 @@ void reset_state(Engine& e, Scratch& s) {
         const bool sliding = strata::core::is_swa_layer(e.g, (int64_t) l);
         const int64_t rows = sliding ? e.g.n_swa : s.ctx;
         const int64_t clear_rows = sliding ? rows : std::min<int64_t>(rows, used);
-        const size_t bytes = (size_t) e.g.n_head_kv * clear_rows * e.g.head_dim * 4;
+        const size_t bytes = (size_t) e.g.n_head_kv * clear_rows * e.g.head_dim * 2;   // FP16 KV (S3)
         KC(cudaMemset(s.kc[l], 0, bytes));
         KC(cudaMemset(s.vc[l], 0, bytes));
     }
