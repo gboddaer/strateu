@@ -770,7 +770,12 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                 std::vector<int> sels;
                 for (int k = 0; k < K; ++k) if (g_ids_host[k] >= S) sels.push_back(k);   // in-slot: the GPU did it
                 pool_experts(e, b, s, g_ids_host, sels);
-                KC(cudaMemcpy(s.ey_cpu, s.ey_h, (size_t) K * N * 4, cudaMemcpyHostToDevice));
+                // K15/K18: the result copy is enqueued on the compute stream, not run as a blocking host copy.
+                // s.ey_h is cudaHostAlloc-pinned (:1127), so the DMA is genuinely asynchronous: the host returns
+                // here and goes on to enqueue the next layer's router/attention launches while the 61 KB moves,
+                // and k_moe_sum2 below is stream-ordered after the copy.  The blocking form serialized the host
+                // against the GPU once per layer, 50 times per token.
+                KC(cudaMemcpyAsync(s.ey_cpu, s.ey_h, (size_t) K * N * 4, cudaMemcpyHostToDevice, g_st));
                 if (e.counters) { ++e.cnt.h2d_n; e.cnt.h2d_bytes += (long long) K * N * 4; }
                 yc = s.ey_cpu;
             } else {
@@ -789,7 +794,8 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
             std::vector<int> sels((size_t) K);
             for (int k = 0; k < K; ++k) sels[(size_t) k] = k;
             pool_experts(e, b, s, g_ids_host, sels);
-            KC(cudaMemcpy(s.ey, s.ey_h, (size_t) K * N * 4, cudaMemcpyHostToDevice));
+            // K15/K18: async on the compute stream (pinned source); see the slots path above for why.
+            KC(cudaMemcpyAsync(s.ey, s.ey_h, (size_t) K * N * 4, cudaMemcpyHostToDevice, g_st));
         } else {
         gemv(gu, s.h, s.eg, s.ids, K, 0, b.table, b.stride);
         gemv(gu, s.h, s.eu, s.ids, K, 0, b.table + b.L.up_off, b.stride);
