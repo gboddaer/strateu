@@ -500,7 +500,7 @@ __global__ void k_attn_prep_p(const float* qx, const float* kx, const float* vx,
 }
 
 __device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, float* out, int H, int HKV, int D, int pos,
-                       int64_t swa, int ctx, float scale, bool sliding, bool force_2pass = false) {
+                       int64_t swa, int ctx, float scale, bool sliding, bool force_2pass = false, int bench_mode = 0) {
     extern __shared__ float sc[];
     __shared__ float sh[512];   // sized for the widest block the two-pass path launches (512 = 4 slices x D)
     const int h = blockIdx.x, kvh = h / (H / HKV);
@@ -508,6 +508,12 @@ __device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, 
     const int n_pos = sliding ? (pos + 1 < (int) swa ? pos + 1 : (int) swa) : pos + 1;
     const int64_t first = sliding ? (int64_t) pos + 1 - n_pos : 0;
     const float* qh = q + (size_t) h * D;
+    // K25: q staged in shared memory for the warp-cooperative score dot.  The scalar loop read qh[d] and
+    // kp[lane][d] with d fixed, so the 32 lanes touched addresses 256 B apart - every warp instruction was 32
+    // separate sectors, fully uncoalesced, and that pass is 91% of the kernel (measured: 10.98 of 12.05 ms).
+    // The staging (load + syncthreads) lives in the two-pass branch only: staging it for every caller cost the
+    // single-pass path 0.305 -> 0.395 ms/launch, ~1 ms/token on short decode, for a buffer it never reads.
+    __shared__ float qsm[128];
     // the scores live in dynamic shared memory up to the 48 KB a T4-class block gets; past that (a 32K full-
     // attention layer) the kernel runs two passes and recomputes each score - slower, and it works
     if (!force_2pass && n_pos <= 11000) {   // 11000*4 = 44 KB dynamic + 2 KB static sh[] < the 48 KB T4 cap
@@ -556,14 +562,38 @@ __device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, 
         float m = -INFINITY, l = 0.f, acc = 0.f;
         for (int64_t t0 = 0; t0 < n_pos; t0 += TILE) {
             const int nt = (int) (n_pos - t0 < TILE ? n_pos - t0 : TILE);
-            for (int p = threadIdx.x; p < nt; p += blockDim.x) {
-                const int64_t gp = first + t0 + p, slot = sliding ? gp % swa : gp;
-                const __half* kp = kc + ((size_t) kvh * rows + slot) * D;
-                float s = 0.f;
-                for (int d = 0; d < D; ++d) s += qh[d] * __half2float(kp[d]);
-                sc[p] = s * scale;
+            // Warp-cooperative score: 32 lanes x 4 halfs = the 128-dim row, so lane l reads 8 contiguous bytes
+            // and a warp instruction covers 256 B of one K row - coalesced, 8x fewer load instructions, and the
+            // dot finishes with a warp shuffle reduce.  Requires D == 128 (the artifact's head_dim); the scalar
+            // path stays for any other width.
+            if (bench_mode == 2) {
+                for (int p = threadIdx.x; p < nt; p += blockDim.x) sc[p] = 1.f;
+            } else if (D == 128) {
+                if (threadIdx.x < D) qsm[threadIdx.x] = qh[threadIdx.x];
+                __syncthreads();
+                const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nwarp = (int) blockDim.x >> 5;
+                const __half2* kbase = reinterpret_cast<const __half2*>(kc) + (size_t) kvh * rows * (D / 2);
+                for (int row = wid; row < nt; row += nwarp) {
+                    const int64_t gp = first + t0 + row, slot = sliding ? gp % swa : gp;
+                    const __half2* kp2 = kbase + slot * (D / 2) + lane * 2;
+                    const float2 a = __half22float2(kp2[0]);
+                    const float2 b = __half22float2(kp2[1]);
+                    float part = qsm[lane * 4] * a.x + qsm[lane * 4 + 1] * a.y
+                               + qsm[lane * 4 + 2] * b.x + qsm[lane * 4 + 3] * b.y;
+                    for (int off = 16; off > 0; off >>= 1) part += __shfl_down_sync(0xffffffffu, part, off);
+                    if (lane == 0) sc[row] = part * scale;
+                }
+                __syncthreads();
+            } else {
+                for (int p = threadIdx.x; p < nt; p += blockDim.x) {
+                    const int64_t gp = first + t0 + p, slot = sliding ? gp % swa : gp;
+                    const __half* kp = kc + ((size_t) kvh * rows + slot) * D;
+                    float s = 0.f;
+                    for (int d = 0; d < D; ++d) s += qh[d] * __half2float(kp[d]);
+                    sc[p] = s * scale;
+                }
+                __syncthreads();
             }
-            __syncthreads();
             float tm = -INFINITY;
             for (int p = threadIdx.x; p < nt; p += blockDim.x) tm = fmaxf(tm, sc[p]);
             sh[threadIdx.x] = tm;
@@ -580,6 +610,7 @@ __device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, 
                 return __half2float(vbase[slot * D + di]);
             };
             float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+            if (bench_mode != 1) {   // score-only: neutralise the V pass
             int p = slice;
             for (; p + 3 * nslice < nt; p += 4 * nslice) {   // four independent chains, then the tail
                 a0 += sc[p] * v_at(p);
@@ -588,6 +619,7 @@ __device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, 
                 a3 += sc[p + 3 * nslice] * v_at(p + 3 * nslice);
             }
             for (; p < nt; p += nslice) a0 += sc[p] * v_at(p);
+            }
             float a = (a0 + a1) + (a2 + a3);
             if (nslice > 1) {                       // reduce the slice partials for this dimension
                 sh[threadIdx.x] = a;
@@ -608,9 +640,9 @@ __device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, 
     }
 }
 __global__ void k_attn(const float* q, const __half* kc, const __half* vc, float* out, int H, int HKV, int D, int pos,
-                       int64_t swa, int ctx, float scale, bool sliding) {
+                       int64_t swa, int ctx, float scale, bool sliding, int bench_mode) {
     const int n_vis = sliding ? (pos + 1 < (int) swa ? pos + 1 : (int) swa) : pos + 1;
-    k_attn_body(q, kc, vc, out, H, HKV, D, pos, swa, ctx, scale, sliding);
+    k_attn_body(q, kc, vc, out, H, HKV, D, pos, swa, ctx, scale, sliding, false, bench_mode);
 }
 /// graph decode: the position from device memory; the dynamic shared memory is the two-pass size (0) so one
 /// capture serves every position (the smem path bakes n_vis into the launch and cannot be replayed across pos).
@@ -763,7 +795,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                 s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos_d, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding);
         else
             k_attn<<<H, n_vis <= 11000 ? kThreads : 512, n_vis <= 11000 ? (size_t) n_vis * sizeof(float) : (size_t) 4096 * sizeof(float), st>>>(
-                s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding);
+                s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding, 0);
         gemv(e.dense.at(L(l, "attn_output.weight")), s.att, s.y, nullptr, 1, 0, nullptr, 0, st);
         k_rms<<<1, kThreads, 0, st>>>(s.y, e.f32.at(L(l, "post_attention_norm.weight")), s.y, N, e.eps);
         k_add<<<(N + B - 1) / B, B, 0, st>>>(s.x, s.y, N);
@@ -1628,6 +1660,7 @@ int strata::kolibri::run(int argc, char** argv) {
     bool load_only = false, serve_mode = false;
     int n_gen = 8, ctx = 8192, cpu_threads = 0, slots = 0, grouped = 0, no_graph = 0, prefill = 0, counters = 0;
     int attn_bench = 0;             // K25 instrument: --attn-bench N launches the real attention kernel N times
+    int attn_mode = 0;              // 0 = full, 1 = score pass only (V neutralised), 2 = V pass only (scores const)
     double expert_vram = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1651,6 +1684,7 @@ int strata::kolibri::run(int argc, char** argv) {
         else if (a == "--no-graph") no_graph = 1;
         else if (a == "--prefill") prefill = 1;
         else if (a == "--attn-bench" && i + 1 < argc) attn_bench = std::atoi(argv[++i]);
+        else if (a == "--attn-mode" && i + 1 < argc) attn_mode = std::atoi(argv[++i]);
         else if (a == "--counters") counters = 1;
     }
     if (model.empty()) {
@@ -1731,16 +1765,16 @@ int strata::kolibri::run(int argc, char** argv) {
         const int thr = n_vis <= 11000 ? kThreads : 512;
         cudaEvent_t ev0, ev1; cudaEventCreate(&ev0); cudaEventCreate(&ev1);
         for (int r = 0; r < 3; ++r)   // warm the clocks and the TLB
-            k_attn<<<H, thr, smem, g_st>>>(q, kc, vc, out, H, HKV, D, pos, e.g.n_swa, ctx, 1.0f / sqrtf((float) D), false);
+            k_attn<<<H, thr, smem, g_st>>>(q, kc, vc, out, H, HKV, D, pos, e.g.n_swa, ctx, 1.0f / sqrtf((float) D), false, attn_mode);
         cudaEventRecord(ev0, g_st);
         for (int r = 0; r < attn_bench; ++r)
-            k_attn<<<H, thr, smem, g_st>>>(q, kc, vc, out, H, HKV, D, pos, e.g.n_swa, ctx, 1.0f / sqrtf((float) D), false);
+            k_attn<<<H, thr, smem, g_st>>>(q, kc, vc, out, H, HKV, D, pos, e.g.n_swa, ctx, 1.0f / sqrtf((float) D), false, attn_mode);
         cudaEventRecord(ev1, g_st);
         KC(cudaEventSynchronize(ev1));
         float ms = 0.f; cudaEventElapsedTime(&ms, ev0, ev1);
         const double per = (double) ms / attn_bench;
-        std::printf("attn-bench: pos=%d n_vis=%d H=%d thr=%d smem=%zu KB | %.3f ms/launch | x12 full layers = %.1f ms/token\n",
-                    pos, n_vis, H, thr, smem / 1024, per, per * 12.0);
+        std::printf("attn-bench: mode=%d pos=%d n_vis=%d H=%d thr=%d smem=%zu KB | %.3f ms/launch | x12 full layers = %.1f ms/token\n",
+                    attn_mode, pos, n_vis, H, thr, smem / 1024, per, per * 12.0);
         std::fflush(stdout);
         return 0;
     }
