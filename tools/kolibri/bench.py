@@ -27,7 +27,15 @@ def run_case(ids: str, n: int, ctx: int, label: str):
             if l.startswith("PP ") or l.startswith("T "):
                 continue
             return l
+    # The engine prints banner lines BEFORE the handshake: with --grouped the first line is
+    # "kolibri: 25 / 50 layers captured as CUDA graphs (the rest use the mmvq loop)", so the assert below
+    # rejected every graph-path run.  That is why the S0 flag table has no grouped-with-graphs row: the graph
+    # path was never measurable through this harness.  Skip banner lines until READY arrives.
     ready = rd()
+    for _ in range(64):
+        if ready is None or ready.startswith("READY"):
+            break
+        ready = rd()
     assert ready and ready.startswith("READY"), f"expected READY, got {ready!r}"
     p.stdin.write(f"GEN {n} {ids}\n")
     p.stdin.flush()
