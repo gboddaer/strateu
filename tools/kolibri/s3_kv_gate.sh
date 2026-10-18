@@ -35,7 +35,7 @@ python3 - "$BIN" "$M" "$CTX" "$OUT" <<'PY'
 import subprocess, sys, re, json
 bin, m, ctx, out = sys.argv[1:5]
 ids = ",".join(str(1000 + (i * 7919) % 100000) for i in range(32768))
-r = subprocess.run([bin, "--model", m, "--tokens", ids, "--n", "32", "--ctx", ctx],
+r = subprocess.run([bin, "--model", m, "--tokens", ids, "--n", "32", "--ctx", ctx, "--prefill"],
                    capture_output=True, text=True, env={**__import__("os").environ,
                    "STRATA_DUMP_CTX": "8192", "GGML_CUDA_DISABLE_GRAPHS": "1"})
 open(f"{out}/tg_after32k.log", "w").write(r.stdout + "\n" + r.stderr)
@@ -52,11 +52,14 @@ for N in 512 2048 8192 32768; do
   T0=$(date +%s.%N)
   build/strata-kolibri --model "$M" --tokens "$IDS" --n 1 --ctx "$CTX" --prefill > "$OUT/pp_$N.log" 2>&1 || { echo "  $N: FAILED (see $OUT/pp_$N.log)"; continue; }
   T1=$(date +%s.%N)
-  python3 - "$N" "$T0" "$T1" <<'PY'
+  # the engine's own prompt rate excludes the ~40 s load that wall time would fold in
+  PP=$(grep -oE "prompt[[:space:]]+[0-9.]+[[:space:]]+tok/s" "$OUT/pp_$N.log" | grep -oE "[0-9.]+" | head -1)
+  python3 - "$N" "$T0" "$T1" "${PP:-0}" <<'PY'
 import sys
-n, t0, t1 = int(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
+n, t0, t1, pp = int(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
 wall = t1 - t0
-print(f"  prefix {n:6d}: wall {wall:7.1f} s   {n/max(wall,1e-9):7.1f} tok/s (wall incl. ~40 s load)")
+# cost per token of the prompt pass: the linearity signal (flat == no quadratic term)
+print(f"  prefix {n:6d}: pp {pp:7.1f} tok/s   prompt cost {1000/pp if pp else 0:8.2f} ms/token   wall {wall:6.1f} s")
 PY
 done
 echo "== done $(date +%H:%M:%S)"
