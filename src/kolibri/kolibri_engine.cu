@@ -561,16 +561,11 @@ __global__ void k_attn(const float* q, const __half* kc, const __half* vc, float
     const int n_vis = sliding ? (pos + 1 < (int) swa ? pos + 1 : (int) swa) : pos + 1;
     k_attn_body(q, kc, vc, out, H, HKV, D, pos, swa, ctx, scale, sliding);
 }
-/// graph decode: the position from device memory.  S2a (plan task 10): a SLIDING layer's visible window is
-/// bounded by n_swa = 513, so its score array is a FIXED 513 floats (2 KB) at every position - one capture
-/// serves positions 0, 512, 513 and 32K alike, and the fast smem path is available under graphs.  Before this,
-/// graph decode forced the two-pass path on every layer, which recomputes expf(score(p)) three times per
-/// position (K25: ~1.7 GFLOP/token at 32K, the reason tg-after-32K sat at 0.6 tok/s while the KV read has a
-/// ~400 tok/s ceiling).  A FULL layer's n_pos = pos + 1 is unbounded, so its smem size cannot be baked into a
-/// capture; it keeps the two-pass path.
+/// graph decode: the position from device memory; the dynamic shared memory is the two-pass size (0) so one
+/// capture serves every position (the smem path bakes n_vis into the launch and cannot be replayed across pos).
 __global__ void k_attn_p(const float* q, const __half* kc, const __half* vc, float* out, int H, int HKV, int D,
                          const int* pos_p, int64_t swa, int ctx, float scale, bool sliding) {
-    k_attn_body(q, kc, vc, out, H, HKV, D, *pos_p, swa, ctx, scale, sliding, /*force_2pass=*/!sliding);
+    k_attn_body(q, kc, vc, out, H, HKV, D, *pos_p, swa, ctx, scale, sliding, true);
 }
 
 
@@ -713,9 +708,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
         const int n_vis = (int) (s.pos + 1 < (int64_t) (sliding ? g.n_swa : s.ctx) ? s.pos + 1
                                                                             : (int64_t) (sliding ? g.n_swa : s.ctx));
         if (graph)
-            // S2a: sliding layers launch with the fixed 2 KB the smem path needs (n_swa floats, position-
-            // independent, so the capture stays replayable); full layers keep smem 0 and the two-pass path.
-            k_attn_p<<<H, kThreads, sliding ? (size_t) g.n_swa * sizeof(float) : 0, st>>>(
+            k_attn_p<<<H, kThreads, 0, st>>>(
                 s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos_d, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding);
         else
             k_attn<<<H, kThreads, n_vis <= 12000 ? (size_t) n_vis * sizeof(float) : 0, st>>>(
