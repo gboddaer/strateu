@@ -1598,6 +1598,17 @@ int strata::kolibri::run(int argc, char** argv) {
         if (e.graphs > 0 && e.gexec.empty()) capture_graphs(e, s);
         return serve(e, s);
     }
+    if (!tokens_file.empty()) {
+        // Read before the emptiness check below: --tokens-file is an alternative SOURCE for --tokens, not a post-step.
+        std::FILE* ft = std::fopen(tokens_file.c_str(), "rb");
+        if (ft == nullptr) { std::fprintf(stderr, "strata-kolibri: cannot open --tokens-file %s\n", tokens_file.c_str()); return 1; }
+        std::string buf;
+        char chunk[65536];
+        size_t got;
+        while ((got = std::fread(chunk, 1, sizeof(chunk), ft)) > 0) buf.append(chunk, got);
+        std::fclose(ft);
+        tokens = std::move(buf);
+    }
     if (tokens.empty()) {
         std::fprintf(stderr, "strata-kolibri: --tokens ID,ID,... (the layer driver is plain; serve arrives in plan T8)\n");
         return 2;
@@ -1621,16 +1632,6 @@ int strata::kolibri::run(int argc, char** argv) {
         }
         return v;
     };
-    if (!tokens_file.empty()) {
-        std::FILE* ft = std::fopen(tokens_file.c_str(), "rb");
-        if (ft == nullptr) { std::fprintf(stderr, "strata-kolibri: cannot open --tokens-file %s\n", tokens_file.c_str()); return 1; }
-        std::string buf;
-        char chunk[65536];
-        size_t got;
-        while ((got = std::fread(chunk, 1, sizeof(chunk), ft)) > 0) buf.append(chunk, got);
-        std::fclose(ft);
-        tokens = std::move(buf);
-    }
     std::vector<int> ids = parse_ids(tokens);
     std::vector<int> forced = parse_ids(force);
     int tok = ids[0];
