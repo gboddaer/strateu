@@ -11,8 +11,8 @@ bash tools/kolibri/s3_kv_gate.sh /tmp/kolibri_s3 build/strata-kolibri > /tmp/kol
 echo "FP16_EXIT=$?" >> /tmp/kolibri_s3/fp16.txt
 
 # before/after pair: the same 32K prompt on the pre-S3 (fp32 KV) binary, same flags
-IDS=$(python3 -c 'print(",".join(str(1000+(i*7919)%100000) for i in range(32768)))')
-/tmp/kolibri-f32kv --model "$M" --tokens "$IDS" --n 32 --ctx 33024 --prefill \
+python3 -c 'open("/tmp/kolibri_s3/ids_32768.txt","w").write(",".join(str(1000+(i*7919)%100000) for i in range(32768)))'
+/tmp/kolibri-f32kv --model "$M" --tokens-file /tmp/kolibri_s3/ids_32768.txt --n 32 --ctx 33024 --prefill \
   > /tmp/kolibri_s3/fp32_tg32k.log 2>&1
 echo "FP32_EXIT=$?" >> /tmp/kolibri_s3/fp32_tg32k.log
 echo ALLDONE >> /tmp/kolibri_s3/fp16.txt

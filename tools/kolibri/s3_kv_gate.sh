@@ -34,8 +34,9 @@ echo "--- tg after 32K ($BIN)"
 python3 - "$BIN" "$M" "$CTX" "$OUT" <<'PY'
 import subprocess, sys, re, json
 bin, m, ctx, out = sys.argv[1:5]
-ids = ",".join(str(1000 + (i * 7919) % 100000) for i in range(32768))
-r = subprocess.run([bin, "--model", m, "--tokens", ids, "--n", "32", "--ctx", ctx, "--prefill"],
+# 32768 ids is ~230 KB of digits: Linux caps ONE argv entry at 128 KB, so feed it through a file.
+open(f"{out}/ids_32768.txt", "w").write(",".join(str(1000 + (i * 7919) % 100000) for i in range(32768)))
+r = subprocess.run([bin, "--model", m, "--tokens-file", f"{out}/ids_32768.txt", "--n", "32", "--ctx", ctx, "--prefill"],
                    capture_output=True, text=True, env={**__import__("os").environ,
                    "STRATA_DUMP_CTX": "8192", "GGML_CUDA_DISABLE_GRAPHS": "1"})
 open(f"{out}/tg_after32k.log", "w").write(r.stdout + "\n" + r.stderr)
@@ -48,9 +49,9 @@ PY
 # 2. prefill cost per token vs prefix length: flat == the quadratic conversion is gone.
 echo "--- prefill linearity (pp per token at growing prefix)"
 for N in 512 2048 8192 32768; do
-  IDS=$(python3 -c "print(','.join(str(1000+(i*7919)%100000) for i in range($N)))")
+  python3 -c "open('$OUT/ids_$N.txt','w').write(','.join(str(1000+(i*7919)%100000) for i in range($N)))"
   T0=$(date +%s.%N)
-  build/strata-kolibri --model "$M" --tokens "$IDS" --n 1 --ctx "$CTX" --prefill > "$OUT/pp_$N.log" 2>&1 || { echo "  $N: FAILED (see $OUT/pp_$N.log)"; continue; }
+  build/strata-kolibri --model "$M" --tokens-file "$OUT/ids_$N.txt" --n 1 --ctx "$CTX" --prefill > "$OUT/pp_$N.log" 2>&1 || { echo "  $N: FAILED (see $OUT/pp_$N.log)"; continue; }
   T1=$(date +%s.%N)
   # the engine's own prompt rate excludes the ~40 s load that wall time would fold in
   PP=$(grep -oE "prompt[[:space:]]+[0-9.]+[[:space:]]+tok/s" "$OUT/pp_$N.log" | grep -oE "[0-9.]+" | head -1)

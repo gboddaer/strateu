@@ -1513,7 +1513,7 @@ bool load(const std::string& path, Engine& e, std::string& err) {
 }  // namespace
 
 int strata::kolibri::run(int argc, char** argv) {
-    std::string model, tokens, dump_layers, dump_logits, dump_full, force;
+    std::string model, tokens, dump_layers, dump_logits, dump_full, force, tokens_file;
     bool load_only = false, serve_mode = false;
     int n_gen = 8, ctx = 8192, cpu_threads = 0, slots = 0, grouped = 0, no_graph = 0, prefill = 0, counters = 0;
     double expert_vram = 0;
@@ -1521,6 +1521,9 @@ int strata::kolibri::run(int argc, char** argv) {
         const std::string a = argv[i];
         if ((a == "--model" || a == "--native") && i + 1 < argc) model = argv[++i];
         else if (a == "--tokens" && i + 1 < argc) tokens = argv[++i];
+        // A 32K-token prompt is ~230 KB of digits, and Linux caps ONE argv entry at 128 KB (MAX_ARG_STRLEN), so
+        // long prompts (the 32K gates, the 100K needle) must come from a file.  Same format as --tokens.
+        else if (a == "--tokens-file" && i + 1 < argc) tokens_file = argv[++i];
         else if (a == "--n" && i + 1 < argc) n_gen = std::atoi(argv[++i]);
         else if (a == "--ctx" && i + 1 < argc) ctx = std::atoi(argv[++i]);
         else if (a == "--dump-layers" && i + 1 < argc) dump_layers = argv[++i];
@@ -1618,6 +1621,16 @@ int strata::kolibri::run(int argc, char** argv) {
         }
         return v;
     };
+    if (!tokens_file.empty()) {
+        std::FILE* ft = std::fopen(tokens_file.c_str(), "rb");
+        if (ft == nullptr) { std::fprintf(stderr, "strata-kolibri: cannot open --tokens-file %s\n", tokens_file.c_str()); return 1; }
+        std::string buf;
+        char chunk[65536];
+        size_t got;
+        while ((got = std::fread(chunk, 1, sizeof(chunk), ft)) > 0) buf.append(chunk, got);
+        std::fclose(ft);
+        tokens = std::move(buf);
+    }
     std::vector<int> ids = parse_ids(tokens);
     std::vector<int> forced = parse_ids(force);
     int tok = ids[0];
