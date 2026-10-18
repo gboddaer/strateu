@@ -23,10 +23,15 @@ M=${M:-/data4/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf}
 CTX=${CTX:-33024}
 export STRATA_DUMP_CTX=8192 GGML_CUDA_DISABLE_GRAPHS=1
 mkdir -p "$OUT"
-if [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; then
-  echo "GPU busy: $(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader | tr '\n' ';')" >&2
-  exit 3
-fi
+# Refuse to share the card, but tolerate a process that is on its way out (a killed run can hold
+# its context for a few seconds, and a hard "exit 3" on first sight wastes the launch).
+for try in 1 2 3 4 5 6; do
+  BUSY=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | tr -d ' ')
+  [ -z "$BUSY" ] && break
+  echo "  GPU held by ${BUSY//$'\n'/, } - waiting (try $try/6)"
+  sleep 10
+done
+if [ -n "$BUSY" ]; then echo "GPU busy: $(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader | tr '\n' ';')" >&2; exit 3; fi
 echo "== S3 gate: bin=$BIN ctx=$CTX $(date +%H:%M:%S)"
 
 # 1. tg after a 32K prompt: the full-layer read traffic is the dominant per-token cost at that context.
