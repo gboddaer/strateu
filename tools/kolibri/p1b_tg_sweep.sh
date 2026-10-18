@@ -38,9 +38,18 @@ pin() { local t="$1"; shift
         if [ "$NUMA" = none ]; then timeout "$t" "$@"
         else timeout "$t" numactl --cpunodebind="$NUMA" --membind="$NUMA" "$@"; fi; }
 
+# Require the T4 to be empty for 6 consecutive samples (30 s) before starting.  ONE empty sample is not
+# enough: bench.py leaves a gap between its pp and tg subprocesses, and this sweep started in exactly that
+# gap (measured: it ran concurrently with the KL leg it was waiting behind - two contexts on the T4 - which
+# invalidates every timing number it produces).
 if [ "${WAIT_GPU:-1}" = 1 ]; then
-  for i in $(seq 1 720); do
-    [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null)" ] && { echo "GPU free after $((i*5))s"; break; }
+  clear=0
+  for i in $(seq 1 1440); do
+    if [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null)" ]; then
+      clear=$((clear + 1)); [ $clear -ge 6 ] && { echo "GPU idle 30s; starting after $((i*5))s"; break; }
+    else
+      clear=0
+    fi
     sleep 5
   done
 fi
