@@ -1241,8 +1241,15 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                 int64_t res_rows = 0;
                 ++s.pf_clock;
                 const int64_t f16_stride = 3 * (int64_t) FF * N;
+                // Promote only the chunk's top-P experts by row count (pf_touch is LPT-sorted, so the first P
+                // cover ~85% of the rows): the promotion stream is PCIe-bound (2.21 MB/expert), and the small
+                // experts are cheap pool-side.  P = STRATA_KOLIBRI_RES_TOP (default 48).
+                static const int res_top = std::getenv("STRATA_KOLIBRI_RES_TOP") ?
+                                               std::atoi(std::getenv("STRATA_KOLIBRI_RES_TOP")) : 48;
                 if (b.f16) {
+                    int pi = 0;
                     for (int x : s.pf_touch) {
+                        if (++pi > res_top) { s.pf_miss.push_back(x); continue; }
                         int slot = -1;
                         for (int s_i = 0; s_i < b.n_cached; ++s_i) if (b.f16_slot_id[s_i] == x) { slot = s_i; break; }
                         if (slot < 0) {   // promote: free slot, else evict least-recently-touched
@@ -1263,7 +1270,6 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                         s.pf_res.push_back(x);
                         s.pf_res_slot.push_back(slot);
                     }
-                    s.pf_miss.clear();   // every touched expert is served from the cache (promoted if needed)
                 } else {
                     for (int x : s.pf_touch) s.pf_miss.push_back(x);
                 }
