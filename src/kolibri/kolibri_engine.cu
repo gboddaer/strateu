@@ -317,6 +317,36 @@ __global__ void k_gemv(const uint8_t* W, size_t row_bytes, size_t expert_bytes, 
     acc = block_sum(acc, sh);
     if (threadIdx.x == 0) y[(size_t) sel * n_out + o] = acc;
 }
+/// S7: the prefill router GEMM, tiled over 32 tokens per block.  nsys priced k_gemv<T_F32> at 19 ms x 100 =
+/// 1.94 s of the pp512 wall: 196k tiny blocks (one per expert x token), each reading the 10 KB row, launch-
+/// and latency-bound at 53 GFLOP/s.  Here one block per (expert, 32-token tile) loads the row ONCE and reuses
+/// it across 32 tokens.  BITWISE-identical to k_gemv<T_F32> by construction: with n_in/32 = 80 chunks and 256
+/// threads, k_gemv's thread tid sums exactly chunk tid (one iteration), l = 0..31 sequential, then block_sum
+/// over 256 lanes (lanes 80..255 contribute 0) - this kernel reproduces that per-token order exactly.
+template <int TT> __global__ void k_router_tile(const uint8_t* W, const float* x, size_t x_stride, float* y,
+                                                int n_in, int T, int n_out) {
+    __shared__ float sh[kThreads];
+    const int o = blockIdx.x, t0 = blockIdx.y * 32;
+    const uint8_t* row = W + (size_t) o * (size_t) (n_in * 4);   // T_F32 row, as bytes for deq32
+    float acc[32];
+    #pragma unroll
+    for (int j = 0; j < 32; ++j) acc[j] = 0.f;
+    const int c = threadIdx.x;   // n_in/32 = 80 chunks: lanes 0..79 active, 80..255 idle (acc 0) - as in k_gemv
+    if (c < n_in / 32) {
+        float v[32];
+        deq32<TT>(row, c, v);
+        for (int j = 0; j < 32; ++j) {
+            const float* xc = x + (size_t) (t0 + j) * x_stride + 32 * c;
+            for (int l = 0; l < 32; ++l) acc[j] += v[l] * xc[l];
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        const float a = block_sum(acc[j], sh);
+        if (threadIdx.x == 0 && t0 + j < T) y[(size_t) (t0 + j) * n_out + o] = a;
+    }
+}
+
 template <int T> __device__ void k_row_body(const uint8_t* W, size_t row_bytes, int row, int n, float* out) {
     const uint8_t* r = W + (size_t) row * row_bytes;
     for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < n / 32; c += gridDim.x * blockDim.x) deq32<T>(r, c, out + 32 * c);
@@ -1119,6 +1149,9 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                     std::fprintf(stderr, "strata-kolibri: cublas router sgemm failed (%d)\n", (int) cst);
                     std::exit(1);
                 }
+            } else if (std::getenv("STRATA_KOLIBRI_ROUTER_TILE") != nullptr) {
+                k_router_tile<T_F32><<<dim3((int) g.n_expert, ((int) T + 31) / 32), kThreads, 0, g_st>>>(
+                    wr.d, s.h_m, (size_t) N, s.router_m, (int) N, (int) T, (int) g.n_expert);
             } else {
                 k_gemv<T_F32><<<dim3(g.n_expert, T), kThreads>>>(wr.d, wr.row_bytes, 0, nullptr, N, s.h_m, (size_t) N,
                                                              s.router_m, (int) g.n_expert);
