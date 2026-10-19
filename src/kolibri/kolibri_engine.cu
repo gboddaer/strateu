@@ -1146,7 +1146,14 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                     ++e.pf_chunks;
                 }
                 KC(cudaMemcpy(s.gout_m, s.ey_h, (size_t) NK * N * 4, cudaMemcpyHostToDevice));
-            } else
+            } else {
+            // The mmvq fallback leg: per-token activation quantize, gate/up per selection, SwiGLU, h quantize,
+            // down per selection.  This leg MUST stay inside the else.  The pool leg above already produced the
+            // expert output (native_down_rows -> s.ey_h) and copied it into s.gout_m, and this leg writes
+            // s.gout_m from s.eg_m/s.eu_m, which the pool NEVER fills.  Measured (nsys, staged pp512, 24 workers):
+            // 76,750 native_q4_k_mmvq launches = 6.10 s = 67% of all GPU kernel time and 42% of the pp512 wall,
+            // all of it dead work, and it OVERWROTE the pool's result with stale-buffer garbage - the cause of
+            // the prefill path's KL 0.075 and of its run-to-run non-determinism (unstaged vs itself meanKL 0.0196).
             for (int t = 0; t < T; ++t) {
                 strata::kernels::native_quantize_q8_1(s.h_m + (size_t) t * N, g_q8, N, 1, g_st);
                 for (int k = 0; k < K; ++k) {
@@ -1165,6 +1172,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                 strata::kernels::native_mmvq(b.L.d_type, blob, (const char*) g_q8, s.gout_m + (size_t) sel * N,
                                              FF, N, 1, g_st);
             }
+            }   // end the mmvq fallback: the pool leg above must not fall through into the swiglu+down leg
         }
         {
             const Dense& wg = e.dense.at(L(l, "ffn_gate_shexp.weight"));
