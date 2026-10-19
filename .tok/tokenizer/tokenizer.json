@@ -1,0 +1,13 @@
+{
+ "model": "gpt2",
+ "pre": "kolibri1",
+ "vocab_size": 128000,
+ "n_merges": 127644,
+ "special_ids": {
+  "tokenizer.ggml.eos_token_id": 127906,
+  "tokenizer.ggml.padding_token_id": 127901
+ },
+ "add_bos_token": false,
+ "pre_pattern": "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+ "pre_pattern_source": "~/llama.cpp src/llama-vocab.cpp L388 (LLAMA_VOCAB_PRE_TYPE_QWEN2)"
+}
