@@ -108,6 +108,13 @@ struct LayerBlobs {
     // this, not on native_ok.
     bool pool_ok = false;
     strata::kernels::cpu::NativeFmt fmt;  // the CPU pool's view of the same blob (native_fmt at load)
+    // S7 expert fp16 cache (STRATA_KOLIBRI_EXPERT_F16=N): the first N experts of this layer dequantized to FP16
+    // ONCE at load, device-resident.  Per expert the layout is [gate (n_ff x n_embd) | up | down (n_embd x n_ff)],
+    // the same slice order as the blob, so a slice is one dequant_f16 of the blob's ggml block rows.  Routed
+    // experts in [0, n_cached) can run their GEMMs as Gemm::f16 (cublas fp16/fp32-acc) with no per-call dequant
+    // and no PCIe blob read; the rest stay on the pool / pinned-table path.  Increment A: cache only, no routing.
+    uint16_t* f16 = nullptr;
+    int n_cached = 0;
 };
 
 /// A persistent worker pool: run(f, n) splits [0, n) over n shards across the pool (caller runs shard 0) and
@@ -193,6 +200,11 @@ struct Engine {
     // so this is the only way to price it.  Gated on --counters: it adds a 12 KB D2H, so it must never run in a
     // timed run that did not ask for counters.
     long long pf_hit_entries = 0, pf_entry_n = 0, pf_uniq_sum = 0, pf_cov_chunks = 0;
+    // S7 expert-cache coverage probe (STRATA_KOLIBRI_EXPERT_HIST=1): per-layer counts of routed touches per expert
+    // id, over the whole run.  The fp16 VRAM cache fits ~2036 of 19,200 experts (10.6%); whether it pays is
+    // decided by the touch SKEW - top-K coverage of this histogram is the cache's hit-rate curve.
+    bool hist_on = false;
+    std::vector<std::vector<uint64_t>> touch_hist;   // [layer][expert] touch counts
     long long pf_stage_chunks = 0, pf_stage_bytes = 0;   // S7 staging: chunks served from VRAM, bytes staged
     // S7 phase timers: the pool leg is 1.76 GFLOP/s/core against pool_bench's 43.7 on the SAME kernels (25x),
     // so the term is inside this loop.  Name it: gu rows / h-quantize / down rows, per 64-row batch.
@@ -1053,6 +1065,12 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
             strata::kernels::native_router_sigmoid_logit_add(s.router_m, e.f32.at(L(l, "exp_probs_b.bias")),
                                                              s.ids_m, s.wts_m, T, g_st);
         }
+        if (e.hist_on) {   // coverage probe: routed touches per expert id, this layer, this chunk
+            std::vector<int> hid((size_t) NK);
+            KC(cudaMemcpy(hid.data(), s.ids_m, (size_t) NK * sizeof(int), cudaMemcpyDeviceToHost));
+            std::vector<uint64_t>& h = e.touch_hist[(size_t) l];
+            for (int i = 0; i < NK; ++i) ++h[(size_t) hid[(size_t) i]];
+        }
         strata::kernels::native_quantize_q8_1(s.h_m, s.xq8_m, N * T, 1, g_st);   // T contiguous rows = one column (q36)
         k_to_f16<<<grid1((int64_t) T * N), kThreads>>>((const float*) s.h_m, s.x16, (int64_t) T * N);
         static const bool pool_all = std::getenv("STRATA_KOLIBRI_POOL_ALL") != nullptr;   // A/B: the pool for every layer
@@ -1484,6 +1502,30 @@ void print_counters(Engine& e, const char* tag) {
                      e.slots, e.pf_cov_chunks, e.pf_entry_n, 100.0 * e.pf_hit_entries / (double) e.pf_entry_n,
                      (double) e.pf_uniq_sum / e.pf_cov_chunks);
     }
+    if (e.hist_on && !e.touch_hist.empty()) {
+        // Top-K coverage per layer: the fp16 VRAM cache's hit-rate curve.  16 GB / 7.86 MB = ~2036 experts =
+        // ~40/layer.  Uniform router touches give coverage ~K/n_expert; skew above that line is what makes the
+        // cache pay.
+        const int NE = (int) e.touch_hist[0].size();
+        const int ks[] = {16, 24, 32, 40, 48, 64, 96, 128, 192, 256};
+        std::fprintf(stderr, "CNT expert touch coverage (per-layer top-K, %d layers, %d experts):\n",
+                     (int) e.touch_hist.size(), NE);
+        for (int K : ks) {
+            if (K > NE) break;
+            double cov = 0;
+            for (auto& h : e.touch_hist) {
+                std::vector<uint64_t> s(h);
+                std::partial_sort(s.begin(), s.begin() + K, s.end(), std::greater<uint64_t>());
+                uint64_t tot = 0, top = 0;
+                for (int i = 0; i < NE; ++i) tot += h[(size_t) i];
+                for (int i = 0; i < K; ++i) top += s[(size_t) i];
+                cov += (double) top / (double) tot;
+            }
+            cov /= (double) e.touch_hist.size();
+            std::fprintf(stderr, "  top-%d: %.1f%% covered (uniform would be %.1f%%)\n", K, 100.0 * cov,
+                         100.0 * K / NE);
+        }
+    }
     if (e.pf_chunks > 0) {
         const double ms = (double) e.pf_pool_ms, gb = e.pf_pool_bytes / 1e9;
         std::fprintf(stderr,
@@ -1758,6 +1800,7 @@ bool load(const std::string& path, Engine& e, std::string& err) {
 
     // pass 1: the routed experts, layer by layer, repacked into pinned [gate|up|down] blob tables
     e.blobs.resize((size_t) e.g.n_layers);
+    if (e.hist_on) e.touch_hist.assign((size_t) e.g.n_layers, std::vector<uint64_t>((size_t) e.g.n_expert, 0));
     size_t expert_bytes = 0;
     for (int64_t l = 0; l < e.g.n_layers; ++l) {
         const strata::TensorInfo *gate = nullptr, *up = nullptr, *down = nullptr;
@@ -1811,6 +1854,25 @@ bool load(const std::string& path, Engine& e, std::string& err) {
             std::memcpy(blob, gs + (size_t) ex * gu_eb, gu_rows * b.L.gu_row);
             std::memcpy(blob + b.L.up_off, us + (size_t) ex * gu_eb, gu_rows * b.L.gu_row);
             std::memcpy(blob + b.L.down_off, ds + (size_t) ex * d_eb, d_rows * b.L.d_row);
+        }
+        // S7 increment A: warm the fp16 expert cache.  Env-gated; gate-off leaves the plain path untouched.
+        static const int expert_f16_n = std::getenv("STRATA_KOLIBRI_EXPERT_F16") ?
+                                            std::atoi(std::getenv("STRATA_KOLIBRI_EXPERT_F16")) : 0;
+        if (expert_f16_n > 0 && strata::kernels::dequant_bf16_supported(b.L.gu_type) &&
+            strata::kernels::dequant_bf16_supported(b.L.d_type)) {
+            const int nc = std::min<int>(expert_f16_n, (int) e.g.n_expert);
+            const size_t gu_n = (size_t) e.g.n_ff * (size_t) e.g.n_embd, d_n = (size_t) e.g.n_embd * (size_t) e.g.n_ff;
+            uint16_t* p = nullptr;
+            KC(cudaMalloc((void**) &p, (size_t) nc * (2 * gu_n + d_n) * 2));
+            for (int ex = 0; ex < nc; ++ex) {
+                const uint8_t* blob = b.table + (size_t) ex * b.stride;
+                uint16_t* out = p + (size_t) ex * (2 * gu_n + d_n);
+                strata::kernels::dequant_f16(b.L.gu_type, blob, 0, e.g.n_ff, e.g.n_embd, out, g_st);
+                strata::kernels::dequant_f16(b.L.gu_type, blob + b.L.up_off, 0, e.g.n_ff, e.g.n_embd, out + gu_n, g_st);
+                strata::kernels::dequant_f16(b.L.d_type, blob + b.L.down_off, 0, e.g.n_embd, e.g.n_ff, out + 2 * gu_n, g_st);
+            }
+            b.f16 = p;
+            b.n_cached = nc;
         }
         expert_bytes += b.stride * (size_t) e.g.n_expert;
     }
@@ -1923,6 +1985,7 @@ int strata::kolibri::run(int argc, char** argv) {
     KC(cudaStreamCreate(&g_st));
     KC(cudaMalloc(&g_q8, strata::kernels::native_q8_1_bytes((int) kActBuf, 1)));
     e.counters = counters != 0;   // before load(): the VRAM report is printed there
+    e.hist_on = std::getenv("STRATA_KOLIBRI_EXPERT_HIST") != nullptr;   // coverage probe; before load() so the table is sized
     if (!load(model, e, err)) {
         std::fprintf(stderr, "strata-kolibri: %s\n", err.c_str());
         return 1;
