@@ -1103,8 +1103,26 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
         k_rms_rows<<<T, kThreads>>>(s.x_m, e.f32.at(L(l, "ffn_norm.weight")), s.h_m, N, e.eps);
         {
             const Dense& wr = e.dense.at(L(l, "ffn_gate_inp.weight"));
-            k_gemv<T_F32><<<dim3(g.n_expert, T), kThreads>>>(wr.d, wr.row_bytes, 0, nullptr, N, s.h_m, (size_t) N,
+            if (std::getenv("STRATA_KOLIBRI_ROUTER_GEMM") != nullptr) {
+                // nsys priced the fp32 SIMT router gemv at 19 ms x 100 = 1.94 s of the pp512 wall.  cublas SGEMM
+                // on the SAME fp32 inputs is ~100x faster, fp32 accumulate, fp32 logits.  DEFAULT OFF: measured
+                // KL 0.02482 vs the 0.02 clause (cache-only baseline 0.01087) - cublas's accumulation order
+                // differs from the SIMT gemv's at the last bits, and the router's top-k flips at near-ties.  An
+                // f16 router is worse (KL 0.135).  The lever needs a SIMT kernel that keeps k_gemv's sum order.
+                const float one = 1.0f, zero = 0.0f;
+                cublasStatus_t cst = cublasSetStream(e.blas, g_st);
+                if (cst == CUBLAS_STATUS_SUCCESS)
+                    cst = cublasSgemm(e.blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) g.n_expert, (int) T, (int) N, &one,
+                                      (const float*) wr.d, (int) N, (const float*) s.h_m, (int) N, &zero,
+                                      s.router_m, (int) g.n_expert);
+                if (cst != CUBLAS_STATUS_SUCCESS) {
+                    std::fprintf(stderr, "strata-kolibri: cublas router sgemm failed (%d)\n", (int) cst);
+                    std::exit(1);
+                }
+            } else {
+                k_gemv<T_F32><<<dim3(g.n_expert, T), kThreads>>>(wr.d, wr.row_bytes, 0, nullptr, N, s.h_m, (size_t) N,
                                                              s.router_m, (int) g.n_expert);
+            }
             strata::kernels::native_router_sigmoid_logit_add(s.router_m, e.f32.at(L(l, "exp_probs_b.bias")),
                                                              s.ids_m, s.wts_m, T, g_st);
         }
@@ -1115,8 +1133,11 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
             for (int i = 0; i < NK; ++i) ++h[(size_t) hid[(size_t) i]];
         }
         strata::kernels::native_quantize_q8_1(s.h_m, s.xq8_m, N * T, 1, g_st);   // T contiguous rows = one column (q36)
-        k_to_f16<<<grid1((int64_t) T * N), kThreads>>>((const float*) s.h_m, s.x16, (int64_t) T * N);
+        k_to_f16<<<grid1((int64_t) T * N), kThreads>>>((const float*) s.h_m, s.x16, (int64_t) T * N);   // ffn-norm h for the shared-FFN GEMMs (the router sgemm takes fp32 h_m directly)
         static const bool pool_all = std::getenv("STRATA_KOLIBRI_POOL_ALL") != nullptr;   // A/B: the pool for every layer
+        // The cache branch stays pool-side: routing the native_ok layers' grouped kernel through the fp16 cache
+        // measured KL 0.13050 (gate FAIL) - that kernel is bitwise-equal to llama.cpp's arithmetic, and fp16
+        // weights+activations deviate ~1e-3 per layer across 50 layers, which the KL-vs-llama clause forbids.
         if (b.native_ok && !(pool_all && e.cpu_threads > 0)) {
             if (e.counters && e.slots > 0) {   // pricing only; --counters runs
                 std::vector<int> hid((size_t) NK);
@@ -2080,11 +2101,15 @@ bool load(const std::string& path, Engine& e, std::string& err) {
         int64_t f16_bytes = 0;
         for (auto& kv : e.dense) {
             Dense& w = kv.second;
-            if (w.shape.size() != 2 || !strata::kernels::dequant_bf16_supported(w.type)) continue;
+            if (w.shape.size() != 2) continue;
             const int64_t K = w.shape[0], N = w.shape[1];
+            const bool dq = strata::kernels::dequant_bf16_supported(w.type);
+            const bool cp = (w.type == T_F32);   // F32 weights (the router) need a plain f32->f16 copy, not a dequant
+            if (!dq && !cp) continue;
             uint16_t* p = nullptr;
             KC(cudaMalloc((void**) &p, (size_t) N * K * 2));
-            strata::kernels::dequant_f16(w.type, w.d, 0, N, K, p, g_st);
+            if (dq) strata::kernels::dequant_f16(w.type, w.d, 0, N, K, p, g_st);
+            else k_to_f16<<<grid1(N * K), kThreads>>>((const float*) w.d, (__half*) p, N * K);
             w.f16 = p;
             f16_bytes += (int64_t) N * K * 2;
         }
