@@ -363,7 +363,8 @@ __global__ void k_pos_add(int* pos) { *pos += 1; }
 // activation rows of one expert contiguously).  out[i] = x[tok[i / N] * N + i % N].
 __global__ void k_gather_f16(const __half* x, const int32_t* tok, __half* out, int N_) {
     int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    out[i] = x[(size_t) tok[(int)(i / N_)] * (size_t) N_ + (int)(i % N_)];
+    const int32_t t = tok[i / N_];
+    out[i] = t >= 0 ? x[(size_t) t * (size_t) N_ + (int)(i % N_)] : __half(0.f);   // tok -1 = padded row
 }
 
 __global__ void k_to_f16(const float* x, __half* y, int64_t n) {
@@ -785,10 +786,22 @@ struct Scratch {
     // no PCIe blob read, no per-call dequant, no pool worker.  Sized to a full chunk (kTmax * K selections).
     uint16_t *res_x16 = nullptr, *res_h16 = nullptr;
     float *res_g = nullptr, *res_u = nullptr, *res_h = nullptr, *res_ey = nullptr;
-    int32_t* res_tok = nullptr;              // device: token row per selection (gather index)
+    int32_t* res_tok = nullptr;              // device: token row per selection (gather index; -1 = padded)
     float* res_ey_h = nullptr;               // pinned: D2H staging in expert-grouped row order, scattered to ey_h
     std::vector<int32_t> res_tok_h, pf_res, pf_miss, pf_res_slot;
     uint64_t pf_clock = 0;                   // LRU clock for the fp16 expert cache (one tick per layer-chunk)
+    // S7 increment C: batched resident GEMMs.  Each expert's tokens are cut into blocks of kResBlk rows (last
+    // block padded); one cublasGemmBatchedEx per slice per layer replaces ~155 launches.  Pointer arrays live on
+    // the device (cublas dereferences them on the GPU); host staging builds them, H2D ships them.
+    static constexpr int kResBlk = 32;
+    static constexpr int kResBlkMax = 512;   // sum ceil(m_i/32) <= n_expert + NK/32 = 384 + 96
+    const uint16_t **pa_g = nullptr, **pa_u = nullptr, **pa_d = nullptr;
+    const uint16_t **pb_x = nullptr, **pb_h = nullptr;
+    float **pc_g = nullptr, **pc_u = nullptr, **pc_ey = nullptr;
+    std::vector<const uint16_t*> pa_g_h, pa_u_h, pa_d_h, pb_x_h, pb_h_h;
+    std::vector<float*> pc_g_h, pc_u_h, pc_ey_h;
+    std::vector<int32_t> blk_expert, blk_lo, blk_m;   // per block: expert id, selection offset, valid rows
+    int pf_nblk = 0;
     // S7: per-chunk expert staging.  The grouped prefill kernel reads the full 2.21 MB blob PER ENTRY (3072
     // entries per layer-chunk = 6.79 GB over PCIe at ~12 GB/s = 566 ms/layer), while the chunk touches only ~150
     // distinct experts.  Stage the touched set once per layer-chunk (150 x 2.21 MB = 332 MB = ~28 ms) and run the
@@ -1233,25 +1246,54 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                 } else {
                     for (int x : s.pf_touch) s.pf_miss.push_back(x);
                 }
-                // Resident GEMMs: per touched expert, gather its tokens' activation rows and run gate/up -> SwiGLU
-                // -> down as cublas fp16 (fp32 accumulate).  All launches on g_st, stream-ordered after the
-                // promotions above and overlapping the pool's CPU work below.
+                // S7 increment C: resident GEMMs as ONE batched cublas call per slice per layer.  Each touched
+                // expert's tokens are cut into blocks of kResBlk rows (last block zero-padded via tok = -1); the
+                // gather ships the activation rows block-contiguous, gate/up -> SwiGLU -> to-f16 -> down run as
+                // three f16_batched calls, and the D2H lands the whole block array in res_ey_h for the scatter
+                // below.  Launches per layer: ~15, replacing ~1085 (11.6k/chunk = ~0.9 s of launch overhead).
                 if (b.f16) {
+                    constexpr int M = Scratch::kResBlk;
+                    int nblk = 0;
+                    s.blk_expert.clear(); s.blk_lo.clear(); s.blk_m.clear();
                     for (size_t ri = 0; ri < s.pf_res.size(); ++ri) {
                         const int x = s.pf_res[ri], slot = s.pf_res_slot[ri];
                         const int lo = cnt[x], hi = cnt[x + 1], m = hi - lo;
-                        for (int a = 0; a < m; ++a) s.res_tok_h[a] = ord[(size_t) lo + a] / K;
-                        KC(cudaMemcpyAsync(s.res_tok, s.res_tok_h.data(), (size_t) m * 4, cudaMemcpyHostToDevice, g_st));
                         const uint16_t* xe = b.f16 + (size_t) slot * f16_stride;
-                        k_gather_f16<<<grid1((int64_t) m * N), kThreads>>>((const __half*) s.x16, s.res_tok, (__half*) s.res_x16, N);
-                        e.gemm.f16(s.res_x16, xe, s.res_g, m, FF, N);
-                        e.gemm.f16(s.res_x16, xe + (int64_t) FF * N, s.res_u, m, FF, N);
-                        k_swiglu_rows<<<grid1((int64_t) m * FF), kThreads>>>(s.res_g, s.res_u, s.res_h, (int64_t) m * FF);
-                        k_to_f16<<<grid1((int64_t) m * FF), kThreads>>>(s.res_h, (__half*) s.res_h16, (int64_t) m * FF);
-                        e.gemm.f16(s.res_h16, xe + 2 * (int64_t) FF * N, s.res_ey, m, N, FF);
-                        KC(cudaMemcpyAsync(s.res_ey_h + res_rows * N, s.res_ey, (size_t) m * N * 4, cudaMemcpyDeviceToHost, g_st));
-                        res_rows += m;
+                        for (int off = 0; off < m; off += M) {
+                            const int mb = std::min(M, m - off);
+                            for (int a = 0; a < mb; ++a) s.res_tok_h[(size_t) nblk * M + a] = ord[(size_t) lo + off + a] / K;
+                            for (int a = mb; a < M; ++a) s.res_tok_h[(size_t) nblk * M + a] = -1;
+                            s.pa_g_h[nblk] = xe;
+                            s.pa_u_h[nblk] = xe + (int64_t) FF * N;
+                            s.pa_d_h[nblk] = xe + 2 * (int64_t) FF * N;
+                            s.pb_x_h[nblk] = s.res_x16 + (int64_t) nblk * M * N;
+                            s.pb_h_h[nblk] = s.res_h16 + (int64_t) nblk * M * FF;
+                            s.pc_g_h[nblk] = s.res_g + (int64_t) nblk * M * FF;
+                            s.pc_u_h[nblk] = s.res_u + (int64_t) nblk * M * FF;
+                            s.pc_ey_h[nblk] = s.res_ey + (int64_t) nblk * M * N;
+                            s.blk_expert.push_back(x); s.blk_lo.push_back(lo + off); s.blk_m.push_back(mb);
+                            ++nblk;
+                        }
                     }
+                    s.pf_nblk = nblk;
+                    res_rows = (int64_t) nblk * M;
+                    const int64_t rows = res_rows;
+                    KC(cudaMemcpyAsync(s.res_tok, s.res_tok_h.data(), (size_t) rows * 4, cudaMemcpyHostToDevice, g_st));
+                    KC(cudaMemcpyAsync(s.pa_g, s.pa_g_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
+                    KC(cudaMemcpyAsync(s.pa_u, s.pa_u_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
+                    KC(cudaMemcpyAsync(s.pa_d, s.pa_d_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
+                    KC(cudaMemcpyAsync(s.pb_x, s.pb_x_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
+                    KC(cudaMemcpyAsync(s.pb_h, s.pb_h_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
+                    KC(cudaMemcpyAsync(s.pc_g, s.pc_g_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
+                    KC(cudaMemcpyAsync(s.pc_u, s.pc_u_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
+                    KC(cudaMemcpyAsync(s.pc_ey, s.pc_ey_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
+                    k_gather_f16<<<grid1(rows * N), kThreads>>>((const __half*) s.x16, s.res_tok, (__half*) s.res_x16, N);
+                    e.gemm.f16_batched(s.pa_g, s.pb_x, s.pc_g, M, FF, N, nblk);
+                    e.gemm.f16_batched(s.pa_u, s.pb_x, s.pc_u, M, FF, N, nblk);
+                    k_swiglu_rows<<<grid1(rows * FF), kThreads>>>(s.res_g, s.res_u, s.res_h, rows * FF);
+                    k_to_f16<<<grid1(rows * FF), kThreads>>>(s.res_h, (__half*) s.res_h16, rows * FF);
+                    e.gemm.f16_batched(s.pa_d, s.pb_h, s.pc_ey, M, N, FF, nblk);
+                    KC(cudaMemcpyAsync(s.res_ey_h, s.res_ey, (size_t) rows * N * 4, cudaMemcpyDeviceToHost, g_st));
                 }
                 const std::vector<int32_t>& pool_list = b.f16 ? s.pf_miss : s.pf_touch;
                 const auto pf_t0 = std::chrono::steady_clock::now();
@@ -1302,17 +1344,16 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                     e.pf_experts += touched;
                     ++e.pf_chunks;
                 }
-                // S7 increment B: the resident rows land in res_ey_h (expert-grouped order); scatter them into
-                // s.ey_h at their selection rows.  The pool wrote the miss rows; every selection row is covered
-                // exactly once, and the existing H2D below ships the whole NK x N block unchanged.
-                if (b.f16 && res_rows > 0) {
+                // S7 increment C: the resident rows land in res_ey_h (block order, padded rows ignored); scatter
+                // them into s.ey_h at their selection rows.  Every selection row is covered exactly once, and the
+                // existing H2D below ships the whole NK x N block unchanged.
+                if (b.f16 && s.pf_nblk > 0) {
                     KC(cudaStreamSynchronize(g_st));
-                    int64_t roff = 0;
-                    for (int x : s.pf_res) {
-                        const int lo = cnt[x], hi = cnt[x + 1], m = hi - lo;
-                        for (int a = 0; a < m; ++a)
-                            std::memcpy(s.ey_h + (size_t) ord[(size_t) lo + a] * N, s.res_ey_h + (roff + a) * N, (size_t) N * 4);
-                        roff += m;
+                    constexpr int M = Scratch::kResBlk;
+                    for (int bi = 0; bi < s.pf_nblk; ++bi) {
+                        const int lo = s.blk_lo[bi], mb = s.blk_m[bi];
+                        for (int a = 0; a < mb; ++a)
+                            std::memcpy(s.ey_h + (size_t) ord[(size_t) lo + a] * N, s.res_ey_h + ((int64_t) bi * M + a) * N, (size_t) N * 4);
                     }
                 }
                 // STREAM RACE (self-determinism probe: two runs, same binary/config, self-KL mean 9.67,
@@ -1513,16 +1554,26 @@ void init_scratch(const Engine& e, Scratch& s) {
         KC(cudaHostAlloc((void**) &s.ff, (size_t) ents * FF * 4, cudaHostAllocDefault));
         KC(cudaHostAlloc((void**) &s.hq, (size_t) ents * h_b, cudaHostAllocDefault));
         KC(cudaHostAlloc((void**) &s.ey_h, (size_t) ents * N * 4, cudaHostAllocDefault));
-        if (expert_f16_n() > 0) {   // S7 increment B: resident-expert GEMM working set (device + pinned)
-            KC(cudaMalloc((void**) &s.res_x16, (size_t) ents * N * 2));
-            KC(cudaMalloc((void**) &s.res_g, (size_t) ents * FF * 4));
-            KC(cudaMalloc((void**) &s.res_u, (size_t) ents * FF * 4));
-            KC(cudaMalloc((void**) &s.res_h, (size_t) ents * FF * 4));
-            KC(cudaMalloc((void**) &s.res_h16, (size_t) ents * FF * 2));
-            KC(cudaMalloc((void**) &s.res_ey, (size_t) ents * N * 4));
-            KC(cudaMalloc((void**) &s.res_tok, (size_t) ents * 4));
-            KC(cudaHostAlloc((void**) &s.res_ey_h, (size_t) ents * N * 4, cudaHostAllocDefault));
-            s.res_tok_h.resize((size_t) ents);
+        if (expert_f16_n() > 0) {   // S7 increment B/C: resident-expert GEMM working set (device + pinned)
+            const int64_t rrows = (int64_t) Scratch::kResBlkMax * Scratch::kResBlk;
+            KC(cudaMalloc((void**) &s.res_x16, (size_t) rrows * N * 2));
+            KC(cudaMalloc((void**) &s.res_g, (size_t) rrows * FF * 4));
+            KC(cudaMalloc((void**) &s.res_u, (size_t) rrows * FF * 4));
+            KC(cudaMalloc((void**) &s.res_h, (size_t) rrows * FF * 4));
+            KC(cudaMalloc((void**) &s.res_h16, (size_t) rrows * FF * 2));
+            KC(cudaMalloc((void**) &s.res_ey, (size_t) rrows * N * 4));
+            KC(cudaMalloc((void**) &s.res_tok, (size_t) rrows * 4));
+            KC(cudaHostAlloc((void**) &s.res_ey_h, (size_t) rrows * N * 4, cudaHostAllocDefault));
+            s.res_tok_h.resize((size_t) rrows);
+            const int nb = Scratch::kResBlkMax;
+            KC(cudaMalloc((void**) &s.pa_g, (size_t) nb * 8)); KC(cudaMalloc((void**) &s.pa_u, (size_t) nb * 8));
+            KC(cudaMalloc((void**) &s.pa_d, (size_t) nb * 8)); KC(cudaMalloc((void**) &s.pb_x, (size_t) nb * 8));
+            KC(cudaMalloc((void**) &s.pb_h, (size_t) nb * 8));
+            KC(cudaMalloc((void**) &s.pc_g, (size_t) nb * 8)); KC(cudaMalloc((void**) &s.pc_u, (size_t) nb * 8));
+            KC(cudaMalloc((void**) &s.pc_ey, (size_t) nb * 8));
+            s.pa_g_h.resize(nb); s.pa_u_h.resize(nb); s.pa_d_h.resize(nb);
+            s.pb_x_h.resize(nb); s.pb_h_h.resize(nb);
+            s.pc_g_h.resize(nb); s.pc_u_h.resize(nb); s.pc_ey_h.resize(nb);
         }
     }
     s.logits = dalloc(g.n_vocab);

@@ -40,6 +40,13 @@ public:
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);
 
+    /// S7 increment C: `batch` independent f16() products of the SAME shape, pointer arrays on the DEVICE
+    /// (cublasGemmBatchedEx).  One launch replaces `batch` f16() launches - the resident-expert leg's 11.6k
+    /// launches/chunk (0.9 s of launch overhead at pp512) collapse to 3 per layer.  Same layout as f16():
+    /// Y_i[T, N] = X_i[T, K] . W_i[N, K]^T, row-major, fp32 out, fp32 accumulate.
+    void f16_batched(const uint16_t* const* Warr, const uint16_t* const* Xarr, float* const* Yarr,
+                     int64_t T, int64_t N, int64_t K, int batch);
+
     /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.  `ldx` (> K) is
     /// X's padded row stride, taken only by STRATA_PF_PAD's path (0 = K).
     /// On an MMQ build a beta = 0 product whose type is covered, whose K is a multiple of 256 values and whose matrix fits

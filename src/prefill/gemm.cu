@@ -809,6 +809,21 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx f16");
 }
 
+// S7 increment C: `batch` independent f16() products of the same shape, one launch.  Pointer arrays live on the
+// DEVICE (cublasGemmBatchedEx dereferences them on the GPU).  Layout mirrors f16() exactly: column-major view
+// C[N, T] = W^T(N, K) . X(K, T), lda = ldb = K, ldc = N, fp16 in, fp32 out, fp32 accumulate.
+void Gemm::f16_batched(const uint16_t* const* Warr, const uint16_t* const* Xarr, float* const* Yarr,
+                       int64_t T, int64_t N, int64_t K, int batch) {
+    const float alpha = 1.0f, beta = 0.0f;
+    ck(cublasGemmBatchedEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha,
+                           (const void* const*) Warr, CUDA_R_16F, (int) K,
+                           (const void* const*) Xarr, CUDA_R_16F, (int) K, &beta,
+                           (void* const*) Yarr, CUDA_R_32F, (int) N,
+                           (int) batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+       "cublasGemmBatchedEx f16");
+    STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmBatchedEx f16");
+}
+
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
 bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int64_t T, int64_t N, int64_t K,
                       int64_t ldy) {
