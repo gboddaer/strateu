@@ -95,6 +95,12 @@ static inline bool dense_f16_on() {
     return on;
 }
 
+// S7 expert fp16 cache: experts per layer to keep VRAM-resident (STRATA_KOLIBRI_EXPERT_F16=N).  0 = off.
+static inline int expert_f16_n() {
+    static const int n = std::getenv("STRATA_KOLIBRI_EXPERT_F16") ? std::atoi(std::getenv("STRATA_KOLIBRI_EXPERT_F16")) : 0;
+    return n;
+}
+
 struct LayerBlobs {
     strata::kernels::NativeExpertLayout L;
     size_t stride = 0;              // blob slot bytes, block-aligned (the lcm of the types' super-blocks)
@@ -115,6 +121,13 @@ struct LayerBlobs {
     // and no PCIe blob read; the rest stay on the pool / pinned-table path.  Increment A: cache only, no routing.
     uint16_t* f16 = nullptr;
     int n_cached = 0;
+    // S7 increment B: slot -> expert id (-1 = free) and last-touch chunk, for LRU promotion.  The coverage probe
+    // showed the hot experts are scattered across the id space (top-40 by frequency = 82.8% of touches), so the
+    // cache must hold the HOT experts, not ids 0..N-1: a touched expert that misses is promoted into a free slot,
+    // evicting the least-recently-touched, and pf_touch's LPT order (biggest-first) promotes the chunk's biggest
+    // experts first.
+    std::vector<int32_t> f16_slot_id;
+    std::vector<uint64_t> f16_slot_last;
 };
 
 /// A persistent worker pool: run(f, n) splits [0, n) over n shards across the pool (caller runs shard 0) and
@@ -200,6 +213,7 @@ struct Engine {
     // so this is the only way to price it.  Gated on --counters: it adds a 12 KB D2H, so it must never run in a
     // timed run that did not ask for counters.
     long long pf_hit_entries = 0, pf_entry_n = 0, pf_uniq_sum = 0, pf_cov_chunks = 0;
+    long long pf_f16_promotes = 0;   // S7 increment B: fp16 cache promotions (LRU churn measure)
     // S7 expert-cache coverage probe (STRATA_KOLIBRI_EXPERT_HIST=1): per-layer counts of routed touches per expert
     // id, over the whole run.  The fp16 VRAM cache fits ~2036 of 19,200 experts (10.6%); whether it pays is
     // decided by the touch SKEW - top-K coverage of this histogram is the cache's hit-rate curve.
@@ -345,6 +359,13 @@ __device__ float block_max(float v, float* sh) {
     return sh[0];
 }
 __global__ void k_pos_add(int* pos) { *pos += 1; }
+// S7 increment B: gather token rows of an FP16 matrix by index (the resident-expert GEMMs take the gathered
+// activation rows of one expert contiguously).  out[i] = x[tok[i / N] * N + i % N].
+__global__ void k_gather_f16(const __half* x, const int32_t* tok, __half* out, int N_) {
+    int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    out[i] = x[(size_t) tok[(int)(i / N_)] * (size_t) N_ + (int)(i % N_)];
+}
+
 __global__ void k_to_f16(const float* x, __half* y, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = __float2half(x[i]);
@@ -759,6 +780,15 @@ struct Scratch {
     float* h_host = nullptr; char* act = nullptr; float* ff = nullptr; char* hq = nullptr; float* ey_h = nullptr;
     std::vector<int32_t> exp_cnt, exp_ord;   // prefill pool: the per-expert grouping
     std::vector<int32_t> pf_touch;           // touched experts, row count DESCENDING: the LPT deal (phase timers showed 84% worker idle)
+    // S7 increment B: the resident-expert fp16 GEMM working set.  Picks whose expert is in the VRAM fp16 cache
+    // (id < b.n_cached) run their gate/up/down products as cublas fp16 GEMMs on the gathered activation rows -
+    // no PCIe blob read, no per-call dequant, no pool worker.  Sized to a full chunk (kTmax * K selections).
+    uint16_t *res_x16 = nullptr, *res_h16 = nullptr;
+    float *res_g = nullptr, *res_u = nullptr, *res_h = nullptr, *res_ey = nullptr;
+    int32_t* res_tok = nullptr;              // device: token row per selection (gather index)
+    float* res_ey_h = nullptr;               // pinned: D2H staging in expert-grouped row order, scattered to ey_h
+    std::vector<int32_t> res_tok_h, pf_res, pf_miss, pf_res_slot;
+    uint64_t pf_clock = 0;                   // LRU clock for the fp16 expert cache (one tick per layer-chunk)
     // S7: per-chunk expert staging.  The grouped prefill kernel reads the full 2.21 MB blob PER ENTRY (3072
     // entries per layer-chunk = 6.79 GB over PCIe at ~12 GB/s = 566 ms/layer), while the chunk touches only ~150
     // distinct experts.  Stage the touched set once per layer-chunk (150 x 2.21 MB = 332 MB = ~28 ms) and run the
@@ -990,7 +1020,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
     }
     for (int64_t l = 0; l < g.n_layers; ++l) {
         const bool sliding = strata::core::is_swa_layer(g, l);
-        const LayerBlobs& b = e.blobs[(size_t) l];
+        LayerBlobs& b = e.blobs[(size_t) l];   // non-const: the fp16 cache's LRU slot table is updated in the pool leg
         k_rms_rows<<<T, kThreads>>>(s.x_m, e.f32.at(L(l, "attn_norm.weight")), s.h_m, N, e.eps);
         strata::kernels::native_quantize_q8_1(s.h_m, s.xq8_m, N * T, 1, g_st);   // T contiguous rows = one column (q36)
         k_to_f16<<<grid1((int64_t) T * N), kThreads>>>((const float*) s.h_m, s.x16, (int64_t) T * N);
@@ -1164,12 +1194,72 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                 if (pf_lpt)
                     std::sort(s.pf_touch.begin(), s.pf_touch.end(),
                               [&](int a, int b) { return (cnt[a + 1] - cnt[a]) > (cnt[b + 1] - cnt[b]); });
+                // S7 increment B: cache-resident experts run their GEMMs on the GPU from the fp16 cache - no
+                // PCIe blob read, no per-call dequant, no pool worker.  The coverage probe showed the hot experts
+                // are scattered across the id space (top-40 by frequency = 82.8% of touches), so residency is
+                // LRU-promoted, not id-ordered: each touched expert is looked up in the layer's slots, a miss is
+                // promoted into a free slot (evicting the least-recently-touched when full), and pf_touch's LPT
+                // order (biggest-first) promotes the chunk's biggest experts first.  Launches go on g_st and
+                // overlap the pool's CPU work below; the existing g_st drain before the ey_h H2D orders them.
+                // Numerics: fp16 weights + fp16 activations, fp32 accumulate (the dense-fp16 template, KL 0.00210);
+                // the pool path keeps its q8-activation arithmetic.
+                s.pf_res.clear(); s.pf_miss.clear();
+                int64_t res_rows = 0;
+                ++s.pf_clock;
+                const int64_t f16_stride = 3 * (int64_t) FF * N;
+                if (b.f16) {
+                    for (int x : s.pf_touch) {
+                        int slot = -1;
+                        for (int s_i = 0; s_i < b.n_cached; ++s_i) if (b.f16_slot_id[s_i] == x) { slot = s_i; break; }
+                        if (slot < 0) {   // promote: free slot, else evict least-recently-touched
+                            for (int s_i = 0; s_i < b.n_cached; ++s_i) if (b.f16_slot_id[s_i] < 0) { slot = s_i; break; }
+                            if (slot < 0) {
+                                slot = 0;
+                                for (int s_i = 1; s_i < b.n_cached; ++s_i) if (b.f16_slot_last[s_i] < b.f16_slot_last[slot]) slot = s_i;
+                            }
+                            const uint8_t* blob = b.table + (size_t) x * b.stride;
+                            uint16_t* out = b.f16 + (size_t) slot * f16_stride;
+                            strata::kernels::dequant_f16(b.L.gu_type, blob, 0, FF, N, out, g_st);
+                            strata::kernels::dequant_f16(b.L.gu_type, blob + b.L.up_off, 0, FF, N, out + (int64_t) FF * N, g_st);
+                            strata::kernels::dequant_f16(b.L.d_type, blob + b.L.down_off, 0, N, FF, out + 2 * (int64_t) FF * N, g_st);
+                            b.f16_slot_id[slot] = x;
+                            if (e.counters) ++e.pf_f16_promotes;
+                        }
+                        b.f16_slot_last[slot] = s.pf_clock;
+                        s.pf_res.push_back(x);
+                        s.pf_res_slot.push_back(slot);
+                    }
+                    s.pf_miss.clear();   // every touched expert is served from the cache (promoted if needed)
+                } else {
+                    for (int x : s.pf_touch) s.pf_miss.push_back(x);
+                }
+                // Resident GEMMs: per touched expert, gather its tokens' activation rows and run gate/up -> SwiGLU
+                // -> down as cublas fp16 (fp32 accumulate).  All launches on g_st, stream-ordered after the
+                // promotions above and overlapping the pool's CPU work below.
+                if (b.f16) {
+                    for (size_t ri = 0; ri < s.pf_res.size(); ++ri) {
+                        const int x = s.pf_res[ri], slot = s.pf_res_slot[ri];
+                        const int lo = cnt[x], hi = cnt[x + 1], m = hi - lo;
+                        for (int a = 0; a < m; ++a) s.res_tok_h[a] = ord[(size_t) lo + a] / K;
+                        KC(cudaMemcpyAsync(s.res_tok, s.res_tok_h.data(), (size_t) m * 4, cudaMemcpyHostToDevice, g_st));
+                        const uint16_t* xe = b.f16 + (size_t) slot * f16_stride;
+                        k_gather_f16<<<grid1((int64_t) m * N), kThreads>>>((const __half*) s.x16, s.res_tok, (__half*) s.res_x16, N);
+                        e.gemm.f16(s.res_x16, xe, s.res_g, m, FF, N);
+                        e.gemm.f16(s.res_x16, xe + (int64_t) FF * N, s.res_u, m, FF, N);
+                        k_swiglu_rows<<<grid1((int64_t) m * FF), kThreads>>>(s.res_g, s.res_u, s.res_h, (int64_t) m * FF);
+                        k_to_f16<<<grid1((int64_t) m * FF), kThreads>>>(s.res_h, (__half*) s.res_h16, (int64_t) m * FF);
+                        e.gemm.f16(s.res_h16, xe + 2 * (int64_t) FF * N, s.res_ey, m, N, FF);
+                        KC(cudaMemcpyAsync(s.res_ey_h + res_rows * N, s.res_ey, (size_t) m * N * 4, cudaMemcpyDeviceToHost, g_st));
+                        res_rows += m;
+                    }
+                }
+                const std::vector<int32_t>& pool_list = b.f16 ? s.pf_miss : s.pf_touch;
                 const auto pf_t0 = std::chrono::steady_clock::now();
                 e.pool.run([&](int shard) {
                     const auto sh_t0 = std::chrono::steady_clock::now();
                     const void* acts[64]; float* ffs[64]; const void* hqs[64]; float* eys[64];
-                    for (size_t xi = (size_t) shard; xi < s.pf_touch.size(); xi += (size_t) NS) {
-                        const int x = s.pf_touch[xi];
+                    for (size_t xi = (size_t) shard; xi < pool_list.size(); xi += (size_t) NS) {
+                        const int x = pool_list[xi];
                         const int lo = cnt[x], hi = cnt[x + 1], m = hi - lo;
                         if (m <= 0) continue;
                         if (e.counters && (size_t) shard < e.pf_shard_bytes.size()) e.pf_shard_bytes[(size_t) shard] += (long long) b.stride;
@@ -1208,9 +1298,22 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                     e.pf_pool_ms += std::chrono::duration_cast<std::chrono::microseconds>(pf_t1 - pf_t0).count() / 1000;
                     int touched = 0;
                     for (int x = 0; x < (int) g.n_expert; ++x) if (cnt[x + 1] > cnt[x]) ++touched;
-                    e.pf_pool_bytes += (long long) touched * b.stride;
+                    e.pf_pool_bytes += (long long) pool_list.size() * b.stride;
                     e.pf_experts += touched;
                     ++e.pf_chunks;
+                }
+                // S7 increment B: the resident rows land in res_ey_h (expert-grouped order); scatter them into
+                // s.ey_h at their selection rows.  The pool wrote the miss rows; every selection row is covered
+                // exactly once, and the existing H2D below ships the whole NK x N block unchanged.
+                if (b.f16 && res_rows > 0) {
+                    KC(cudaStreamSynchronize(g_st));
+                    int64_t roff = 0;
+                    for (int x : s.pf_res) {
+                        const int lo = cnt[x], hi = cnt[x + 1], m = hi - lo;
+                        for (int a = 0; a < m; ++a)
+                            std::memcpy(s.ey_h + (size_t) ord[(size_t) lo + a] * N, s.res_ey_h + (roff + a) * N, (size_t) N * 4);
+                        roff += m;
+                    }
                 }
                 // STREAM RACE (self-determinism probe: two runs, same binary/config, self-KL mean 9.67,
                 // argmax-agree 5/32, maxabs 20.1 logits).  The grouped kernel above writes s.gout_m on g_st; this
@@ -1410,6 +1513,17 @@ void init_scratch(const Engine& e, Scratch& s) {
         KC(cudaHostAlloc((void**) &s.ff, (size_t) ents * FF * 4, cudaHostAllocDefault));
         KC(cudaHostAlloc((void**) &s.hq, (size_t) ents * h_b, cudaHostAllocDefault));
         KC(cudaHostAlloc((void**) &s.ey_h, (size_t) ents * N * 4, cudaHostAllocDefault));
+        if (expert_f16_n() > 0) {   // S7 increment B: resident-expert GEMM working set (device + pinned)
+            KC(cudaMalloc((void**) &s.res_x16, (size_t) ents * N * 2));
+            KC(cudaMalloc((void**) &s.res_g, (size_t) ents * FF * 4));
+            KC(cudaMalloc((void**) &s.res_u, (size_t) ents * FF * 4));
+            KC(cudaMalloc((void**) &s.res_h, (size_t) ents * FF * 4));
+            KC(cudaMalloc((void**) &s.res_h16, (size_t) ents * FF * 2));
+            KC(cudaMalloc((void**) &s.res_ey, (size_t) ents * N * 4));
+            KC(cudaMalloc((void**) &s.res_tok, (size_t) ents * 4));
+            KC(cudaHostAlloc((void**) &s.res_ey_h, (size_t) ents * N * 4, cudaHostAllocDefault));
+            s.res_tok_h.resize((size_t) ents);
+        }
     }
     s.logits = dalloc(g.n_vocab);
     KC(cudaMalloc(&s.ids, K * sizeof(int)));
@@ -1530,9 +1644,10 @@ void print_counters(Engine& e, const char* tag) {
         const double ms = (double) e.pf_pool_ms, gb = e.pf_pool_bytes / 1e9;
         std::fprintf(stderr,
                      "CNT prefill pool: chunks=%lld experts/chunk=%.0f bytes=%.2f GB (%.0f MB/chunk) pool=%.0f ms"
-                     " (%.1f ms/chunk, %.1f GB/s)\n",
+                     " (%.1f ms/chunk, %.1f GB/s)%s\n",
                      e.pf_chunks, (double) e.pf_experts / e.pf_chunks, gb, gb * 1e3 / e.pf_chunks, ms, ms / e.pf_chunks,
-                     ms > 0 ? gb / (ms / 1000.0) : 0.0);
+                     ms > 0 ? gb / (ms / 1000.0) : 0.0,
+                     e.pf_f16_promotes > 0 ? (std::string(" promotes=") + std::to_string(e.pf_f16_promotes)).c_str() : "");
         int active = 0; long long mx = 0, mn = -1;
         for (long long v : e.pf_shard_bytes) if (v > 0) { ++active; mx = std::max(mx, v); if (mn < 0) mn = v; }
         std::fprintf(stderr, "CNT prefill shards: workers=%d active=%d bytes/min=%.2f GB max=%.2f GB\n",
@@ -1856,11 +1971,10 @@ bool load(const std::string& path, Engine& e, std::string& err) {
             std::memcpy(blob + b.L.down_off, ds + (size_t) ex * d_eb, d_rows * b.L.d_row);
         }
         // S7 increment A: warm the fp16 expert cache.  Env-gated; gate-off leaves the plain path untouched.
-        static const int expert_f16_n = std::getenv("STRATA_KOLIBRI_EXPERT_F16") ?
-                                            std::atoi(std::getenv("STRATA_KOLIBRI_EXPERT_F16")) : 0;
-        if (expert_f16_n > 0 && strata::kernels::dequant_bf16_supported(b.L.gu_type) &&
+        const int expert_f16 = expert_f16_n();
+        if (expert_f16 > 0 && strata::kernels::dequant_bf16_supported(b.L.gu_type) &&
             strata::kernels::dequant_bf16_supported(b.L.d_type)) {
-            const int nc = std::min<int>(expert_f16_n, (int) e.g.n_expert);
+            const int nc = std::min<int>(expert_f16, (int) e.g.n_expert);
             const size_t gu_n = (size_t) e.g.n_ff * (size_t) e.g.n_embd, d_n = (size_t) e.g.n_embd * (size_t) e.g.n_ff;
             uint16_t* p = nullptr;
             KC(cudaMalloc((void**) &p, (size_t) nc * (2 * gu_n + d_n) * 2));
@@ -1873,6 +1987,8 @@ bool load(const std::string& path, Engine& e, std::string& err) {
             }
             b.f16 = p;
             b.n_cached = nc;
+            b.f16_slot_id.assign((size_t) nc, -1);
+            b.f16_slot_last.assign((size_t) nc, 0);
         }
         expert_bytes += b.stride * (size_t) e.g.n_expert;
     }
