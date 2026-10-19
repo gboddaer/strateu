@@ -731,6 +731,7 @@ struct Scratch {
     // the CPU expert path's pinned host side: the layer's h, its quantized activations, the FF rows, the down rows
     float* h_host = nullptr; char* act = nullptr; float* ff = nullptr; char* hq = nullptr; float* ey_h = nullptr;
     std::vector<int32_t> exp_cnt, exp_ord;   // prefill pool: the per-expert grouping
+    std::vector<int32_t> pf_touch;           // touched experts, row count DESCENDING: the LPT deal (phase timers showed 84% worker idle)
     // S7: per-chunk expert staging.  The grouped prefill kernel reads the full 2.21 MB blob PER ENTRY (3072
     // entries per layer-chunk = 6.79 GB over PCIe at ~12 GB/s = 566 ms/layer), while the chunk touches only ~150
     // distinct experts.  Stage the touched set once per layer-chunk (150 x 2.21 MB = 332 MB = ~28 ms) and run the
@@ -1112,10 +1113,20 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                     for (int sel = 0; sel < NK; ++sel) ord[cur[g_ids_host[(size_t) sel]]++] = sel;
                 }
                 const int NS = std::min((int) g.n_expert, e.cpu_threads);
+                // Work-balanced shard deal (LPT).  The old split strode over ALL 384 expert ids, so a worker that
+                // drew the hot experts set the barrier: the phase timers measured 88.2 s of kernel work in a 22.9 s
+                // window on 24 workers = 16% parallel efficiency.  Deal the TOUCHED experts, biggest first, round
+                // robin.  Each expert's rows stay in ONE native_gu_rows/native_down_rows call, so the arithmetic is
+                // untouched and the result is bitwise-identical.
+                s.pf_touch.clear();
+                for (int x = 0; x < (int) g.n_expert; ++x) if (cnt[x + 1] > cnt[x]) s.pf_touch.push_back(x);
+                std::sort(s.pf_touch.begin(), s.pf_touch.end(),
+                          [&](int a, int b) { return (cnt[a + 1] - cnt[a]) > (cnt[b + 1] - cnt[b]); });
                 const auto pf_t0 = std::chrono::steady_clock::now();
                 e.pool.run([&](int shard) {
                     const void* acts[64]; float* ffs[64]; const void* hqs[64]; float* eys[64];
-                    for (int x = shard; x < (int) g.n_expert; x += NS) {
+                    for (size_t xi = (size_t) shard; xi < s.pf_touch.size(); xi += (size_t) NS) {
+                        const int x = s.pf_touch[xi];
                         const int lo = cnt[x], hi = cnt[x + 1], m = hi - lo;
                         if (m <= 0) continue;
                         if (e.counters && (size_t) shard < e.pf_shard_bytes.size()) e.pf_shard_bytes[(size_t) shard] += (long long) b.stride;
