@@ -178,6 +178,7 @@ struct Engine {
     // so this is the only way to price it.  Gated on --counters: it adds a 12 KB D2H, so it must never run in a
     // timed run that did not ask for counters.
     long long pf_hit_entries = 0, pf_entry_n = 0, pf_uniq_sum = 0, pf_cov_chunks = 0;
+    long long pf_stage_chunks = 0, pf_stage_bytes = 0;   // S7 staging: chunks served from VRAM, bytes staged
     cublasHandle_t blas = nullptr;
     strata::prefill::Gemm gemm;
     std::vector<unsigned long long> gexec;   // cudaGraphExec_t per layer (0 = the layer is not capturable)
@@ -727,6 +728,13 @@ struct Scratch {
     // the CPU expert path's pinned host side: the layer's h, its quantized activations, the FF rows, the down rows
     float* h_host = nullptr; char* act = nullptr; float* ff = nullptr; char* hq = nullptr; float* ey_h = nullptr;
     std::vector<int32_t> exp_cnt, exp_ord;   // prefill pool: the per-expert grouping
+    // S7: per-chunk expert staging.  The grouped prefill kernel reads the full 2.21 MB blob PER ENTRY (3072
+    // entries per layer-chunk = 6.79 GB over PCIe at ~12 GB/s = 566 ms/layer), while the chunk touches only ~150
+    // distinct experts.  Stage the touched set once per layer-chunk (150 x 2.21 MB = 332 MB = ~28 ms) and run the
+    // SAME kernel against the staged copy, which is byte-identical, so the result must be bitwise-equal.
+    uint8_t* stage = nullptr; int stage_n = 0;
+    int* stage_ids_m = nullptr;
+    std::vector<int32_t> stage_rank, stage_ids_h;
     // --expert-slots: the GPU-slot experts' rows and the overflow rows (CPU pool or pinned table)
     float *eg2 = nullptr, *eu2 = nullptr, *eh2 = nullptr, *ey2 = nullptr, *ey_cpu = nullptr;
     float* yc = nullptr;            // the slots path's overflow rows: ey_cpu (pool) or ey (pinned table)
@@ -1034,11 +1042,47 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                 for (int i = 0; i < NK; ++i) { const int id = hid[(size_t) i]; if (!seen[(size_t) id]) { seen[(size_t) id] = 1; ++uniq; } if (id < e.slots) ++hits; }
                 e.pf_hit_entries += hits; e.pf_entry_n += NK; e.pf_uniq_sum += uniq; ++e.pf_cov_chunks;
             }
+            static const bool pf_stage = std::getenv("STRATA_KOLIBRI_PF_STAGE") != nullptr;   // S7 A/B
+            if (pf_stage && s.stage != nullptr && NK <= (int) s.stage_ids_h.size()) {
+                g_ids_host.resize((size_t) NK);
+                KC(cudaMemcpy(g_ids_host.data(), s.ids_m, (size_t) NK * sizeof(int), cudaMemcpyDeviceToHost));
+                int32_t* rank = s.stage_rank.data();
+                std::fill(rank, rank + g.n_expert, -1);
+                int nt = 0;
+                for (int i = 0; i < NK; ++i) {
+                    const int id = g_ids_host[(size_t) i];
+                    if (rank[id] < 0) {
+                        if (nt >= s.stage_n) { nt = -1; break; }   // touched set exceeds the stage: table path
+                        rank[id] = nt;
+                        KC(cudaMemcpyAsync(s.stage + (size_t) nt * b.stride, b.table + (size_t) id * b.stride,
+                                           b.stride, cudaMemcpyHostToDevice, g_st));
+                        ++nt;
+                    }
+                }
+                if (nt > 0) {
+                    for (int i = 0; i < NK; ++i) s.stage_ids_h[(size_t) i] = rank[g_ids_host[(size_t) i]];
+                    KC(cudaMemcpyAsync(s.stage_ids_m, s.stage_ids_h.data(), (size_t) NK * sizeof(int),
+                                       cudaMemcpyHostToDevice, g_st));
+                    k_group<<<1, 1024>>>(s.stage_ids_m, NK, K, s.stage_n, s.stage, (unsigned long long) b.stride,
+                                         s.grp_ptr_m, s.grp_start_m, s.n_groups_m, s.ent_dst_m, s.ent_tok_m);
+                    strata::kernels::native_expert_grouped(b.L, s.grp_ptr_m, s.grp_start_m, s.n_groups_m, s.ent_dst_m,
+                                                           s.ent_tok_m, std::min<int64_t>(NK, s.stage_n) + 1, NK,
+                                                           s.xq8_m, s.scratch_m, s.gout_m, g_st);
+                    if (e.counters) { ++e.pf_stage_chunks; e.pf_stage_bytes += (long long) nt * b.stride; }
+                } else {
+                    k_group<<<1, 1024>>>(s.ids_m, NK, K, (int) g.n_expert, b.table, (unsigned long long) b.stride,
+                                         s.grp_ptr_m, s.grp_start_m, s.n_groups_m, s.ent_dst_m, s.ent_tok_m);
+                    strata::kernels::native_expert_grouped(b.L, s.grp_ptr_m, s.grp_start_m, s.n_groups_m, s.ent_dst_m,
+                                                           s.ent_tok_m, std::min<int64_t>(NK, g.n_expert) + 1, NK,
+                                                           s.xq8_m, s.scratch_m, s.gout_m, g_st);
+                }
+            } else {
             k_group<<<1, 1024>>>(s.ids_m, NK, K, (int) g.n_expert, b.table, (unsigned long long) b.stride,
                                  s.grp_ptr_m, s.grp_start_m, s.n_groups_m, s.ent_dst_m, s.ent_tok_m);
             strata::kernels::native_expert_grouped(b.L, s.grp_ptr_m, s.grp_start_m, s.n_groups_m, s.ent_dst_m,
                                                    s.ent_tok_m, std::min<int64_t>(NK, g.n_expert) + 1, NK, s.xq8_m,
                                                    s.scratch_m, s.gout_m, g_st);
+            }
         } else {
             g_ids_host.resize((size_t) NK);
             KC(cudaMemcpy(g_ids_host.data(), s.ids_m, NK * sizeof(int), cudaMemcpyDeviceToHost));
@@ -1189,6 +1233,18 @@ void init_scratch(const Engine& e, Scratch& s) {
     if (e.prefill > 0) {   // the chunk's rows: tmax tokens, tmax*K expert entries, the FP16 attention images
         const int T = Scratch::kTmax, NK = T * K;
         s.exp_cnt.resize((size_t) g.n_expert + 1);
+        // S7 staging buffers: 192 slots x max stride (~460 MB, inside the 13.53 GiB free; 122 slots/layer of the
+        // full cache fails to allocate, so the stage is sized per-chunk, not per-model) + the id->rank map.
+        // top_k lives on the Engine (e.top_k), NOT on ModelGeometry - g.top_k does not compile.
+        {
+            size_t stride_max = 0;
+            for (const auto& bb : e.blobs) stride_max = std::max(stride_max, (size_t) bb.stride);
+            s.stage_n = 192;
+            KC(cudaMalloc((void**) &s.stage, (size_t) s.stage_n * stride_max));
+            KC(cudaMalloc((void**) &s.stage_ids_m, (size_t) Scratch::kTmax * (size_t) e.top_k * sizeof(int)));
+            s.stage_rank.assign((size_t) g.n_expert, -1);
+            s.stage_ids_h.assign((size_t) Scratch::kTmax * (size_t) e.top_k, 0);
+        }
         s.exp_ord.resize((size_t) NK);
         const size_t hd = (size_t) g.n_head * g.head_dim, hkd = (size_t) g.n_head_kv * g.head_dim;
         KC(cudaMalloc((void**) &s.toks_d, T * 4));
@@ -1342,6 +1398,10 @@ void print_counters(Engine& e, const char* tag) {
     // in-situ record of what the pool actually streamed, and at what rate.
     // S7: the prefill pool leg's own line - bytes, achieved rate, and ms per chunk, which is what says whether
     // a slow pp is the pool, the GPU, or the seam between them.
+    if (e.pf_stage_chunks > 0) {
+        std::fprintf(stderr, "CNT prefill staged: chunks=%lld staged=%.2f GB (%.0f MB/chunk)\n", e.pf_stage_chunks,
+                     e.pf_stage_bytes / 1e9, e.pf_stage_bytes / 1e6 / e.pf_stage_chunks);
+    }
     if (e.pf_cov_chunks > 0) {
         std::fprintf(stderr, "CNT prefill slot coverage: S=%d chunks=%lld entries=%lld hits=%.1f%% uniq/chunk=%.0f\n",
                      e.slots, e.pf_cov_chunks, e.pf_entry_n, 100.0 * e.pf_hit_entries / (double) e.pf_entry_n,
