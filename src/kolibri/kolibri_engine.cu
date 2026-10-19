@@ -179,6 +179,9 @@ struct Engine {
     // timed run that did not ask for counters.
     long long pf_hit_entries = 0, pf_entry_n = 0, pf_uniq_sum = 0, pf_cov_chunks = 0;
     long long pf_stage_chunks = 0, pf_stage_bytes = 0;   // S7 staging: chunks served from VRAM, bytes staged
+    // S7 phase timers: the pool leg is 1.76 GFLOP/s/core against pool_bench's 43.7 on the SAME kernels (25x),
+    // so the term is inside this loop.  Name it: gu rows / h-quantize / down rows, per 64-row batch.
+    std::atomic<long long> pf_gu_ns{0}, pf_qh_ns{0}, pf_dn_ns{0};
     cublasHandle_t blas = nullptr;
     strata::prefill::Gemm gemm;
     std::vector<unsigned long long> gexec;   // cudaGraphExec_t per layer (0 = the layer is not capturable)
@@ -1124,7 +1127,9 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                                 acts[k] = s.act + (size_t) (sel / K) * b.fmt.act_bytes;
                                 ffs[k] = s.ff + (size_t) sel * FF;
                             }
+                            const auto tA = std::chrono::steady_clock::now();
                             strata::kernels::cpu::native_gu_rows(b.fmt, blob, acts, mm, ffs, 0, FF);
+                            const auto tB = std::chrono::steady_clock::now();
                             for (int k = 0; k < mm; ++k) {
                                 const int sel = ord[(size_t) lo + a + k];
                                 char* hqp = s.hq + (size_t) sel * b.fmt.h_bytes;
@@ -1132,7 +1137,12 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                                 hqs[k] = hqp;
                                 eys[k] = s.ey_h + (size_t) sel * N;
                             }
+                            const auto tC = std::chrono::steady_clock::now();
                             strata::kernels::cpu::native_down_rows(b.fmt, blob, hqs, mm, eys, 0, N);
+                            const auto tD = std::chrono::steady_clock::now();
+                            e.pf_gu_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(tB - tA).count();
+                            e.pf_qh_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(tC - tB).count();
+                            e.pf_dn_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(tD - tC).count();
                         }
                     }
                 }, NS);
@@ -1430,6 +1440,12 @@ void print_counters(Engine& e, const char* tag) {
         for (long long v : e.pf_shard_bytes) if (v > 0) { ++active; mx = std::max(mx, v); if (mn < 0) mn = v; }
         std::fprintf(stderr, "CNT prefill shards: workers=%d active=%d bytes/min=%.2f GB max=%.2f GB\n",
                      e.cpu_threads, active, mn / 1e9, mx / 1e9);
+        const double gu = e.pf_gu_ns / 1e6, qh = e.pf_qh_ns / 1e6, dn = e.pf_dn_ns / 1e6;
+        const double ptot = gu + qh + dn;
+        std::fprintf(stderr, "CNT prefill phases: gu=%.0f ms (%.0f%%) quant_h=%.0f ms (%.0f%%) down=%.0f ms (%.0f%%)"
+                             " sum=%.0f ms of pool=%.0f ms (%.0f%% outside the batch loop)\n",
+                     gu, ptot > 0 ? 100.0 * gu / ptot : 0.0, qh, ptot > 0 ? 100.0 * qh / ptot : 0.0,
+                     dn, ptot > 0 ? 100.0 * dn / ptot : 0.0, ptot, ms, ms > 0 ? 100.0 * ptot / ms : 0.0);
     }
     if (e.epool) {
         const double ms_gu = e.epool->ms_multi_gu, ms_q = e.epool->ms_multi_q, ms_dn = e.epool->ms_multi_down;
