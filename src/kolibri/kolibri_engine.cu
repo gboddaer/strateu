@@ -1121,8 +1121,13 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                 // untouched and the result is bitwise-identical.
                 s.pf_touch.clear();
                 for (int x = 0; x < (int) g.n_expert; ++x) if (cnt[x + 1] > cnt[x]) s.pf_touch.push_back(x);
-                std::sort(s.pf_touch.begin(), s.pf_touch.end(),
-                          [&](int a, int b) { return (cnt[a + 1] - cnt[a]) > (cnt[b + 1] - cnt[b]); });
+                // A/B gate for the bitwise verification: STRATA_KOLIBRI_LPT=0 keeps the touched list in ascending
+                // expert order (the pre-LPT deal shape) so the two deal orders can be compared on identical code.
+                static const bool pf_lpt = std::getenv("STRATA_KOLIBRI_LPT") == nullptr ||
+                                           std::string(std::getenv("STRATA_KOLIBRI_LPT")) != "0";
+                if (pf_lpt)
+                    std::sort(s.pf_touch.begin(), s.pf_touch.end(),
+                              [&](int a, int b) { return (cnt[a + 1] - cnt[a]) > (cnt[b + 1] - cnt[b]); });
                 const auto pf_t0 = std::chrono::steady_clock::now();
                 e.pool.run([&](int shard) {
                     const auto sh_t0 = std::chrono::steady_clock::now();
