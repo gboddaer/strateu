@@ -20,6 +20,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/dequant_bf16.hpp"   // S7 dense-fp16 cache: dequant_f16 (Q4_K blocks -> FP16 bits on device)
 #include "strata/kernels/kolibri_window.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -79,7 +80,20 @@ struct Dense {
     int type = -1;
     std::vector<int64_t> shape;
     size_t row_bytes = 0;
+    // S7 dense-fp16 cache (STRATA_KOLIBRI_DENSE_F16=1): the Q4_K blocks dequantized to FP16 ONCE at load, so the
+    // prefill GEMMs run cublas fp16/fp32-acc (Gemm::f16) with no per-call dequant.  Measured: gemm.native
+    // dequantizes the whole weight into scratch on EVERY call (gemm.hpp:5,43) - the shared-expert FFN's 7.5 ms
+    // per launch is that dequant, 553 GFLOP at ~6% of the T4.  Layout: GGUF shape[0]=K, shape[1]=N, so the
+    // device blocks are N rows of K values = exactly the [N,K] row-major W that Gemm::f16 takes.
+    uint16_t* f16 = nullptr;
 };
+
+// The dense-fp16 gate, read once.  Absent/0 = the plain path (the oracle's path) untouched.
+static inline bool dense_f16_on() {
+    static const bool on = std::getenv("STRATA_KOLIBRI_DENSE_F16") != nullptr &&
+                           std::string(std::getenv("STRATA_KOLIBRI_DENSE_F16")) != "0";
+    return on;
+}
 
 struct LayerBlobs {
     strata::kernels::NativeExpertLayout L;
@@ -970,11 +984,14 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
         k_to_f16<<<grid1((int64_t) T * N), kThreads>>>((const float*) s.h_m, s.x16, (int64_t) T * N);
         {
             const Dense& wq = e.dense.at(L(l, "attn_q.weight"));
-            e.gemm.native((const uint16_t*) s.x16, wq.type, wq.d, s.q_m, T, H * D, N);
+            if (dense_f16_on() && wq.f16) e.gemm.f16((const uint16_t*) s.x16, wq.f16, s.q_m, T, H * D, N);
+            else e.gemm.native((const uint16_t*) s.x16, wq.type, wq.d, s.q_m, T, H * D, N);
             const Dense& wk = e.dense.at(L(l, "attn_k.weight"));
-            e.gemm.native((const uint16_t*) s.x16, wk.type, wk.d, s.k_m, T, HKV * D, N);
+            if (dense_f16_on() && wk.f16) e.gemm.f16((const uint16_t*) s.x16, wk.f16, s.k_m, T, HKV * D, N);
+            else e.gemm.native((const uint16_t*) s.x16, wk.type, wk.d, s.k_m, T, HKV * D, N);
             const Dense& wv = e.dense.at(L(l, "attn_v.weight"));
-            e.gemm.native((const uint16_t*) s.x16, wv.type, wv.d, s.v_m, T, HKV * D, N);
+            if (dense_f16_on() && wv.f16) e.gemm.f16((const uint16_t*) s.x16, wv.f16, s.v_m, T, HKV * D, N);
+            else e.gemm.native((const uint16_t*) s.x16, wv.type, wv.d, s.v_m, T, HKV * D, N);
         }
         k_attn_prep_multi<<<dim3(H + HKV, T), kThreads>>>(s.q_m, s.k_m, s.v_m, e.f32.at(L(l, "attn_q_norm.weight")),
                                                           e.f32.at(L(l, "attn_k_norm.weight")), s.q_m, s.kc[l],
@@ -1023,7 +1040,8 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
         k_to_f16<<<grid1((int64_t) T * H * D), kThreads>>>(s.att_m, s.att16, (int64_t) T * H * D);
         {
             const Dense& wo = e.dense.at(L(l, "attn_output.weight"));
-            e.gemm.native((const uint16_t*) s.att16, wo.type, wo.d, s.y_m, T, N, H * D);
+            if (dense_f16_on() && wo.f16) e.gemm.f16((const uint16_t*) s.att16, wo.f16, s.y_m, T, N, H * D);
+            else e.gemm.native((const uint16_t*) s.att16, wo.type, wo.d, s.y_m, T, N, H * D);
         }
         k_rms_rows<<<T, kThreads>>>(s.y_m, e.f32.at(L(l, "post_attention_norm.weight")), s.y_m, N, e.eps);
         k_add_rows<<<grid1((int64_t) T * N), kThreads>>>(s.x_m, s.y_m, (int64_t) T * N);
@@ -1213,13 +1231,16 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
         }
         {
             const Dense& wg = e.dense.at(L(l, "ffn_gate_shexp.weight"));
-            e.gemm.native((const uint16_t*) s.x16, wg.type, wg.d, s.sg_m, T, FS, N);
+            if (dense_f16_on() && wg.f16) e.gemm.f16((const uint16_t*) s.x16, wg.f16, s.sg_m, T, FS, N);
+            else e.gemm.native((const uint16_t*) s.x16, wg.type, wg.d, s.sg_m, T, FS, N);
             const Dense& wu = e.dense.at(L(l, "ffn_up_shexp.weight"));
-            e.gemm.native((const uint16_t*) s.x16, wu.type, wu.d, s.su_m, T, FS, N);
+            if (dense_f16_on() && wu.f16) e.gemm.f16((const uint16_t*) s.x16, wu.f16, s.su_m, T, FS, N);
+            else e.gemm.native((const uint16_t*) s.x16, wu.type, wu.d, s.su_m, T, FS, N);
             k_swiglu_rows<<<grid1((int64_t) T * FS), kThreads>>>(s.sg_m, s.su_m, s.sh_m, (int64_t) T * FS);
             k_to_f16<<<grid1((int64_t) T * FS), kThreads>>>(s.sh_m, s.x16, (int64_t) T * FS);
             const Dense& wd = e.dense.at(L(l, "ffn_down_shexp.weight"));
-            e.gemm.native((const uint16_t*) s.x16, wd.type, wd.d, s.sy_m, T, N, FS);
+            if (dense_f16_on() && wd.f16) e.gemm.f16((const uint16_t*) s.x16, wd.f16, s.sy_m, T, N, FS);
+            else e.gemm.native((const uint16_t*) s.x16, wd.type, wd.d, s.sy_m, T, N, FS);
         }
         k_moe_sum_rows<<<dim3(T, (N + B - 1) / B), B>>>(s.moe_m, s.gout_m, s.wts_m, s.sy_m, K, N);
         k_rms_rows<<<T, kThreads>>>(s.moe_m, e.f32.at(L(l, "post_ffw_norm.weight")), s.moe_m, N, e.eps);
@@ -1824,6 +1845,24 @@ bool load(const std::string& path, Engine& e, std::string& err) {
         }
     }
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    // S7 dense-fp16 cache: dequantize every 2-D dense weight to FP16 on the device, once.  Env-gated so the plain
+    // path (and the oracle) is untouched when the flag is absent.
+    if (dense_f16_on()) {
+        int64_t f16_bytes = 0;
+        for (auto& kv : e.dense) {
+            Dense& w = kv.second;
+            if (w.shape.size() != 2 || !strata::kernels::dequant_bf16_supported(w.type)) continue;
+            const int64_t K = w.shape[0], N = w.shape[1];
+            uint16_t* p = nullptr;
+            KC(cudaMalloc((void**) &p, (size_t) N * K * 2));
+            strata::kernels::dequant_f16(w.type, w.d, 0, N, K, p, g_st);
+            w.f16 = p;
+            f16_bytes += (int64_t) N * K * 2;
+        }
+        KC(cudaStreamSynchronize(g_st));
+        std::fprintf(stderr, "strata-kolibri: dense fp16 cache: %.2f GiB dequantized at load (STRATA_KOLIBRI_DENSE_F16)\n",
+                     (double) f16_bytes / (1 << 30));
+    }
     int native_layers = 0;
     for (const LayerBlobs& b : e.blobs) native_layers += b.native_ok ? 1 : 0;
     std::fprintf(stderr,
