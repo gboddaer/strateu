@@ -1166,6 +1166,12 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                     e.pf_experts += touched;
                     ++e.pf_chunks;
                 }
+                // STREAM RACE (self-determinism probe: two runs, same binary/config, self-KL mean 9.67,
+                // argmax-agree 5/32, maxabs 20.1 logits).  The grouped kernel above writes s.gout_m on g_st; this
+                // H2D overwrites the SAME buffer on the default stream.  The two streams are unsynchronised here,
+                // so the grouped kernel's writes race the pool's - a per-run-varying blend, which is exactly the
+                // observed magnitude.  Drain g_st first.
+                KC(cudaStreamSynchronize(g_st));
                 KC(cudaMemcpy(s.gout_m, s.ey_h, (size_t) NK * N * 4, cudaMemcpyHostToDevice));
             } else {
             // The mmvq fallback leg: per-token activation quantize, gate/up per selection, SwiGLU, h quantize,
@@ -1303,6 +1309,13 @@ void init_scratch(const Engine& e, Scratch& s) {
         KC(cudaMalloc((void**) &s.grp_ptr_m, ((size_t) std::min<int64_t>(NK, g.n_expert) + 1) * sizeof(unsigned long long)));
         KC(cudaMalloc((void**) &s.grp_start_m, ((size_t) std::min<int64_t>(NK, g.n_expert) + 1) * 4));
         KC(cudaMalloc((void**) &s.n_groups_m, 4));
+    // Self-determinism probe (two runs, same binary/config: self-KL mean 9.67, argmax-agree 5/32).  The grouped
+    // launch runs with grid_groups = 0, which the header documents as cap_groups (min(NK,n_expert)+1 = 385) block
+    // rows, while k_group fills only the first *n_groups (~155) entries.  Zero the group tables so the surplus
+    // rows read a benign 0 pointer/offset instead of uninitialized device memory.
+    KC(cudaMemset(s.grp_ptr_m, 0, ((size_t) std::min<int64_t>(NK, g.n_expert) + 1) * sizeof(unsigned long long)));
+    KC(cudaMemset(s.grp_start_m, 0, ((size_t) std::min<int64_t>(NK, g.n_expert) + 1) * 4));
+    KC(cudaMemset(s.n_groups_m, 0, 4));
         KC(cudaMalloc((void**) &s.ent_dst_m, NK * 4));
         KC(cudaMalloc((void**) &s.ent_tok_m, NK * 4));
         KC(cudaMalloc((void**) &s.xq8_m, strata::kernels::native_q8_1_bytes((int) g.n_embd, 1) * (size_t) T));
