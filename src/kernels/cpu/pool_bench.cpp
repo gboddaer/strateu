@@ -71,7 +71,7 @@ int main(int argc, char** argv) {
 #if PB_HAVE_GGML
     gu_type = d_type = GGML_TYPE_Q4_K;
 #endif
-    int reps = 20, n_experts = 6, blob_pool = 1024;
+    int reps = 20, n_experts = 6, blob_pool = 1024, rows = 1;
     std::vector<int> thread_list = {1, 6, 12, 24, 48};
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -79,6 +79,7 @@ int main(int argc, char** argv) {
         else if (a == "--experts" && i + 1 < argc) n_experts = std::atoi(argv[++i]);
         else if (a == "--threads" && i + 1 < argc) { thread_list = split_ints(argv[++i]); }
         else if (a == "--blob-pool" && i + 1 < argc) { blob_pool = std::atoi(argv[++i]); }
+        else if (a == "--rows" && i + 1 < argc) { rows = std::atoi(argv[++i]); }
     }
     if (!native_experts_available()) { std::fprintf(stderr, "pool_bench: no ggml-cpu native expert path in this build\n"); return 1; }
     NativeFmt f;
@@ -109,22 +110,27 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> act(f.act_bytes), hq(f.h_bytes);
     native_quant_act(f, x.data(), act.data());
     native_quant_h(f, h.data(), hq.data());
-    std::vector<float> ff((size_t)n_ff), out((size_t)n_embd, 0.f);
+    std::vector<float> ff((size_t)rows * n_ff), out((size_t)rows * n_embd, 0.f);
 
-    // [1] single core, direct kernels (no pool at all): the pure per-blob ceiling.
+    // [1] single core, direct kernels (no pool at all): the pure per-blob ceiling.  --rows N reproduces the
+    // PREFILL shape: N activation rows sharing one cold blob (measured in-situ: ~20 rows/expert/chunk).  The
+    // in-situ pool leg runs these same kernels at 9.5 GFLOP/s/core; this isolates kernel shape from call pattern.
     {
-        const void* ap = act.data();
-        const void* hp = hq.data();
-        float* fp = ff.data();
-        float* op = out.data();
+        std::vector<const void*> aps((size_t)rows, act.data());
+        std::vector<const void*> hps((size_t)rows, hq.data());
+        std::vector<float*> fps((size_t)rows), ops((size_t)rows);
+        for (int r = 0; r < rows; ++r) {
+            fps[r] = ff.data() + (size_t) r * n_ff;
+            ops[r] = out.data() + (size_t) r * n_embd;
+        }
         auto t0 = Clock::now();
         for (int r = 0; r < reps; ++r) {
-            native_gu_rows(f, blob.data(), &ap, 1, &fp, 0, (int)n_ff);
-            native_down_rows(f, blob.data(), &hp, 1, &op, 0, (int)n_embd);
+            native_gu_rows(f, blob.data(), aps.data(), rows, fps.data(), 0, (int)n_ff);
+            native_down_rows(f, blob.data(), hps.data(), rows, ops.data(), 0, (int)n_embd);
         }
         const double ms = ms_since(t0) / reps;
-        std::printf("\n[1] single core, direct kernels: %.3f ms/blob -> %.1f GFLOP/s, %.1f GB/s\n", ms,
-                    flop_per / (ms * 1e-3) / 1e9, blob_bytes / (ms * 1e-3) / 1e9);
+        std::printf("\n[1] single core, direct kernels, %d rows/blob: %.3f ms/blob-call -> %.1f GFLOP/s, %.1f GB/s (%.3f ms/row)\n",
+                    rows, ms, rows * flop_per / (ms * 1e-3) / 1e9, blob_bytes / (ms * 1e-3) / 1e9, ms / rows);
     }
 
     // [2]+[3] through ExpertPool on the native path: n_experts jobs of one token each, per layer.

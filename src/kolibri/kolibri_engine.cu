@@ -173,6 +173,7 @@ struct Engine {
     // construct whose decode-side defect was "worker i runs exactly shard i"; if the work concentrates in a few
     // shards, that is the whole 0.06 GB/s/core story.  Each shard writes only its own slot, so no atomics needed.
     std::vector<long long> pf_shard_bytes = std::vector<long long>(64, 0);   // sized at declaration: the load path holds a const Engine&
+    std::vector<long long> pf_shard_ns = std::vector<long long>(64, 0);      // per-shard BUSY time: window/max-busy = the true imbalance
     // S7: coverage of a hypothetical prefill slot cache, measured on the chunk's real id set.  The wiring design
     // needs "what fraction of a chunk's picks land under S", and the grouped leg never copies ids to the host,
     // so this is the only way to price it.  Gated on --counters: it adds a 12 KB D2H, so it must never run in a
@@ -1124,6 +1125,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                           [&](int a, int b) { return (cnt[a + 1] - cnt[a]) > (cnt[b + 1] - cnt[b]); });
                 const auto pf_t0 = std::chrono::steady_clock::now();
                 e.pool.run([&](int shard) {
+                    const auto sh_t0 = std::chrono::steady_clock::now();
                     const void* acts[64]; float* ffs[64]; const void* hqs[64]; float* eys[64];
                     for (size_t xi = (size_t) shard; xi < s.pf_touch.size(); xi += (size_t) NS) {
                         const int x = s.pf_touch[xi];
@@ -1156,6 +1158,9 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                             e.pf_dn_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(tD - tC).count();
                         }
                     }
+                    if (e.counters && (size_t) shard < e.pf_shard_ns.size())
+                        e.pf_shard_ns[(size_t) shard] +=
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - sh_t0).count();
                 }, NS);
                 if (e.counters) {
                     const auto pf_t1 = std::chrono::steady_clock::now();
@@ -1464,6 +1469,15 @@ void print_counters(Engine& e, const char* tag) {
         for (long long v : e.pf_shard_bytes) if (v > 0) { ++active; mx = std::max(mx, v); if (mn < 0) mn = v; }
         std::fprintf(stderr, "CNT prefill shards: workers=%d active=%d bytes/min=%.2f GB max=%.2f GB\n",
                      e.cpu_threads, active, mn / 1e9, mx / 1e9);
+        long long bmax = 0, bmin = -1, bsum = 0; int bact = 0;
+        for (long long v : e.pf_shard_ns) if (v > 0) { ++bact; bmax = std::max(bmax, v); if (bmin < 0) bmin = v; bsum += v; }
+        if (bact > 0) {
+            const double win = (double) e.pf_pool_ms * 1e6;   // summed pool windows across chunks
+            std::fprintf(stderr, "CNT prefill shard-busy: max=%.0f ms min=%.0f ms mean=%.0f ms  window=%.0f ms -> "
+                                 "barrier idle = window - max = %.0f ms (%.0f%% of window); spread max/min=%.1fx\n",
+                         bmax / 1e6, bmin / 1e6, bsum / (double) bact / 1e6, win / 1e6, (win - bmax) / 1e6,
+                         win > 0 ? 100.0 * (win - bmax) / win : 0.0, bmin > 0 ? (double) bmax / bmin : 0.0);
+        }
         const double gu = e.pf_gu_ns / 1e6, qh = e.pf_qh_ns / 1e6, dn = e.pf_dn_ns / 1e6;
         const double ptot = gu + qh + dn;
         std::fprintf(stderr, "CNT prefill phases: gu=%.0f ms (%.0f%%) quant_h=%.0f ms (%.0f%%) down=%.0f ms (%.0f%%)"
