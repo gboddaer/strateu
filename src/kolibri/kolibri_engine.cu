@@ -173,6 +173,11 @@ struct Engine {
     // construct whose decode-side defect was "worker i runs exactly shard i"; if the work concentrates in a few
     // shards, that is the whole 0.06 GB/s/core story.  Each shard writes only its own slot, so no atomics needed.
     std::vector<long long> pf_shard_bytes = std::vector<long long>(64, 0);   // sized at declaration: the load path holds a const Engine&
+    // S7: coverage of a hypothetical prefill slot cache, measured on the chunk's real id set.  The wiring design
+    // needs "what fraction of a chunk's picks land under S", and the grouped leg never copies ids to the host,
+    // so this is the only way to price it.  Gated on --counters: it adds a 12 KB D2H, so it must never run in a
+    // timed run that did not ask for counters.
+    long long pf_hit_entries = 0, pf_entry_n = 0, pf_uniq_sum = 0, pf_cov_chunks = 0;
     cublasHandle_t blas = nullptr;
     strata::prefill::Gemm gemm;
     std::vector<unsigned long long> gexec;   // cudaGraphExec_t per layer (0 = the layer is not capturable)
@@ -1021,6 +1026,14 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
         k_to_f16<<<grid1((int64_t) T * N), kThreads>>>((const float*) s.h_m, s.x16, (int64_t) T * N);
         static const bool pool_all = std::getenv("STRATA_KOLIBRI_POOL_ALL") != nullptr;   // A/B: the pool for every layer
         if (b.native_ok && !(pool_all && e.cpu_threads > 0)) {
+            if (e.counters && e.slots > 0) {   // pricing only; --counters runs
+                std::vector<int> hid((size_t) NK);
+                KC(cudaMemcpy(hid.data(), s.ids_m, (size_t) NK * sizeof(int), cudaMemcpyDeviceToHost));
+                std::vector<char> seen((size_t) g.n_expert, 0);
+                int uniq = 0, hits = 0;
+                for (int i = 0; i < NK; ++i) { const int id = hid[(size_t) i]; if (!seen[(size_t) id]) { seen[(size_t) id] = 1; ++uniq; } if (id < e.slots) ++hits; }
+                e.pf_hit_entries += hits; e.pf_entry_n += NK; e.pf_uniq_sum += uniq; ++e.pf_cov_chunks;
+            }
             k_group<<<1, 1024>>>(s.ids_m, NK, K, (int) g.n_expert, b.table, (unsigned long long) b.stride,
                                  s.grp_ptr_m, s.grp_start_m, s.n_groups_m, s.ent_dst_m, s.ent_tok_m);
             strata::kernels::native_expert_grouped(b.L, s.grp_ptr_m, s.grp_start_m, s.n_groups_m, s.ent_dst_m,
@@ -1329,6 +1342,11 @@ void print_counters(Engine& e, const char* tag) {
     // in-situ record of what the pool actually streamed, and at what rate.
     // S7: the prefill pool leg's own line - bytes, achieved rate, and ms per chunk, which is what says whether
     // a slow pp is the pool, the GPU, or the seam between them.
+    if (e.pf_cov_chunks > 0) {
+        std::fprintf(stderr, "CNT prefill slot coverage: S=%d chunks=%lld entries=%lld hits=%.1f%% uniq/chunk=%.0f\n",
+                     e.slots, e.pf_cov_chunks, e.pf_entry_n, 100.0 * e.pf_hit_entries / (double) e.pf_entry_n,
+                     (double) e.pf_uniq_sum / e.pf_cov_chunks);
+    }
     if (e.pf_chunks > 0) {
         const double ms = (double) e.pf_pool_ms, gb = e.pf_pool_bytes / 1e9;
         std::fprintf(stderr,
