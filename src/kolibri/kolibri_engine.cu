@@ -169,6 +169,10 @@ struct Engine {
     // prefill path does not use), so a 13.9 tok/s pp was unreadable - grouped bytes, achieved rate and the
     // pool/GPU split were all invisible.  These are that leg's counters.
     long long pf_pool_ms = 0, pf_pool_bytes = 0, pf_chunks = 0, pf_experts = 0;
+    // Per-shard bytes for the prefill leg.  The leg calls the engine's ~20-line shard fan-out (e.pool.run), the
+    // construct whose decode-side defect was "worker i runs exactly shard i"; if the work concentrates in a few
+    // shards, that is the whole 0.06 GB/s/core story.  Each shard writes only its own slot, so no atomics needed.
+    std::vector<long long> pf_shard_bytes = std::vector<long long>(64, 0);   // sized at declaration: the load path holds a const Engine&
     cublasHandle_t blas = nullptr;
     strata::prefill::Gemm gemm;
     std::vector<unsigned long long> gexec;   // cudaGraphExec_t per layer (0 = the layer is not capturable)
@@ -1050,6 +1054,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                     for (int x = shard; x < (int) g.n_expert; x += NS) {
                         const int lo = cnt[x], hi = cnt[x + 1], m = hi - lo;
                         if (m <= 0) continue;
+                        if (e.counters && (size_t) shard < e.pf_shard_bytes.size()) e.pf_shard_bytes[(size_t) shard] += (long long) b.stride;
                         const uint8_t* blob = b.table + (size_t) x * b.stride;
                         for (int a = 0; a < m; a += 64) {
                             const int mm = std::min(64, m - a);
@@ -1331,6 +1336,10 @@ void print_counters(Engine& e, const char* tag) {
                      " (%.1f ms/chunk, %.1f GB/s)\n",
                      e.pf_chunks, (double) e.pf_experts / e.pf_chunks, gb, gb * 1e3 / e.pf_chunks, ms, ms / e.pf_chunks,
                      ms > 0 ? gb / (ms / 1000.0) : 0.0);
+        int active = 0; long long mx = 0, mn = -1;
+        for (long long v : e.pf_shard_bytes) if (v > 0) { ++active; mx = std::max(mx, v); if (mn < 0) mn = v; }
+        std::fprintf(stderr, "CNT prefill shards: workers=%d active=%d bytes/min=%.2f GB max=%.2f GB\n",
+                     e.cpu_threads, active, mn / 1e9, mx / 1e9);
     }
     if (e.epool) {
         const double ms_gu = e.epool->ms_multi_gu, ms_q = e.epool->ms_multi_q, ms_dn = e.epool->ms_multi_down;
