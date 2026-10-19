@@ -1065,8 +1065,12 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                                        cudaMemcpyHostToDevice, g_st));
                     k_group<<<1, 1024>>>(s.stage_ids_m, NK, K, s.stage_n, s.stage, (unsigned long long) b.stride,
                                          s.grp_ptr_m, s.grp_start_m, s.n_groups_m, s.ent_dst_m, s.ent_tok_m);
+                    // cap_groups MUST match the table path's (n_expert + 1), NOT (stage_n + 1).  The kernel strides
+                    // its block rows over cap_groups, so a smaller cap changes the per-output reduction order and
+                    // the staged path stopped being bitwise-equal (measured: max per-step KL 0.157 vs unstaged).
+                    // The stage's group count (<= stage_n) is under the cap, so the larger cap is legal.
                     strata::kernels::native_expert_grouped(b.L, s.grp_ptr_m, s.grp_start_m, s.n_groups_m, s.ent_dst_m,
-                                                           s.ent_tok_m, std::min<int64_t>(NK, s.stage_n) + 1, NK,
+                                                           s.ent_tok_m, std::min<int64_t>(NK, g.n_expert) + 1, NK,
                                                            s.xq8_m, s.scratch_m, s.gout_m, g_st);
                     if (e.counters) { ++e.pf_stage_chunks; e.pf_stage_bytes += (long long) nt * b.stride; }
                 } else {
