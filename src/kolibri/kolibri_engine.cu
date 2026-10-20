@@ -270,6 +270,9 @@ struct Engine {
         // S6: the decode's per-layer segments, ns (env-gated by STRATA_KOLIBRI_DEC_PHASES): the pre-expert
         // chain, the ids+h D2H wait, the pool call, and the post-expert chain - the decode's 47 ms/token split.
         long long dec_pre_ns = 0, dec_d2h_ns = 0, dec_pool_ns = 0, dec_post_ns = 0, dec_layers = 0;
+        // S7: the PREFILL's per-layer segments, ns (the ATTN_PHASES gate): dense GEMMs, attention, the expert
+        // leg (GPU grouped + CPU pool), and the layer's other kernels - the pp512 breakdown.
+        long long pf_dense_ns = 0, pf_attn_ns = 0, pf_exp_ns = 0, pf_other_ns = 0, pf_layers = 0;
     };
     mutable Counters cnt;   // layer_step takes the Engine as const (like `mutable Pool pool`)
     bool counters = false;
@@ -1559,7 +1562,17 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
     case T_F16: k_row_multi<T_F16><<<dim3(T, 4), 128>>>(emb.d, emb.row_bytes, s.toks_d, N, s.x_m); break;
     default: std::fprintf(stderr, "strata-kolibri: token_embd type %d\n", emb.type); std::exit(1);
     }
+    const bool pph = attn_phases_on();   // S7: the prefill's per-layer phase marks (the same gate as the attn timers)
+    std::chrono::steady_clock::time_point pp_t0{};
+    auto pp_mark = [&](long long& acc) {
+        if (!pph) return;
+        cudaStreamSynchronize(g_st);
+        const auto n = std::chrono::steady_clock::now();
+        acc += std::chrono::duration_cast<std::chrono::nanoseconds>(n - pp_t0).count();
+        pp_t0 = n;
+    };
     for (int64_t l = 0; l < g.n_layers; ++l) {
+        if (pph) { cudaStreamSynchronize(g_st); pp_t0 = std::chrono::steady_clock::now(); }
         const bool sliding = strata::core::is_swa_layer(g, l);
         LayerBlobs& b = e.blobs[(size_t) l];   // non-const: the fp16 cache's LRU slot table is updated in the pool leg
         k_rms_rows<<<T, kThreads>>>(s.x_m, e.f32.at(L(l, "attn_norm.weight")), s.h_m, N, e.eps);
@@ -1576,6 +1589,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
             if (dense_f16_on() && wv.f16) e.gemm.f16((const uint16_t*) s.x16, wv.f16, s.v_m, T, HKV * D, N);
             else e.gemm.native((const uint16_t*) s.x16, wv.type, wv.d, s.v_m, T, HKV * D, N);
         }
+        pp_mark(e.cnt.pf_dense_ns);
         k_attn_prep_multi<<<dim3(H + HKV, T), kThreads>>>(s.q_m, s.k_m, s.v_m, e.f32.at(L(l, "attn_q_norm.weight")),
                                                           e.f32.at(L(l, "attn_k_norm.weight")), s.q_m, s.kc[l],
                                                           s.vc[l], H, HKV, D, p0, g.n_swa, s.ctx, e.rope_base,
@@ -1682,6 +1696,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
             ph_close(e.cnt.attn_pv_ns);
         }
         }   // attn_flash's else
+        pp_mark(e.cnt.pf_attn_ns);
         k_to_f16<<<grid1((int64_t) T * H * D), kThreads>>>(s.att_m, s.att16, (int64_t) T * H * D);
         if (attn_dump_path() && (attn_dump_layer() < 0 || (int) l == attn_dump_layer())) {
             const size_t nf = (size_t) T * H * D;
@@ -1932,6 +1947,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                 }
                 const std::vector<int32_t>& pool_list = b.f16 ? s.pf_miss : s.pf_touch;
                 const auto pf_t0 = std::chrono::steady_clock::now();
+                pp_mark(e.cnt.pf_exp_ns);   // S7: the expert leg (the GPU grouped GEMMs + the CPU pool)
                 e.pool.run([&](int shard) {
                     const auto sh_t0 = std::chrono::steady_clock::now();
                     const void* acts[64]; float* ffs[64]; const void* hqs[64]; float* eys[64];
@@ -1979,7 +1995,9 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                     e.pf_experts += touched;
                     ++e.pf_chunks;
                 }
-                // S7 increment C: the resident rows land in res_ey_h (block order, padded rows ignored); scatter
+                pp_mark(e.cnt.pf_other_ns);   // S7: the layer's other kernels (the shared expert, the MoE sum, the norms)
+        e.cnt.pf_layers++;
+        // S7 increment C: the resident rows land in res_ey_h (block order, padded rows ignored); scatter
                 // them into s.ey_h at their selection rows.  Every selection row is covered exactly once, and the
                 // existing H2D below ships the whole NK x N block unchanged.
                 if (b.f16 && s.pf_nblk > 0) {
@@ -2300,6 +2318,12 @@ void print_counters(Engine& e, const char* tag) {
     if (e.pf_stage_chunks > 0) {
         std::fprintf(stderr, "CNT prefill staged: chunks=%lld staged=%.2f GB (%.0f MB/chunk)\n", e.pf_stage_chunks,
                      e.pf_stage_bytes / 1e9, e.pf_stage_bytes / 1e6 / e.pf_stage_chunks);
+    }
+    if (e.cnt.pf_layers > 0) {
+        const double n = (double) e.cnt.pf_layers;
+        std::fprintf(stderr, "CNT prefill phases: dense=%.1f ms attn=%.1f ms experts=%.1f ms other=%.1f ms (per layer)\n",
+                     e.cnt.pf_dense_ns / 1e6 / n, e.cnt.pf_attn_ns / 1e6 / n, e.cnt.pf_exp_ns / 1e6 / n,
+                     e.cnt.pf_other_ns / 1e6 / n);
     }
     if (e.cnt.attn_sc_ns > 0)
         std::fprintf(stderr, "CNT prefill attn: scores=%.0f ms softmax=%.0f ms pv=%.0f ms\n",
