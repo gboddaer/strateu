@@ -139,6 +139,14 @@ static inline bool attn_simt_on() {
     return on;
 }
 
+// S7 prong B (full flash): fuse the prefill tq loop into ONE k_attn_flash launch per layer (scores+softmax+PV
+// in-kernel; no fp32 score/p16 round trips).  Gate-off = exact current path.  Guards at dispatch: the kolibri
+// shape the kernel hard-codes (H 48 / KV 4 / D 128); any other shape falls through to the cublas path.
+static inline bool attn_flash_on() {
+    static const bool on = std::getenv("STRATA_KOLIBRI_ATTN_FLASH") != nullptr;
+    return on;
+}
+
 struct LayerBlobs {
     strata::kernels::NativeExpertLayout L;
     size_t stride = 0;              // blob slot bytes, block-aligned (the lcm of the types' super-blocks)
@@ -509,7 +517,116 @@ __global__ void __launch_bounds__(256) k_attn_scores_simt(const __half* __restri
     }
 }
 
+/// S7 prong B (full flash): the prefill's scores + softmax + PV in ONE kernel - no fp32 score or p16 round
+/// trips.  Grid (ceil(T/QT), HKV); one CTA = QT consecutive queries x all G=12 heads of one kvh, so every
+/// K/V key tile is loaded to shared memory ONCE and shared across the heads (the GQA traffic lever; live
+/// CTAs walk the same stream, so DRAM sees ~one copy).  8 warps: warp w owns query q0+w; its G rows keep
+/// the online-softmax max/sum and the PV dim-slice accumulator in REGISTERS across the whole k-loop
+/// (lane = 4 dims - the dot partials' dims and the acc's dims are the same slice).  Per dot: the lane
+/// partial (4 FMA, in order) + the 5-step shfl_xor butterfly (deterministic sum order); scale before max;
+/// w = exp(s*scale - m); acc/l rescaled per step; final normalize by the sum -> att_m.  Mask per row via
+/// the same helper the softmax uses ([lo, pos0+q+1), slice-relative rows, so one row-indexing covers both
+/// the full cache and the gathered ring).  D is hard-coded 128 (the dispatch guards it); env
+/// STRATA_KOLIBRI_ATTN_FLASH=1.
+__global__ void __launch_bounds__(256) k_attn_flash(const __half* __restrict__ q16, const __half* __restrict__ kcache,
+                                                    const __half* __restrict__ vcache, float* __restrict__ att_m,
+                                                    int H, long long kstride, int T, int P, int p0, int64_t swa,
+                                                    int first, float scale) {
+    constexpr int QT = 8, GW = 12, KCK = 32;
+    __shared__ __align__(16) __half Ks[KCK][128];
+    __shared__ __align__(16) __half Vs[KCK][128];   // 16 KB: 4 CTAs/SM on sm_75 (v1 held a 24.6 KB Q tile too:
+    // 1 CTA/SM, 8 warps, and the ~200-cycle dependent chains (5 chained shuffles + expf x2) per (row, key) did
+    // not hide - measured 2.3x WORSE than the cublas path at 32K; the q slices now live in registers per lane.
+    const int q0 = blockIdx.x * QT, kvh = blockIdx.y;
+    const int hbase = kvh * GW;
+    const __half* kh0 = kcache + (size_t) kvh * (size_t) kstride * 128;
+    const __half* vh0 = vcache + (size_t) kvh * (size_t) kstride * 128;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+    const int dl = lane * 4;   // this lane's D-slice (the dot partials' dims and the PV acc's dims)
+    // the lane's q slices, loaded once: 12 heads x 4 dims (uint2 per row, 16-B safe at dl*2 multiple)
+    float qsl[GW][4];
+    bool warp_live = q0 + warp < T;
+    if (warp_live) {
+#pragma unroll
+        for (int h = 0; h < GW; ++h) {
+            const __half* qh4 = q16 + ((size_t) (q0 + warp) * H + hbase + (size_t) h) * 128 + dl;
+            const uint2 v = *reinterpret_cast<const uint2*>(qh4);
+            const __half* hh = reinterpret_cast<const __half*>(&v);
+            qsl[h][0] = __half2float(hh[0]); qsl[h][1] = __half2float(hh[1]);
+            qsl[h][2] = __half2float(hh[2]); qsl[h][3] = __half2float(hh[3]);
+        }
+    }
+    int lo9, nmax;             // the block's max causal bound: the last valid warp row's
+    strata::kolibri::attn_mask_bounds(P, p0, min(q0 + 7, T - 1), swa, first, &lo9, &nmax);
+    int lo_d, nn;              // this warp's row's bounds (slice-relative rows, ring and cache alike)
+    strata::kolibri::attn_mask_bounds(P, p0, q0 + warp, swa, first, &lo_d, &nn);
+    float m[GW], l[GW], acc[GW][4];
+#pragma unroll
+    for (int h = 0; h < GW; ++h) {
+        m[h] = -INFINITY; l[h] = 0.f;
+        acc[h][0] = acc[h][1] = acc[h][2] = acc[h][3] = 0.f;
+    }
+    for (int kt = 0; kt < nmax; kt += KCK) {
+        const int kn = min(KCK, nmax - kt);
+        for (int idx = threadIdx.x; idx < kn * 16; idx += 256) {
+            const int kr = idx / 16, u = idx % 16;
+            *reinterpret_cast<uint4*>(&Ks[kr][u * 8]) =
+                *reinterpret_cast<const uint4*>(kh0 + (size_t) (kt + kr) * 128 + u * 8);
+            *reinterpret_cast<uint4*>(&Vs[kr][u * 8]) =
+                *reinterpret_cast<const uint4*>(vh0 + (size_t) (kt + kr) * 128 + u * 8);
+        }
+        __syncthreads();
+        if (warp_live && kt < nn) {
+            const int knw = min(KCK, nn - kt);
+            // the k loop OUTER, the 12 heads unrolled INSIDE: one small hot body (fits the instruction cache;
+            // the h-outer layout was 12 copies of the k-loop body that thrashed it every tile), K/V smem
+            // reads hoisted per k, and the 12 independent shuffle chains interleaved for ILP
+            for (int k = 0; k < knw; ++k) {
+                if (kt + k < lo_d) continue;   // the sliding window's start (0 or 1 at this chunk size)
+                const __half* kh4 = &Ks[k][dl];
+                const float k0f = __half2float(kh4[0]), k1f = __half2float(kh4[1]),
+                            k2f = __half2float(kh4[2]), k3f = __half2float(kh4[3]);
+                const __half* vh4 = &Vs[k][dl];
+                const float v0f = __half2float(vh4[0]), v1f = __half2float(vh4[1]),
+                            v2f = __half2float(vh4[2]), v3f = __half2float(vh4[3]);
+#pragma unroll
+                for (int h = 0; h < GW; ++h) {
+                    float p = qsl[h][0] * k0f;
+                    p = fmaf(qsl[h][1], k1f, p);
+                    p = fmaf(qsl[h][2], k2f, p);
+                    p = fmaf(qsl[h][3], k3f, p);
+                    p += __shfl_xor_sync(0xffffffffu, p, 16);
+                    p += __shfl_xor_sync(0xffffffffu, p, 8);
+                    p += __shfl_xor_sync(0xffffffffu, p, 4);
+                    p += __shfl_xor_sync(0xffffffffu, p, 2);
+                    p += __shfl_xor_sync(0xffffffffu, p, 1);
+                    const float s = p * scale;
+                    const float mn = fmaxf(m[h], s);
+                    const float rsv = expf(m[h] - mn);
+                    const float ce = expf(s - mn);
+                    acc[h][0] = fmaf(ce, v0f, acc[h][0] * rsv);
+                    acc[h][1] = fmaf(ce, v1f, acc[h][1] * rsv);
+                    acc[h][2] = fmaf(ce, v2f, acc[h][2] * rsv);
+                    acc[h][3] = fmaf(ce, v3f, acc[h][3] * rsv);
+                    m[h] = mn;
+                    l[h] = fmaf(l[h], rsv, ce);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (warp_live) {
+#pragma unroll
+        for (int h = 0; h < GW; ++h) {
+            const float il = 1.f / l[h];   // l >= 1 for any row with a visible key (its own position)
+            float* o = att_m + ((size_t) (q0 + warp) * H + hbase + (size_t) h) * 128 + dl;
+            o[0] = acc[h][0] * il; o[1] = acc[h][1] * il; o[2] = acc[h][2] * il; o[3] = acc[h][3] * il;
+        }
+    }
+}
+
 /// S3: the KV cache is FP16 at the source, so a full-attention layer feeds the score/PV GEMMs straight from the
+
 /// cache (rows 0..P-1 of a ctx-row buffer) with NO per-chunk conversion.  Only the sliding ring wraps, and its
 /// gather is a half-to-half copy of at most n_swa cells (2 KB per head-cell, not 4).  The old kernels converted
 /// the WHOLE prefix per chunk -- O(prefix^2) in KV traffic, the dominant prefill term (K19).
@@ -1197,6 +1314,12 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
             k_kv_ring<<<grid1((int64_t) HKV * P * D), kThreads>>>(s.kc[l], s.vc[l], s.k16, s.v16, g.n_swa, P,
                                                                   first, D, HKV);
         k_to_f16<<<grid1((int64_t) T * H * D), kThreads>>>(s.q_m, s.q16, (int64_t) T * H * D);
+        if (attn_flash_on() && H == 48 && HKV == 4 && D == 128) {
+            k_attn_flash<<<dim3((unsigned) ((T + 7) / 8), (unsigned) HKV), 256, 0, g_st>>>(
+                s.q16, sliding ? s.k16 : s.kc[l], sliding ? s.v16 : s.vc[l], s.att_m, (int) H,
+                sliding ? (long long) P : (long long) s.ctx, (int) T, P, (int) p0,
+                sliding ? (int64_t) g.n_swa : 0, (int) first, 1.0f / sqrtf((float) D));
+        } else {
         const int ldp = (P + 7) / 8 * 8;
         const int G = H / HKV;
         const int64_t tq_lim = (int64_t) (attn_cap_floats() / ((size_t) H * 512)) * 512;   // nt * ldp <= tq_lim
@@ -1280,6 +1403,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
             }
             ph_close(e.cnt.attn_pv_ns);
         }
+        }   // attn_flash's else
         k_to_f16<<<grid1((int64_t) T * H * D), kThreads>>>(s.att_m, s.att16, (int64_t) T * H * D);
         {
             const Dense& wo = e.dense.at(L(l, "attn_output.weight"));
