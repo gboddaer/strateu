@@ -101,6 +101,18 @@ static inline int expert_f16_n() {
     return n;
 }
 
+// S7 prong A: the prefill scores-buffer cap, in floats (STRATA_KOLIBRI_ATTN_MB, MiB; default 48 = the old
+// kAttScoreFloats 12<<20).  The tq loop batches this many score elements at once; larger caps (e.g. 384) cut
+// the K/V re-read amplification and give cublas real M at deep prefixes.  Gate-off (default) = bitwise today.
+static inline int64_t attn_cap_floats() {
+    static const int64_t mb = [] {
+        const char* v = std::getenv("STRATA_KOLIBRI_ATTN_MB");
+        int64_t m = v ? (int64_t) std::atoi(v) : (int64_t) 48;
+        return m < 1 ? (int64_t) 48 : m;
+    }();
+    return mb * ((1 << 20) / 4);   // floats; 48 MiB = 12,582,912 floats
+}
+
 struct LayerBlobs {
     strata::kernels::NativeExpertLayout L;
     size_t stride = 0;              // blob slot bytes, block-aligned (the lcm of the types' super-blocks)
@@ -1091,8 +1103,8 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
         k_to_f16<<<grid1((int64_t) T * H * D), kThreads>>>(s.q_m, s.q16, (int64_t) T * H * D);
         const int ldp = (P + 7) / 8 * 8;
         const int G = H / HKV;
-        const size_t kAttScoreFloats = 12u << 20;
-        const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (kAttScoreFloats / ((size_t) H * ldp))));
+        const int64_t tq_lim = (int64_t) (attn_cap_floats() / ((size_t) H * 512)) * 512;   // nt * ldp <= tq_lim
+        const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, tq_lim / ldp));
         for (int t0 = 0; t0 < T; t0 += tq) {
             const int nt = std::min(tq, T - t0);
             for (int kvh = 0; kvh < HKV; ++kvh) {
@@ -1580,8 +1592,8 @@ void init_scratch(const Engine& e, Scratch& s) {
         KC(cudaMalloc((void**) &s.k16, (size_t) g.n_head_kv * s.ctx * g.head_dim * f16));
         KC(cudaMalloc((void**) &s.v16, (size_t) g.n_head_kv * s.ctx * g.head_dim * f16));
         // the scores slice is H * tq * ldp; the runtime tq uses the chunk's ldp (>= 512), so the worst case is
-        // the smallest ldp: tq = 12M / (H * 512), and tq * ldp <= 12M / H always
-        const size_t tq_w = std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) ((12u << 20) / ((size_t) g.n_head * 512))));
+        // tq_w * 512 is the nt * ldp bound the buffer must cover (== the attn cap / H); nt * ldp <= tq_w * 512
+        const size_t tq_w = std::max<int64_t>(1, (int64_t) (attn_cap_floats() / ((size_t) g.n_head * 512)));
         KC(cudaMalloc((void**) &s.att_s, (size_t) g.n_head * tq_w * 512 * 4 + (size_t) g.n_head * 8 * 4));
         KC(cudaMalloc((void**) &s.p16, ((size_t) g.n_head * tq_w * 512 + (size_t) g.n_head * 8) * f16));
     }
