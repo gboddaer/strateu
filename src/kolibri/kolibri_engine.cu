@@ -131,6 +131,14 @@ static inline bool attn_kg_on() {
     return on;
 }
 
+// S7 prong B: the prompt scores via k_attn_scores_simt (deterministic fp32 SIMT tiling, fp16 operands converted
+// at the smem tiles, k=0..127 fmaf chain in order) instead of the cublas scores GEMM.  Same [H][nt][ldp] att_s
+// layout, so softmax16 and the PV GEMM are untouched.  Gate-off = exact cublas path.
+static inline bool attn_simt_on() {
+    static const bool on = std::getenv("STRATA_KOLIBRI_ATTN_SIMT") != nullptr;
+    return on;
+}
+
 struct LayerBlobs {
     strata::kernels::NativeExpertLayout L;
     size_t stride = 0;              // blob slot bytes, block-aligned (the lcm of the types' super-blocks)
@@ -433,6 +441,74 @@ __global__ void k_to_f16(const float* x, __half* y, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = __float2half(x[i]);
 }
+/// S7 prong B: the prompt scores as a deterministic fp32 SIMT-tiled kernel (main's block_scores_simt structure,
+/// ported to kolibri's fp16 KV and per-head scores).  grid (k-tiles 64, q-tiles 32, head-groups of 4 within one
+/// kvh); 256 threads; each thread owns 2 queries x 4 heads x TN keys; the k = 0..127 fmaf chain runs IN ORDER in
+/// every tiling (main's bitwise-tiling property).  fp16 q/K are converted to fp32 at the smem tile load, so the
+/// FMA operands are exactly the fp16 cache bits.  The epilogue skips masked cells (key >= pos0+q+1, or below the
+/// sliding window) - the softmax only reads [lo, n).  Replaces ONLY the cublas scores GEMM call (gate:
+/// STRATA_KOLIBRI_ATTN_SIMT); softmax16 and the PV GEMM are untouched.
+template <int QT, int NB, int KC, int TN>
+__global__ void __launch_bounds__(256) k_attn_scores_simt(const __half* __restrict__ q16, const __half* __restrict__ kcache,
+                                                          int H, int p0, int t0, int h0, int nt, int P, int D, int ldp,
+                                                          int64_t swa, int first, float* __restrict__ att_s) {
+    constexpr int ROWS = QT * 4, QSB = ROWS + 4, KSB = NB + 4, CX = NB / TN;   // h0 = kvh*G; the CTA's 4 heads = h0 + blockIdx.z*4 + (r&3)
+    __shared__ __align__(16) float Qs[KC][QSB];
+    __shared__ __align__(16) float Ks[KC][KSB];
+    const int q0 = blockIdx.y * QT, b0 = blockIdx.x * NB;
+    const int hbase = h0 + (int) blockIdx.z * 4;
+    const int tid = threadIdx.x, tx = tid % CX, ty = tid / CX;
+    float acc[8][TN] = {};
+    for (int d0 = 0; d0 < D; d0 += KC) {
+        for (int idx = tid; idx < ROWS * (KC / 8); idx += 256) {   // the q rows: one uint4 (8 halves) -> 8 smem floats
+            const int r = idx / (KC / 8), u = idx % (KC / 8);
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (q0 + (r >> 2) < nt)
+                v = *reinterpret_cast<const uint4*>(q16 + ((size_t) (t0 + q0 + (r >> 2)) * H + hbase + (size_t) (r & 3)) * D + d0 + u * 8);
+            const __half* hh = reinterpret_cast<const __half*>(&v);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) Qs[u * 8 + j][r] = __half2float(hh[j]);
+        }
+        for (int idx = tid; idx < NB * (KC / 8); idx += 256) {     // the key rows, same conversion
+            const int c = idx / (KC / 8), u = idx % (KC / 8);
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (b0 + c < P)
+                v = *reinterpret_cast<const uint4*>(kcache + (size_t) (b0 + c) * D + d0 + u * 8);
+            const __half* hh = reinterpret_cast<const __half*>(&v);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) Ks[u * 8 + j][c] = __half2float(hh[j]);
+        }
+        __syncthreads();
+#pragma unroll 8
+        for (int k = 0; k < KC; ++k) {
+            float qr[8], kr[TN];
+            *reinterpret_cast<float4*>(&qr[0]) = *reinterpret_cast<const float4*>(&Qs[k][ty * 8]);
+            *reinterpret_cast<float4*>(&qr[4]) = *reinterpret_cast<const float4*>(&Qs[k][ty * 8 + 4]);
+#pragma unroll
+            for (int t = 0; t < TN; t += 4)
+                *reinterpret_cast<float4*>(&kr[t]) = *reinterpret_cast<const float4*>(&Ks[k][tx * TN + t]);
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+#pragma unroll
+                for (int j = 0; j < TN; ++j) acc[i][j] = fmaf(qr[i], kr[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int q = q0 + ty * 2 + (i >> 2);
+        if (q >= nt) continue;
+        int lo, n;
+        strata::kolibri::attn_mask_bounds(P, p0 + t0, q, swa, first, &lo, &n);   // per-row [lo, pos0+q+1)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            const int b = b0 + tx * TN + j;
+            if (b >= n || b < lo) continue;
+            att_s[((size_t) (h0 + blockIdx.z * 4 + (i & 3)) * (size_t) nt + (size_t) q) * ldp + b] = acc[i][j];
+        }
+    }
+}
+
 /// S3: the KV cache is FP16 at the source, so a full-attention layer feeds the score/PV GEMMs straight from the
 /// cache (rows 0..P-1 of a ctx-row buffer) with NO per-chunk conversion.  Only the sliding ring wraps, and its
 /// gather is a half-to-half copy of at most n_swa cells (2 KB per head-cell, not 4).  The old kernels converted
@@ -1173,7 +1249,13 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                                                : s.kc[l] + (size_t) kvh * s.ctx * D;
                 const __half* Qh = s.q16 + ((size_t) t0 * H + kvh * G) * D;
                 float* Sh = s.att_s + (size_t) kvh * G * nt * ldp;
-                if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, D, &one, Kh, CUDA_R_16F, D, 0,
+                if (attn_simt_on()) {
+                    const dim3 sg((unsigned) ((P + 63) / 64), (unsigned) ((nt + 31) / 32), (unsigned) (G / 4));
+                    k_attn_scores_simt<32, 64, 32, 4><<<sg, 256, 0, g_st>>>(s.q16, Kh, (int) H, (int) p0, (int) t0,
+                                                                           kvh * G, nt, P, (int) D, ldp,
+                                                                           sliding ? (int64_t) g.n_swa : 0,
+                                                                           (int) first, s.att_s);
+                } else if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, D, &one, Kh, CUDA_R_16F, D, 0,
                                                Qh, CUDA_R_16F, H * D, D, &zero, Sh, CUDA_R_32F, ldp,
                                                (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
                     CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "strata-kolibri: scores GEMM failed\n"); std::exit(1); }
