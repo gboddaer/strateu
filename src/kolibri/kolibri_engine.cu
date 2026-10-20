@@ -113,6 +113,24 @@ static inline int64_t attn_cap_floats() {
     return mb * ((1 << 20) / 4);   // floats; 48 MiB = 12,582,912 floats
 }
 
+// S7 prong-B pricing: split the tq loop into scores / softmax / PV wall segments (env-gated; the syncs
+// serialize the stream, so measurement-only runs only).
+static inline bool attn_phases_on() {
+    static const bool on = std::getenv("STRATA_KOLIBRI_ATTN_PHASES") != nullptr;
+    return on;
+}
+
+// S7 prong B-lite: batch the tq loop by head-group at M = the whole chunk (T queries per GEMM) instead of
+// tq queries per GEMM.  cublas ran M=42 at 0.8%% of tensor peak (phase timers: scores 133.5 s of the 166 s
+// attention term at 32K); M=512 shapes are real tensor tiles.  The cap-sized buffers hold per-slot slices
+// [slot][T][ldp] (Bh reusable slots, consumed in stream order); the softmax rows and per-item PV shapes are
+// unchanged - only the cublas M/batch, the softmax grid and the slice bases change.  Gate-off = exact current
+// path.  Needs one head's whole-chunk scores to fit the cap: T*ldp <= cap floats.
+static inline bool attn_kg_on() {
+    static const bool on = std::getenv("STRATA_KOLIBRI_ATTN_KG") != nullptr;
+    return on;
+}
+
 struct LayerBlobs {
     strata::kernels::NativeExpertLayout L;
     size_t stride = 0;              // blob slot bytes, block-aligned (the lcm of the types' super-blocks)
@@ -208,6 +226,8 @@ struct Engine {
         // the routed experts.  The branch counts settle which layers go where; they are the input to task 9's
         // placement, and they make every future placement change readable from CNT without a profiler.
         long long br_pool = 0, br_gpu = 0, br_slots = 0, br_grouped = 0;
+        // S7 prong-B pricing (STRATA_KOLIBRI_ATTN_PHASES): the prefilm tq loop's three segments, ns, all layers.
+        long long attn_sc_ns = 0, attn_sm_ns = 0, attn_pv_ns = 0;
     };
     mutable Counters cnt;   // layer_step takes the Engine as const (like `mutable Pool pool`)
     bool counters = false;
@@ -1105,7 +1125,48 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
         const int G = H / HKV;
         const int64_t tq_lim = (int64_t) (attn_cap_floats() / ((size_t) H * 512)) * 512;   // nt * ldp <= tq_lim
         const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, tq_lim / ldp));
-        for (int t0 = 0; t0 < T; t0 += tq) {
+        const bool attn_ph = attn_phases_on();
+        std::chrono::steady_clock::time_point ph_last{};
+        if (attn_ph) ph_last = std::chrono::steady_clock::now();
+        auto ph_close = [&](long long& acc) {
+            if (!attn_ph) return;
+            cudaStreamSynchronize(g_st);
+            const auto n = std::chrono::steady_clock::now();
+            acc += std::chrono::duration_cast<std::chrono::nanoseconds>(n - ph_last).count();
+            ph_last = n;
+        };
+        if (attn_kg_on() && (int64_t) T * ldp <= attn_cap_floats()) {
+            const int Bh = (int) std::max<int64_t>(1, std::min<int64_t>(G, attn_cap_floats() / ((size_t) T * ldp)));
+            for (int kvh = 0; kvh < HKV; ++kvh) {
+                const __half* Kh = sliding ? s.k16 + (size_t) kvh * P * D
+                                           : s.kc[l] + (size_t) kvh * s.ctx * D;
+                const __half* Vh = sliding ? s.v16 + (size_t) kvh * P * D
+                                           : s.vc[l] + (size_t) kvh * s.ctx * D;
+                for (int hb = 0; hb < G; hb += Bh) {
+                    const int nb = std::min(Bh, G - hb);
+                    const __half* Qh = s.q16 + (size_t) (kvh * G + hb) * D;
+                    // the cap-sized buffers hold Bh reusable slots (stream order: scores -> softmax -> PV
+                    // per slot before the next (kvh, hb) reuses it), so base = the slot, NOT the global head
+                    float* Sh = s.att_s + (size_t) (hb / Bh) * T * ldp;
+                    if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, T, D, &one, Kh, CUDA_R_16F,
+                                                   D, 0, Qh, CUDA_R_16F, H * D, D, &zero, Sh, CUDA_R_32F, ldp,
+                                                   (long long) T * ldp, nb, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                        CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "strata-kolibri: scores GEMM failed\n"); std::exit(1); }
+                    ph_close(e.cnt.attn_sc_ns);
+                    k_attn_softmax16<<<dim3(T, nb), kThreads>>>(Sh, s.p16 + (size_t) (hb / Bh) * T * ldp,
+                                                                ldp, T, P, p0, 1.0f / sqrtf((float) D),
+                                                                sliding ? g.n_swa : 0, (int) first);
+                    ph_close(e.cnt.attn_sm_ns);
+                    const __half* Ph = s.p16 + (size_t) (hb / Bh) * T * ldp;
+                    float* Oh = s.att_m + (size_t) (kvh * G + hb) * D;
+                    if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, D, T, P, &one, Vh, CUDA_R_16F, D, 0,
+                                                   Ph, CUDA_R_16F, ldp, (long long) T * ldp, &zero, Oh, CUDA_R_32F,
+                                                   H * D, D, nb, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                        CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "strata-kolibri: PV GEMM failed\n"); std::exit(1); }
+                    ph_close(e.cnt.attn_pv_ns);
+                }
+            }
+        } else for (int t0 = 0; t0 < T; t0 += tq) {
             const int nt = std::min(tq, T - t0);
             for (int kvh = 0; kvh < HKV; ++kvh) {
                 const __half* Kh = sliding ? s.k16 + (size_t) kvh * P * D
@@ -1117,8 +1178,10 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                                                (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
                     CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "strata-kolibri: scores GEMM failed\n"); std::exit(1); }
             }
+            ph_close(e.cnt.attn_sc_ns);
             k_attn_softmax16<<<dim3(nt, H), kThreads>>>(s.att_s, s.p16, ldp, nt, P, (int) p0 + t0,
                                                         1.0f / sqrtf((float) D), sliding ? g.n_swa : 0, (int) first);
+            ph_close(e.cnt.attn_sm_ns);
             for (int kvh = 0; kvh < HKV; ++kvh) {
                 const __half* Vh = sliding ? s.v16 + (size_t) kvh * P * D
                                                : s.vc[l] + (size_t) kvh * s.ctx * D;
@@ -1133,6 +1196,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                     std::exit(1);
                 }
             }
+            ph_close(e.cnt.attn_pv_ns);
         }
         k_to_f16<<<grid1((int64_t) T * H * D), kThreads>>>(s.att_m, s.att16, (int64_t) T * H * D);
         {
@@ -1734,6 +1798,9 @@ void print_counters(Engine& e, const char* tag) {
         std::fprintf(stderr, "CNT prefill staged: chunks=%lld staged=%.2f GB (%.0f MB/chunk)\n", e.pf_stage_chunks,
                      e.pf_stage_bytes / 1e9, e.pf_stage_bytes / 1e6 / e.pf_stage_chunks);
     }
+    if (e.cnt.attn_sc_ns > 0)
+        std::fprintf(stderr, "CNT prefill attn: scores=%.0f ms softmax=%.0f ms pv=%.0f ms\n",
+                     e.cnt.attn_sc_ns / 1e6, e.cnt.attn_sm_ns / 1e6, e.cnt.attn_pv_ns / 1e6);
     if (e.pf_cov_chunks > 0) {
         std::fprintf(stderr, "CNT prefill slot coverage: S=%d chunks=%lld entries=%lld hits=%.1f%% uniq/chunk=%.0f\n",
                      e.slots, e.pf_cov_chunks, e.pf_entry_n, 100.0 * e.pf_hit_entries / (double) e.pf_entry_n,
