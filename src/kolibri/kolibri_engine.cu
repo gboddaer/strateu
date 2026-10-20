@@ -95,6 +95,13 @@ static inline bool dense_f16_on() {
     return on;
 }
 
+// An env gate that reads the VALUE (0 = off): the plain presence test (getenv != nullptr) turns the feature ON
+// for an empty or "0" value - which silently voided an A/B (both arms on the same path).
+static inline bool env_on(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+}
+
 // S7 expert fp16 cache: experts per layer to keep VRAM-resident (STRATA_KOLIBRI_EXPERT_F16=N).  0 = off.
 static inline int expert_f16_n() {
     static const int n = std::getenv("STRATA_KOLIBRI_EXPERT_F16") ? std::atoi(std::getenv("STRATA_KOLIBRI_EXPERT_F16")) : 0;
@@ -116,7 +123,7 @@ static inline int64_t attn_cap_floats() {
 // S7 prong-B pricing: split the tq loop into scores / softmax / PV wall segments (env-gated; the syncs
 // serialize the stream, so measurement-only runs only).
 static inline bool attn_phases_on() {
-    static const bool on = std::getenv("STRATA_KOLIBRI_ATTN_PHASES") != nullptr;
+    static const bool on = env_on("STRATA_KOLIBRI_ATTN_PHASES");
     return on;
 }
 
@@ -127,7 +134,7 @@ static inline bool attn_phases_on() {
 // unchanged - only the cublas M/batch, the softmax grid and the slice bases change.  Gate-off = exact current
 // path.  Needs one head's whole-chunk scores to fit the cap: T*ldp <= cap floats.
 static inline bool attn_kg_on() {
-    static const bool on = std::getenv("STRATA_KOLIBRI_ATTN_KG") != nullptr;
+    static const bool on = env_on("STRATA_KOLIBRI_ATTN_KG");
     return on;
 }
 
@@ -135,7 +142,7 @@ static inline bool attn_kg_on() {
 // at the smem tiles, k=0..127 fmaf chain in order) instead of the cublas scores GEMM.  Same [H][nt][ldp] att_s
 // layout, so softmax16 and the PV GEMM are untouched.  Gate-off = exact cublas path.
 static inline bool attn_simt_on() {
-    static const bool on = std::getenv("STRATA_KOLIBRI_ATTN_SIMT") != nullptr;
+    static const bool on = env_on("STRATA_KOLIBRI_ATTN_SIMT");
     return on;
 }
 
@@ -143,7 +150,7 @@ static inline bool attn_simt_on() {
 // in-kernel; no fp32 score/p16 round trips).  Gate-off = exact current path.  Guards at dispatch: the kolibri
 // shape the kernel hard-codes (H 48 / KV 4 / D 128); any other shape falls through to the cublas path.
 static inline bool attn_flash_on() {
-    static const bool on = std::getenv("STRATA_KOLIBRI_ATTN_FLASH") != nullptr;
+    static const bool on = env_on("STRATA_KOLIBRI_ATTN_FLASH");
     return on;
 }
 
@@ -160,6 +167,8 @@ static inline int attn_dump_layer() {
                              ? std::atoi(std::getenv("STRATA_KOLIBRI_ATTN_DUMP_LAYER")) : 0;
     return l;
 }
+
+
 
 struct LayerBlobs {
     strata::kernels::NativeExpertLayout L;
@@ -658,7 +667,7 @@ __device__ __forceinline__ void mma168(float* c, const uint32_t* a, const uint32
 }
 
 static inline bool attn_mma_on() {
-    static const bool on = std::getenv("STRATA_KOLIBRI_ATTN_MMA") != nullptr;
+    static const bool on = env_on("STRATA_KOLIBRI_ATTN_MMA");
     return on;
 }
 
@@ -672,7 +681,11 @@ __global__ void __launch_bounds__(128) k_attn_flash_mma(const __half* __restrict
     __shared__ __align__(16) __half Ks[KCK][KP];   // [key][dim]
     __shared__ __align__(16) __half Vs[KCK][KP];   // [key][dim]
     __shared__ float part[4][HS][16][KCK];         // the d-slice partials, then the sums (the w=0 slot)
-    const int q0 = blockIdx.x * Q16, kvh = blockIdx.y;
+    const int q0 = blockIdx.x * Q16, kvh = blockIdx.y / 4, hgrp = (int) (blockIdx.y % 4) * 3;
+    // all 4 warps handle the SAME 3 heads and split the 128 dims (each warp = 32 dims): the score partials
+    // then reduce per HEAD across the warps (before, the head depended on the warp and the reduction added
+    // different heads' partials - the first wrong cell was dim 32 = warp 1's slice, and the mma output there
+    // was exactly 0).
     const __half* kh0 = kcache + (size_t) kvh * (size_t) kstride * 128;
     const __half* vh0 = vcache + (size_t) kvh * (size_t) kstride * 128;
     const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
@@ -686,8 +699,8 @@ __global__ void __launch_bounds__(128) k_attn_flash_mma(const __half* __restrict
     uint32_t qa[HS][4][2];   // the A-frags: 3 heads x 4 dim-tiles x {row gid, row gid+8} half2s
 #pragma unroll
     for (int hs = 0; hs < HS; ++hs) {
-        const __half* qh = q16 + ((size_t) (q0 + gid) * H + kvh * 12 + warp + 4 * hs) * 128 + warp * 32 + tig * 2;
-        const __half* qh8 = q16 + ((size_t) (q0 + gid + 8) * H + kvh * 12 + warp + 4 * hs) * 128 + warp * 32 + tig * 2;
+        const __half* qh = q16 + ((size_t) (q0 + gid) * H + kvh * 12 + hgrp + hs) * 128 + warp * 32 + tig * 2;
+        const __half* qh8 = q16 + ((size_t) (q0 + gid + 8) * H + kvh * 12 + hgrp + hs) * 128 + warp * 32 + tig * 2;
 #pragma unroll
         for (int ds = 0; ds < 4; ++ds) {
             qa[hs][ds][0] = live0 ? *reinterpret_cast<const uint32_t*>(qh + ds * 8) : 0u;
@@ -798,7 +811,7 @@ __global__ void __launch_bounds__(128) k_attn_flash_mma(const __half* __restrict
     for (int hs = 0; hs < HS; ++hs) {
         const float i0 = l[hs][0] > 0.0f ? 1.0f / l[hs][0] : 0.0f;
         const float i8 = l[hs][1] > 0.0f ? 1.0f / l[hs][1] : 0.0f;
-        const int h = kvh * 12 + warp + 4 * hs;
+        const int h = kvh * 12 + hgrp + hs;
 #pragma unroll
         for (int ds = 0; ds < 4; ++ds) {
             const int d = warp * 32 + ds * 8 + tig * 2;
@@ -1502,7 +1515,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                                                                   first, D, HKV);
         k_to_f16<<<grid1((int64_t) T * H * D), kThreads>>>(s.q_m, s.q16, (int64_t) T * H * D);
         if (attn_mma_on() && H == 48 && HKV == 4 && D == 128) {
-            k_attn_flash_mma<<<dim3((unsigned) ((T + 15) / 16), (unsigned) HKV), 128, 0, g_st>>>(
+            k_attn_flash_mma<<<dim3((unsigned) ((T + 15) / 16), (unsigned) (HKV * 4)), 128, 0, g_st>>>(
                 s.q16, sliding ? s.k16 : s.kc[l], sliding ? s.v16 : s.vc[l], s.att_m, (int) H,
                 sliding ? (long long) P : (long long) s.ctx, (int) T, P, (int) p0,
                 sliding ? (int64_t) g.n_swa : 0, (int) first, 1.0f / sqrtf((float) D));
@@ -1597,14 +1610,15 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
         }
         }   // attn_flash's else
         k_to_f16<<<grid1((int64_t) T * H * D), kThreads>>>(s.att_m, s.att16, (int64_t) T * H * D);
-        if (attn_dump_path() && (int) l == attn_dump_layer()) {
+        if (attn_dump_path() && (attn_dump_layer() < 0 || (int) l == attn_dump_layer())) {
             const size_t nf = (size_t) T * H * D;
             float* h = (float*) std::malloc(nf * sizeof(float));
             if (h) {
                 KC(cudaMemcpy(h, s.att_m, nf * sizeof(float), cudaMemcpyDeviceToHost));
                 std::FILE* f = std::fopen(attn_dump_path(), "ab");
                 if (f) {
-                    std::fwrite(&l, sizeof(int), 1, f);
+                    const int hdr[3] = {(int) l, (int) T, (int) 0x4b4d414d};   // layer, rows, magic
+                    std::fwrite(hdr, sizeof(int), 3, f);
                     std::fwrite(h, sizeof(float), nf, f);
                     std::fclose(f);
                 }
