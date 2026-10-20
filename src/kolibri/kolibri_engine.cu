@@ -267,6 +267,9 @@ struct Engine {
         long long br_pool = 0, br_gpu = 0, br_slots = 0, br_grouped = 0;
         // S7 prong-B pricing (STRATA_KOLIBRI_ATTN_PHASES): the prefilm tq loop's three segments, ns, all layers.
         long long attn_sc_ns = 0, attn_sm_ns = 0, attn_pv_ns = 0;
+        // S6: the decode's per-layer segments, ns (env-gated by STRATA_KOLIBRI_DEC_PHASES): the pre-expert
+        // chain, the ids+h D2H wait, the pool call, and the post-expert chain - the decode's 47 ms/token split.
+        long long dec_pre_ns = 0, dec_d2h_ns = 0, dec_pool_ns = 0, dec_post_ns = 0, dec_layers = 0;
     };
     mutable Counters cnt;   // layer_step takes the Engine as const (like `mutable Pool pool`)
     bool counters = false;
@@ -371,6 +374,27 @@ constexpr int kThreads = 128;
 // constant; production default is 11000 (44 KB dynamic + 2.5 KB static, under the 48 KB T4 per-block cap).
 static int g_two_pass_max = 11000;
 cudaStream_t g_st = nullptr;   // the router kernels require a created stream (kolibriref does the same)
+/// S6: the decode's dense gemv from the PRE-DEQUANTIZED fp16 weights (STRATA_KOLIBRI_DENSE_F16): no per-token
+/// Q4_K dequant (the decode's pre-expert chain measured 0.9 ms/layer = 66%% of the decode's wall, at 36 GB/s
+/// effective = 6%% of the T4's bandwidth - the dequant, not the bandwidth).  The x vector is converted to fp16
+/// once per call site; the dot accumulates in fp32.
+__global__ void k_gemv_f16(const __half* __restrict__ W, const __half* __restrict__ x, int n_in, float* y, int n_out) {
+    __shared__ float sh[kThreads];
+    const int o = blockIdx.x;
+    const __half* row = W + (size_t) o * (size_t) n_in;
+    float acc = 0.f;
+    for (int c = threadIdx.x * 8; c < n_in; c += blockDim.x * 8) {
+        const uint4 wv = *reinterpret_cast<const uint4*>(row + c);
+        const uint4 xv = *reinterpret_cast<const uint4*>(x + c);
+        const __half* wh = reinterpret_cast<const __half*>(&wv);
+        const __half* xh = reinterpret_cast<const __half*>(&xv);
+#pragma unroll
+        for (int l = 0; l < 8; ++l) acc = fmaf(__half2float(wh[l]), __half2float(xh[l]), acc);
+    }
+    acc = block_sum(acc, sh);
+    if (threadIdx.x == 0) y[o] = acc;
+}
+
 template <int T>
 __global__ void k_gemv(const uint8_t* W, size_t row_bytes, size_t expert_bytes, const int* ids, int n_in, const float* x,
                        size_t x_stride, float* y, int n_out) {
@@ -1198,6 +1222,28 @@ constexpr size_t kActBuf = 1 << 16;
 /// One matmul, bitwise kolibriref's gemv: quantized weights go through native_mmvq on a q8_1 copy of the
 /// activation (one call per selection, expert ids[sel] from the host picks); F32/F16/BF16 through plain k_gemv.
 /// `base`/`eb` point at an expert blob table (pinned host, UVA-read); null for the dense GPU tensors.
+/// S6: the decode's dense gemv through the fp16 cache (the caller converts x to fp16 once).  n_sel must be 1
+/// (the decode) and the weight must have its f16 copy.
+void gemv_f16(const Dense& w, const __half* x, float* y, cudaStream_t st = 0) {
+    const int n_in = (int) w.shape[0], n_out = (int) w.shape[1];
+    k_gemv_f16<<<dim3(n_out), kThreads, 0, st>>>((const __half*) w.f16, x, n_in, y, n_out);
+    KC(cudaGetLastError());
+}
+
+void gemv(const Dense& w, const float* x, float* y, const int* ids, int n_sel, size_t x_stride, const uint8_t* base,
+          size_t eb, cudaStream_t st);
+
+/// S6: the decode's dense call: the fp16 path when the weight has its pre-dequantized fp16 copy (and the
+/// caller has the fp16 x ready), else the exact current path.  env STRATA_KOLIBRI_DEC_F16 gates the route.
+void gemv_dec(const Dense& w, const float* x, const __half* x16, float* y, cudaStream_t st = 0) {
+    static const bool on = env_on("STRATA_KOLIBRI_DEC_F16");
+    if (on && w.f16 && x16) {
+        gemv_f16(w, x16, y, st);
+        return;
+    }
+    gemv(w, x, y, nullptr, 1, 0, nullptr, 0, st);
+}
+
 void gemv(const Dense& w, const float* x, float* y, const int* ids, int n_sel, size_t x_stride, const uint8_t* base,
           size_t eb, cudaStream_t st = 0) {
     const int n_in = (int) w.shape[0], n_out = (int) w.shape[1];
@@ -1230,6 +1276,8 @@ void gemv(const Dense& w, const float* x, float* y, const int* ids, int n_sel, s
 struct Scratch {
     int ctx = 8192, pos = 0;
     float *x, *h, *y, *q, *k, *v, *att, *router, *eg, *eu, *eh, *ey, *sg, *su, *sh, *sy, *moe, *wts, *logits;
+    __half* dec_h16 = nullptr;    // S6: the decode's fp16 activation copies (for the fp16 dense gemv)
+    __half* dec_att16 = nullptr;
     int* ids;
     std::vector<__half*> kc, vc;   // S3: FP16 KV -- half the bytes/token and half the prefill traffic
     // the CPU expert path's pinned host side: the layer's h, its quantized activations, the FF rows, the down rows
@@ -1322,19 +1370,29 @@ void pool_experts(const Engine& e, const LayerBlobs& b, Scratch& s, const std::v
     e.epool->run_split_multi_native(b.fmt, jobs.data(), (int) sels.size());
 }
 
+// S6: the decode's per-layer phase timers (measurement-only: the syncs serialize the stream, so this is
+// only for pricing runs).
+static inline bool dec_phases_on() {
+    static const bool on = env_on("STRATA_KOLIBRI_DEC_PHASES");
+    return on;
+}
+
 void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t st, float* layers_host) {
     const auto& g = e.g;
     const int N = (int) g.n_embd, K = (int) e.top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
     const int H = (int) g.n_head, HKV = (int) g.n_head_kv, D = (int) g.head_dim;
     const int B = 256;
     (void) layers_host;
+    std::chrono::steady_clock::time_point dp0{};
+    if (dec_phases_on()) { KC(cudaStreamSynchronize(st)); dp0 = std::chrono::steady_clock::now(); }
 
         const bool sliding = strata::core::is_swa_layer(g, l);
         const LayerBlobs& b = e.blobs[(size_t) l];
         k_rms<<<1, kThreads, 0, st>>>(s.x, e.f32.at(L(l, "attn_norm.weight")), s.h, N, e.eps);
-        gemv(e.dense.at(L(l, "attn_q.weight")), s.h, s.q, nullptr, 1, 0, nullptr, 0, st);
-        gemv(e.dense.at(L(l, "attn_k.weight")), s.h, s.k, nullptr, 1, 0, nullptr, 0, st);
-        gemv(e.dense.at(L(l, "attn_v.weight")), s.h, s.v, nullptr, 1, 0, nullptr, 0, st);
+        if (s.dec_h16) k_to_f16<<<dim3((N + 127) / 128), 128, 0, st>>>(s.h, s.dec_h16, N);   // S6: the fp16 copy for the dense gemvs
+        gemv_dec(e.dense.at(L(l, "attn_q.weight")), s.h, s.dec_h16, s.q, st);
+        gemv_dec(e.dense.at(L(l, "attn_k.weight")), s.h, s.dec_h16, s.k, st);
+        gemv_dec(e.dense.at(L(l, "attn_v.weight")), s.h, s.dec_h16, s.v, st);
         if (graph)
             k_attn_prep_p<<<H + HKV, kThreads, 0, st>>>(s.q, s.k, s.v, e.f32.at(L(l, "attn_q_norm.weight")),
                                            e.f32.at(L(l, "attn_k_norm.weight")), s.q, s.kc[l], s.vc[l], H, D, s.pos_d,
@@ -1351,13 +1409,17 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
         else
             k_attn<<<H, n_vis <= g_two_pass_max ? kThreads : 512, n_vis <= g_two_pass_max ? (size_t) n_vis * sizeof(float) : (size_t) 4096 * sizeof(float), st>>>(
                 s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding, 0, g_two_pass_max);
-        gemv(e.dense.at(L(l, "attn_output.weight")), s.att, s.y, nullptr, 1, 0, nullptr, 0, st);
+        if (s.dec_att16) k_to_f16<<<dim3((H * D + 127) / 128), 128, 0, st>>>(s.att, s.dec_att16, H * D);   // S6
+        gemv_dec(e.dense.at(L(l, "attn_output.weight")), s.att, s.dec_att16, s.y, st);
         k_rms<<<1, kThreads, 0, st>>>(s.y, e.f32.at(L(l, "post_attention_norm.weight")), s.y, N, e.eps);
         k_add<<<(N + B - 1) / B, B, 0, st>>>(s.x, s.y, N);
         k_rms<<<1, kThreads, 0, st>>>(s.x, e.f32.at(L(l, "ffn_norm.weight")), s.h, N, e.eps);
-        gemv(e.dense.at(L(l, "ffn_gate_inp.weight")), s.h, s.router, nullptr, 1, 0, nullptr, 0, st);
+        gemv_dec(e.dense.at(L(l, "ffn_gate_inp.weight")), s.h, s.dec_h16, s.router, st);
         strata::kernels::native_router_sigmoid_logit_add(s.router, e.f32.at(L(l, "exp_probs_b.bias")), s.ids, s.wts, 1,
                                                          g_st);
+        const bool dph = dec_phases_on();
+        std::chrono::steady_clock::time_point dpt{};
+        if (dph) { KC(cudaStreamSynchronize(st)); dpt = std::chrono::steady_clock::now(); }
         if (!graph) {
             g_ids_host.resize((size_t) K);
             KC(cudaMemcpy(g_ids_host.data(), s.ids, K * sizeof(int), cudaMemcpyDeviceToHost));
@@ -1432,12 +1494,18 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
             s.yc = yc;   // the MoE sum runs in the shared code, after the shared-expert gemv
         } else if (e.cpu_threads > 0 && b.pool_ok) {   // the pool's own capability, not the GPU's (see LayerBlobs)
             if (e.counters) ++e.cnt.br_pool;
+            if (dph) { KC(cudaStreamSynchronize(st)); const auto n = std::chrono::steady_clock::now();
+                       e.cnt.dec_d2h_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(n - dpt).count();
+                       dpt = n; }
             KC(cudaMemcpy(s.h_host, s.h, N * 4, cudaMemcpyDeviceToHost));
             if (e.counters) { ++e.cnt.d2h_n; e.cnt.d2h_bytes += (long long) N * 4; }   // was uncounted: the pool-only leg read as "no pool" from CNT
             strata::kernels::cpu::native_quant_act(b.fmt, s.h_host, s.act);
             std::vector<int> sels((size_t) K);
             for (int k = 0; k < K; ++k) sels[(size_t) k] = k;
             pool_experts(e, b, s, g_ids_host, sels);
+            if (dph) { const auto n = std::chrono::steady_clock::now();
+                       e.cnt.dec_pool_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(n - dpt).count();
+                       dpt = n; }
             // K15/K18: async on the compute stream (pinned source); see the slots path above for why.
             KC(cudaMemcpyAsync(s.ey, s.ey_h, (size_t) K * N * 4, cudaMemcpyHostToDevice, g_st));
             if (e.counters) { ++e.cnt.h2d_n; e.cnt.h2d_bytes += (long long) K * N * 4; }   // was uncounted
@@ -1449,16 +1517,21 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
         gemv(dn, s.eh, s.ey, s.ids, K, FF, b.table + b.L.down_off, b.stride);
         }
         }
-        gemv(e.dense.at(L(l, "ffn_gate_shexp.weight")), s.h, s.sg, nullptr, 1, 0, nullptr, 0, st);
-        gemv(e.dense.at(L(l, "ffn_up_shexp.weight")), s.h, s.su, nullptr, 1, 0, nullptr, 0, st);
+        gemv_dec(e.dense.at(L(l, "ffn_gate_shexp.weight")), s.h, s.dec_h16, s.sg, st);
+        gemv_dec(e.dense.at(L(l, "ffn_up_shexp.weight")), s.h, s.dec_h16, s.su, st);
         k_swiglu<<<(FS + B - 1) / B, B, 0, st>>>(s.sg, s.su, s.sh, FS);
-        gemv(e.dense.at(L(l, "ffn_down_shexp.weight")), s.sh, s.sy, nullptr, 1, 0, nullptr, 0, st);
+        if (s.dec_h16) k_to_f16<<<dim3((FS + 127) / 128), 128, 0, st>>>(s.sh, s.dec_h16, FS);   // S6: sh -> h16
+        gemv_dec(e.dense.at(L(l, "ffn_down_shexp.weight")), s.sh, s.dec_h16, s.sy, st);
         if (e.grouped > 0 && b.native_ok) k_moe_sum<<<(N + B - 1) / B, B, 0, st>>>(s.moe, s.gout, s.wts, K, s.sy, N);
         else if (e.slots > 0) k_moe_sum2<<<(N + B - 1) / B, B, 0, st>>>(s.moe, s.ey2, s.yc, s.wts, K, s.sy, N);
         else k_moe_sum<<<(N + B - 1) / B, B, 0, st>>>(s.moe, s.ey, s.wts, K, s.sy, N);
         k_rms<<<1, kThreads, 0, st>>>(s.moe, e.f32.at(L(l, "post_ffw_norm.weight")), s.moe, N, e.eps);
         k_add<<<(N + B - 1) / B, B, 0, st>>>(s.x, s.moe, N);
         if (layers_host && !graph) KC(cudaMemcpy(layers_host + (size_t) l * N, s.x, N * 4, cudaMemcpyDeviceToHost));
+        if (dph) { KC(cudaStreamSynchronize(st)); const auto n = std::chrono::steady_clock::now();
+                   e.cnt.dec_post_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(n - dpt).count();
+                   e.cnt.dec_pre_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(dpt - dp0).count();
+                   e.cnt.dec_layers++; }
         KC(cudaGetLastError());
     
 }
@@ -1972,7 +2045,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
         KC(cudaGetLastError());
     }
     k_rms<<<1, kThreads>>>(s.x_m + (size_t) (T - 1) * N, e.f32.at("output_norm.weight"), s.h, N, e.eps);
-    gemv(e.dense.at("output.weight"), s.h, s.logits, nullptr, 1, 0, nullptr, 0);
+    gemv_dec(e.dense.at("output.weight"), s.h, s.dec_h16, s.logits, 0);
     KC(cudaDeviceSynchronize());
 }
 
@@ -2007,7 +2080,7 @@ void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
         for (int64_t l = 0; l < g.n_layers; ++l) layer_step(e, s, l, false, 0, layers_host);
     }
     k_rms<<<1, kThreads>>>(s.x, e.f32.at("output_norm.weight"), s.h, N, e.eps);
-    gemv(e.dense.at("output.weight"), s.h, s.logits, nullptr, 1, 0, nullptr, 0);
+    gemv_dec(e.dense.at("output.weight"), s.h, s.dec_h16, s.logits, 0);
     KC(cudaDeviceSynchronize());
     ++s.pos;
 }
@@ -2139,6 +2212,10 @@ void init_scratch(const Engine& e, Scratch& s) {
         }
     }
     s.logits = dalloc(g.n_vocab);
+    if (dense_f16_on()) {   // S6: the decode's fp16 activation buffers (one dense vector + the attention output)
+        s.dec_h16 = (__half*) dalloc((size_t) g.n_embd * 2);
+        s.dec_att16 = (__half*) dalloc((size_t) g.n_head * g.head_dim * 2);
+    }
     KC(cudaMalloc(&s.ids, K * sizeof(int)));
     for (int64_t l = 0; l < g.n_layers; ++l) {
         const int64_t rows = strata::core::is_swa_layer(g, l) ? g.n_swa : s.ctx;
@@ -2305,6 +2382,12 @@ void print_counters(Engine& e, const char* tag) {
                      wp, dr, rp, wp + dr + rp, (wp + dr + rp) / tok, ms / tok);
     }
     std::fflush(stderr);
+    if (e.cnt.dec_layers > 0) {
+        const double n = (double) e.cnt.dec_layers;
+        std::fprintf(stderr, "CNT decode phases: pre=%.1f ms d2h=%.1f ms pool=%.1f ms post=%.1f ms (per layer)\n",
+                     e.cnt.dec_pre_ns / 1e6 / n, e.cnt.dec_d2h_ns / 1e6 / n, e.cnt.dec_pool_ns / 1e6 / n,
+                     e.cnt.dec_post_ns / 1e6 / n);
+    }
     if (e.cnt.br_pool + e.cnt.br_gpu + e.cnt.br_slots + e.cnt.br_grouped > 0)
         std::fprintf(stderr, "CNT branches per tok: pool %.1f gpu-expert %.1f slots-path %.1f grouped %.1f"
                              " (layers/token total %.1f of %lld)\n",
