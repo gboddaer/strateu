@@ -147,6 +147,20 @@ static inline bool attn_flash_on() {
     return on;
 }
 
+// S7 cycle-2 instrument: dump one layer's att_m (the prefill's attention output) to a binary file, so the
+// FIRST NaN cell (row, head, dim) can be read.  Env STRATA_KOLIBRI_ATTN_DUMP=<path>; the layer index comes
+// from STRATA_KOLIBRI_ATTN_DUMP_LAYER (default 0).  Measurement-only: the copy is after the layer's
+// attention and does not touch the numerics.
+static inline const char* attn_dump_path() {
+    static const char* p = std::getenv("STRATA_KOLIBRI_ATTN_DUMP");
+    return p;
+}
+static inline int attn_dump_layer() {
+    static const int l = std::getenv("STRATA_KOLIBRI_ATTN_DUMP_LAYER")
+                             ? std::atoi(std::getenv("STRATA_KOLIBRI_ATTN_DUMP_LAYER")) : 0;
+    return l;
+}
+
 struct LayerBlobs {
     strata::kernels::NativeExpertLayout L;
     size_t stride = 0;              // blob slot bytes, block-aligned (the lcm of the types' super-blocks)
@@ -621,6 +635,179 @@ __global__ void __launch_bounds__(256) k_attn_flash(const __half* __restrict__ q
             const float il = 1.f / l[h];   // l >= 1 for any row with a visible key (its own position)
             float* o = att_m + ((size_t) (q0 + warp) * H + hbase + (size_t) h) * 128 + dl;
             o[0] = acc[h][0] * il; o[1] = acc[h][1] * il; o[2] = acc[h][2] * il; o[3] = acc[h][3] * il;
+        }
+    }
+}
+
+// S7 prong B (mma): the prefill's fused attention on tensor cores - mma.sync.m16n8k8 f16 (Turing) with fp32
+// accumulation and NO fp32 score/p16 round trips.  Grid (ceil(T/16), HKV); block 128 = 4 warps; warp w owns
+// the d-slice [32w, 32w+32) of the output and 3 of the 12 heads; the block = 16 consecutive queries of one
+// kvh.  Score partials per 24-key tile cross warps through shared memory and sum in a fixed order
+// (deterministic); the online softmax (m/l per row-pair in registers, the frag-max gathered with two XOR
+// shuffles inside the 4-lane group) rescales the register accumulators; p.v is mma'd straight from the
+// softmaxed weights (packed per row-pair in registers) against the shared V tile - the two keys' halves
+// picked strided and packed per lane, exactly as the ported reference does on its [key][dim] V layout.
+// Fragment maps (the PTX ISA, verified against the working reference): a = {row gid, the k-pair 2*tig..+1}
+// & {row gid+8, ...}; b = {k 2*tig..+1} x {n gid}; c = {row gid: n 2tig/+1; row gid+8: n 2tig/+1}.  The K/V
+// tiles are [key][dim] rows padded to 136 halves so the 272-B row steps walk the 32 smem banks.
+// env STRATA_KOLIBRI_ATTN_MMA=1.
+__device__ __forceinline__ void mma168(float* c, const uint32_t* a, const uint32_t* b) {
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(b[0]));
+}
+
+static inline bool attn_mma_on() {
+    static const bool on = std::getenv("STRATA_KOLIBRI_ATTN_MMA") != nullptr;
+    return on;
+}
+
+__global__ void __launch_bounds__(128) k_attn_flash_mma(const __half* __restrict__ q16,
+                                                        const __half* __restrict__ kcache,
+                                                        const __half* __restrict__ vcache,
+                                                        float* __restrict__ att_m, int H, long long kstride,
+                                                        int T, int P, int p0, int64_t swa, int first,
+                                                        float scale) {
+    constexpr int Q16 = 16, KCK = 24, HS = 3, KP = 136;
+    __shared__ __align__(16) __half Ks[KCK][KP];   // [key][dim]
+    __shared__ __align__(16) __half Vs[KCK][KP];   // [key][dim]
+    __shared__ float part[4][HS][16][KCK];         // the d-slice partials, then the sums (the w=0 slot)
+    const int q0 = blockIdx.x * Q16, kvh = blockIdx.y;
+    const __half* kh0 = kcache + (size_t) kvh * (size_t) kstride * 128;
+    const __half* vh0 = vcache + (size_t) kvh * (size_t) kstride * 128;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+    const int gid = lane / 4, tig = lane % 4;
+    int lo9, nmax;   // the block's last valid row's bounds
+    strata::kolibri::attn_mask_bounds(P, p0, min(q0 + 15, T - 1), swa, first, &lo9, &nmax);
+    int lo_r, nn, lo_8, nn8;   // this lane's two rows (gid, gid+8)
+    strata::kolibri::attn_mask_bounds(P, p0, min(q0 + gid, T - 1), swa, first, &lo_r, &nn);
+    strata::kolibri::attn_mask_bounds(P, p0, min(q0 + gid + 8, T - 1), swa, first, &lo_8, &nn8);
+    const bool live0 = q0 + gid < T, live8 = q0 + gid + 8 < T;
+    uint32_t qa[HS][4][2];   // the A-frags: 3 heads x 4 dim-tiles x {row gid, row gid+8} half2s
+#pragma unroll
+    for (int hs = 0; hs < HS; ++hs) {
+        const __half* qh = q16 + ((size_t) (q0 + gid) * H + kvh * 12 + warp + 4 * hs) * 128 + warp * 32 + tig * 2;
+        const __half* qh8 = q16 + ((size_t) (q0 + gid + 8) * H + kvh * 12 + warp + 4 * hs) * 128 + warp * 32 + tig * 2;
+#pragma unroll
+        for (int ds = 0; ds < 4; ++ds) {
+            qa[hs][ds][0] = live0 ? *reinterpret_cast<const uint32_t*>(qh + ds * 8) : 0u;
+            qa[hs][ds][1] = live8 ? *reinterpret_cast<const uint32_t*>(qh8 + ds * 8) : 0u;
+        }
+    }
+    float m[HS][2], l[HS][2], acc[HS][4][4];   // the acc: c0/c1 = row gid (dims 2tig/+1), c2/c3 = gid+8
+#pragma unroll
+    for (int hs = 0; hs < HS; ++hs) {
+        m[hs][0] = m[hs][1] = -INFINITY; l[hs][0] = l[hs][1] = 0.f;
+#pragma unroll
+        for (int ds = 0; ds < 4; ++ds)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) acc[hs][ds][c] = 0.f;
+    }
+    for (int kt = 0; kt < nmax; kt += KCK) {
+        const int kn = min(KCK, nmax - kt);
+        for (int idx = threadIdx.x; idx < KCK * 16; idx += 128) {
+            const int kr = idx / 16, u = idx % 16;
+            if (kr < kn && kt + kr < nmax) {
+                *reinterpret_cast<uint4*>(&Ks[kr][u * 8]) =
+                    *reinterpret_cast<const uint4*>(kh0 + (size_t) (kt + kr) * 128 + u * 8);
+                *reinterpret_cast<uint4*>(&Vs[kr][u * 8]) =
+                    *reinterpret_cast<const uint4*>(vh0 + (size_t) (kt + kr) * 128 + u * 8);
+            } else {   // the rows past the tile: ZERO, never stale smem - the PV mma multiplies them by the
+                *reinterpret_cast<uint4*>(&Ks[kr][u * 8]) = make_uint4(0, 0, 0, 0);   // softmax weights, and
+                *reinterpret_cast<uint4*>(&Vs[kr][u * 8]) = make_uint4(0, 0, 0, 0);   // 0 * NaN = NaN
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int hs = 0; hs < HS; ++hs) {
+#pragma unroll
+            for (int kf = 0; kf < 3; ++kf) {
+                float sc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+                for (int ds = 0; ds < 4; ++ds) {
+                    const uint32_t kb = *reinterpret_cast<const uint32_t*>(&Ks[kf*8 + gid][warp * 32 + ds*8 + tig*2]);
+                    mma168(sc, qa[hs][ds], &kb);
+                }
+                part[warp][hs][gid][kf*8 + tig*2] = sc[0];
+                part[warp][hs][gid][kf*8 + tig*2 + 1] = sc[1];
+                part[warp][hs][gid + 8][kf*8 + tig*2] = sc[2];
+                part[warp][hs][gid + 8][kf*8 + tig*2 + 1] = sc[3];
+            }
+        }
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < 4 * HS * 16 * KCK; idx += 128) {
+            const int g3 = idx % (HS * 16 * KCK);
+            const int hs = g3 / (16 * KCK), r2 = (g3 % (16 * KCK)) / KCK, k2 = g3 % KCK;
+            const float s = part[0][hs][r2][k2] + part[1][hs][r2][k2] + part[2][hs][r2][k2] + part[3][hs][r2][k2];
+            part[0][hs][r2][k2] = s;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int hs = 0; hs < HS; ++hs) {
+#pragma unroll
+            for (int kf = 0; kf < 3; ++kf) {
+                const float s00 = part[0][hs][gid][kf*8 + tig*2] * scale;
+                const float s01 = part[0][hs][gid][kf*8 + tig*2 + 1] * scale;
+                const float s10 = part[0][hs][gid + 8][kf*8 + tig*2] * scale;
+                const float s11 = part[0][hs][gid + 8][kf*8 + tig*2 + 1] * scale;
+                const int kg0 = kt + kf*8 + tig*2, kg1 = kg0 + 1;
+                const float w00 = (live0 && kg0 >= lo_r && kg0 < nn) ? s00 : -INFINITY;
+                const float w01 = (live0 && kg1 >= lo_r && kg1 < nn) ? s01 : -INFINITY;
+                const float w10 = (live8 && kg0 >= lo_8 && kg0 < nn8) ? s10 : -INFINITY;
+                const float w11 = (live8 && kg1 >= lo_8 && kg1 < nn8) ? s11 : -INFINITY;
+                float mx0 = fmaxf(w00, w01), mx8 = fmaxf(w10, w11);
+                mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+                mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+                mx8 = fmaxf(mx8, __shfl_xor_sync(0xffffffffu, mx8, 1));
+                mx8 = fmaxf(mx8, __shfl_xor_sync(0xffffffffu, mx8, 2));
+                const float mn0 = fmaxf(m[hs][0], mx0), mn8 = fmaxf(m[hs][1], mx8);
+                const float rs0 = (mn0 > -INFINITY) ? expf(m[hs][0] - mn0) : 0.0f;
+                const float rs8 = (mn8 > -INFINITY) ? expf(m[hs][1] - mn8) : 0.0f;
+                const float c00 = (kg0 >= lo_r && kg0 < nn) ? expf(w00 - mn0) : 0.0f;
+                const float c01 = (kg1 >= lo_r && kg1 < nn) ? expf(w01 - mn0) : 0.0f;
+                const float c10 = (kg0 >= lo_8 && kg0 < nn8) ? expf(w10 - mn8) : 0.0f;
+                const float c11 = (kg1 >= lo_8 && kg1 < nn8) ? expf(w11 - mn8) : 0.0f;
+                float ls0 = c00 + c01, ls8 = c10 + c11;
+                ls0 += __shfl_xor_sync(0xffffffffu, ls0, 1);
+                ls0 += __shfl_xor_sync(0xffffffffu, ls0, 2);
+                ls8 += __shfl_xor_sync(0xffffffffu, ls8, 1);
+                ls8 += __shfl_xor_sync(0xffffffffu, ls8, 2);
+                l[hs][0] = fmaf(l[hs][0], rs0, ls0);
+                l[hs][1] = fmaf(l[hs][1], rs8, ls8);
+#pragma unroll
+                for (int ds = 0; ds < 4; ++ds) {
+                    acc[hs][ds][0] *= rs0; acc[hs][ds][1] *= rs0;
+                    acc[hs][ds][2] *= rs8; acc[hs][ds][3] *= rs8;
+                }
+                const __half2 wa0 = __floats2half2_rn(c00, c01), wa8 = __floats2half2_rn(c10, c11);
+                const uint32_t aa[2] = {*reinterpret_cast<const uint32_t*>(&wa0),
+                                        *reinterpret_cast<const uint32_t*>(&wa8)};
+                m[hs][0] = mn0; m[hs][1] = mn8;
+#pragma unroll
+                for (int ds = 0; ds < 4; ++ds) {
+                    const __half2 vb = __halves2half2(*(const __half*)&Vs[kf*8 + 2*tig][warp * 32 + ds*8 + gid],
+                                                      *(const __half*)&Vs[kf*8 + 2*tig + 1][warp * 32 + ds*8 + gid]);
+                    const uint32_t ab = *reinterpret_cast<const uint32_t*>(&vb);
+                    mma168(acc[hs][ds], aa, &ab);
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int hs = 0; hs < HS; ++hs) {
+        const float i0 = l[hs][0] > 0.0f ? 1.0f / l[hs][0] : 0.0f;
+        const float i8 = l[hs][1] > 0.0f ? 1.0f / l[hs][1] : 0.0f;
+        const int h = kvh * 12 + warp + 4 * hs;
+#pragma unroll
+        for (int ds = 0; ds < 4; ++ds) {
+            const int d = warp * 32 + ds * 8 + tig * 2;
+            if (live0)
+                *reinterpret_cast<float2*>(&att_m[(((size_t) (q0 + gid)) * H + h) * 128 + d]) =
+                    make_float2(acc[hs][ds][0] * i0, acc[hs][ds][1] * i0);
+            if (live8)
+                *reinterpret_cast<float2*>(&att_m[(((size_t) (q0 + gid + 8)) * H + h) * 128 + d]) =
+                    make_float2(acc[hs][ds][2] * i8, acc[hs][ds][3] * i8);
         }
     }
 }
@@ -1314,7 +1501,12 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
             k_kv_ring<<<grid1((int64_t) HKV * P * D), kThreads>>>(s.kc[l], s.vc[l], s.k16, s.v16, g.n_swa, P,
                                                                   first, D, HKV);
         k_to_f16<<<grid1((int64_t) T * H * D), kThreads>>>(s.q_m, s.q16, (int64_t) T * H * D);
-        if (attn_flash_on() && H == 48 && HKV == 4 && D == 128) {
+        if (attn_mma_on() && H == 48 && HKV == 4 && D == 128) {
+            k_attn_flash_mma<<<dim3((unsigned) ((T + 15) / 16), (unsigned) HKV), 128, 0, g_st>>>(
+                s.q16, sliding ? s.k16 : s.kc[l], sliding ? s.v16 : s.vc[l], s.att_m, (int) H,
+                sliding ? (long long) P : (long long) s.ctx, (int) T, P, (int) p0,
+                sliding ? (int64_t) g.n_swa : 0, (int) first, 1.0f / sqrtf((float) D));
+        } else if (attn_flash_on() && H == 48 && HKV == 4 && D == 128) {
             k_attn_flash<<<dim3((unsigned) ((T + 7) / 8), (unsigned) HKV), 256, 0, g_st>>>(
                 s.q16, sliding ? s.k16 : s.kc[l], sliding ? s.v16 : s.vc[l], s.att_m, (int) H,
                 sliding ? (long long) P : (long long) s.ctx, (int) T, P, (int) p0,
@@ -1405,6 +1597,20 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
         }
         }   // attn_flash's else
         k_to_f16<<<grid1((int64_t) T * H * D), kThreads>>>(s.att_m, s.att16, (int64_t) T * H * D);
+        if (attn_dump_path() && (int) l == attn_dump_layer()) {
+            const size_t nf = (size_t) T * H * D;
+            float* h = (float*) std::malloc(nf * sizeof(float));
+            if (h) {
+                KC(cudaMemcpy(h, s.att_m, nf * sizeof(float), cudaMemcpyDeviceToHost));
+                std::FILE* f = std::fopen(attn_dump_path(), "ab");
+                if (f) {
+                    std::fwrite(&l, sizeof(int), 1, f);
+                    std::fwrite(h, sizeof(float), nf, f);
+                    std::fclose(f);
+                }
+                std::free(h);
+            }
+        }
         {
             const Dense& wo = e.dense.at(L(l, "attn_output.weight"));
             if (dense_f16_on() && wo.f16) e.gemm.f16((const uint16_t*) s.att16, wo.f16, s.y_m, T, N, H * D);
