@@ -405,6 +405,13 @@ bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems,
     workspace_ = workspace;
     note(cublasSetWorkspace(h, workspace_, ws_bytes), "cublasSetWorkspace");
     note(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH), "cublasSetMathMode");
+    // DETERMINISM PROBE: cuBLAS's default permits atomics-based (split-K) kernels, whose reduction order varies run to
+    // run.  The plain path is bit-exact across runs while the prefill is not (self-KL 0.07-0.26), and the prefill is
+    // the only path that asks cuBLAS for multi-token shapes - so this switch tests that hypothesis directly.
+    // STRATA_GEMM_DETERMINISTIC=1 forbids atomics: reproducible, possibly slower, and the only way a prefill KL gate
+    // can mean anything.
+    if (std::getenv("STRATA_GEMM_DETERMINISTIC") != nullptr)
+        note(cublasSetAtomicsMode(h, CUBLAS_ATOMICS_NOT_ALLOWED), "cublasSetAtomicsMode");
     scratch_ = scratch;
     scratch_elems_ = scratch_elems;
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
@@ -445,6 +452,13 @@ bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
     }
     note(cublasSetWorkspace(h, workspace_, ws), "cublasSetWorkspace");
     note(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH), "cublasSetMathMode");
+    // DETERMINISM PROBE: cuBLAS's default permits atomics-based (split-K) kernels, whose reduction order varies run to
+    // run.  The plain path is bit-exact across runs while the prefill is not (self-KL 0.07-0.26), and the prefill is
+    // the only path that asks cuBLAS for multi-token shapes - so this switch tests that hypothesis directly.
+    // STRATA_GEMM_DETERMINISTIC=1 forbids atomics: reproducible, possibly slower, and the only way a prefill KL gate
+    // can mean anything.
+    if (std::getenv("STRATA_GEMM_DETERMINISTIC") != nullptr)
+        note(cublasSetAtomicsMode(h, CUBLAS_ATOMICS_NOT_ALLOWED), "cublasSetAtomicsMode");
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     hipblaslt_state_ = create_hipblaslt_state(workspace_, ws).release();
 #endif
