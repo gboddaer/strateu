@@ -59,13 +59,16 @@ std::vector<int> parse_ids(const std::string& s) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model, prompt, tokens, dump_layers, dump_logits, force, dump_full;
+    std::string model, prompt, tokens, tokens_file, dump_layers, dump_logits, force, dump_full;
     int n_gen = 64, ngl = 99, n_cpu_moe = 0;
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string a = argv[i], v = argv[i + 1];
         if (a == "--model") model = v;
         else if (a == "--prompt") prompt = v;
         else if (a == "--tokens") tokens = v;
+        // A 100K-token prompt is ~700 KB of ids, which cannot travel in one argv entry (Linux caps it at 128 KB), so the
+        // long-context anchor comparison needs the ids from a file.
+        else if (a == "--tokens-file") tokens_file = v;
         else if (a == "--n") n_gen = std::atoi(v.c_str());
         else if (a == "--ngl") ngl = std::atoi(v.c_str());
         else if (a == "--cpu-moe") n_cpu_moe = std::atoi(v.c_str());
@@ -98,6 +101,16 @@ int main(int argc, char** argv) {
     if (!mdl) { std::fprintf(stderr, "cannot load %s\n", model.c_str()); return 1; }
     const llama_vocab* vocab = llama_model_get_vocab(mdl);
     std::vector<llama_token> ids;
+    if (!tokens_file.empty()) {   // read the id list OUTSIDE the emptiness test: --tokens-file alone leaves `tokens` empty
+        std::FILE* f = std::fopen(tokens_file.c_str(), "rb");
+        if (!f) { std::fprintf(stderr, "cannot open %s\n", tokens_file.c_str()); return 1; }
+        std::string all;
+        char buf[1 << 16];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) all.append(buf, n);
+        std::fclose(f);
+        tokens = all;
+    }
     if (!tokens.empty()) {
         for (int t : parse_ids(tokens)) ids.push_back(t);
     } else {
@@ -115,7 +128,10 @@ int main(int argc, char** argv) {
     const char* cx = std::getenv("STRATA_DUMP_CTX");
     const int nctx = cx ? std::atoi(cx) : 4096;
     cp.n_ctx = nctx;
-    cp.n_batch = cp.n_ubatch = nctx;
+    // A long-context prompt must be prefilled in BATCHES: with n_batch = n_ubatch = n_ctx a 105K-token prompt makes
+    // llama.cpp reserve a compute graph for a 105K batch (measured: "allocating 76463.15 MiB on device 0 ... failed to
+    // allocate CUDA0 buffer of size 80177422080").  The context stays nctx; only the batch is bounded.
+    cp.n_batch = cp.n_ubatch = std::min(nctx, 2048);
     cp.op_offload = ngl > 0;   // --ngl 0 is the CPU backend: no prompt matmuls offloaded to a GPU either
     cp.cb_eval = on_tensor;
     cp.cb_eval_user_data = &cap;
@@ -146,8 +162,33 @@ int main(int argc, char** argv) {
     for (int t : ids) std::printf(" %d", t);
     std::printf("\n");
     std::vector<llama_token> gen;
-    llama_batch b = llama_batch_get_one(ids.data(), (int) ids.size());
-    if (llama_decode(ctx, b) != 0) { std::fprintf(stderr, "decode failed\n"); return 1; }
+    // A 100K-token prompt cannot be one llama_batch (that asks llama.cpp for a 100K-token compute graph, measured as a
+    // 76 GB allocation failure).  Ingest it in bounded slices; the last slice carries the final token, whose logits are
+    // what the first generated token needs.
+    {
+        const size_t kSlice = 2048;
+        for (size_t off = 0; off < ids.size(); off += kSlice) {
+            const size_t m = std::min<size_t>(kSlice, ids.size() - off);
+            // explicit batch: llama_batch_get_one marks no token for logits, so a chunked ingest ends with n_outputs=0
+            // and the first generated token has nothing to read ("get_logits_ith: invalid logits id -1").  Ask for the
+            // logits of the FINAL prompt token only.
+            llama_batch b = llama_batch_init((int32_t) m, 0, 1);
+            for (size_t k = 0; k < m; ++k) {
+                const int32_t idx = b.n_tokens++;
+                b.token[idx] = ids[off + k];
+                b.pos[idx] = (llama_pos) (off + k);
+                b.n_seq_id[idx] = 1;
+                b.seq_id[idx][0] = 0;
+                b.logits[idx] = (off + k + 1 == ids.size()) ? 1 : 0;
+            }
+            const int rc = llama_decode(ctx, b);
+            llama_batch_free(b);
+            if (rc != 0) {
+                std::fprintf(stderr, "decode failed at prompt token %zu\n", off);
+                return 1;
+            }
+        }
+    }
     write_layers((int) ids.size());
     for (int i = 0; i < n_gen; ++i) {
         const float* lg = llama_get_logits_ith(ctx, -1);
