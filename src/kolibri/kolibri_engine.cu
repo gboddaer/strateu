@@ -1759,7 +1759,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
         k_rms_rows<<<T, kThreads>>>(s.x_m, e.f32.at(L(l, "ffn_norm.weight")), s.h_m, N, e.eps);
         {
             const Dense& wr = e.dense.at(L(l, "ffn_gate_inp.weight"));
-            if (std::getenv("STRATA_KOLIBRI_ROUTER_GEMM") != nullptr) {
+            if (env_on("STRATA_KOLIBRI_ROUTER_GEMM")) {
                 // nsys priced the fp32 SIMT router gemv at 19 ms x 100 = 1.94 s of the pp512 wall.  cublas SGEMM
                 // on the SAME fp32 inputs is ~100x faster, fp32 accumulate, fp32 logits.  DEFAULT OFF: measured
                 // KL 0.02482 vs the 0.02 clause (cache-only baseline 0.01087) - cublas's accumulation order
@@ -1775,7 +1775,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                     std::fprintf(stderr, "strata-kolibri: cublas router sgemm failed (%d)\n", (int) cst);
                     std::exit(1);
                 }
-            } else if (std::getenv("STRATA_KOLIBRI_ROUTER_TILE") != nullptr) {
+            } else if (env_on("STRATA_KOLIBRI_ROUTER_TILE")) {
                 const int tj = router_tj();
                 if (tj <= 8)
                     k_router_tile<T_F32, 8><<<dim3((int) g.n_expert, ((int) T + 7) / 8), kThreads, 0, g_st>>>(
@@ -1801,7 +1801,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
         }
         strata::kernels::native_quantize_q8_1(s.h_m, s.xq8_m, N * T, 1, g_st);   // T contiguous rows = one column (q36)
         k_to_f16<<<grid1((int64_t) T * N), kThreads>>>((const float*) s.h_m, s.x16, (int64_t) T * N);   // ffn-norm h for the shared-FFN GEMMs (the router sgemm takes fp32 h_m directly)
-        static const bool pool_all = std::getenv("STRATA_KOLIBRI_POOL_ALL") != nullptr;   // A/B: the pool for every layer
+        static const bool pool_all = env_on("STRATA_KOLIBRI_POOL_ALL");   // A/B: the pool for every layer
         // The cache branch stays pool-side: routing the native_ok layers' grouped kernel through the fp16 cache
         // measured KL 0.13050 (gate FAIL) - that kernel is bitwise-equal to llama.cpp's arithmetic, and fp16
         // weights+activations deviate ~1e-3 per layer across 50 layers, which the KL-vs-llama clause forbids.
@@ -1814,7 +1814,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                 for (int i = 0; i < NK; ++i) { const int id = hid[(size_t) i]; if (!seen[(size_t) id]) { seen[(size_t) id] = 1; ++uniq; } if (id < e.slots) ++hits; }
                 e.pf_hit_entries += hits; e.pf_entry_n += NK; e.pf_uniq_sum += uniq; ++e.pf_cov_chunks;
             }
-            static const bool pf_stage = std::getenv("STRATA_KOLIBRI_PF_STAGE") != nullptr;   // S7 A/B
+            static const bool pf_stage = env_on("STRATA_KOLIBRI_PF_STAGE");   // S7 A/B
             // NOTE (refuted by measurement): skipping the staging for the f16 layers (the staged table looked
             // dead - the pool serves the misses from the pinned table) made pp512 3.8x SLOWER (17.8 s vs 4.7 s):
             // the staged path is load-bearing (it carries the group table the native grouped kernel needs).
@@ -2674,7 +2674,7 @@ int serve(Engine& e, Scratch& s) {
 // zero-slot poison test can prove the poison reaches the arithmetic (a test with no teeth).  Debug-only: the
 // env is unset in every production run, and the zero slot is read only by the overflow path.
 static inline bool poison_zero_slot() {
-    static const bool on = std::getenv("STRATA_KOLIBRI_POISON_ZERO_SLOT") != nullptr;
+    static const bool on = env_on("STRATA_KOLIBRI_POISON_ZERO_SLOT");
     return on;
 }
 
@@ -2905,7 +2905,7 @@ int strata::kolibri::run(int argc, char** argv) {
     KC(cudaStreamCreate(&g_st));
     KC(cudaMalloc(&g_q8, strata::kernels::native_q8_1_bytes((int) kActBuf, 1)));
     e.counters = counters != 0;   // before load(): the VRAM report is printed there
-    e.hist_on = std::getenv("STRATA_KOLIBRI_EXPERT_HIST") != nullptr;   // coverage probe; before load() so the table is sized
+    e.hist_on = env_on("STRATA_KOLIBRI_EXPERT_HIST");   // coverage probe; before load() so the table is sized
     if (!load(model, e, err)) {
         std::fprintf(stderr, "strata-kolibri: %s\n", err.c_str());
         return 1;
