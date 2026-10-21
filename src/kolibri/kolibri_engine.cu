@@ -527,6 +527,20 @@ __global__ void k_add(float* x, const float* y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] += y[i];
 }
+// S6 (per-layer round-trip removal, the cheap half): rmsnorm followed by the residual add in ONE launch.  The decode's
+// chain is launch-latency bound - ~15 launches a layer at ~44 us of exposed latency each, because the host stalls on
+// the per-layer D2H - so removing a launch is worth about as much as removing its arithmetic (which is trivial here).
+// SAME block reduce and SAME per-element expression as k_rms + k_add, so the result is bitwise.
+__global__ void k_rms_add(const float* xin, const float* w, float* acc, int n, float eps) {
+    __shared__ float sh[kThreads];
+    const float* xg = xin + (size_t) blockIdx.x * n;
+    float* ag = acc + (size_t) blockIdx.x * n;
+    float s = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) s += xg[i] * xg[i];
+    s = block_sum(s, sh);
+    const float r = 1.0f / sqrtf(s / (float) n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) ag[i] += xg[i] * r * (w ? w[i] : 1.0f);
+}
 static inline dim3 grid1(int64_t n, int block = kThreads) { return dim3((unsigned) ((n + block - 1) / block)); }
 __device__ float block_max(float v, float* sh) {
     sh[threadIdx.x] = v;
@@ -1654,8 +1668,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
         }
         if (s.dec_att16) k_to_f16<<<dim3((H * D + 127) / 128), 128, 0, st>>>(s.att, s.dec_att16, H * D);   // S6
         gemv_dec(e.dense.at(L(l, "attn_output.weight")), s.att, s.dec_att16, s.y, st);
-        k_rms<<<1, kThreads, 0, st>>>(s.y, e.f32.at(L(l, "post_attention_norm.weight")), s.y, N, e.eps);
-        k_add<<<(N + B - 1) / B, B, 0, st>>>(s.x, s.y, N);
+        k_rms_add<<<1, kThreads, 0, st>>>(s.y, e.f32.at(L(l, "post_attention_norm.weight")), s.x, N, e.eps);
         k_rms<<<1, kThreads, 0, st>>>(s.x, e.f32.at(L(l, "ffn_norm.weight")), s.h, N, e.eps);
         gemv_dec(e.dense.at(L(l, "ffn_gate_inp.weight")), s.h, s.dec_h16, s.router, st);
         strata::kernels::native_router_sigmoid_logit_add(s.router, e.f32.at(L(l, "exp_probs_b.bias")), s.ids, s.wts, 1,
@@ -1823,8 +1836,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
         if (e.grouped > 0 && b.native_ok) k_moe_sum<<<(N + B - 1) / B, B, 0, st>>>(s.moe, s.gout, s.wts, K, s.sy, N);
         else if (e.slots > 0) k_moe_sum2<<<(N + B - 1) / B, B, 0, st>>>(s.moe, s.ey2, s.yc, s.wts, K, s.sy, N);
         else k_moe_sum<<<(N + B - 1) / B, B, 0, st>>>(s.moe, s.ey, s.wts, K, s.sy, N);
-        k_rms<<<1, kThreads, 0, st>>>(s.moe, e.f32.at(L(l, "post_ffw_norm.weight")), s.moe, N, e.eps);
-        k_add<<<(N + B - 1) / B, B, 0, st>>>(s.x, s.moe, N);
+        k_rms_add<<<1, kThreads, 0, st>>>(s.moe, e.f32.at(L(l, "post_ffw_norm.weight")), s.x, N, e.eps);
         if (layers_host && !graph) KC(cudaMemcpy(layers_host + (size_t) l * N, s.x, N * 4, cudaMemcpyDeviceToHost));
         if (dph) { KC(cudaStreamSynchronize(st)); const auto n = std::chrono::steady_clock::now();
                    e.cnt.dec_post_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(n - dpt).count();
