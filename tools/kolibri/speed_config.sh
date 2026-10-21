@@ -23,3 +23,9 @@ export GGML_CUDA_DISABLE_GRAPHS=1
 export KOLIBRI_MODEL=/data4/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf
 export BENCH_EXTRA="--prefill --counters --cpu-threads 24"
 export KOLIBRI_BENCH=/tmp/kolibri_bench_node1.sh   # numactl --cpunodebind=1 --membind=1
+# PREFILL ONLY: both sockets' CPUs for the pool (+7.4% at 32K, +6.1% at 4K; the pool leg goes 114 s -> 89 s at
+# 231-236 GFLOP/s against the 226 GFLOP/s node-1 roof, i.e. the roof was a one-socket number).  Decode is SLOWER
+# this way (32K-after: tg 13.3-13.5 vs 14.6) because every per-token pool call then crosses the socket link, so
+# keep decode on node 1.  Memory stays bound to node 1 (-membind=1): the 42.9 GB pinned expert table lives there.
+# NOTE: node 0 also hosts the concurrent work on this box, so this trades some of its bandwidth for ours.
+export KOLIBRI_BENCH_BOTH=/tmp/kolibri_bench_both.sh   # numactl --cpunodebind=0,1 --membind=1
