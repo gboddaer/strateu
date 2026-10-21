@@ -3358,6 +3358,10 @@ int strata::kolibri::run(int argc, char** argv) {
             const int T = (int) std::min<int64_t>(pf_chunk_at(s.pos), n - i);
             KC(cudaMemcpy(s.toks_d, ids.data() + i, (size_t) T * 4, cudaMemcpyHostToDevice));
             forward_multi(e, s, T, s.pos);
+            // P1 probe: a fence between chunks.  A single-chunk prefill is bit-exact and a two-chunk one is not, so
+            // the race lives in the chunk-to-chunk handoff; this says whether the handoff is missing a fence (and if
+            // it is, which producer needs it can then be found by removing the fence again and adding targeted waits).
+            if (std::getenv("STRATA_KOLIBRI_PF_FENCE") != nullptr) KC(cudaStreamSynchronize(g_st));
             s.pos += T;
             i += T;
             std::printf("PFchunk %lld/%lld %.0fms\n", (long long) i, (long long) n, ms_since(tp0));
