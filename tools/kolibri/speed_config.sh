@@ -18,6 +18,11 @@ export STRATA_KOLIBRI_EXPERT_F16=24
 # grows faster than the pool shrinks.  56 is worth +3.6% at BOTH 4K and 32K (32K 119.5 -> 123.8, two runs).
 export STRATA_KOLIBRI_RES_TOP=56
 export STRATA_KOLIBRI_ROUTER_TILE=1
+# K31: THREE experts per router block (TJ=8), so the activation tile is read once for three experts instead of once each.
+# The router was 35% of the prefill's GPU busy, bound on those re-reads (~1.6 GB per chunk-layer); this is bitwise (ids
+# identical for TK=0/2/3/4 with ATTN_FLASH on) and worth +17-23%: 32K 120.5 -> 147.6 tok/s (148.7/144.1/150.0), 4K
+# 120.7 -> 161.0.  TK=0 restores the old per-expert path; 2 and 4 are the other shapes (4 spills registers and loses).
+export STRATA_KOLIBRI_ROUTER_TK=3
 export STRATA_KOLIBRI_ATTN_MB=256
 # K27: the transposed KV mirror for the sliding layers. ON by default (it is NOT a numerics change - same values,
 # same accumulation order, contiguous addresses - and the oracle prints BITWISE PASS with it). Measured: tg128

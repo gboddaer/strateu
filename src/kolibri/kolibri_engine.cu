@@ -1545,8 +1545,12 @@ struct Scratch {
 // smaller tiles give more CTAs (occupancy) and a shorter FMA dependency chain.  Bitwise-identical either way
 // (the per-token sum's order and the reduction tree are unchanged).
 static inline int router_tk() {
-    static const int tk = std::getenv("STRATA_KOLIBRI_ROUTER_TK") ? std::atoi(std::getenv("STRATA_KOLIBRI_ROUTER_TK")) : 0;
-    return tk;
+    // K31: DEFAULT 3 (three experts per block, TJ=8).  Measured at 32K, both sockets: TK=0 120.5, TK=2/TJ=16 141.8,
+    // TK=2/TJ=32 143.3, **TK=3/TJ=8 147.6** (148.7/144.1/150.0); at 4K TK=3 161.0 against TK=0 120.7.  Bitwise: identical
+    // generated ids for TK = 0, 2, 3 and 4 on the same prompt with ATTN_FLASH on.  STRATA_KOLIBRI_ROUTER_TK=0 restores the
+    // per-expert path for an A/B, 2 or 4 select the other block shapes.
+    const char* v = std::getenv("STRATA_KOLIBRI_ROUTER_TK");
+    return v ? std::atoi(v) : 3;
 }
 static inline int router_tj() {
     static const int t = std::getenv("STRATA_KOLIBRI_ROUTER_TJ") ? std::atoi(std::getenv("STRATA_KOLIBRI_ROUTER_TJ")) : 32;
@@ -2115,9 +2119,15 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                     std::exit(1);
                 }
             } else if (router_tk() > 1) {
-                const int tk = router_tk();
+                const int tk = router_tk(), tj = router_tj();
                 if (tk >= 4)
                     k_router_tile_k<T_F32, 8, 4><<<dim3(((int) g.n_expert + 3) / 4, ((int) T + 7) / 8), kThreads, 0, g_st>>>(
+                        wr.d, s.h_m, (size_t) N, s.router_m, (int) N, (int) T, (int) g.n_expert);
+                else if (tk == 3)
+                    k_router_tile_k<T_F32, 8, 3><<<dim3(((int) g.n_expert + 2) / 3, ((int) T + 7) / 8), kThreads, 0, g_st>>>(
+                        wr.d, s.h_m, (size_t) N, s.router_m, (int) N, (int) T, (int) g.n_expert);
+                else if (tj >= 32)
+                    k_router_tile_k<T_F32, 32, 2><<<dim3(((int) g.n_expert + 1) / 2, ((int) T + 31) / 32), kThreads, 0, g_st>>>(
                         wr.d, s.h_m, (size_t) N, s.router_m, (int) N, (int) T, (int) g.n_expert);
                 else
                     k_router_tile_k<T_F32, 16, 2><<<dim3(((int) g.n_expert + 1) / 2, ((int) T + 15) / 16), kThreads, 0, g_st>>>(
