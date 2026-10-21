@@ -1338,6 +1338,28 @@ struct Scratch {
     float* att_s = nullptr;
 };
 
+// S7: the prefill's chunk size at runtime (STRATA_KOLIBRI_PF_CHUNK, default 512 = Scratch::kTmax).  The
+// router's GEMV re-reads the chunk's activation matrix once per expert row, so the traffic scales with the
+// chunk: at T=512 the x matrix (T x N x 4 = 5.2 MB) does NOT fit the T4's 4 MB L2 and the 384 reads go to
+// DRAM; smaller chunks keep x L2-resident.  The buffers are sized for kTmax, so a smaller chunk is safe.
+static inline int pf_chunk_at(int64_t p0) {
+    // The env value CAPS the chunk; the default is prefix-dependent: a short prefix runs a SMALL chunk (the
+    // router's x matrix then fits the T4's L2 - the 384 expert GEMVs re-read it, and at T=512 it is 5.2 MB vs
+    // the 4 MB L2: pp512 4.73 s at T=256 vs 5.13 s at T=512), while a long prefix runs the full 512 (more chunks
+    // mean more per-chunk overheads: at 32K, T=256 measured 320.9 s vs T=512's 301.5 s).
+    static const int cap = [] {
+        const char* v = std::getenv("STRATA_KOLIBRI_PF_CHUNK");
+        int64_t n = v ? (int64_t) std::atoi(v) : (int64_t) Scratch::kTmax;
+        if (n < 1) n = (int64_t) Scratch::kTmax;
+        if (n > (int64_t) Scratch::kTmax) n = (int64_t) Scratch::kTmax;
+        return (int) n;
+    }();
+    const int small = 256;
+    if (p0 < 8192 && cap >= 256) return small < cap ? small : cap;
+    return cap;
+}
+
+
 
 std::string L(int64_t l, const char* s) { return "blk." + std::to_string(l) + "." + s; }
 
@@ -1771,6 +1793,9 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                 e.pf_hit_entries += hits; e.pf_entry_n += NK; e.pf_uniq_sum += uniq; ++e.pf_cov_chunks;
             }
             static const bool pf_stage = std::getenv("STRATA_KOLIBRI_PF_STAGE") != nullptr;   // S7 A/B
+            // NOTE (refuted by measurement): skipping the staging for the f16 layers (the staged table looked
+            // dead - the pool serves the misses from the pinned table) made pp512 3.8x SLOWER (17.8 s vs 4.7 s):
+            // the staged path is load-bearing (it carries the group table the native grouped kernel needs).
             if (pf_stage && s.stage != nullptr && NK <= (int) s.stage_ids_h.size()) {
                 g_ids_host.resize((size_t) NK);
                 KC(cudaMemcpy(g_ids_host.data(), s.ids_m, (size_t) NK * sizeof(int), cudaMemcpyDeviceToHost));
@@ -2574,7 +2599,7 @@ int serve(Engine& e, Scratch& s) {
             int64_t i = reuse;
             const int64_t n = fresh - 1 - reuse;   // the prompt minus its last token
             while (i - reuse < n) {
-                const int T = (int) std::min<int64_t>(Scratch::kTmax, n - (i - reuse));
+                const int T = (int) std::min<int64_t>(pf_chunk_at(s.pos), n - (i - reuse));
                 KC(cudaMemcpy(s.toks_d, ids.data() + i, (size_t) T * 4, cudaMemcpyHostToDevice));
                 forward_multi(e, s, T, s.pos);
                 s.pos += T;
@@ -2961,7 +2986,7 @@ int strata::kolibri::run(int argc, char** argv) {
         const int64_t n = (int64_t) ids.size() - 1;
         const auto tp0 = Clock::now();
         while (i < n) {
-            const int T = (int) std::min<int64_t>(Scratch::kTmax, n - i);
+            const int T = (int) std::min<int64_t>(pf_chunk_at(s.pos), n - i);
             KC(cudaMemcpy(s.toks_d, ids.data() + i, (size_t) T * 4, cudaMemcpyHostToDevice));
             forward_multi(e, s, T, s.pos);
             s.pos += T;
