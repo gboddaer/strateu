@@ -3564,6 +3564,19 @@ int strata::kolibri::run(int argc, char** argv) {
     };
     std::vector<int> ids = parse_ids(tokens);
     std::vector<int> forced = parse_ids(force);
+    // **BOUND THE REQUEST BY THE CONTEXT (the `:2244` crash).**  Nothing on this path compared the request with `s.ctx`:
+    // a 116,025-token prompt run with `--ctx 104448` prefilled to exactly 104,448 and then wrote the next chunk's K/V
+    // outside `kc/vc` (allocated from `s.ctx`, :2713) - the fault surfaced later, at the first blocking copy, as
+    // "illegal memory access".  The serve path has its own guard (:3077); this is the CLI equivalent, which was missing.
+    {
+        const int64_t n_steps_est = forced.empty() ? (int64_t) n_gen : (int64_t) forced.size() + 1;
+        if ((int64_t) ids.size() + n_steps_est > (int64_t) s.ctx) {
+            std::fprintf(stderr, "strata-kolibri: prompt (%zu tokens) + %lld step(s) exceeds ctx (%d); raise --ctx\n",
+                         ids.size(), (long long) n_steps_est, s.ctx);
+            std::fflush(stderr);
+            return 2;
+        }
+    }
     int tok = ids[0];
     if (e.prefill > 0 && fl == nullptr) {   // chunked prefill: the whole prompt minus its last token (layer dumps stay per-token)
         int64_t i = 0;
@@ -3581,7 +3594,14 @@ int strata::kolibri::run(int argc, char** argv) {
                 ? strata::kernels::cpu::pin_current_thread(strata::kernels::cpu::planned_host_core())
                 : strata::kernels::cpu::ThreadAffinity{};
         while (i < n) {
-            const int T = (int) std::min<int64_t>(pf_chunk_at(s.pos), n - i);
+            int T = (int) std::min<int64_t>(pf_chunk_at(s.pos), n - i);
+            // DEFENCE IN DEPTH for the `:2244` crash: whatever the caller computed, never let a chunk's KV write run past
+            // the allocation (kc/vc are sized from s.ctx).  The entry guard above should make this unreachable; if the
+            // clamp ever fires, the request is truncated rather than corrupting memory past the buffer.
+            if (s.pos + (int64_t) T > (int64_t) s.ctx) {
+                T = (int) std::max<int64_t>(0, (int64_t) s.ctx - s.pos);
+                if (T <= 0) break;
+            }
             KC(cudaMemcpy(s.toks_d, ids.data() + i, (size_t) T * 4, cudaMemcpyHostToDevice));
             forward_multi(e, s, T, s.pos);
             // P1 probe: a fence between chunks.  A single-chunk prefill is bit-exact and a two-chunk one is not, so
