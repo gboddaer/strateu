@@ -421,25 +421,31 @@ __global__ void k_gemv(const uint8_t* W, size_t row_bytes, size_t expert_bytes, 
 /// it across 32 tokens.  BITWISE-identical to k_gemv<T_F32> by construction: with n_in/32 = 80 chunks and 256
 /// threads, k_gemv's thread tid sums exactly chunk tid (one iteration), l = 0..31 sequential, then block_sum
 /// over 256 lanes (lanes 80..255 contribute 0) - this kernel reproduces that per-token order exactly.
-template <int TT> __global__ void k_router_tile(const uint8_t* W, const float* x, size_t x_stride, float* y,
-                                                int n_in, int T, int n_out) {
+// S7: the token tile per thread is a template parameter (TJ): the per-token sum is UNCHANGED (the same chunk
+// order, the same l order, the same 128-lane block_sum tree), so every tile size is bitwise-identical to
+// k_gemv<T_F32>.  The tile size trades ILP against parallelism: TJ=32 gives each thread 32 accumulators (a
+// long dependent FMA chain, 80 of 128 lanes active) - the nsys trace priced the router at 20.85 ms per call
+// (31% of the 4K prefill), ~390x off the bandwidth roof, i.e. latency-bound; a smaller tile gives more CTAs
+// (more SM occupancy) and a shorter dependency chain.
+template <int TT, int TJ> __global__ void k_router_tile(const uint8_t* W, const float* x, size_t x_stride, float* y,
+                                                        int n_in, int T, int n_out) {
     __shared__ float sh[kThreads];
-    const int o = blockIdx.x, t0 = blockIdx.y * 32;
+    const int o = blockIdx.x, t0 = blockIdx.y * TJ;
     const uint8_t* row = W + (size_t) o * (size_t) (n_in * 4);   // T_F32 row, as bytes for deq32
-    float acc[32];
+    float acc[TJ];
     #pragma unroll
-    for (int j = 0; j < 32; ++j) acc[j] = 0.f;
-    const int c = threadIdx.x;   // n_in/32 = 80 chunks: lanes 0..79 active, 80..255 idle (acc 0) - as in k_gemv
+    for (int j = 0; j < TJ; ++j) acc[j] = 0.f;
+    const int c = threadIdx.x;   // n_in/32 = 80 chunks: lanes 0..79 active, the rest idle (acc 0) - as in k_gemv
     if (c < n_in / 32) {
         float v[32];
         deq32<TT>(row, c, v);
-        for (int j = 0; j < 32; ++j) {
+        for (int j = 0; j < TJ; ++j) {
             const float* xc = x + (size_t) (t0 + j) * x_stride + 32 * c;
             for (int l = 0; l < 32; ++l) acc[j] += v[l] * xc[l];
         }
     }
     #pragma unroll
-    for (int j = 0; j < 32; ++j) {
+    for (int j = 0; j < TJ; ++j) {
         const float a = block_sum(acc[j], sh);
         if (threadIdx.x == 0 && t0 + j < T) y[(size_t) (t0 + j) * n_out + o] = a;
     }
@@ -1338,6 +1344,14 @@ struct Scratch {
     float* att_s = nullptr;
 };
 
+// S7: the router's token tile per thread (STRATA_KOLIBRI_ROUTER_TJ, default 32): 32 is the original shape;
+// smaller tiles give more CTAs (occupancy) and a shorter FMA dependency chain.  Bitwise-identical either way
+// (the per-token sum's order and the reduction tree are unchanged).
+static inline int router_tj() {
+    static const int t = std::getenv("STRATA_KOLIBRI_ROUTER_TJ") ? std::atoi(std::getenv("STRATA_KOLIBRI_ROUTER_TJ")) : 32;
+    return t;
+}
+
 // S7: the prefill's chunk size at runtime (STRATA_KOLIBRI_PF_CHUNK, default 512 = Scratch::kTmax).  The
 // router's GEMV re-reads the chunk's activation matrix once per expert row, so the traffic scales with the
 // chunk: at T=512 the x matrix (T x N x 4 = 5.2 MB) does NOT fit the T4's 4 MB L2 and the 384 reads go to
@@ -1762,7 +1776,15 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                     std::exit(1);
                 }
             } else if (std::getenv("STRATA_KOLIBRI_ROUTER_TILE") != nullptr) {
-                k_router_tile<T_F32><<<dim3((int) g.n_expert, ((int) T + 31) / 32), kThreads, 0, g_st>>>(
+                const int tj = router_tj();
+                if (tj <= 8)
+                    k_router_tile<T_F32, 8><<<dim3((int) g.n_expert, ((int) T + 7) / 8), kThreads, 0, g_st>>>(
+                        wr.d, s.h_m, (size_t) N, s.router_m, (int) N, (int) T, (int) g.n_expert);
+                else if (tj <= 16)
+                    k_router_tile<T_F32, 16><<<dim3((int) g.n_expert, ((int) T + 15) / 16), kThreads, 0, g_st>>>(
+                        wr.d, s.h_m, (size_t) N, s.router_m, (int) N, (int) T, (int) g.n_expert);
+                else
+                    k_router_tile<T_F32, 32><<<dim3((int) g.n_expert, ((int) T + 31) / 32), kThreads, 0, g_st>>>(
                     wr.d, s.h_m, (size_t) N, s.router_m, (int) N, (int) T, (int) g.n_expert);
             } else {
                 k_gemv<T_F32><<<dim3(g.n_expert, T), kThreads>>>(wr.d, wr.row_bytes, 0, nullptr, N, s.h_m, (size_t) N,
