@@ -2904,8 +2904,17 @@ int strata::kolibri::run(int argc, char** argv) {
             return 1;
         }
     }
-    if (expert_vram > 0 && slots == 0)
-        slots = (int) (expert_vram * (1 << 30) / (e.blobs[0].stride * (double) e.g.n_layers));
+    if (expert_vram > 0 && slots == 0) {
+        // S5 (task-8 defect): the slot count must be budgeted with the LARGEST layer stride, not the first
+        // layer's: the stride is the block-aligned blob size (the lcm of the types' super-blocks), and the
+        // Q6_K layers need a larger alignment than the Q4_K ones, so the first layer's stride UNDER-estimates
+        // the per-layer allocation - the 2 GiB budget asked for 1018 slots/layer and the Q6_K layers' table
+        // then did not fit (the engine died before READY).  Budget with the max stride: the total stays
+        // within the requested VRAM for every layer.
+        size_t stride_max = 0;
+        for (auto& b : e.blobs) stride_max = std::max(stride_max, b.stride);
+        slots = (int) (expert_vram * (1 << 30) / ((double) stride_max * (double) e.g.n_layers));
+    }
     e.slots = std::min(slots, (int) e.g.n_expert);
     if (e.slots > 0) {   // the GPU expert cache: slots blobs + 1 zero slot per layer, copied up front
         for (auto& b : e.blobs) {
