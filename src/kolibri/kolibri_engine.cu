@@ -2980,6 +2980,15 @@ int strata::kolibri::run(int argc, char** argv) {
     // ids per layer and are not capturable.  --no-graph keeps the plain launches.
     e.graphs = grouped && !no_graph && slots == 0 && cpu_threads == 0 ? 1 : 0;
     e.prefill = prefill;
+    // The CPU pool is OPT-IN (--cpu-threads) and its absence is SILENT: with no pool every routed expert falls
+    // through to the per-expert GPU mmvq loop (measured on 2026-10-21: 364,350 mmvq launches = 26.8 s of 35 s
+    // GPU busy, and the prefill 4.6x slower - 22,126 ms vs 4,744 ms - with nothing in the log).  A future reader
+    // would read that as a regression, so the prefill says so out loud.
+    if (e.prefill > 0 && e.cpu_threads == 0)
+        std::fprintf(stderr, "strata-kolibri: WARNING: --prefill without --cpu-threads means NO CPU pool: every "
+                             "routed expert takes the per-expert GPU mmvq fallback (measured 4.6x slower on the "
+                             "512-token prefill: 22,126 ms vs 4,744 ms).  Pass --cpu-threads 24 for the speed "
+                             "configuration.\n");
     if (e.prefill > 0) {
         if (cublasCreate(&e.blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(e.blas, g_st) != CUBLAS_STATUS_SUCCESS) {
             std::fprintf(stderr, "strata-kolibri: cuBLAS init failed\n");

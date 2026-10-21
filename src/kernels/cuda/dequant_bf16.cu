@@ -276,7 +276,15 @@ bool dequant_wide_on() {
         int major = 0, minor = 0;
         if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
             cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) { (void) cudaGetLastError(); return false; }
-        per_dev[dev] = major == 6 && minor == 1 ? 2 : 1;
+        // The wide kernels need 8-byte loads and 16-byte stores (sm_35+ has both).  Enabled where MEASURED:
+        // sm_61 (a Tesla P40, 2026-09: Q6_K 7.2 -> 0.33 ms, 227 GB/s) and sm_86 (2026-10-15, the RTX 3060 /
+        // RTX A4000).  sm_75 (a Tesla T4) was added on 2026-10-21 by the Kolibri-1 work: the dequant was 60% of
+        // the 4K prefill's GPU busy time on that card (17.6 s of 29.1 s) because the narrow kernel runs at
+        // ~10 GB/s; with the wide path the 4K prefill is 33,097 -> 24,801 ms (123.8 -> 165.2 tok/s) and pp512
+        // 4,708 -> 4,309 ms (108.7 -> 118.8 tok/s), with dequant_wide_parity 360/360 OK ON THAT CARD and the
+        // Kolibri plain-path oracle BITWISE.  Same arithmetic on the same operands, so the output is identical.
+        const bool wide_card = (major == 6 && minor == 1) || (major == 7 && minor == 5) || (major == 8 && minor == 6);
+        per_dev[dev] = wide_card ? 2 : 1;
     }
     return per_dev[dev] == 2;
 }
