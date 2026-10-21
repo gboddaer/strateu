@@ -1774,17 +1774,38 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                 // layer_step takes `const Engine&` (the decode never mutates the engine), but Gemm::f16 is non-const;
                 // the GEMM object's only mutable state is its cuBLAS handle, which is what we want to use.
                 auto& gemm = const_cast<strata::prefill::Gemm&>(e.gemm);
+                // ONE BATCHED CALL PER SLICE, not a three-call chain per pick.  Measured: the per-pick chain cost ~40 us
+                // of serialized cuBLAS latency per resident pick (174 picks/token = ~7 ms), which ate the ~8.7 ms the
+                // pool saved.  The batched form is the prefill's own mechanism (f16_batched over pointer arrays), so the
+                // block bookkeeping is already proven.
+                const int nblk = (int) res_k.size();
                 const int64_t f16_stride = 3 * (int64_t) FF * N;
                 k_to_f16<<<dim3((N + 127) / 128), 128, 0, st>>>(s.h, s.dec_x16, N);   // h in f16 for this layer
-                for (size_t r = 0; r < res_k.size(); ++r) {
-                    const int k = res_k[r];
-                    const uint16_t* xe = b.f16 + (int64_t) res_slot[r] * f16_stride;
-                    gemm.f16((const uint16_t*) s.dec_x16, xe, s.eg, 1, FF, N);
-                    gemm.f16((const uint16_t*) s.dec_x16, xe + (int64_t) FF * N, s.eu, 1, FF, N);
-                    k_swiglu<<<(FF + B - 1) / B, B, 0, st>>>(s.eg, s.eu, s.eh, FF);
-                    k_to_f16<<<dim3((FF + 127) / 128), 128, 0, st>>>(s.eh, s.dec_eh16, FF);
-                    gemm.f16((const uint16_t*) s.dec_eh16, xe + 2 * (int64_t) FF * N, s.ey + (size_t) k * N, 1, N, FF);
+                for (int r = 0; r < nblk; ++r) {
+                    const uint16_t* xe = b.f16 + (int64_t) res_slot[(size_t) r] * f16_stride;
+                    s.pa_g_h[(size_t) r] = xe;
+                    s.pa_u_h[(size_t) r] = xe + (int64_t) FF * N;
+                    s.pa_d_h[(size_t) r] = xe + 2 * (int64_t) FF * N;
+                    s.pb_x_h[(size_t) r] = (const uint16_t*) s.dec_x16;
+                    s.pb_h_h[(size_t) r] = (const uint16_t*) s.dec_eh16 + (int64_t) r * FF;
+                    s.pc_g_h[(size_t) r] = s.eg + (int64_t) r * FF;
+                    s.pc_u_h[(size_t) r] = s.eu + (int64_t) r * FF;
+                    s.pc_ey_h[(size_t) r] = s.ey + (size_t) res_k[(size_t) r] * N;
                 }
+                const size_t pb = (size_t) nblk * sizeof(void*);
+                KC(cudaMemcpyAsync(s.pa_g, s.pa_g_h.data(), pb, cudaMemcpyHostToDevice, g_st));
+                KC(cudaMemcpyAsync(s.pa_u, s.pa_u_h.data(), pb, cudaMemcpyHostToDevice, g_st));
+                KC(cudaMemcpyAsync(s.pa_d, s.pa_d_h.data(), pb, cudaMemcpyHostToDevice, g_st));
+                KC(cudaMemcpyAsync(s.pb_x, s.pb_x_h.data(), pb, cudaMemcpyHostToDevice, g_st));
+                KC(cudaMemcpyAsync(s.pb_h, s.pb_h_h.data(), pb, cudaMemcpyHostToDevice, g_st));
+                KC(cudaMemcpyAsync(s.pc_g, s.pc_g_h.data(), pb, cudaMemcpyHostToDevice, g_st));
+                KC(cudaMemcpyAsync(s.pc_u, s.pc_u_h.data(), pb, cudaMemcpyHostToDevice, g_st));
+                KC(cudaMemcpyAsync(s.pc_ey, s.pc_ey_h.data(), pb, cudaMemcpyHostToDevice, g_st));
+                gemm.f16_batched(s.pa_g, s.pb_x, s.pc_g, 1, FF, N, nblk);
+                gemm.f16_batched(s.pa_u, s.pb_x, s.pc_u, 1, FF, N, nblk);
+                k_swiglu<<<grid1((int64_t) nblk * FF), kThreads>>>(s.eg, s.eu, s.eh, nblk * FF);
+                k_to_f16<<<grid1((int64_t) nblk * FF), kThreads>>>(s.eh, s.dec_eh16, nblk * FF);
+                gemm.f16_batched(s.pa_d, s.pb_h, s.pc_ey, 1, N, FF, nblk);
             }
         } else {
         if (e.counters) ++e.cnt.br_gpu;   // the plain pinned-table mmvq path
@@ -2566,7 +2587,7 @@ void init_scratch(const Engine& e, Scratch& s) {
     s.logits = dalloc(g.n_vocab);
     if (dec_res_on()) {   // K29: the residency path's own fp16 scratch (see the Scratch declarations)
         s.dec_x16 = (__half*) dalloc((size_t) g.n_embd * 2);
-        s.dec_eh16 = (__half*) dalloc((size_t) g.n_ff * 2);
+        s.dec_eh16 = (__half*) dalloc((size_t) 16 * g.n_ff * 2);   // one FF block per resident pick
     }
     if (dense_f16_on()) {   // S6: the decode's fp16 activation buffers (one dense vector + the attention output)
         s.dec_h16 = (__half*) dalloc((size_t) g.n_embd * 2);
