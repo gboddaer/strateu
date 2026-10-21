@@ -102,6 +102,13 @@ static inline bool env_on(const char* name) {
     return v != nullptr && v[0] != 0 && std::atoi(v) != 0;
 }
 
+// The same value-parse for a gate that is ON unless the env says otherwise (an unset gate must not silently
+// disable a default: "STRATA_KOLIBRI_PF_PIN=0" is the A/B arm, an absent variable is the shipped behaviour).
+static inline bool env_on_default_on(const char* name) {
+    const char* v = std::getenv(name);
+    return v == nullptr || (v[0] != 0 && std::atoi(v) != 0);
+}
+
 // S7 expert fp16 cache: experts per layer to keep VRAM-resident (STRATA_KOLIBRI_EXPERT_F16=N).  0 = off.
 static inline int expert_f16_n() {
     static const int n = std::getenv("STRATA_KOLIBRI_EXPERT_F16") ? std::atoi(std::getenv("STRATA_KOLIBRI_EXPERT_F16")) : 0;
@@ -203,6 +210,8 @@ struct LayerBlobs {
 /// returns when all shards are done.  --cpu-threads sizes it; the CPU expert pool is its user.
 struct Pool {
     int n_threads = 0;
+    bool pin = false;               // STRATA_KOLIBRI_PF_PIN=0 reproduces the unpinned A/B arm
+    std::vector<int> cores;         // one pinnable physical core per worker lane
     std::vector<std::thread> workers;
     std::mutex mu;
     std::condition_variable work_cv, done_cv;
@@ -213,7 +222,22 @@ struct Pool {
     bool quit = false;
     void start(int t) {
         n_threads = t;
+        // **THE PREFILL LANES HAD NO AFFINITY AT ALL.**  The library ExpertPool pins every worker to a physical
+        // core; this pool - the one S7's prefill fan-out actually uses - spawned plain threads.  Under
+        // `numactl --cpunodebind=1` this node's cpuset is 28 logical CPUs = 14 physical cores x 2, so 24
+        // unpinned lanes float over 14 cores: lanes share cores, and the per-chunk barrier waits for whichever
+        // lane loses the SMT toss.  Measured on the 32K prefill (chunks=4000, 568.77 GB): shard bytes PERFECTLY
+        // equal (min = max = 28.21 GB) with a **2.0x shard-busy spread** (max 49,709 ms / mean 34,785 ms) and
+        // 10.7 GB/s, against the library pool's 34.0 GB/s on the SAME kernels on the SAME node (pool_bench:
+        // 12 workers 34.5, 24 workers 34.0, 48 collapse to 2.8).  Equal bytes and unequal time is the signature
+        // of a placement problem, not a kernel one, so pin.
+        cores = pin ? strata::kernels::cpu::physical_cores(true) : std::vector<int>();
         for (int i = 1; i < t; ++i) workers.emplace_back([this, i] {
+            if (pin) {
+                const size_t idx = (size_t) (i - 1);
+                const int core = idx < cores.size() ? cores[idx] : -1;
+                if (core >= 0) strata::kernels::cpu::pin_current_thread(core);
+            }
             unsigned long my_gen = 0;
             for (;;) {
                 std::unique_lock<std::mutex> lk(mu);
@@ -245,6 +269,7 @@ struct Engine {
     int64_t top_k = 6;
     float eps = 1e-6f, rope_base = 1e4f;
     int cpu_threads = 0;            // --cpu-threads: routed experts on the CPU pool (ggml-cpu vec_dot, no PCIe)
+    int pf_lanes = 0;               // the prefill fan-out's lane count (host lane + one lane per pinnable core)
     int64_t pf_total = 0;           // the prefill's total prompt length (the POOL_ALL rule keys on it)
     int slots = 0;                  // --expert-slots: experts per layer resident in VRAM (the GPU expert cache)
     int grouped = 0;                // --grouped: native_expert_grouped for the routed experts (one launch per layer)
@@ -1935,7 +1960,11 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                     std::vector<int32_t> cur(cnt.begin(), cnt.begin() + g.n_expert + 1);
                     for (int sel = 0; sel < NK; ++sel) ord[cur[g_ids_host[(size_t) sel]]++] = sel;
                 }
-                const int NS = std::min((int) g.n_expert, e.cpu_threads);
+                // The shard count must equal the pool's LANE count, not --cpu-threads: the fan-out maps shard i
+                // to lane i (shard 0 = the host), so ns > lanes leaves some lanes with two shards and others
+                // with one - equal bytes per SHARD, 2x unequal time per lane, and the barrier waits for the
+                // double-shard lane.  That is the measured 2.0x spread on the 32K prefill.
+                const int NS = std::min((int) g.n_expert, e.pf_lanes > 0 ? e.pf_lanes : e.cpu_threads);
                 // Work-balanced shard deal (LPT).  The old split strode over ALL 384 expert ids, so a worker that
                 // drew the hot experts set the barrier: the phase timers measured 88.2 s of kernel work in a 22.9 s
                 // window on 24 workers = 16% parallel efficiency.  Deal the TOUCHED experts, biggest first, round
@@ -3025,7 +3054,28 @@ int strata::kolibri::run(int argc, char** argv) {
                      e.slots, (double) e.slots * e.blobs[0].stride * e.g.n_layers / (1 << 30));
     }
     if (e.cpu_threads > 1) {
-        e.pool.start(e.cpu_threads);
+        // The prefill fan-out's pool: lanes = the host lane + one lane per pinnable PHYSICAL core of this
+        // cpuset.  Asking for more lanes than there are cores does not add bandwidth (pool_bench on this node:
+        // 12 workers 34.5 GB/s, 24 workers 34.0) - it only puts two lanes on one core, and the barrier then waits
+        // for the HT-shared one.  The old code passed --cpu-threads through verbatim and said nothing.
+        const std::vector<int> pf_cores = strata::kernels::cpu::physical_cores(true);
+        const int lanes_cap = pf_cores.empty() ? e.cpu_threads : (int) pf_cores.size() + 1;
+        int lanes = e.cpu_threads;
+        const char* lanes_env = std::getenv("STRATA_KOLIBRI_PF_LANES");
+        if (lanes_env != nullptr && std::atoi(lanes_env) > 0)
+            lanes = std::atoi(lanes_env);   // the A/B override: reproduces the old lane count on identical code
+        else if (lanes > lanes_cap)
+            lanes = lanes_cap;
+        if (lanes > e.cpu_threads) lanes = e.cpu_threads;
+        if (lanes < 1) lanes = 1;
+        e.pf_lanes = lanes;
+        e.pool.pin = env_on_default_on("STRATA_KOLIBRI_PF_PIN");
+        std::fprintf(stderr,
+                     "strata-kolibri: prefill pool: %d lane(s) = the host + %d thread(s), %zu pinnable physical"
+                     " core(s)%s%s\n",
+                     lanes, lanes - 1, pf_cores.size(), e.pool.pin ? ", pinned" : ", PINNING OFF",
+                     lanes < e.cpu_threads ? " (capped from --cpu-threads)" : "");
+        e.pool.start(lanes);
         // P1b: the expert rows go to the library's pool (row-split over all workers, affinity-aware).  The
         // measured placement rule (pool_bench): ~24 workers on the GPU's socket; 48 on one socket collapse.
         e.epool = std::make_unique<strata::kernels::cpu::ExpertPool>(
@@ -3116,6 +3166,15 @@ int strata::kolibri::run(int argc, char** argv) {
         const int64_t n = (int64_t) ids.size() - 1;
         e.pf_total = n;   // the POOL_ALL rule: one decision for the whole prompt
         const auto tp0 = Clock::now();
+        // **THE HOST IS A POOL LANE, SO IT MUST SIT ON ITS OWN CORE.**  The prefill fan-out runs shard 0 on the
+        // calling thread; leaving that thread unpinned lets it land on a worker's core (or its SMT sibling) and
+        // makes the barrier wait for it - the library's own measurement of this reservation being a fiction is
+        // 36.32 GB/s on 5 pinned workers vs 26.9 inside an unpinned host loop (1.35x, include/strata/kernels/
+        // cpu/pool.hpp).  Same rule, same reason, here.
+        const strata::kernels::cpu::ThreadAffinity pf_host_prev =
+            (e.pool.pin && e.cpu_threads > 1)
+                ? strata::kernels::cpu::pin_current_thread(strata::kernels::cpu::planned_host_core())
+                : strata::kernels::cpu::ThreadAffinity{};
         while (i < n) {
             const int T = (int) std::min<int64_t>(pf_chunk_at(s.pos), n - i);
             KC(cudaMemcpy(s.toks_d, ids.data() + i, (size_t) T * 4, cudaMemcpyHostToDevice));
@@ -3125,6 +3184,7 @@ int strata::kolibri::run(int argc, char** argv) {
             std::printf("PFchunk %lld/%lld %.0fms\n", (long long) i, (long long) n, ms_since(tp0));
             std::fflush(stdout);
         }
+        if (pf_host_prev.valid) strata::kernels::cpu::restore_thread_affinity(pf_host_prev);
         tok = ids.back();
     } else
     for (size_t t = 1; t < ids.size(); ++t) {
