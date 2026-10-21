@@ -316,6 +316,11 @@ struct Engine {
     // prefill path does not use), so a 13.9 tok/s pp was unreadable - grouped bytes, achieved rate and the
     // pool/GPU split were all invisible.  These are that leg's counters.
     long long pf_pool_ms = 0, pf_pool_bytes = 0, pf_chunks = 0, pf_experts = 0;
+    // THE POOL'S REAL WORK IS ROWS, NOT BYTES.  Removing the fp16 cache made the pool leg 3.6x slower (126.6 s ->
+    // 454.0 s at 32K) while its bytes rose only 1.33x, so the leg is arithmetic-bound and every byte-rate quoted
+    // for it (10.7 GB/s "against a 34 GB/s roof") was comparing the wrong quantity.  Count the rows the pool
+    // actually computes and print GFLOP/s - the CPU pool's measured roof is 226 GFLOP/s.
+    std::atomic<long long> pf_rows{0};
     // Per-shard bytes for the prefill leg.  The leg calls the engine's ~20-line shard fan-out (e.pool.run), the
     // construct whose decode-side defect was "worker i runs exactly shard i"; if the work concentrates in a few
     // shards, that is the whole 0.06 GB/s/core story.  Each shard writes only its own slot, so no atomics needed.
@@ -2115,6 +2120,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                             const auto tC = std::chrono::steady_clock::now();
                             strata::kernels::cpu::native_down_rows(b.fmt, blob, hqs, mm, eys, 0, N);
                             const auto tD = std::chrono::steady_clock::now();
+                            if (e.counters) e.pf_rows += mm;   // the pool's real work: one row = gate/up + down over N
                             e.pf_gu_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(tB - tA).count();
                             e.pf_qh_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(tC - tB).count();
                             e.pf_dn_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(tD - tC).count();
@@ -2503,6 +2509,20 @@ void print_counters(Engine& e, const char* tag) {
                      e.pf_chunks, (double) e.pf_experts / e.pf_chunks, gb, gb * 1e3 / e.pf_chunks, ms, ms / e.pf_chunks,
                      ms > 0 ? gb / (ms / 1000.0) : 0.0,
                      e.pf_f16_promotes > 0 ? (std::string(" promotes=") + std::to_string(e.pf_f16_promotes)).c_str() : "");
+        // The leg's honest rate: rows and GFLOP/s against the CPU pool's measured roof (226 GFLOP/s).  Every
+        // earlier reading of this leg quoted GB/s, which measures the bytes it streamed rather than the arithmetic
+        // it did - and the arithmetic is what binds once the fp16 cache is doing its job.
+        {
+            const double rows = (double) e.pf_rows.load();
+            const double flop_per_row =
+                2.0 * ((double) e.g.n_embd * (2.0 * (double) e.g.n_ff) + (double) e.g.n_ff * (double) e.g.n_embd);
+            const double gflops = ms > 0 ? rows * flop_per_row / (ms * 1e6) : 0.0;
+            std::fprintf(stderr,
+                         "CNT prefill pool work: rows=%.0f (%.1f/chunk) = %.1f GFLOP at %.0f GFLOP/s (%.0f%% of the"
+                         " 226 GFLOP/s pool roof); %.1f MB/row streamed\n",
+                         rows, rows / (double) e.pf_chunks, rows * flop_per_row / 1e9, gflops,
+                         gflops / 226.0 * 100.0, rows > 0 ? gb * 1e3 / rows : 0.0);
+        }
         int active = 0; long long mx = 0, mn = -1;
         for (long long v : e.pf_shard_bytes) if (v > 0) { ++active; mx = std::max(mx, v); if (mn < 0) mn = v; }
         std::fprintf(stderr, "CNT prefill shards: workers=%d active=%d bytes/min=%.2f GB max=%.2f GB\n",

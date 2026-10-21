@@ -10,6 +10,9 @@ ap.add_argument("--model", required=True)
 ap.add_argument("--ids512", required=True, help="file: 512 prompt ids")
 ap.add_argument("--ids32k", required=True, help="file: 32768 prompt ids")
 ap.add_argument("--ctx", type=int, default=33024)
+# The short case used to hard-code ctx=8192, which silently capped every prompt there at 8191 tokens ("prompt
+# (8192) + max_new (8) exceeds the context (8192)").  Default unchanged, so no existing script moves.
+ap.add_argument("--short-ctx", type=int, default=8192)
 ap.add_argument("--tg", type=int, default=128)
 ap.add_argument("--extra", default="", help="extra engine flags, e.g. '--prefill --counters'")
 ap.add_argument("--case", choices=["short", "after", "both"], default="both", help="short = pp512/tg128 only (the plain path needs ~7 h for pp32768)")
@@ -51,6 +54,6 @@ def run_case(ids: str, n: int, ctx: int, label: str):
 ids512 = open(a.ids512).read().strip()
 ids32k = open(a.ids32k).read().strip()
 if a.case in ("short", "both"):
-    run_case(ids512, a.tg, 8192, "short   ")
+    run_case(ids512, a.tg, a.short_ctx, "short   ")
 if a.case in ("after", "both"):
     run_case(ids32k, a.tg, a.ctx, "after32K")
