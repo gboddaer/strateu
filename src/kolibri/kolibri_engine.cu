@@ -2234,6 +2234,15 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                 // so the grouped kernel's writes race the pool's - a per-run-varying blend, which is exactly the
                 // observed magnitude.  Drain g_st first.
                 KC(cudaStreamSynchronize(g_st));
+                if (std::getenv("STRATA_KOLIBRI_PF_HASH") != nullptr) {
+                    // P1 probe: a per-chunk checksum of the expert leg's OUTPUT (the pool's miss rows plus the
+                    // resident scatter into the same host buffer).  Two identical runs print two sequences; the first
+                    // line that differs names the exact chunk where the prefill stops being reproducible.  The dump
+                    // instruments cannot do this - --dump-layers disables chunking entirely, so it never runs this code.
+                    double hs = 0.0;
+                    for (int64_t q = 0; q < NK * N; ++q) hs += (double) s.ey_h[(size_t) q];
+                    std::fprintf(stderr, "PFHASH l=%d chunk=%lld sum=%.9e\n", (int) l, (long long) e.pf_chunks, hs);
+                }
                 KC(cudaMemcpy(s.gout_m, s.ey_h, (size_t) NK * N * 4, cudaMemcpyHostToDevice));
             } else {
             // The mmvq fallback leg: per-token activation quantize, gate/up per selection, SwiGLU, h quantize,
