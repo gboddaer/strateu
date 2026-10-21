@@ -3200,6 +3200,12 @@ int strata::kolibri::run(int argc, char** argv) {
             std::fprintf(stderr, "strata-kolibri: cuBLAS init failed\n");
             return 1;
         }
+        // P1: THE ATTENTION HAS ITS OWN HANDLE, which is why STRATA_GEMM_DETERMINISTIC changed nothing when it was
+        // applied only to the Gemm object.  Its strided-batched score/PV calls are exactly the multi-token shapes at
+        // which cuBLAS may pick an atomics-based (split-K) kernel - and the default attention is the one component that
+        // measured non-deterministic (T>=64) while ATTN_FLASH, which does not use it, is bit-identical.
+        if (std::getenv("STRATA_GEMM_DETERMINISTIC") != nullptr)
+            cublasSetAtomicsMode(e.blas, CUBLAS_ATOMICS_NOT_ALLOWED);
         const int64_t big = std::max(e.g.n_head * e.g.head_dim, e.g.n_embd) * (int64_t) e.g.n_embd;
         if (!e.gemm.init(g_st, big, err)) {
             std::fprintf(stderr, "strata-kolibri: prompt GEMM init failed: %s\n", err.c_str());
