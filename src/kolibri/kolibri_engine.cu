@@ -1437,6 +1437,10 @@ struct Scratch {
     std::vector<__half*> kt;       // K27: the transposed K mirror for the sliding layers (STRATA_KOLIBRI_ATTN_KT)
     std::vector<__half*> vt;       // K27: and the transposed V mirror (the PV pass reads V the same way)
     std::vector<int64_t> kt_rows;  // K27: each mirror's row stride (min(rows, two_pass_max))
+    // K27b: is this layer's mirror already built for the current request?  Filling it once and then appending the new
+    // row per token costs 1/513th of rebuilding the window every token - which the profile showed as 6.5% of the
+    // decode's GPU time (578 calls x 36.9 us; it was my own overhead, the largest single line I had added).
+    std::vector<char> kt_ready;
     // the CPU expert path's pinned host side: the layer's h, its quantized activations, the FF rows, the down rows
     float* h_host = nullptr; char* act = nullptr; float* ff = nullptr; char* hq = nullptr; float* ey_h = nullptr;
     std::vector<int32_t> exp_cnt, exp_ord;   // prefill pool: the per-expert grouping
@@ -1585,6 +1589,13 @@ static inline bool dec_phases_on() {
 // needs the KL gate before it can be a default.
 static inline bool dec_res_on() { return env_on("STRATA_KOLIBRI_DEC_RES"); }
 
+// K30: run the decode's SHARED EXPERT during the CPU pool drain.  It depends only on `h` (already computed), so its
+// five launches can be enqueued before pool_experts and the GPU executes them while the host computes the routed
+// experts - the one piece of per-layer GPU work the dependency chain does NOT forbid.  Bitwise: same kernels, same
+// order, same stream; only the enqueue point moves.  (The prefill version of this idea failed because there the shared
+// expert WRITES the f16 activation buffer the routed path reads; at decode it only reads dec_h16.)
+static inline bool dec_xexp_on() { return env_on("STRATA_KOLIBRI_DEC_XEXP"); }
+
 /// K29: seed the decode's fp16 cache with each layer's HOT experts.  Without this the slots hold only the last prefill
 /// chunk's RES_TOP promotions, which measured 27% of decode picks; the prompt's own routing says which 24 per layer
 /// matter (the coverage probe measures 45.0% for a top-24 set).  ~1200 promotions, ~2.2 GB over PCIe, once per request.
@@ -1647,19 +1658,21 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
             k_attn_p<<<H, 512, (size_t) 4096 * sizeof(float), st>>>(
                 s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos_d, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding);
         else {
-            // K27: rebuild the transposed mirror for the visible window, then let the score dot read it.  The copy is
-            // 513 rows x 128 dims x 4 kv heads = 525 KB per layer per token, which is cheap against the ~15 ms/token
-            // the uncoalesced dot costs; and because the mirror is rebuilt from the same host ring every token it needs
-            // no incremental bookkeeping (no first-use case, no drift after a prefill).
+            // K27: the transposed mirror the score dot reads.  K27b makes it incremental: the window is copied ONCE
+            // per layer per request (the first decode token, which also covers everything a prefill wrote) and one row
+            // is appended per token after that - 1/513th of the work, and it was 6.5% of the decode's GPU busy.
             const __half* ktc = nullptr;
             const __half* vtc = nullptr;
             if ((size_t) l < s.kt.size() && s.kt[(size_t) l] != nullptr && n_vis <= g_two_pass_max) {
-                const int64_t first_kt = sliding ? (int64_t) s.pos + 1 - n_vis : 0;
+                const bool full_kt = s.kt_ready[(size_t) l] == 0;
+                const int64_t n_kt = full_kt ? n_vis : 1;
+                const int64_t first_kt = sliding ? (full_kt ? (int64_t) s.pos + 1 - n_vis : (int64_t) s.pos) : 0;
                 const int64_t rows_kt = s.kt_rows[(size_t) l];
-                const int64_t total = (int64_t) HKV * (int64_t) n_vis * (int64_t) D;
+                const int64_t total = (int64_t) HKV * n_kt * (int64_t) D;
                 k_kt_window<<<(unsigned) ((total + 255) / 256), 256, 0, st>>>(
-                    s.kc[l], s.vc[l], s.kt[(size_t) l], s.vt[(size_t) l], rows_kt, n_vis, first_kt, g.n_swa, D, HKV,
-                    sliding);
+                    s.kc[l], s.vc[l], s.kt[(size_t) l], s.vt[(size_t) l], rows_kt, (int) n_kt, first_kt, g.n_swa, D,
+                    HKV, sliding);
+                if (full_kt) s.kt_ready[(size_t) l] = 1;
                 ktc = s.kt[(size_t) l];
                 vtc = s.vt[(size_t) l];
             }
@@ -1680,6 +1693,15 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
             g_ids_host.resize((size_t) K);
             KC(cudaMemcpy(g_ids_host.data(), s.ids, K * sizeof(int), cudaMemcpyDeviceToHost));
         }
+        bool shexp_done = false;
+        auto run_shexp = [&] {
+            gemv_dec(e.dense.at(L(l, "ffn_gate_shexp.weight")), s.h, s.dec_h16, s.sg, st);
+            gemv_dec(e.dense.at(L(l, "ffn_up_shexp.weight")), s.h, s.dec_h16, s.su, st);
+            k_swiglu<<<(FS + B - 1) / B, B, 0, st>>>(s.sg, s.su, s.sh, FS);
+            if (s.dec_h16) k_to_f16<<<dim3((FS + 127) / 128), 128, 0, st>>>(s.sh, s.dec_h16, FS);
+            gemv_dec(e.dense.at(L(l, "ffn_down_shexp.weight")), s.sh, s.dec_h16, s.sy, st);
+            shexp_done = true;
+        };
         Dense gu; gu.type = b.L.gu_type; gu.shape = {g.n_embd, g.n_ff, g.n_expert}; gu.row_bytes = b.L.gu_row;
         Dense dn; dn.type = b.L.d_type; dn.shape = {g.n_ff, g.n_embd, g.n_expert}; dn.row_bytes = b.L.d_row;
         // --grouped: one native_expert_grouped launch per layer reads the blobs from the pinned table over UVA
@@ -1756,6 +1778,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
             KC(cudaMemcpy(s.h_host, s.h, N * 4, cudaMemcpyDeviceToHost));
             if (e.counters) { ++e.cnt.d2h_n; e.cnt.d2h_bytes += (long long) N * 4; }   // was uncounted: the pool-only leg read as "no pool" from CNT
             strata::kernels::cpu::native_quant_act(b.fmt, s.h_host, s.act);
+            if (dec_xexp_on()) run_shexp();   // K30: the GPU works during the drain below
             std::vector<int> sels((size_t) K);
             for (int k = 0; k < K; ++k) sels[(size_t) k] = k;
             // K29: resident picks run on the GPU from the fp16 cache; only the misses go to the pool.
@@ -1828,11 +1851,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
         gemv(dn, s.eh, s.ey, s.ids, K, FF, b.table + b.L.down_off, b.stride);
         }
         }
-        gemv_dec(e.dense.at(L(l, "ffn_gate_shexp.weight")), s.h, s.dec_h16, s.sg, st);
-        gemv_dec(e.dense.at(L(l, "ffn_up_shexp.weight")), s.h, s.dec_h16, s.su, st);
-        k_swiglu<<<(FS + B - 1) / B, B, 0, st>>>(s.sg, s.su, s.sh, FS);
-        if (s.dec_h16) k_to_f16<<<dim3((FS + 127) / 128), 128, 0, st>>>(s.sh, s.dec_h16, FS);   // S6: sh -> h16
-        gemv_dec(e.dense.at(L(l, "ffn_down_shexp.weight")), s.sh, s.dec_h16, s.sy, st);
+        if (!shexp_done) run_shexp();
         if (e.grouped > 0 && b.native_ok) k_moe_sum<<<(N + B - 1) / B, B, 0, st>>>(s.moe, s.gout, s.wts, K, s.sy, N);
         else if (e.slots > 0) k_moe_sum2<<<(N + B - 1) / B, B, 0, st>>>(s.moe, s.ey2, s.yc, s.wts, K, s.sy, N);
         else k_moe_sum<<<(N + B - 1) / B, B, 0, st>>>(s.moe, s.ey, s.wts, K, s.sy, N);
@@ -2640,10 +2659,12 @@ void init_scratch(const Engine& e, Scratch& s) {
             KC(cudaMalloc(&pkt, (size_t) g.n_head_kv * (size_t) kt_rows * (size_t) g.head_dim * 2));
             KC(cudaMalloc(&pvt, (size_t) g.n_head_kv * (size_t) kt_rows * (size_t) g.head_dim * 2));
             s.kt_rows.push_back(kt_rows);
+            s.kt_ready.push_back(0);
             s.kt.push_back((__half*) pkt);   // the transposed mirrors: [kvh][d][slot]
             s.vt.push_back((__half*) pvt);
         } else {
             s.kt_rows.push_back(0);
+            s.kt_ready.push_back(0);
             s.kt.push_back(nullptr);
             s.vt.push_back(nullptr);
         }
@@ -2690,6 +2711,7 @@ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std:
 /// Drop the held state: position 0 and empty KV caches (the serve protocol's fresh-request path).
 void reset_state(Engine& e, Scratch& s) {
     const Clock::time_point t0 = Clock::now();
+    std::fill(s.kt_ready.begin(), s.kt_ready.end(), (char) 0);   // K27b: the mirrors describe the old KV
     // K11: the old clear memset the WHOLE cache (1.35 GB at ctx 33024 = 4 ms per request).  Attention only
     // reads rows below the position counter, so a fresh request only needs the rows it can reach: full-attention
     // layers clear 0..pos, and the sliding layers keep their full (cheap, 513-row) ring clear.
