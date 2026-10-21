@@ -220,7 +220,7 @@ struct Pool {
     std::atomic<int> left{0};
     int n_shards = 0;
     bool quit = false;
-    void start(int t) {
+    void start(int t, const std::vector<int>& lane_cores) {
         n_threads = t;
         // **THE PREFILL LANES HAD NO AFFINITY AT ALL.**  The library ExpertPool pins every worker to a physical
         // core; this pool - the one S7's prefill fan-out actually uses - spawned plain threads.  Under
@@ -231,7 +231,16 @@ struct Pool {
         // 10.7 GB/s, against the library pool's 34.0 GB/s on the SAME kernels on the SAME node (pool_bench:
         // 12 workers 34.5, 24 workers 34.0, 48 collapse to 2.8).  Equal bytes and unequal time is the signature
         // of a placement problem, not a kernel one, so pin.
-        cores = pin ? strata::kernels::cpu::physical_cores(true) : std::vector<int>();
+        cores = pin ? lane_cores : std::vector<int>();
+        // **DERIVE THE MAP BEFORE PINNING, NEVER AFTER.**  `physical_cores()` reads the CALLING thread's affinity,
+        // so once the host lane is pinned to one core the map comes back EMPTY - a probe run in that order
+        // printed "pinned 0 worker lanes" while looking successful.  The map is therefore computed at startup
+        // (before any pinning) and passed in; an empty map here is a bug, not a quiet fallback to the old
+        // unpinned behaviour, so say so.
+        if (pin && cores.empty())
+            std::fprintf(stderr,
+                         "strata-kolibri: prefill pool: PINNING REQUESTED BUT THE CORE MAP IS EMPTY - the lanes run"
+                         " unpinned (the caller derived the topology after it was pinned)\n");
         for (int i = 1; i < t; ++i) workers.emplace_back([this, i] {
             if (pin) {
                 const size_t idx = (size_t) (i - 1);
@@ -270,6 +279,7 @@ struct Engine {
     float eps = 1e-6f, rope_base = 1e4f;
     int cpu_threads = 0;            // --cpu-threads: routed experts on the CPU pool (ggml-cpu vec_dot, no PCIe)
     int pf_lanes = 0;               // the prefill fan-out's lane count (host lane + one lane per pinnable core)
+    std::vector<int> pf_cores;      // the pinnable physical cores, derived ONCE at startup before any pinning
     int64_t pf_total = 0;           // the prefill's total prompt length (the POOL_ALL rule keys on it)
     int slots = 0;                  // --expert-slots: experts per layer resident in VRAM (the GPU expert cache)
     int grouped = 0;                // --grouped: native_expert_grouped for the routed experts (one launch per layer)
@@ -3059,6 +3069,7 @@ int strata::kolibri::run(int argc, char** argv) {
         // 12 workers 34.5 GB/s, 24 workers 34.0) - it only puts two lanes on one core, and the barrier then waits
         // for the HT-shared one.  The old code passed --cpu-threads through verbatim and said nothing.
         const std::vector<int> pf_cores = strata::kernels::cpu::physical_cores(true);
+        e.pf_cores = pf_cores;   // stored: deriving it again later can return EMPTY once a thread is pinned
         const int lanes_cap = pf_cores.empty() ? e.cpu_threads : (int) pf_cores.size() + 1;
         int lanes = e.cpu_threads;
         const char* lanes_env = std::getenv("STRATA_KOLIBRI_PF_LANES");
@@ -3075,7 +3086,7 @@ int strata::kolibri::run(int argc, char** argv) {
                      " core(s)%s%s\n",
                      lanes, lanes - 1, pf_cores.size(), e.pool.pin ? ", pinned" : ", PINNING OFF",
                      lanes < e.cpu_threads ? " (capped from --cpu-threads)" : "");
-        e.pool.start(lanes);
+        e.pool.start(lanes, e.pf_cores);
         // P1b: the expert rows go to the library's pool (row-split over all workers, affinity-aware).  The
         // measured placement rule (pool_bench): ~24 workers on the GPU's socket; 48 on one socket collapse.
         e.epool = std::make_unique<strata::kernels::cpu::ExpertPool>(
