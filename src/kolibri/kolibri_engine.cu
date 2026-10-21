@@ -1101,8 +1101,18 @@ __global__ void k_attn_prep_p(const float* qx, const float* kx, const float* vx,
 }
 
 // S6: the decode's single-pass score dot, coalesced (STRATA_KOLIBRI_ATTN_COALESCED): a NUMERICS change
-// (the shuffle tree's summation order vs the scalar loop's), so it is env-gated and KL-gated; the plain path
-// stays bitwise without it.
+// K27: the transposed-K mirror (STRATA_KOLIBRI_ATTN_KT).  Unlike ATTN_COALESCED this is NOT a numerics change - the
+// mirror holds the same values and the dot keeps the scalar d order - it only makes the warp's K loads contiguous.
+// Allocated for the SLIDING layers only (26 MB total): those are the 39 layers that dominate short-context decode,
+// and their window is fixed at n_swa rows, so the mirror is small and cheap to rebuild every token.
+static inline bool attn_kt_on() {
+    // ON by default: unlike ATTN_COALESCED this is not a numerics change - the mirror holds the same values and the
+    // dot keeps the scalar d order - and the oracle prints BITWISE PASS with it enabled (measured on this card).
+    // STRATA_KOLIBRI_ATTN_KT=0 reproduces the pre-K27 path for an A/B.
+    const char* v = std::getenv("STRATA_KOLIBRI_ATTN_KT");
+    return v == nullptr || (v[0] != 0 && std::atoi(v) != 0);
+}
+
 __host__ __device__ inline bool attn_coalesced_on() {
 #if defined(__CUDA_ARCH__)
     return g_attn_coalesced;   // the host sets it once at startup
@@ -1112,9 +1122,27 @@ __host__ __device__ inline bool attn_coalesced_on() {
 #endif
 }
 
+// K27: THE TRANSPOSED K MIRROR.  kt[(kvh*D + d)*rows + slot] = kc[(kvh*rows + slot)*D + d].  The score dot then
+// reads kt[d*rows + slot]: the 32 lanes of a warp own 32 CONSECUTIVE positions, so at each d their halves are
+// contiguous - a coalesced warp load - while every lane keeps the untouched scalar d = 0..127 chain.  That is why
+// this can be bitwise where the warp-cooperative dot (a shuffle tree) is not, and build/attn_k_parity measured the
+// pass 12.5x faster this way (0.2097 -> 0.0167 ms at H=48, 256 threads, sw 513).
+__global__ void k_kt_window(const __half* kc, const __half* vc, __half* kt, __half* vt, int64_t rows, int n_vis,
+                            int64_t first, int64_t swa, int D, int HKV, bool sliding) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t per = (int64_t) n_vis * D;
+    if (i >= (int64_t) HKV * per) return;
+    const int64_t kvh = i / per, rest = i % per;
+    const int64_t p = rest / D, d = rest % D;
+    const int64_t gp = first + p, slot = sliding ? gp % swa : gp;
+    const int64_t src = ((size_t) kvh * rows + slot) * D + d, dst = ((size_t) kvh * D + d) * rows + slot;
+    kt[dst] = kc[src];
+    vt[dst] = vc[src];   // V gets the same mirror: its PV accumulation walks positions at stride D, uncoalesced too
+}
+
 __device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, float* out, int H, int HKV, int D, int pos,
                        int64_t swa, int ctx, float scale, bool sliding, bool force_2pass = false, int bench_mode = 0,
-                       int two_pass_max = 11000) {
+                       int two_pass_max = 11000, const __half* ktc = nullptr, const __half* vtc = nullptr) {
     extern __shared__ float sc[];
     __shared__ float sh[512];   // sized for the widest block the two-pass path launches (512 = 4 slices x D)
     const int h = blockIdx.x, kvh = h / (H / HKV);
@@ -1157,9 +1185,14 @@ __device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, 
     } else {
     for (int p = threadIdx.x; p < n_pos; p += blockDim.x) {
         const int64_t gp = first + p, slot = sliding ? gp % swa : gp;
-        const __half* kp = kc + ((size_t) kvh * rows + slot) * D;
         float s = 0.f;
-        for (int i = 0; i < D; ++i) s += qh[i] * __half2float(kp[i]);
+        if (ktc != nullptr) {   // K27: the transposed mirror - same expression, same d order, coalesced addresses
+            const __half* ktbase = ktc + (size_t) kvh * D * rows;
+            for (int i = 0; i < D; ++i) s += qh[i] * __half2float(ktbase[(size_t) i * rows + slot]);
+        } else {
+            const __half* kp = kc + ((size_t) kvh * rows + slot) * D;
+            for (int i = 0; i < D; ++i) s += qh[i] * __half2float(kp[i]);
+        }
         sc[p] = s * scale;
     }
     }
@@ -1176,9 +1209,17 @@ __device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, 
     sum = block_sum(sum, sh);
     for (int i = threadIdx.x; i < D; i += blockDim.x) {
         float acc = 0.f;
-        for (int p = 0; p < n_pos; ++p) {
-            const int64_t gp = first + p, slot = sliding ? gp % swa : gp;
-            acc += sc[p] * __half2float(vc[((size_t) kvh * rows + slot) * D + i]);
+        if (vtc != nullptr) {   // K27: the transposed V mirror - same p order, contiguous addresses
+            const __half* vtbase = vtc + (size_t) kvh * D * rows;
+            for (int p = 0; p < n_pos; ++p) {
+                const int64_t gp = first + p, slot = sliding ? gp % swa : gp;
+                acc += sc[p] * __half2float(vtbase[(size_t) i * rows + slot]);
+            }
+        } else {
+            for (int p = 0; p < n_pos; ++p) {
+                const int64_t gp = first + p, slot = sliding ? gp % swa : gp;
+                acc += sc[p] * __half2float(vc[((size_t) kvh * rows + slot) * D + i]);
+            }
         }
         out[(size_t) h * D + i] = acc / sum;
     }
@@ -1279,9 +1320,10 @@ __device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, 
     }
 }
 __global__ void k_attn(const float* q, const __half* kc, const __half* vc, float* out, int H, int HKV, int D, int pos,
-                       int64_t swa, int ctx, float scale, bool sliding, int bench_mode, int two_pass_max) {
+                       int64_t swa, int ctx, float scale, bool sliding, int bench_mode, int two_pass_max,
+                       const __half* ktc = nullptr, const __half* vtc = nullptr) {
     const int n_vis = sliding ? (pos + 1 < (int) swa ? pos + 1 : (int) swa) : pos + 1;
-    k_attn_body(q, kc, vc, out, H, HKV, D, pos, swa, ctx, scale, sliding, false, bench_mode, two_pass_max);
+    k_attn_body(q, kc, vc, out, H, HKV, D, pos, swa, ctx, scale, sliding, false, bench_mode, two_pass_max, ktc, vtc);
 }
 /// graph decode: the position from device memory; the dynamic shared memory is the two-pass size (0) so one
 /// capture serves every position (the smem path bakes n_vis into the launch and cannot be replayed across pos).
@@ -1369,6 +1411,9 @@ struct Scratch {
     __half* dec_att16 = nullptr;
     int* ids;
     std::vector<__half*> kc, vc;   // S3: FP16 KV -- half the bytes/token and half the prefill traffic
+    std::vector<__half*> kt;       // K27: the transposed K mirror for the sliding layers (STRATA_KOLIBRI_ATTN_KT)
+    std::vector<__half*> vt;       // K27: and the transposed V mirror (the PV pass reads V the same way)
+    std::vector<int64_t> kt_rows;  // K27: each mirror's row stride (min(rows, two_pass_max))
     // the CPU expert path's pinned host side: the layer's h, its quantized activations, the FF rows, the down rows
     float* h_host = nullptr; char* act = nullptr; float* ff = nullptr; char* hq = nullptr; float* ey_h = nullptr;
     std::vector<int32_t> exp_cnt, exp_ord;   // prefill pool: the per-expert grouping
@@ -1525,9 +1570,26 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
         if (graph)
             k_attn_p<<<H, 512, (size_t) 4096 * sizeof(float), st>>>(
                 s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos_d, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding);
-        else
+        else {
+            // K27: rebuild the transposed mirror for the visible window, then let the score dot read it.  The copy is
+            // 513 rows x 128 dims x 4 kv heads = 525 KB per layer per token, which is cheap against the ~15 ms/token
+            // the uncoalesced dot costs; and because the mirror is rebuilt from the same host ring every token it needs
+            // no incremental bookkeeping (no first-use case, no drift after a prefill).
+            const __half* ktc = nullptr;
+            const __half* vtc = nullptr;
+            if ((size_t) l < s.kt.size() && s.kt[(size_t) l] != nullptr && n_vis <= g_two_pass_max) {
+                const int64_t first_kt = sliding ? (int64_t) s.pos + 1 - n_vis : 0;
+                const int64_t rows_kt = s.kt_rows[(size_t) l];
+                const int64_t total = (int64_t) HKV * (int64_t) n_vis * (int64_t) D;
+                k_kt_window<<<(unsigned) ((total + 255) / 256), 256, 0, st>>>(
+                    s.kc[l], s.vc[l], s.kt[(size_t) l], s.vt[(size_t) l], rows_kt, n_vis, first_kt, g.n_swa, D, HKV,
+                    sliding);
+                ktc = s.kt[(size_t) l];
+                vtc = s.vt[(size_t) l];
+            }
             k_attn<<<H, n_vis <= g_two_pass_max ? kThreads : 512, n_vis <= g_two_pass_max ? (size_t) n_vis * sizeof(float) : (size_t) 4096 * sizeof(float), st>>>(
-                s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding, 0, g_two_pass_max);
+                s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding, 0, g_two_pass_max, ktc, vtc);
+        }
         if (s.dec_att16) k_to_f16<<<dim3((H * D + 127) / 128), 128, 0, st>>>(s.att, s.dec_att16, H * D);   // S6
         gemv_dec(e.dense.at(L(l, "attn_output.weight")), s.att, s.dec_att16, s.y, st);
         k_rms<<<1, kThreads, 0, st>>>(s.y, e.f32.at(L(l, "post_attention_norm.weight")), s.y, N, e.eps);
@@ -2401,6 +2463,24 @@ void init_scratch(const Engine& e, Scratch& s) {
         } else {
             s.kc.push_back(halloc(elems));
             s.vc.push_back(halloc(elems));
+        }
+        if (attn_kt_on() && sliding) {
+            // SLIDING LAYERS ONLY, and measured: mirroring the full layers too is 25.3/25.4 tok/s against 25.7/25.7
+            // here, because their stride is min(ctx, two_pass_max) = 11000 halves (22 KB between successive d's, so
+            // every step of the dot lands in a new line), where the sliding window's 513 rows are 1 KB apart.  The
+            // mirror is also 6x smaller this way (26 MB against 150 MB).
+            const int64_t kt_rows = rows;
+            void* pkt = nullptr;
+            void* pvt = nullptr;
+            KC(cudaMalloc(&pkt, (size_t) g.n_head_kv * (size_t) kt_rows * (size_t) g.head_dim * 2));
+            KC(cudaMalloc(&pvt, (size_t) g.n_head_kv * (size_t) kt_rows * (size_t) g.head_dim * 2));
+            s.kt_rows.push_back(kt_rows);
+            s.kt.push_back((__half*) pkt);   // the transposed mirrors: [kvh][d][slot]
+            s.vt.push_back((__half*) pvt);
+        } else {
+            s.kt_rows.push_back(0);
+            s.kt.push_back(nullptr);
+            s.vt.push_back(nullptr);
         }
     }
 }

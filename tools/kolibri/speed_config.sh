@@ -19,6 +19,11 @@ export STRATA_KOLIBRI_EXPERT_F16=24
 export STRATA_KOLIBRI_RES_TOP=56
 export STRATA_KOLIBRI_ROUTER_TILE=1
 export STRATA_KOLIBRI_ATTN_MB=256
+# K27: the transposed KV mirror for the sliding layers. ON by default (it is NOT a numerics change - same values,
+# same accumulation order, contiguous addresses - and the oracle prints BITWISE PASS with it). Measured: tg128
+# 22.8 -> 25.7 tok/s (+12.7%), tg after 32K 14.5 -> 15.5 (+7%), prefill untouched. STRATA_KOLIBRI_ATTN_KT=0 is the
+# A/B arm. Mirrors are sliding-layer only BY MEASUREMENT: mirroring the full layers too is slower (25.3 vs 25.7)
+# because their 11000-half row stride puts each d-step in a new line.
 export GGML_CUDA_DISABLE_GRAPHS=1
 export KOLIBRI_MODEL=/data4/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf
 export BENCH_EXTRA="--prefill --counters --cpu-threads 24"
