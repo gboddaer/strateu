@@ -99,7 +99,7 @@ static inline bool dense_f16_on() {
 // for an empty or "0" value - which silently voided an A/B (both arms on the same path).
 static inline bool env_on(const char* name) {
     const char* v = std::getenv(name);
-    return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+    return v != nullptr && v[0] != 0 && std::atoi(v) != 0;
 }
 
 // S7 expert fp16 cache: experts per layer to keep VRAM-resident (STRATA_KOLIBRI_EXPERT_F16=N).  0 = off.
@@ -378,6 +378,8 @@ constexpr int kThreads = 128;
 // constant; production default is 11000 (44 KB dynamic + 2.5 KB static, under the 48 KB T4 per-block cap).
 static int g_two_pass_max = 11000;
 cudaStream_t g_st = nullptr;   // the router kernels require a created stream (kolibriref does the same)
+// S6: the decode's coalesced score dot flag, mirrored to the device (the kernel body is device code).
+__device__ bool g_attn_coalesced = false;
 /// S6: the decode's dense gemv from the PRE-DEQUANTIZED fp16 weights (STRATA_KOLIBRI_DENSE_F16): no per-token
 /// Q4_K dequant (the decode's pre-expert chain measured 0.9 ms/layer = 66%% of the decode's wall, at 36 GB/s
 /// effective = 6%% of the T4's bandwidth - the dequant, not the bandwidth).  The x vector is converted to fp16
@@ -1058,6 +1060,18 @@ __global__ void k_attn_prep_p(const float* qx, const float* kx, const float* vx,
     k_attn_prep_body(qx, kx, vx, qw, kw, q, kc, vc, H, D, *pos_p, swa, ctx, base, eps, rope);
 }
 
+// S6: the decode's single-pass score dot, coalesced (STRATA_KOLIBRI_ATTN_COALESCED): a NUMERICS change
+// (the shuffle tree's summation order vs the scalar loop's), so it is env-gated and KL-gated; the plain path
+// stays bitwise without it.
+__host__ __device__ inline bool attn_coalesced_on() {
+#if defined(__CUDA_ARCH__)
+    return g_attn_coalesced;   // the host sets it once at startup
+#else
+    static const bool on = env_on("STRATA_KOLIBRI_ATTN_COALESCED");
+    return on;
+#endif
+}
+
 __device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, float* out, int H, int HKV, int D, int pos,
                        int64_t swa, int ctx, float scale, bool sliding, bool force_2pass = false, int bench_mode = 0,
                        int two_pass_max = 11000) {
@@ -1077,12 +1091,37 @@ __device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, 
     // the scores live in dynamic shared memory up to the 48 KB a T4-class block gets; past that (a 32K full-
     // attention layer) the kernel runs two passes and recomputes each score - slower, and it works
     if (!force_2pass && n_pos <= two_pass_max) {   // 11000*4 = 44 KB dynamic + 2.5 KB static sh[]/qsm[] < the 48 KB T4 cap
+    // S6: the single-pass score dot, warp-cooperative and COALESCED (the same pattern the two-pass path
+    // uses for D == 128): the scalar form had every thread read a whole 128-dim K row (256 B), so a warp
+    // instruction touched 32 separate sectors - the decode's attention ran at ~10 GFLOP/s (the T4's fp32 peak
+    // is 32.5 TFLOPS) and cost 14.7 ms/token at a 512-token context.  Here lane l reads 8 contiguous bytes of
+    // one K row (a warp instruction covers 256 B) and the dot finishes with a warp shuffle reduce.
+    // The summation order changes (the shuffle tree vs the scalar loop), so this is a NUMERICS change: it is
+    // env-gated (STRATA_KOLIBRI_ATTN_COALESCED) and KL-gated, and the plain path stays bitwise without it.
+    const bool coal = D == 128 && attn_coalesced_on();
+    if (coal) {
+        if (threadIdx.x < D) qsm[threadIdx.x] = qh[threadIdx.x];
+        __syncthreads();
+        const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nwarp = (int) blockDim.x >> 5;
+        const __half2* kbase = reinterpret_cast<const __half2*>(kc) + (size_t) kvh * rows * (D / 2);
+        for (int row = wid; row < n_pos; row += nwarp) {
+            const int64_t gp = first + row, slot = sliding ? gp % swa : gp;
+            const __half2* kp2 = kbase + slot * (D / 2) + lane * 2;
+            const float2 a = __half22float2(kp2[0]);
+            const float2 b = __half22float2(kp2[1]);
+            float part = qsm[lane * 4] * a.x + qsm[lane * 4 + 1] * a.y
+                       + qsm[lane * 4 + 2] * b.x + qsm[lane * 4 + 3] * b.y;
+            for (int off = 16; off > 0; off >>= 1) part += __shfl_down_sync(0xffffffffu, part, off);
+            if (lane == 0) sc[row] = part * scale;
+        }
+    } else {
     for (int p = threadIdx.x; p < n_pos; p += blockDim.x) {
         const int64_t gp = first + p, slot = sliding ? gp % swa : gp;
         const __half* kp = kc + ((size_t) kvh * rows + slot) * D;
         float s = 0.f;
         for (int i = 0; i < D; ++i) s += qh[i] * __half2float(kp[i]);
         sc[p] = s * scale;
+    }
     }
     __syncthreads();
     float mx = -INFINITY;
@@ -2917,6 +2956,10 @@ int strata::kolibri::run(int argc, char** argv) {
     Engine e;
     std::string err;
     KC(cudaStreamCreate(&g_st));
+    {   // S6: mirror the decode's coalesced-dot flag to the device (the kernel body is device code)
+        const bool v = env_on("STRATA_KOLIBRI_ATTN_COALESCED");
+        KC(cudaMemcpyToSymbol(g_attn_coalesced, &v, sizeof(bool)));
+    }
     KC(cudaMalloc(&g_q8, strata::kernels::native_q8_1_bytes((int) kActBuf, 1)));
     e.counters = counters != 0;   // before load(): the VRAM report is printed there
     e.hist_on = env_on("STRATA_KOLIBRI_EXPERT_HIST");   // coverage probe; before load() so the table is sized
