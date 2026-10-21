@@ -295,6 +295,8 @@ struct Engine {
         long long slot_bytes = 0;     // expert bytes pulled over PCIe by those misses
         long long d2h_n = 0, d2h_bytes = 0;
         long long h2d_n = 0, h2d_bytes = 0;
+        // K29: decode residency - picks served from the fp16 cache against picks made.
+        long long dec_res_hits = 0, dec_res_picks = 0;
         long long reset_ms = 0, reset_n = 0;
         // Which expert branch each layer-step actually took.  The nsys trace showed GPU mmvq at 575 launches/token
         // (= 48 layers' gate+up for all 6 picks) WHILE the pool branch ran 26x/token - i.e. both sides computing
@@ -1408,6 +1410,13 @@ struct Scratch {
     int ctx = 8192, pos = 0;
     float *x, *h, *y, *q, *k, *v, *att, *router, *eg, *eu, *eh, *ey, *sg, *su, *sh, *sy, *moe, *wts, *logits;
     __half* dec_h16 = nullptr;    // S6: the decode's fp16 activation copies (for the fp16 dense gemv)
+    // K29: the residency path's own fp16 buffers - h's copy and the SwiGLU output.  They must NOT be dec_h16/dec_h16's
+    // neighbours: those are allocated only when STRATA_KOLIBRI_DENSE_F16 is set (off by default), and reusing
+    // dec_h16 would clobber the copy the shared expert's gemvs still need later in the same layer.  Allocated when
+    // DEC_RES is on, independent of the dense-f16 gate - passing a null pointer to cublasGemmEx is exactly the
+    // CUBLAS_STATUS_INVALID_VALUE this cost one build cycle to find.
+    __half* dec_x16 = nullptr;
+    __half* dec_eh16 = nullptr;
     __half* dec_att16 = nullptr;
     int* ids;
     std::vector<__half*> kc, vc;   // S3: FP16 KV -- half the bytes/token and half the prefill traffic
@@ -1556,6 +1565,12 @@ static inline bool dec_phases_on() {
     return on;
 }
 
+// K29: route the decode's RESIDENT picks through the fp16 cache on the GPU, leaving only the misses to the pool.  The
+// coverage probe says a 24-slot per-layer cache covers 45.0% of routing, so the pool's 15 ms/token of blob reads should
+// fall to ~8 ms.  Off by default: it changes the decode's arithmetic (fp16 experts instead of the q8 pool), so it
+// needs the KL gate before it can be a default.
+static inline bool dec_res_on() { return env_on("STRATA_KOLIBRI_DEC_RES"); }
+
 void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t st, float* layers_host) {
     const auto& g = e.g;
     const int N = (int) g.n_embd, K = (int) e.top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
@@ -1698,13 +1713,47 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
             strata::kernels::cpu::native_quant_act(b.fmt, s.h_host, s.act);
             std::vector<int> sels((size_t) K);
             for (int k = 0; k < K; ++k) sels[(size_t) k] = k;
-            pool_experts(e, b, s, g_ids_host, sels);
+            // K29: resident picks run on the GPU from the fp16 cache; only the misses go to the pool.
+            std::vector<int> res_k;
+            std::vector<int> res_slot;
+            if (dec_res_on() && b.f16 != nullptr && !b.f16_slot_id.empty()) {
+                res_k.reserve((size_t) K);
+                sels.clear();
+                for (int k = 0; k < K; ++k) {
+                    const int id = g_ids_host[(size_t) k];
+                    int slot = -1;
+                    for (int si = 0; si < b.n_cached; ++si)
+                        if (b.f16_slot_id[(size_t) si] == id) { slot = si; break; }
+                    if (slot >= 0) { res_k.push_back(k); res_slot.push_back(slot); }
+                    else sels.push_back(k);
+                }
+                if (e.counters) { e.cnt.dec_res_hits += (long long) res_k.size(); e.cnt.dec_res_picks += K; }
+            }
+            pool_experts(e, b, s, g_ids_host, sels);   // no-op when every pick was resident
             if (dph) { const auto n = std::chrono::steady_clock::now();
                        e.cnt.dec_pool_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(n - dpt).count();
                        dpt = n; }
             // K15/K18: async on the compute stream (pinned source); see the slots path above for why.
             KC(cudaMemcpyAsync(s.ey, s.ey_h, (size_t) K * N * 4, cudaMemcpyHostToDevice, g_st));
             if (e.counters) { ++e.cnt.h2d_n; e.cnt.h2d_bytes += (long long) K * N * 4; }   // was uncounted
+            // K29: the resident rows are written AFTER the copy above (same stream), so they win over whatever the
+            // pool left in s.ey_h for those rows.  No new kernel: gemm.f16 takes f16 weights and T = 1.
+            if (!res_k.empty()) {
+                // layer_step takes `const Engine&` (the decode never mutates the engine), but Gemm::f16 is non-const;
+                // the GEMM object's only mutable state is its cuBLAS handle, which is what we want to use.
+                auto& gemm = const_cast<strata::prefill::Gemm&>(e.gemm);
+                const int64_t f16_stride = 3 * (int64_t) FF * N;
+                k_to_f16<<<dim3((N + 127) / 128), 128, 0, st>>>(s.h, s.dec_x16, N);   // h in f16 for this layer
+                for (size_t r = 0; r < res_k.size(); ++r) {
+                    const int k = res_k[r];
+                    const uint16_t* xe = b.f16 + (int64_t) res_slot[r] * f16_stride;
+                    gemm.f16((const uint16_t*) s.dec_x16, xe, s.eg, 1, FF, N);
+                    gemm.f16((const uint16_t*) s.dec_x16, xe + (int64_t) FF * N, s.eu, 1, FF, N);
+                    k_swiglu<<<(FF + B - 1) / B, B, 0, st>>>(s.eg, s.eu, s.eh, FF);
+                    k_to_f16<<<dim3((FF + 127) / 128), 128, 0, st>>>(s.eh, s.dec_eh16, FF);
+                    gemm.f16((const uint16_t*) s.dec_eh16, xe + 2 * (int64_t) FF * N, s.ey + (size_t) k * N, 1, N, FF);
+                }
+            }
         } else {
         if (e.counters) ++e.cnt.br_gpu;   // the plain pinned-table mmvq path
         gemv(gu, s.h, s.eg, s.ids, K, 0, b.table, b.stride);
@@ -2483,6 +2532,10 @@ void init_scratch(const Engine& e, Scratch& s) {
         }
     }
     s.logits = dalloc(g.n_vocab);
+    if (dec_res_on()) {   // K29: the residency path's own fp16 scratch (see the Scratch declarations)
+        s.dec_x16 = (__half*) dalloc((size_t) g.n_embd * 2);
+        s.dec_eh16 = (__half*) dalloc((size_t) g.n_ff * 2);
+    }
     if (dense_f16_on()) {   // S6: the decode's fp16 activation buffers (one dense vector + the attention output)
         s.dec_h16 = (__half*) dalloc((size_t) g.n_embd * 2);
         s.dec_att16 = (__half*) dalloc((size_t) g.n_head * g.head_dim * 2);
@@ -2717,6 +2770,9 @@ void print_counters(Engine& e, const char* tag) {
                      e.cnt.dec_post_ns / 1e6 / n);
     }
     if (e.cnt.br_pool + e.cnt.br_gpu + e.cnt.br_slots + e.cnt.br_grouped > 0)
+        std::fprintf(stderr, "CNT decode residency: %lld of %lld picks served from the fp16 cache (%.1f%%)\n",
+                     e.cnt.dec_res_hits, e.cnt.dec_res_picks,
+                     e.cnt.dec_res_picks ? 100.0 * (double) e.cnt.dec_res_hits / (double) e.cnt.dec_res_picks : 0.0);
         std::fprintf(stderr, "CNT branches per tok: pool %.1f gpu-expert %.1f slots-path %.1f grouped %.1f"
                              " (layers/token total %.1f of %lld)\n",
                      e.cnt.br_pool / tok, e.cnt.br_gpu / tok, e.cnt.br_slots / tok, e.cnt.br_grouped / tok,
