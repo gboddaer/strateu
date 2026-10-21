@@ -23,6 +23,11 @@ export STRATA_KOLIBRI_ROUTER_TILE=1
 # identical for TK=0/2/3/4 with ATTN_FLASH on) and worth +17-23%: 32K 120.5 -> 147.6 tok/s (148.7/144.1/150.0), 4K
 # 120.7 -> 161.0.  TK=0 restores the old per-expert path; 2 and 4 are the other shapes (4 spills registers and loses).
 export STRATA_KOLIBRI_ROUTER_TK=3
+# TJ pins which (TJ, TK) instantiation runs.  Measured at 32K, both sockets, six runs: TJ=8 147.6 (148.7/144.1/150.0),
+# TJ=16 147.9 (151.1/146.6/145.9), TJ=32 151.1 (once).  The box's run-to-run spread (~4%, 144-151) is larger than the
+# difference between the three, so 16 is pinned as the middle register footprint (192 at TJ=32, 144 at TJ=16) - all
+# three are bitwise (identical ids against TK=0 with ATTN_FLASH on).
+export STRATA_KOLIBRI_ROUTER_TJ=16
 export STRATA_KOLIBRI_ATTN_MB=256
 # K27: the transposed KV mirror for the sliding layers. ON by default (it is NOT a numerics change - same values,
 # same accumulation order, contiguous addresses - and the oracle prints BITWISE PASS with it). Measured: tg128

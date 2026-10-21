@@ -2123,9 +2123,17 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                 if (tk >= 4)
                     k_router_tile_k<T_F32, 8, 4><<<dim3(((int) g.n_expert + 3) / 4, ((int) T + 7) / 8), kThreads, 0, g_st>>>(
                         wr.d, s.h_m, (size_t) N, s.router_m, (int) N, (int) T, (int) g.n_expert);
-                else if (tk == 3)
-                    k_router_tile_k<T_F32, 8, 3><<<dim3(((int) g.n_expert + 2) / 3, ((int) T + 7) / 8), kThreads, 0, g_st>>>(
-                        wr.d, s.h_m, (size_t) N, s.router_m, (int) N, (int) T, (int) g.n_expert);
+                else if (tk == 3) {
+                    if (tj >= 32)
+                        k_router_tile_k<T_F32, 32, 3><<<dim3(((int) g.n_expert + 2) / 3, ((int) T + 31) / 32), kThreads, 0, g_st>>>(
+                            wr.d, s.h_m, (size_t) N, s.router_m, (int) N, (int) T, (int) g.n_expert);
+                    else if (tj >= 16)
+                        k_router_tile_k<T_F32, 16, 3><<<dim3(((int) g.n_expert + 2) / 3, ((int) T + 15) / 16), kThreads, 0, g_st>>>(
+                            wr.d, s.h_m, (size_t) N, s.router_m, (int) N, (int) T, (int) g.n_expert);
+                    else
+                        k_router_tile_k<T_F32, 8, 3><<<dim3(((int) g.n_expert + 2) / 3, ((int) T + 7) / 8), kThreads, 0, g_st>>>(
+                            wr.d, s.h_m, (size_t) N, s.router_m, (int) N, (int) T, (int) g.n_expert);
+                }
                 else if (tj >= 32)
                     k_router_tile_k<T_F32, 32, 2><<<dim3(((int) g.n_expert + 1) / 2, ((int) T + 31) / 32), kThreads, 0, g_st>>>(
                         wr.d, s.h_m, (size_t) N, s.router_m, (int) N, (int) T, (int) g.n_expert);
