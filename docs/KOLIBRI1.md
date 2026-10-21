@@ -136,6 +136,15 @@ the placement flips), not a faster pool.
 - Q8_0 beyond a smoke run (parity is at Q4_K_M).
 - Speculative decoding: the model has no MTP layer; prompt-lookup drafting is future work.
 - Multi-GPU, images, the Intel Arc (SYCL) build (refused, like Qwen3.6's).
+- The two open speed floors on this box, with their measured gates: the prompt read at 32K is 129 tok/s
+  (llama.cpp on the same box: 157.5) and the decode is 21.2 tok/s (the floor is 30).  Both are priced in
+  `docs/superpowers/plans/2026-10-17-kolibri1-speed-ledger.md`: the decode's expert leg is at 93% of
+  pool_bench's ceiling for the same shape (so the lever is less expert traffic or a card class where the
+  placement sign flips), and the 32K attention runs at ~1 TFLOP/s against the T4's 32.5 TFLOPS fp32 peak
+  (neither a cublas re-tiling nor a tensor-core fused flash closed it - both measured and recorded).
+- A card class other than this one: every number above is measured on a Tesla T4 + 2x E5-2690 v4.  The
+  card-class rule (the host's streaming bandwidth vs the GPU's PCIe read) is stated in the speed section
+  above, but the class-B and class-C numbers are NOT measured.
 
 ## End-to-end acceptance (2026-10-17, Tesla T4 16 GB, 755 GB RAM, Q4_K_M)
 
