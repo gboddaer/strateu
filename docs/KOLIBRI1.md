@@ -90,19 +90,45 @@ The KL gates pass and strata sits closer to llama.cpp's GPU output than llama.cp
 the greedy and tail-layer thresholds are not met on this card against llama's fp16 reference — the divergence
 is near-tie cascades, and the engine's forward is bitwise kolibriref (p00 8/8).
 
-Speed (`tools/kolibri/bench.py`, the plain exactness-first path; grouped GPU experts, VRAM expert slots,
-split-K decode attention, fp16 prompt attention and decode graphs are the recorded speed work, not built):
+### Speed (measured 2026-10-18..21 on this box, Tesla T4 16 GB + 2x E5-2690 v4, 755 GB RAM, Q4_K_M)
 
-| test | Strata kolibri1 | llama.cpp (same box) | llama.cpp README (RTX 5070) |
-|------|-----------------|----------------------|------------------------------|
-| pp 512 (short) | 10.0 tok/s | 126.1 tok/s | 723 tok/s |
-| tg 128 (short) | 9.3 tok/s | 19.1 tok/s | 18.0 tok/s |
-| pp 32768 | 1.3 tok/s | 157.5 tok/s | — |
-| tg 128 after 32K | 0.6 tok/s | 21.2 tok/s | — |
+Two harnesses, both on this tree: `tools/kolibri/bench.py` (the serve protocol: PP lines for the prompt rate,
+the DONE line for the decode rate) and the CLI (`--prefill --tokens-file`, the PFchunk lines).  The
+**speed configuration** is the passing one: `--prefill --cpu-threads 24`, the fp16 resident expert cache
+(`STRATA_KOLIBRI_EXPERT_F16=28`), the router tile kernel, the adaptive prefill chunk and the prefix-dependent
+POOL_ALL rule, with `numactl --cpunodebind=1 --membind=1` (the T4's DMA and the pool's workers on different
+memory controllers - measured: the same config at node-0 is 20% slower at 32K).
 
-Decode short is within 2× of llama.cpp's (the experts stream over PCIe from RAM: 663 MB/token); prompt-read
-and long-context decode are far behind — the plain path reads every expert blob over PCIe per token and its
-full-attention decode is O(n) per position with a two-pass softmax past the 48 KB shared-memory cap.
+| test | Strata kolibri1 (speed config) | Strata (the exactness-first plain path) | llama.cpp (same box) | llama.cpp README (RTX 5070) |
+|------|------|------|------|------|
+| pp 512 (short) | **107 tok/s** (4,824 ms) | 10.0 tok/s | 126.1 tok/s | 723 tok/s |
+| pp 4,096 | **126 tok/s** (32,520 ms) | — | — | — |
+| pp 32,768 | **129 tok/s** (253.6 s) | 1.3 tok/s | 157.5 tok/s | — |
+| tg 128 (short) | **21.2 tok/s** (the pool route) | 9.3 tok/s | 19.1 tok/s | 18.0 tok/s |
+| tg 128 after 32K | 7.4 tok/s | 0.6 tok/s | 21.2 tok/s | — |
+| 100K needle | **passes verbatim** at depths 0/10/50/90 (6,899 s) | 8.9 tok/s mean (11,534 s) | — | — |
+| KL vs llama.cpp (390 teacher-forced steps) | **0.00634** (ratio 3.77) | 0.00210-0.00648 | — | — |
+
+**Card classes - what carries over, and what does not.**  The placement sign (the findings register's
+"Slots refutation: box-scoped") is the whole story, and it is decided by ONE ratio: the host's streaming
+bandwidth vs the GPU's.  On this box the host streams at 43.4 GB/s (pool_bench, 24 workers, cold blobs, the
+decode's shape) while the GPU reads the pinned table over PCIe at 5.7-6.1 GB/s, so **the CPU pool is the expert
+placement** and VRAM slots lose to it by 1.7x (they beat PCIe by 9x).  The class rules:
+
+| class | the ratio | the expert placement | the expected shape of the numbers |
+|---|---|---|---|
+| **A - host-streaming** (this box: a T4 with a host that streams > 10x the GPU's PCIe read) | host 43.4 GB/s vs PCIe 5.7-6.1 GB/s | the **CPU pool** (the pinned table is the store; no PCIe round trip) | the pool's rate is the prefill's and the decode's floor: 15.3-16.5 ms/token of expert work |
+| **B - balanced** (the host streams at roughly the GPU's PCIe read) | ~6 GB/s both | either | the two placements cross over; measure, do not inherit |
+| **C - GPU-memory** (a 300+ GB/s card, e.g. the RTX 5070 class) | the GPU's memory is 50x the host's | **VRAM slots** (Flash-Next's design target) | the expert bytes live in VRAM; the pool's ceiling stops mattering |
+
+The byte arithmetic is portable; the placement sign is not - that is why the class rule is stated as a ratio and
+not as a card name.  On a class-C card the slot cache should become the primary path (the findings register
+records the sign flip and the byte math behind it).
+
+**The honest gaps on this box (class A):** the prompt read is 3.4x short of llama.cpp's 157.5 tok/s at 32K
+(129 vs 157.5) and the decode is 2.3x short of the 30 tok/s floor - the decode's expert leg is at 93% of
+pool_bench's ceiling for the same shape, so the remaining lever is LESS EXPERT TRAFFIC (or a card class where
+the placement flips), not a faster pool.
 
 ## Not verified (v1)
 
