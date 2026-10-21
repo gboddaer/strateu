@@ -245,6 +245,7 @@ struct Engine {
     int64_t top_k = 6;
     float eps = 1e-6f, rope_base = 1e4f;
     int cpu_threads = 0;            // --cpu-threads: routed experts on the CPU pool (ggml-cpu vec_dot, no PCIe)
+    int64_t pf_total = 0;           // the prefill's total prompt length (the POOL_ALL rule keys on it)
     int slots = 0;                  // --expert-slots: experts per layer resident in VRAM (the GPU expert cache)
     int grouped = 0;                // --grouped: native_expert_grouped for the routed experts (one launch per layer)
     int graphs = 0;                 // --grouped + graphs (default on with --grouped): per-layer CUDA graphs
@@ -1801,7 +1802,19 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
         }
         strata::kernels::native_quantize_q8_1(s.h_m, s.xq8_m, N * T, 1, g_st);   // T contiguous rows = one column (q36)
         k_to_f16<<<grid1((int64_t) T * N), kThreads>>>((const float*) s.h_m, s.x16, (int64_t) T * N);   // ffn-norm h for the shared-FFN GEMMs (the router sgemm takes fp32 h_m directly)
-        static const bool pool_all = env_on("STRATA_KOLIBRI_POOL_ALL");   // A/B: the pool for every layer
+        // POOL_ALL: the pool for EVERY layer (the 25 "native" ones too).  Measured on this box: neutral at
+        // pp512 (the pool leg is small), -9% at 4K (the Q4_K grouped kernel's 8.6 s and the 98 GB of staging
+        // both vanish) and -17% at 32K (255.7 s vs 308.4 s).  The env value CAPS the rule: 0 = off, 1 = on
+        // always, 2 = on for a prefix >= 4K (the default: the win needs a long prefix).
+        static const int pool_all_mode = [] {
+            const char* v = std::getenv("STRATA_KOLIBRI_POOL_ALL");
+            if (!v || !v[0]) return 2;                       // the default: the prefix-dependent rule
+            const int m = std::atoi(v);
+            return m < 0 ? 0 : m;
+        }();
+        // The rule's threshold: the prompt's total length >= 1024 (POOL_ALL is neutral at pp512 - the pool leg
+        // is small - and wins from ~4K up: -9% at 4K, -17% at 32K).
+        const bool pool_all = pool_all_mode == 1 || (pool_all_mode >= 2 && e.pf_total >= 1024);
         // The cache branch stays pool-side: routing the native_ok layers' grouped kernel through the fp16 cache
         // measured KL 0.13050 (gate FAIL) - that kernel is bitwise-equal to llama.cpp's arithmetic, and fp16
         // weights+activations deviate ~1e-3 per layer across 50 layers, which the KL-vs-llama clause forbids.
@@ -2620,6 +2633,7 @@ int serve(Engine& e, Scratch& s) {
         if (e.prefill > 0) {   // chunked prefill: 512 rows per pass, progress per chunk
             int64_t i = reuse;
             const int64_t n = fresh - 1 - reuse;   // the prompt minus its last token
+            e.pf_total = n;   // the POOL_ALL rule: one decision for the whole prompt
             while (i - reuse < n) {
                 const int T = (int) std::min<int64_t>(pf_chunk_at(s.pos), n - (i - reuse));
                 KC(cudaMemcpy(s.toks_d, ids.data() + i, (size_t) T * 4, cudaMemcpyHostToDevice));
@@ -3048,6 +3062,7 @@ int strata::kolibri::run(int argc, char** argv) {
     if (e.prefill > 0 && fl == nullptr) {   // chunked prefill: the whole prompt minus its last token (layer dumps stay per-token)
         int64_t i = 0;
         const int64_t n = (int64_t) ids.size() - 1;
+        e.pf_total = n;   // the POOL_ALL rule: one decision for the whole prompt
         const auto tp0 = Clock::now();
         while (i < n) {
             const int T = (int) std::min<int64_t>(pf_chunk_at(s.pos), n - i);
