@@ -1481,6 +1481,15 @@ static inline int router_tj() {
 // router's GEMV re-reads the chunk's activation matrix once per expert row, so the traffic scales with the
 // chunk: at T=512 the x matrix (T x N x 4 = 5.2 MB) does NOT fit the T4's 4 MB L2 and the 384 reads go to
 // DRAM; smaller chunks keep x L2-resident.  The buffers are sized for kTmax, so a smaller chunk is safe.
+static int64_t g_pf_total = 0;   // K28: the request's prefix length, so pf_chunk_at can key its rule on it
+// K28: key the small-chunk rule on the prefix LENGTH instead of the position.  OPT-IN (default 0), because it is a
+// NUMERICS change: at a 12K prefix it cuts the chunk-layers 2000 -> 1200 and the pool leg 42.2 -> 38.8 s (bytes
+// 661 -> 488 GB, better dedup), but the generated ids diverge ("4991 66 96 576 30761..." against
+// "4991 66 96 568 262 30761..."), so it needs the KL-vs-llama gate before it can become a default.
+static inline bool pf_chunk_key_total() {
+    const char* v = std::getenv("STRATA_KOLIBRI_PF_CHUNK_KEY");
+    return v != nullptr && v[0] != 0 && std::atoi(v) != 0;
+}
 static inline int pf_chunk_at(int64_t p0) {
     // The env value CAPS the chunk; the default is prefix-dependent: a short prefix runs a SMALL chunk (the
     // router's x matrix then fits the T4's L2 - the 384 expert GEMVs re-read it, and at T=512 it is 5.2 MB vs
@@ -1494,7 +1503,11 @@ static inline int pf_chunk_at(int64_t p0) {
         return (int) n;
     }();
     const int small = 256;
-    if (p0 < 8192 && cap >= 256) return small < cap ? small : cap;
+    // The rule keys on the PREFIX LENGTH, not on the position - K28.  Keyed on p0 it made a 32K prompt run the
+    // small chunk for its first 8,192 tokens (32 of its 80 chunk-layers), even though the measurement behind the
+    // rule was taken on long prefixes, where the full chunk wins (301.5 s at T=512 against 320.9 s at T=256).  A
+    // genuinely short prefix (< 8192 tokens in total) keeps the 256 it was tuned for.
+    if ((g_pf_total > 0 && pf_chunk_key_total() ? g_pf_total : p0) < 8192 && cap >= 256) return small < cap ? small : cap;
     return cap;
 }
 
@@ -2831,6 +2844,7 @@ int serve(Engine& e, Scratch& s) {
             int64_t i = reuse;
             const int64_t n = fresh - 1 - reuse;   // the prompt minus its last token
             e.pf_total = n;   // the POOL_ALL rule: one decision for the whole prompt
+        g_pf_total = n;   // K28: and the chunk rule keys on it (see pf_chunk_at)
             while (i - reuse < n) {
                 const int T = (int) std::min<int64_t>(pf_chunk_at(s.pos), n - (i - reuse));
                 KC(cudaMemcpy(s.toks_d, ids.data() + i, (size_t) T * 4, cudaMemcpyHostToDevice));
@@ -3295,6 +3309,7 @@ int strata::kolibri::run(int argc, char** argv) {
         int64_t i = 0;
         const int64_t n = (int64_t) ids.size() - 1;
         e.pf_total = n;   // the POOL_ALL rule: one decision for the whole prompt
+        g_pf_total = n;   // K28: and the chunk rule keys on it (see pf_chunk_at)
         const auto tp0 = Clock::now();
         // **THE HOST IS A POOL LANE, SO IT MUST SIT ON ITS OWN CORE.**  The prefill fan-out runs shard 0 on the
         // calling thread; leaving that thread unpinned lets it land on a worker's core (or its SMT sibling) and
