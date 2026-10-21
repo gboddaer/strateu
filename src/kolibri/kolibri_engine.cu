@@ -2379,10 +2379,29 @@ void init_scratch(const Engine& e, Scratch& s) {
         s.dec_att16 = (__half*) dalloc((size_t) g.n_head * g.head_dim * 2);
     }
     KC(cudaMalloc(&s.ids, K * sizeof(int)));
+    // **THE FULL-ATTENTION KV IS THE 32K DECODE'S LARGEST PCIe TERM.**  kc/vc are pinned HOST buffers, so every decode
+    // token pulls the whole visible window across PCIe: the 11 full layers read 2 x 33024 x 4 kv heads x 128 x 2 B =
+    // 744 MB/token, ~62 ms at 12 GB/s - against a measured 67 ms/token (14.9 tok/s) for the whole token.  Under UVA a
+    // kernel dereferences either kind of pointer and cudaMemset clears either, and nothing on the host reads these
+    // buffers (every use is a device kernel or the clear), so moving ONLY the full layers to VRAM changes the address
+    // and nothing else.  Cost: 709.5 MiB of the ~4.5 GiB free.  The sliding layers keep their host ring (513 rows,
+    // 26 MB in total).  STRATA_KOLIBRI_KV_DEV=1, default off until measured.
+    const bool kv_dev = env_on("STRATA_KOLIBRI_KV_DEV");
     for (int64_t l = 0; l < g.n_layers; ++l) {
-        const int64_t rows = strata::core::is_swa_layer(g, l) ? g.n_swa : s.ctx;
-        s.kc.push_back(halloc((size_t) g.n_head_kv * rows * g.head_dim));
-        s.vc.push_back(halloc((size_t) g.n_head_kv * rows * g.head_dim));
+        const bool sliding = strata::core::is_swa_layer(g, l);
+        const int64_t rows = sliding ? g.n_swa : s.ctx;
+        const size_t elems = (size_t) g.n_head_kv * (size_t) rows * (size_t) g.head_dim;   // halves
+        if (kv_dev && !sliding) {
+            void* pk = nullptr;
+            void* pv = nullptr;
+            KC(cudaMalloc(&pk, elems * 2));
+            KC(cudaMalloc(&pv, elems * 2));
+            s.kc.push_back((__half*) pk);
+            s.vc.push_back((__half*) pv);
+        } else {
+            s.kc.push_back(halloc(elems));
+            s.vc.push_back(halloc(elems));
+        }
     }
 }
 
