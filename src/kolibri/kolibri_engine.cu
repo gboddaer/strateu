@@ -2078,7 +2078,12 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                 // overlap the pool's CPU work below; the existing g_st drain before the ey_h H2D orders them.
                 // Numerics: fp16 weights + fp16 activations, fp32 accumulate (the dense-fp16 template, KL 0.00210);
                 // the pool path keeps its q8-activation arithmetic.
-                s.pf_res.clear(); s.pf_miss.clear();
+                // P1 BUG (fixed): `pf_res_slot` was never cleared.  pf_res was, so from the SECOND chunk on every
+                // `pf_res[ri]` was paired with a slot index left over from an earlier chunk or layer, and the block loop
+                // below (which reads pf_res_slot[ri]) built the resident GEMMs from whatever expert happened to sit in
+                // that stale slot - wrong weights, and a result that depended on cache state and timing.  The probe
+                // showed it directly: duplicate slot indices inside one chunk grew monotonically 120 -> 168 -> 224.
+                s.pf_res.clear(); s.pf_miss.clear(); s.pf_res_slot.clear();
                 int64_t res_rows = 0;
                 ++s.pf_clock;
                 const int64_t f16_stride = 3 * (int64_t) FF * N;
@@ -2087,10 +2092,19 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                 // experts are cheap pool-side.  P = STRATA_KOLIBRI_RES_TOP (default 48).
                 static const int res_top = std::getenv("STRATA_KOLIBRI_RES_TOP") ?
                                                std::atoi(std::getenv("STRATA_KOLIBRI_RES_TOP")) : 48;
+                // **P1 BUG (fixed): RESIDENCY MUST NOT EXCEED THE SLOT COUNT.**  res_top was applied as-is while the
+                // layer's cache has only `b.n_cached` slots (24), so a chunk with res_top > n_cached assigned several
+                // experts to the SAME slot: the later promotion's dequant overwrote the earlier expert's weights, the
+                // earlier expert's blocks still pointed at that slot (the block loop stores `xe = b.f16 + slot*stride`),
+                // and the batched GEMM multiplied activations by the WRONG expert's weights.  The probe measured it
+                // directly: duplicate slot indices inside one chunk = 300 at res_top=48 (48 residents, 24 slots).
+                // Capping at the slot count makes each resident own its slot, which is also the only reading under
+                // which "resident" means anything.
+                const int res_eff = b.f16 ? std::min(res_top, b.n_cached) : 0;
                 if (b.f16) {
                     int pi = 0;
                     for (int x : s.pf_touch) {
-                        if (++pi > res_top) { s.pf_miss.push_back(x); continue; }
+                        if (++pi > res_eff) { s.pf_miss.push_back(x); continue; }
                         int slot = -1;
                         for (int s_i = 0; s_i < b.n_cached; ++s_i) if (b.f16_slot_id[s_i] == x) { slot = s_i; break; }
                         if (slot < 0) {   // promote: free slot, else evict least-recently-touched
@@ -2241,7 +2255,16 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                     // instruments cannot do this - --dump-layers disables chunking entirely, so it never runs this code.
                     double hs = 0.0;
                     for (int64_t q = 0; q < NK * N; ++q) hs += (double) s.ey_h[(size_t) q];
-                    std::fprintf(stderr, "PFHASH l=%d chunk=%lld sum=%.9e\n", (int) l, (long long) e.pf_chunks, hs);
+                    // The structural discriminators: if these differ between two identical runs the defect is in the
+                    // cache BOOKKEEPING (which experts are resident, which slot each got); if they agree while the sum
+                    // differs, the bookkeeping is fine and the arithmetic/GPU side is at fault.
+                    int dup = 0;
+                    for (size_t a = 0; a < s.pf_res_slot.size(); ++a)
+                        for (size_t b2 = a + 1; b2 < s.pf_res_slot.size(); ++b2)
+                            if (s.pf_res_slot[a] == s.pf_res_slot[b2]) ++dup;
+                    std::fprintf(stderr, "PFHASH l=%d chunk=%lld sum=%.9e res=%zu miss=%zu nblk=%d dupslot=%d\n",
+                                 (int) l, (long long) e.pf_chunks, hs, s.pf_res.size(), s.pf_miss.size(),
+                                 (int) s.pf_nblk, dup);
                 }
                 KC(cudaMemcpy(s.gout_m, s.ey_h, (size_t) NK * N * 4, cudaMemcpyHostToDevice));
             } else {
