@@ -1571,6 +1571,38 @@ static inline bool dec_phases_on() {
 // needs the KL gate before it can be a default.
 static inline bool dec_res_on() { return env_on("STRATA_KOLIBRI_DEC_RES"); }
 
+/// K29: seed the decode's fp16 cache with each layer's HOT experts.  Without this the slots hold only the last prefill
+/// chunk's RES_TOP promotions, which measured 27% of decode picks; the prompt's own routing says which 24 per layer
+/// matter (the coverage probe measures 45.0% for a top-24 set).  ~1200 promotions, ~2.2 GB over PCIe, once per request.
+static void seed_hot(Engine& e, Scratch& s) {
+    if (!dec_res_on() || e.touch_hist.empty()) return;
+    const int64_t N = e.g.n_embd, FF = e.g.n_ff, f16_stride = 3 * FF * N;
+    for (size_t l = 0; l < e.blobs.size(); ++l) {
+        LayerBlobs& b = e.blobs[l];
+        if (b.f16 == nullptr || b.n_cached <= 0) continue;
+        const std::vector<uint64_t>& h = e.touch_hist[l];
+        std::vector<int> idx(h.size());
+        for (size_t i = 0; i < h.size(); ++i) idx[i] = (int) i;
+        const size_t take = std::min<size_t>((size_t) b.n_cached, idx.size());
+        std::partial_sort(idx.begin(), idx.begin() + take, idx.end(),
+                          [&](int a, int c) { return h[(size_t) a] > h[(size_t) c]; });
+        for (int si = 0; si < b.n_cached; ++si) {
+            const int x = idx[(size_t) si];
+            if (h[(size_t) x] == 0) { b.f16_slot_id[(size_t) si] = -1; continue; }   // prompt never touched it
+            const uint8_t* blob = b.table + (size_t) x * b.stride;
+            uint16_t* out = b.f16 + (size_t) si * f16_stride;
+            strata::kernels::dequant_f16(b.L.gu_type, blob, 0, (int) FF, (int) N, out, g_st);
+            strata::kernels::dequant_f16(b.L.gu_type, blob + b.L.up_off, 0, (int) FF, (int) N,
+                                         out + (int64_t) FF * N, g_st);
+            strata::kernels::dequant_f16(b.L.d_type, blob + b.L.down_off, 0, (int) N, (int) FF,
+                                         out + 2 * (int64_t) FF * N, g_st);
+            b.f16_slot_id[(size_t) si] = x;
+            b.f16_slot_last[(size_t) si] = s.pf_clock;
+        }
+    }
+    KC(cudaStreamSynchronize(g_st));
+}
+
 void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t st, float* layers_host) {
     const auto& g = e.g;
     const int N = (int) g.n_embd, K = (int) e.top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
@@ -1999,7 +2031,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
             strata::kernels::native_router_sigmoid_logit_add(s.router_m, e.f32.at(L(l, "exp_probs_b.bias")),
                                                              s.ids_m, s.wts_m, T, g_st);
         }
-        if (e.hist_on) {   // coverage probe: routed touches per expert id, this layer, this chunk
+        if (e.hist_on || dec_res_on()) {   // coverage probe; also the touch counts the hot seed needs (K29)
             std::vector<int> hid((size_t) NK);
             KC(cudaMemcpy(hid.data(), s.ids_m, (size_t) NK * sizeof(int), cudaMemcpyDeviceToHost));
             std::vector<uint64_t>& h = e.touch_hist[(size_t) l];
@@ -2952,7 +2984,8 @@ int serve(Engine& e, Scratch& s) {
                         (double) (t - reuse) / std::max(1e-9, ms_since(t0) / 1000.0));
             std::fflush(stdout);
         }
-        if (e.graphs > 0) KC(cudaMemcpy(s.pos_d, &s.pos, 4, cudaMemcpyHostToDevice));
+        seed_hot(e, s);   // K29: the prompt's hot experts into the fp16 slots before decoding
+    if (e.graphs > 0) KC(cudaMemcpy(s.pos_d, &s.pos, 4, cudaMemcpyHostToDevice));
         live.insert(live.end(), ids.begin() + (long) reuse, ids.end());
         const double prompt_ms = ms_since(t0);
         std::mt19937_64 rng(smp.seed);
@@ -3027,7 +3060,8 @@ bool load(const std::string& path, Engine& e, std::string& err) {
 
     // pass 1: the routed experts, layer by layer, repacked into pinned [gate|up|down] blob tables
     e.blobs.resize((size_t) e.g.n_layers);
-    if (e.hist_on) e.touch_hist.assign((size_t) e.g.n_layers, std::vector<uint64_t>((size_t) e.g.n_expert, 0));
+    if (e.hist_on || dec_res_on())
+        e.touch_hist.assign((size_t) e.g.n_layers, std::vector<uint64_t>((size_t) e.g.n_expert, 0));
     size_t expert_bytes = 0;
     for (int64_t l = 0; l < e.g.n_layers; ++l) {
         const strata::TensorInfo *gate = nullptr, *up = nullptr, *down = nullptr;
