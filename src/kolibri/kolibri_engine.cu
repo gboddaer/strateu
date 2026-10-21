@@ -496,6 +496,51 @@ template <int TT, int TJ> __global__ void k_router_tile(const uint8_t* W, const 
     }
 }
 
+// K31: THE ROUTER RE-READS ITS ACTIVATION TILE ONCE PER EXPERT.  nsys priced it at 35% of the 32K prefill's GPU busy
+// (60.7 s, 158 us/call) and the trace says it is bound on ~1.6 GB per chunk-layer of x reads: 384 blocks each pull the
+// same T-tile (TJ tokens x n_in floats).  A TJ sweep from 8 to 384 changed nothing, which is what a pure x-traffic
+// bound looks like.  This variant puts TK experts in ONE block: their dequantized weight rows live in registers and the
+// activation tile is read ONCE and accumulated into all TK accumulators.  x traffic / TK, W traffic unchanged.
+// BITWISE: each output's accumulation order (chunk c ascending, then l ascending) and the block_sum tree over 128
+// threads are exactly k_router_tile's - only the block that computes each output changes.
+template <int TT, int TJ, int TK>
+__global__ void k_router_tile_k(const uint8_t* W, const float* x, size_t x_stride, float* y, int n_in, int T,
+                                int n_out) {
+    __shared__ float sh[kThreads];
+    const int o0 = blockIdx.x * TK, t0 = blockIdx.y * TJ;
+    float acc[TK][TJ];
+#pragma unroll
+    for (int k = 0; k < TK; ++k)
+#pragma unroll
+        for (int j = 0; j < TJ; ++j) acc[k][j] = 0.f;
+    const int c = threadIdx.x;   // n_in/32 chunks: lanes 0..79 active, the rest contribute 0 - as in k_router_tile
+    if (c < n_in / 32) {
+        float v[TK][32];
+#pragma unroll
+        for (int k = 0; k < TK; ++k) {
+            if (o0 + k >= n_out) continue;
+            const uint8_t* row = W + (size_t) (o0 + k) * (size_t) (n_in * 4);
+            deq32<TT>(row, c, v[k]);
+        }
+        for (int j = 0; j < TJ; ++j) {
+            const float* xc = x + (size_t) (t0 + j) * x_stride + 32 * c;
+            float xr[32];
+#pragma unroll
+            for (int l = 0; l < 32; ++l) xr[l] = xc[l];       // the ONE read this expert group shares
+#pragma unroll
+            for (int k = 0; k < TK; ++k)
+#pragma unroll
+                for (int l = 0; l < 32; ++l) acc[k][j] += v[k][l] * xr[l];
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < TK; ++k)
+        for (int j = 0; j < TJ; ++j) {
+            const float a = block_sum(acc[k][j], sh);
+            if (threadIdx.x == 0 && t0 + j < T && o0 + k < n_out) y[(size_t) (t0 + j) * n_out + (o0 + k)] = a;
+        }
+}
+
 template <int T> __device__ void k_row_body(const uint8_t* W, size_t row_bytes, int row, int n, float* out) {
     const uint8_t* r = W + (size_t) row * row_bytes;
     for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < n / 32; c += gridDim.x * blockDim.x) deq32<T>(r, c, out + 32 * c);
@@ -1499,6 +1544,10 @@ struct Scratch {
 // S7: the router's token tile per thread (STRATA_KOLIBRI_ROUTER_TJ, default 32): 32 is the original shape;
 // smaller tiles give more CTAs (occupancy) and a shorter FMA dependency chain.  Bitwise-identical either way
 // (the per-token sum's order and the reduction tree are unchanged).
+static inline int router_tk() {
+    static const int tk = std::getenv("STRATA_KOLIBRI_ROUTER_TK") ? std::atoi(std::getenv("STRATA_KOLIBRI_ROUTER_TK")) : 0;
+    return tk;
+}
 static inline int router_tj() {
     static const int t = std::getenv("STRATA_KOLIBRI_ROUTER_TJ") ? std::atoi(std::getenv("STRATA_KOLIBRI_ROUTER_TJ")) : 32;
     return t;
@@ -2065,6 +2114,14 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                     std::fprintf(stderr, "strata-kolibri: cublas router sgemm failed (%d)\n", (int) cst);
                     std::exit(1);
                 }
+            } else if (router_tk() > 1) {
+                const int tk = router_tk();
+                if (tk >= 4)
+                    k_router_tile_k<T_F32, 8, 4><<<dim3(((int) g.n_expert + 3) / 4, ((int) T + 7) / 8), kThreads, 0, g_st>>>(
+                        wr.d, s.h_m, (size_t) N, s.router_m, (int) N, (int) T, (int) g.n_expert);
+                else
+                    k_router_tile_k<T_F32, 16, 2><<<dim3(((int) g.n_expert + 1) / 2, ((int) T + 15) / 16), kThreads, 0, g_st>>>(
+                        wr.d, s.h_m, (size_t) N, s.router_m, (int) N, (int) T, (int) g.n_expert);
             } else if (env_on("STRATA_KOLIBRI_ROUTER_TILE")) {
                 const int tj = router_tj();
                 if (tj <= 8)
