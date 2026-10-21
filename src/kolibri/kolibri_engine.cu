@@ -2670,6 +2670,14 @@ int serve(Engine& e, Scratch& s) {
     }
 }
 
+// S5 (task-8, the poison test's control): fill the zero slot with a POISON pattern instead of zeros, so the
+// zero-slot poison test can prove the poison reaches the arithmetic (a test with no teeth).  Debug-only: the
+// env is unset in every production run, and the zero slot is read only by the overflow path.
+static inline bool poison_zero_slot() {
+    static const bool on = std::getenv("STRATA_KOLIBRI_POISON_ZERO_SLOT") != nullptr;
+    return on;
+}
+
 /// Load: geometry + layout from the header; dense tensors to the GPU; routed experts repacked to pinned blob
 /// tables.  Split files: every tensor lives in one shard; the shard's mmap pointer is the source.
 bool load(const std::string& path, Engine& e, std::string& err) {
@@ -2677,6 +2685,25 @@ bool load(const std::string& path, Engine& e, std::string& err) {
     const strata::GgufModel gm = strata::GgufModel::open(path);
     if (!strata::core::geometry_from_gguf(gm.meta(), e.g, e.top_k, err)) return false;
     if (e.g.family != strata::ModelFamily::Kolibri1) { err = "strata-kolibri runs kolibri1 files only"; return false; }
+    // S5 (task-8): the mixed-type expert check runs BEFORE the layout check, so a file whose
+    // ffn_gate_exps.type != ffn_up_exps.type is always rejected with the type message (the layout check
+    // would otherwise report a size error first for a header-only or truncated file, hiding the real cause).
+    // The repack writes gate and up into ONE [gate|up] blob under a single layout, so a mixed-type file would
+    // otherwise have its up rows parsed with gate's type - silent numeric corruption, not a failure.
+    for (int64_t l = 0; l < e.g.n_layers; ++l) {
+        const strata::TensorInfo *gate = nullptr, *up = nullptr;
+        for (size_t s = 0; s < gm.size(); ++s)
+            for (const strata::TensorInfo& ti : gm.shard(s).tensors()) {
+                if (ti.name == L(l, "ffn_gate_exps.weight")) gate = &ti;
+                if (ti.name == L(l, "ffn_up_exps.weight")) up = &ti;
+            }
+        if (gate && up && gate->type != up->type) {
+            err = "layer " + std::to_string(l) + ": ffn_gate_exps type " + std::to_string((int) gate->type) +
+                  " != ffn_up_exps type " + std::to_string((int) up->type) +
+                  "; the [gate|up] blob has one layout, so a mixed-type expert file is rejected";
+            return false;
+        }
+    }
     size_t checked = 0;
     if (!strata::core::check_gguf_layout(gm, e.g, err, &checked)) return false;
     const std::string p = "kolibri1.";
@@ -2721,7 +2748,10 @@ bool load(const std::string& path, Engine& e, std::string& err) {
         const size_t sb = lcm(lcm((size_t) 144, (size_t) 210), (size_t) 34);   // Q4_K / Q6_K / Q8_0 super-blocks
         b.stride = ((b.L.bytes + sb - 1) / sb) * sb;
         KC(cudaHostAlloc((void**) &b.table, b.stride * (size_t) (e.g.n_expert + 1), cudaHostAllocDefault));
-        std::memset(b.table + b.stride * (size_t) e.g.n_expert, 0, b.stride);  // the slots path's zero slot
+        if (poison_zero_slot())
+            std::memset(b.table + b.stride * (size_t) e.g.n_expert, 0xA5, b.stride);   // the poison control
+        else
+            std::memset(b.table + b.stride * (size_t) e.g.n_expert, 0, b.stride);  // the slots path's zero slot
         const size_t gu_rows = (size_t) e.g.n_ff, d_rows = (size_t) e.g.n_embd;
         const size_t gu_eb = gu_rows * b.L.gu_row, d_eb = d_rows * b.L.d_row;
         const uint8_t* gs = gf->tensor_data(*gate);
@@ -2920,7 +2950,10 @@ int strata::kolibri::run(int argc, char** argv) {
         for (auto& b : e.blobs) {
             KC(cudaMalloc((void**) &b.dev, b.stride * (size_t) (e.slots + 1)));
             KC(cudaMemcpy(b.dev, b.table, b.stride * (size_t) e.slots, cudaMemcpyHostToDevice));
-            KC(cudaMemset(b.dev + b.stride * (size_t) e.slots, 0, b.stride));
+            if (poison_zero_slot())
+                KC(cudaMemset(b.dev + b.stride * (size_t) e.slots, 0xA5, b.stride));   // the poison control
+            else
+                KC(cudaMemset(b.dev + b.stride * (size_t) e.slots, 0, b.stride));
         }
         std::fprintf(stderr, "strata-kolibri: expert cache: %d slots/layer = %.2f GiB VRAM\n",
                      e.slots, (double) e.slots * e.blobs[0].stride * e.g.n_layers / (1 << 30));
