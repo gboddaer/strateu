@@ -1482,13 +1482,15 @@ static inline int router_tj() {
 // chunk: at T=512 the x matrix (T x N x 4 = 5.2 MB) does NOT fit the T4's 4 MB L2 and the 384 reads go to
 // DRAM; smaller chunks keep x L2-resident.  The buffers are sized for kTmax, so a smaller chunk is safe.
 static int64_t g_pf_total = 0;   // K28: the request's prefix length, so pf_chunk_at can key its rule on it
-// K28: key the small-chunk rule on the prefix LENGTH instead of the position.  OPT-IN (default 0), because it is a
-// NUMERICS change: at a 12K prefix it cuts the chunk-layers 2000 -> 1200 and the pool leg 42.2 -> 38.8 s (bytes
-// 661 -> 488 GB, better dedup), but the generated ids diverge ("4991 66 96 576 30761..." against
-// "4991 66 96 568 262 30761..."), so it needs the KL-vs-llama gate before it can become a default.
+// K28: key the small-chunk rule on the prefix LENGTH instead of the position.  ON by default: at a 12K prefix it cuts
+// the chunk-layers 2000 -> 1200 and the pool leg 42.2 -> 38.8 s (bytes 661 -> 488 GB, better dedup), and it is
+// BITWISE - the 12K ids match the position-keyed rule exactly ("4991 66 96 568 262 3882 12400 379" both ways).  The
+// divergence first seen here was the P1 residency bug, not the chunking: a chunked causal prefill computes each
+// token's row and per-token softmax identically regardless of how the prompt is cut.  STRATA_KOLIBRI_PF_CHUNK_KEY=0
+// restores the position-keyed rule for an A/B.
 static inline bool pf_chunk_key_total() {
     const char* v = std::getenv("STRATA_KOLIBRI_PF_CHUNK_KEY");
-    return v != nullptr && v[0] != 0 && std::atoi(v) != 0;
+    return v == nullptr || (v[0] != 0 && std::atoi(v) != 0);
 }
 static inline int pf_chunk_at(int64_t p0) {
     // The env value CAPS the chunk; the default is prefix-dependent: a short prefix runs a SMALL chunk (the
