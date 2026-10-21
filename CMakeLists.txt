@@ -885,6 +885,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(gdn_rec_parity src/prefill/gdn_rec_parity.cu)
     target_link_libraries(gdn_rec_parity PRIVATE ${_strata_gpu_runtime_target})
     add_test(NAME gdn_rec_parity COMMAND gdn_rec_parity)
+    # the decode attention's score pass as a LAYOUT question: K stored "[d][row]" keeps the sequential
+    # accumulation (bitwise) while the warp's loads coalesce, where the existing warp-cooperative dot reorders the
+    # sum and moved the oracle.  GPU, synthetic, no model; --bench prices both.
+    add_executable(attn_k_parity src/kolibri/attn_k_parity.cu)
+    target_link_libraries(attn_k_parity PRIVATE ${_strata_gpu_runtime_target})
+    # the harness states the arithmetic EXACTLY, so it must not be built with the project's --use_fast_math: that
+    # flag lets nvcc reassociate/contract the two loop shapes differently and the comparison then measures the
+    # compiler instead of the layout (measured: 5/7 shapes matched with fast math on, and 2/7 differed in 1-6% of
+    # rows even with explicit __fmaf_rn in both loops).
+    target_compile_options(attn_k_parity PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math=false> )
+    add_test(NAME attn_k_parity COMMAND attn_k_parity)
     # the prompt path's BF16 products against cuBLAS's own BF16 GEMM, within fp32 rounding (sm_7x runs them on the
     # FP16 tensor cores; GPU, synthetic, no model; --bench adds timings)
     add_executable(gemm_bf16_parity src/prefill/gemm_bf16_parity.cu)
