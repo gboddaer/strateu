@@ -12,6 +12,11 @@
 # Usage:  source tools/kolibri/speed_config.sh   (exports the vars; BENCH_EXTRA carries the engine flags)
 export STRATA_KOLIBRI_PF_STAGE=1
 export STRATA_KOLIBRI_EXPERT_F16=24
+# The fp16 promotion budget per chunk-layer (default 48).  Measured curve, 4K prefill, same binary and fixture:
+# 12 -> 90.7 tok/s, 24 -> 119.2, 48 -> 134.2, 56 -> 139.0, 64 -> 138.7, 72 -> 133.0, 96 -> 112.4, 192 -> 84.6.
+# Promotions buy pool rows (one promotion ~21 rows ~0.85 ms of CPU for ~0.16 ms of PCIe); past ~64 the GPU side
+# grows faster than the pool shrinks.  56 is worth +3.6% at BOTH 4K and 32K (32K 119.5 -> 123.8, two runs).
+export STRATA_KOLIBRI_RES_TOP=56
 export STRATA_KOLIBRI_ROUTER_TILE=1
 export STRATA_KOLIBRI_ATTN_MB=256
 export GGML_CUDA_DISABLE_GRAPHS=1
