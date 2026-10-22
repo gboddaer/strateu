@@ -1558,6 +1558,14 @@ struct ActSet {
     float *x_m = nullptr, *h_m = nullptr, *y_m = nullptr, *q_m = nullptr, *k_m = nullptr, *v_m = nullptr;
     float *att_m = nullptr, *router_m = nullptr, *moe_m = nullptr, *sy_m = nullptr;
     float *sg_m = nullptr, *su_m = nullptr, *sh_m = nullptr, *gout_m = nullptr;
+    // A2b class 1: per-chunk device buffers the layer also owns.  Not in the first set's ActSet because they predate it -
+    // they are here so a second in-flight chunk cannot collide on them (x16 in particular is written by the shared
+    // expert's k_to_f16 and read by the routed gather, the aliasing that broke an earlier experiment).
+    __half *x16 = nullptr, *q16 = nullptr;
+    char *xq8_m = nullptr;
+    int *ids_m = nullptr, *toks_d = nullptr;
+    int *grp_start_m = nullptr, *n_groups_m = nullptr, *ent_dst_m = nullptr, *ent_tok_m = nullptr;
+    unsigned long long *grp_ptr_m = nullptr;
 };
 
 struct Scratch {
@@ -1632,6 +1640,11 @@ struct Scratch {
     float *x_m2 = nullptr, *h_m2 = nullptr, *y_m2 = nullptr, *q_m2 = nullptr, *k_m2 = nullptr, *v_m2 = nullptr;
     float *att_m2 = nullptr, *router_m2 = nullptr, *moe_m2 = nullptr, *sy_m2 = nullptr;
     float *sg_m2 = nullptr, *su_m2 = nullptr, *sh_m2 = nullptr, *gout_m2 = nullptr;
+    __half *x16_2 = nullptr, *q16_2 = nullptr;
+    char *xq8_m2 = nullptr;
+    int *ids_m2 = nullptr, *toks_d2 = nullptr;
+    int *grp_start_m2 = nullptr, *n_groups_m2 = nullptr, *ent_dst_m2 = nullptr, *ent_tok_m2 = nullptr;
+    unsigned long long *grp_ptr_m2 = nullptr;
     float *sg_m = nullptr, *su_m = nullptr, *sh_m = nullptr;
     float *gout_m = nullptr, *eg_m = nullptr, *eu_m = nullptr, *eh_m = nullptr;
     ActSet act1, act2;   // A2b: the two per-chunk activation sets (act2 only when STRATA_KOLIBRI_PF_PIPE is on)
@@ -2042,10 +2055,10 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
     const float one = 1.0f, zero = 0.0f;
     const Dense& emb = e.dense.at("token_embd.weight");
     switch (emb.type) {
-    case T_Q8_0: k_row_multi<T_Q8_0><<<dim3(T, 4), 128>>>(emb.d, emb.row_bytes, s.toks_d, N, A.x_m); break;
-    case T_Q4_K: k_row_multi<T_Q4_K><<<dim3(T, 4), 128>>>(emb.d, emb.row_bytes, s.toks_d, N, A.x_m); break;
-    case T_Q6_K: k_row_multi<T_Q6_K><<<dim3(T, 4), 128>>>(emb.d, emb.row_bytes, s.toks_d, N, A.x_m); break;
-    case T_F16: k_row_multi<T_F16><<<dim3(T, 4), 128>>>(emb.d, emb.row_bytes, s.toks_d, N, A.x_m); break;
+    case T_Q8_0: k_row_multi<T_Q8_0><<<dim3(T, 4), 128>>>(emb.d, emb.row_bytes, A.toks_d, N, A.x_m); break;
+    case T_Q4_K: k_row_multi<T_Q4_K><<<dim3(T, 4), 128>>>(emb.d, emb.row_bytes, A.toks_d, N, A.x_m); break;
+    case T_Q6_K: k_row_multi<T_Q6_K><<<dim3(T, 4), 128>>>(emb.d, emb.row_bytes, A.toks_d, N, A.x_m); break;
+    case T_F16: k_row_multi<T_F16><<<dim3(T, 4), 128>>>(emb.d, emb.row_bytes, A.toks_d, N, A.x_m); break;
     default: std::fprintf(stderr, "strata-kolibri: token_embd type %d\n", emb.type); std::exit(1);
     }
     const bool pph = attn_phases_on();   // S7: the prefill's per-layer phase marks (the same gate as the attn timers)
@@ -2062,18 +2075,18 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
         const bool sliding = strata::core::is_swa_layer(g, l);
         LayerBlobs& b = e.blobs[(size_t) l];   // non-const: the fp16 cache's LRU slot table is updated in the pool leg
         k_rms_rows<<<T, kThreads>>>(A.x_m, e.f32.at(L(l, "attn_norm.weight")), A.h_m, N, e.eps);
-        strata::kernels::native_quantize_q8_1(A.h_m, s.xq8_m, N * T, 1, g_st);   // T contiguous rows = one column (q36)
-        k_to_f16<<<grid1((int64_t) T * N), kThreads>>>((const float*) A.h_m, s.x16, (int64_t) T * N);
+        strata::kernels::native_quantize_q8_1(A.h_m, A.xq8_m, N * T, 1, g_st);   // T contiguous rows = one column (q36)
+        k_to_f16<<<grid1((int64_t) T * N), kThreads>>>((const float*) A.h_m, A.x16, (int64_t) T * N);
         {
             const Dense& wq = e.dense.at(L(l, "attn_q.weight"));
-            if (dense_f16_on() && wq.f16) e.gemm.f16((const uint16_t*) s.x16, wq.f16, A.q_m, T, H * D, N);
-            else e.gemm.native((const uint16_t*) s.x16, wq.type, wq.d, A.q_m, T, H * D, N);
+            if (dense_f16_on() && wq.f16) e.gemm.f16((const uint16_t*) A.x16, wq.f16, A.q_m, T, H * D, N);
+            else e.gemm.native((const uint16_t*) A.x16, wq.type, wq.d, A.q_m, T, H * D, N);
             const Dense& wk = e.dense.at(L(l, "attn_k.weight"));
-            if (dense_f16_on() && wk.f16) e.gemm.f16((const uint16_t*) s.x16, wk.f16, A.k_m, T, HKV * D, N);
-            else e.gemm.native((const uint16_t*) s.x16, wk.type, wk.d, A.k_m, T, HKV * D, N);
+            if (dense_f16_on() && wk.f16) e.gemm.f16((const uint16_t*) A.x16, wk.f16, A.k_m, T, HKV * D, N);
+            else e.gemm.native((const uint16_t*) A.x16, wk.type, wk.d, A.k_m, T, HKV * D, N);
             const Dense& wv = e.dense.at(L(l, "attn_v.weight"));
-            if (dense_f16_on() && wv.f16) e.gemm.f16((const uint16_t*) s.x16, wv.f16, A.v_m, T, HKV * D, N);
-            else e.gemm.native((const uint16_t*) s.x16, wv.type, wv.d, A.v_m, T, HKV * D, N);
+            if (dense_f16_on() && wv.f16) e.gemm.f16((const uint16_t*) A.x16, wv.f16, A.v_m, T, HKV * D, N);
+            else e.gemm.native((const uint16_t*) A.x16, wv.type, wv.d, A.v_m, T, HKV * D, N);
         }
         pp_mark(e.cnt.pf_dense_ns);
         k_attn_prep_multi<<<dim3(H + HKV, T), kThreads>>>(A.q_m, A.k_m, A.v_m, e.f32.at(L(l, "attn_q_norm.weight")),
@@ -2086,15 +2099,15 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
         if (sliding)
             k_kv_ring<<<grid1((int64_t) HKV * P * D), kThreads>>>(s.kc[l], s.vc[l], s.k16, s.v16, g.n_swa, P,
                                                                   first, D, HKV);
-        k_to_f16<<<grid1((int64_t) T * H * D), kThreads>>>(A.q_m, s.q16, (int64_t) T * H * D);
+        k_to_f16<<<grid1((int64_t) T * H * D), kThreads>>>(A.q_m, A.q16, (int64_t) T * H * D);
         if (attn_mma_on() && H == 48 && HKV == 4 && D == 128) {
             k_attn_flash_mma<<<dim3((unsigned) ((T + 15) / 16), (unsigned) (HKV * 4)), 128, 0, g_st>>>(
-                s.q16, sliding ? s.k16 : s.kc[l], sliding ? s.v16 : s.vc[l], A.att_m, (int) H,
+                A.q16, sliding ? s.k16 : s.kc[l], sliding ? s.v16 : s.vc[l], A.att_m, (int) H,
                 sliding ? (long long) P : (long long) s.ctx, (int) T, P, (int) p0,
                 sliding ? (int64_t) g.n_swa : 0, (int) first, 1.0f / sqrtf((float) D));
         } else if (attn_flash_on() && H == 48 && HKV == 4 && D == 128) {
             k_attn_flash<<<dim3((unsigned) ((T + 7) / 8), (unsigned) HKV), 256, 0, g_st>>>(
-                s.q16, sliding ? s.k16 : s.kc[l], sliding ? s.v16 : s.vc[l], A.att_m, (int) H,
+                A.q16, sliding ? s.k16 : s.kc[l], sliding ? s.v16 : s.vc[l], A.att_m, (int) H,
                 sliding ? (long long) P : (long long) s.ctx, (int) T, P, (int) p0,
                 sliding ? (int64_t) g.n_swa : 0, (int) first, 1.0f / sqrtf((float) D));
         } else {
@@ -2121,7 +2134,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                                            : s.vc[l] + (size_t) kvh * s.ctx * D;
                 for (int hb = 0; hb < G; hb += Bh) {
                     const int nb = std::min(Bh, G - hb);
-                    const __half* Qh = s.q16 + (size_t) (kvh * G + hb) * D;
+                    const __half* Qh = A.q16 + (size_t) (kvh * G + hb) * D;
                     // the cap-sized buffers hold Bh reusable slots (stream order: scores -> softmax -> PV
                     // per slot before the next (kvh, hb) reuses it), so base = the slot, NOT the global head
                     float* Sh = s.att_s + (size_t) (hb / Bh) * T * ldp;
@@ -2148,11 +2161,11 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
             for (int kvh = 0; kvh < HKV; ++kvh) {
                 const __half* Kh = sliding ? s.k16 + (size_t) kvh * P * D
                                                : s.kc[l] + (size_t) kvh * s.ctx * D;
-                const __half* Qh = s.q16 + ((size_t) t0 * H + kvh * G) * D;
+                const __half* Qh = A.q16 + ((size_t) t0 * H + kvh * G) * D;
                 float* Sh = s.att_s + (size_t) kvh * G * nt * ldp;
                 if (attn_simt_on()) {
                     const dim3 sg((unsigned) ((P + 63) / 64), (unsigned) ((nt + 31) / 32), (unsigned) (G / 4));
-                    k_attn_scores_simt<32, 64, 32, 4><<<sg, 256, 0, g_st>>>(s.q16, Kh, (int) H, (int) p0, (int) t0,
+                    k_attn_scores_simt<32, 64, 32, 4><<<sg, 256, 0, g_st>>>(A.q16, Kh, (int) H, (int) p0, (int) t0,
                                                                            kvh * G, nt, P, (int) D, ldp,
                                                                            sliding ? (int64_t) g.n_swa : 0,
                                                                            (int) first, s.att_s);
@@ -2263,16 +2276,16 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                                                              A.router_m, (int) g.n_expert);
             }
             strata::kernels::native_router_sigmoid_logit_add(A.router_m, e.f32.at(L(l, "exp_probs_b.bias")),
-                                                             s.ids_m, s.wts_m, T, g_st);
+                                                             A.ids_m, s.wts_m, T, g_st);
         }
         if (e.hist_on || dec_res_on()) {   // coverage probe; also the touch counts the hot seed needs (K29)
             std::vector<int> hid((size_t) NK);
-            KC(cudaMemcpy(hid.data(), s.ids_m, (size_t) NK * sizeof(int), cudaMemcpyDeviceToHost));
+            KC(cudaMemcpy(hid.data(), A.ids_m, (size_t) NK * sizeof(int), cudaMemcpyDeviceToHost));
             std::vector<uint64_t>& h = e.touch_hist[(size_t) l];
             for (int i = 0; i < NK; ++i) ++h[(size_t) hid[(size_t) i]];
         }
-        strata::kernels::native_quantize_q8_1(A.h_m, s.xq8_m, N * T, 1, g_st);   // T contiguous rows = one column (q36)
-        k_to_f16<<<grid1((int64_t) T * N), kThreads>>>((const float*) A.h_m, s.x16, (int64_t) T * N);   // ffn-norm h for the shared-FFN GEMMs (the router sgemm takes fp32 h_m directly)
+        strata::kernels::native_quantize_q8_1(A.h_m, A.xq8_m, N * T, 1, g_st);   // T contiguous rows = one column (q36)
+        k_to_f16<<<grid1((int64_t) T * N), kThreads>>>((const float*) A.h_m, A.x16, (int64_t) T * N);   // ffn-norm h for the shared-FFN GEMMs (the router sgemm takes fp32 h_m directly)
         // POOL_ALL: the pool for EVERY layer (the 25 "native" ones too).  Measured on this box: neutral at
         // pp512 (the pool leg is small), -9% at 4K (the Q4_K grouped kernel's 8.6 s and the 98 GB of staging
         // both vanish) and -17% at 32K (255.7 s vs 308.4 s).  The env value CAPS the rule: 0 = off, 1 = on
@@ -2292,7 +2305,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
         if (b.native_ok && !(pool_all && e.cpu_threads > 0)) {
             if (e.counters && e.slots > 0) {   // pricing only; --counters runs
                 std::vector<int> hid((size_t) NK);
-                KC(cudaMemcpy(hid.data(), s.ids_m, (size_t) NK * sizeof(int), cudaMemcpyDeviceToHost));
+                KC(cudaMemcpy(hid.data(), A.ids_m, (size_t) NK * sizeof(int), cudaMemcpyDeviceToHost));
                 std::vector<char> seen((size_t) g.n_expert, 0);
                 int uniq = 0, hits = 0;
                 for (int i = 0; i < NK; ++i) { const int id = hid[(size_t) i]; if (!seen[(size_t) id]) { seen[(size_t) id] = 1; ++uniq; } if (id < e.slots) ++hits; }
@@ -2304,7 +2317,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
             // the staged path is load-bearing (it carries the group table the native grouped kernel needs).
             if (pf_stage && s.stage != nullptr && NK <= (int) s.stage_ids_h.size()) {
                 g_ids_host.resize((size_t) NK);
-                KC(cudaMemcpy(g_ids_host.data(), s.ids_m, (size_t) NK * sizeof(int), cudaMemcpyDeviceToHost));
+                KC(cudaMemcpy(g_ids_host.data(), A.ids_m, (size_t) NK * sizeof(int), cudaMemcpyDeviceToHost));
                 int32_t* rank = s.stage_rank.data();
                 std::fill(rank, rank + g.n_expert, -1);
                 int nt = 0;
@@ -2323,32 +2336,32 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                     KC(cudaMemcpyAsync(s.stage_ids_m, s.stage_ids_h.data(), (size_t) NK * sizeof(int),
                                        cudaMemcpyHostToDevice, g_st));
                     k_group<<<1, 1024>>>(s.stage_ids_m, NK, K, s.stage_n, s.stage, (unsigned long long) b.stride,
-                                         s.grp_ptr_m, s.grp_start_m, s.n_groups_m, s.ent_dst_m, s.ent_tok_m);
+                                         A.grp_ptr_m, A.grp_start_m, A.n_groups_m, A.ent_dst_m, A.ent_tok_m);
                     // cap_groups MUST match the table path's (n_expert + 1), NOT (stage_n + 1).  The kernel strides
                     // its block rows over cap_groups, so a smaller cap changes the per-output reduction order and
                     // the staged path stopped being bitwise-equal (measured: max per-step KL 0.157 vs unstaged).
                     // The stage's group count (<= stage_n) is under the cap, so the larger cap is legal.
-                    strata::kernels::native_expert_grouped(b.L, s.grp_ptr_m, s.grp_start_m, s.n_groups_m, s.ent_dst_m,
-                                                           s.ent_tok_m, std::min<int64_t>(NK, g.n_expert) + 1, NK,
-                                                           s.xq8_m, s.scratch_m, A.gout_m, g_st);
+                    strata::kernels::native_expert_grouped(b.L, A.grp_ptr_m, A.grp_start_m, A.n_groups_m, A.ent_dst_m,
+                                                           A.ent_tok_m, std::min<int64_t>(NK, g.n_expert) + 1, NK,
+                                                           A.xq8_m, s.scratch_m, A.gout_m, g_st);
                     if (e.counters) { ++e.pf_stage_chunks; e.pf_stage_bytes += (long long) nt * b.stride; }
                 } else {
-                    k_group<<<1, 1024>>>(s.ids_m, NK, K, (int) g.n_expert, b.table, (unsigned long long) b.stride,
-                                         s.grp_ptr_m, s.grp_start_m, s.n_groups_m, s.ent_dst_m, s.ent_tok_m);
-                    strata::kernels::native_expert_grouped(b.L, s.grp_ptr_m, s.grp_start_m, s.n_groups_m, s.ent_dst_m,
-                                                           s.ent_tok_m, std::min<int64_t>(NK, g.n_expert) + 1, NK,
-                                                           s.xq8_m, s.scratch_m, A.gout_m, g_st);
+                    k_group<<<1, 1024>>>(A.ids_m, NK, K, (int) g.n_expert, b.table, (unsigned long long) b.stride,
+                                         A.grp_ptr_m, A.grp_start_m, A.n_groups_m, A.ent_dst_m, A.ent_tok_m);
+                    strata::kernels::native_expert_grouped(b.L, A.grp_ptr_m, A.grp_start_m, A.n_groups_m, A.ent_dst_m,
+                                                           A.ent_tok_m, std::min<int64_t>(NK, g.n_expert) + 1, NK,
+                                                           A.xq8_m, s.scratch_m, A.gout_m, g_st);
                 }
             } else {
-            k_group<<<1, 1024>>>(s.ids_m, NK, K, (int) g.n_expert, b.table, (unsigned long long) b.stride,
-                                 s.grp_ptr_m, s.grp_start_m, s.n_groups_m, s.ent_dst_m, s.ent_tok_m);
-            strata::kernels::native_expert_grouped(b.L, s.grp_ptr_m, s.grp_start_m, s.n_groups_m, s.ent_dst_m,
-                                                   s.ent_tok_m, std::min<int64_t>(NK, g.n_expert) + 1, NK, s.xq8_m,
+            k_group<<<1, 1024>>>(A.ids_m, NK, K, (int) g.n_expert, b.table, (unsigned long long) b.stride,
+                                 A.grp_ptr_m, A.grp_start_m, A.n_groups_m, A.ent_dst_m, A.ent_tok_m);
+            strata::kernels::native_expert_grouped(b.L, A.grp_ptr_m, A.grp_start_m, A.n_groups_m, A.ent_dst_m,
+                                                   A.ent_tok_m, std::min<int64_t>(NK, g.n_expert) + 1, NK, A.xq8_m,
                                                    s.scratch_m, A.gout_m, g_st);
             }
         } else {
             g_ids_host.resize((size_t) NK);
-            KC(cudaMemcpy(g_ids_host.data(), s.ids_m, NK * sizeof(int), cudaMemcpyDeviceToHost));
+            KC(cudaMemcpy(g_ids_host.data(), A.ids_m, NK * sizeof(int), cudaMemcpyDeviceToHost));
             if (e.cpu_threads > 0) {   // pool_all reaches here for the native_ok layers too (the ids are copied above)   // the CPU pool: ggml's own expert arithmetic over the pinned blobs, the
                                        // chunk's NK entries split over the pool's threads (bandwidth-bound,
                                        // ~10x the launch-bound mmvq loop on this box)
@@ -2486,7 +2499,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                     KC(cudaMemcpyAsync(s.pc_g, s.pc_g_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
                     KC(cudaMemcpyAsync(s.pc_u, s.pc_u_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
                     KC(cudaMemcpyAsync(s.pc_ey, s.pc_ey_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
-                    k_gather_f16<<<grid1(rows * N), kThreads>>>((const __half*) s.x16, s.res_tok, (__half*) s.res_x16, N);
+                    k_gather_f16<<<grid1(rows * N), kThreads>>>((const __half*) A.x16, s.res_tok, (__half*) s.res_x16, N);
                     e.gemm.f16_batched(s.pa_g, s.pb_x, s.pc_g, M, FF, N, nblk);
                     e.gemm.f16_batched(s.pa_u, s.pb_x, s.pc_u, M, FF, N, nblk);
                     k_swiglu_rows<<<grid1(rows * FF), kThreads>>>(s.res_g, s.res_u, s.res_h, rows * FF);
@@ -2615,16 +2628,16 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
         }
         {
             const Dense& wg = e.dense.at(L(l, "ffn_gate_shexp.weight"));
-            if (dense_f16_on() && wg.f16) e.gemm.f16((const uint16_t*) s.x16, wg.f16, A.sg_m, T, FS, N);
-            else e.gemm.native((const uint16_t*) s.x16, wg.type, wg.d, A.sg_m, T, FS, N);
+            if (dense_f16_on() && wg.f16) e.gemm.f16((const uint16_t*) A.x16, wg.f16, A.sg_m, T, FS, N);
+            else e.gemm.native((const uint16_t*) A.x16, wg.type, wg.d, A.sg_m, T, FS, N);
             const Dense& wu = e.dense.at(L(l, "ffn_up_shexp.weight"));
-            if (dense_f16_on() && wu.f16) e.gemm.f16((const uint16_t*) s.x16, wu.f16, A.su_m, T, FS, N);
-            else e.gemm.native((const uint16_t*) s.x16, wu.type, wu.d, A.su_m, T, FS, N);
+            if (dense_f16_on() && wu.f16) e.gemm.f16((const uint16_t*) A.x16, wu.f16, A.su_m, T, FS, N);
+            else e.gemm.native((const uint16_t*) A.x16, wu.type, wu.d, A.su_m, T, FS, N);
             k_swiglu_rows<<<grid1((int64_t) T * FS), kThreads>>>(A.sg_m, A.su_m, A.sh_m, (int64_t) T * FS);
-            k_to_f16<<<grid1((int64_t) T * FS), kThreads>>>(A.sh_m, s.x16, (int64_t) T * FS);
+            k_to_f16<<<grid1((int64_t) T * FS), kThreads>>>(A.sh_m, A.x16, (int64_t) T * FS);
             const Dense& wd = e.dense.at(L(l, "ffn_down_shexp.weight"));
-            if (dense_f16_on() && wd.f16) e.gemm.f16((const uint16_t*) s.x16, wd.f16, A.sy_m, T, N, FS);
-            else e.gemm.native((const uint16_t*) s.x16, wd.type, wd.d, A.sy_m, T, N, FS);
+            if (dense_f16_on() && wd.f16) e.gemm.f16((const uint16_t*) A.x16, wd.f16, A.sy_m, T, N, FS);
+            else e.gemm.native((const uint16_t*) A.x16, wd.type, wd.d, A.sy_m, T, N, FS);
         }
         pp_mark(e.cnt.pf_shx_ns);   // the shared expert's three gemvs + SwiGLU
         k_moe_sum_rows<<<dim3(T, (N + B - 1) / B), B>>>(A.moe_m, A.gout_m, s.wts_m, A.sy_m, K, N);
@@ -2704,6 +2717,7 @@ void init_scratch(const Engine& e, Scratch& s) {
         s.exp_ord.resize((size_t) NK);
         const size_t hd = (size_t) g.n_head * g.head_dim, hkd = (size_t) g.n_head_kv * g.head_dim;
         KC(cudaMalloc((void**) &s.toks_d, T * 4));
+        if (pf_pipe_on()) KC(cudaMalloc((void**) &s.toks_d2, T * 4));
         KC(cudaMalloc((void**) &s.x_m, (size_t) T * N * 4));
         KC(cudaMalloc((void**) &s.h_m, (size_t) T * N * 4));
         KC(cudaMalloc((void**) &s.y_m, (size_t) T * N * 4));
@@ -2738,15 +2752,23 @@ void init_scratch(const Engine& e, Scratch& s) {
             std::fprintf(stderr, "strata-kolibri: prefill pipeline: second activation set allocated (A2b step 1, unused)\n");
             s.act2 = ActSet{s.x_m2, s.h_m2, s.y_m2, s.q_m2, s.k_m2, s.v_m2, s.att_m2, s.router_m2, s.moe_m2, s.sy_m2,
                             s.sg_m2, s.su_m2, s.sh_m2, s.gout_m2};
+            s.act2.x16 = s.x16_2; s.act2.q16 = s.q16_2; s.act2.xq8_m = s.xq8_m2;
+            s.act2.ids_m = s.ids_m2; s.act2.toks_d = s.toks_d2;
+            s.act2.grp_start_m = s.grp_start_m2; s.act2.n_groups_m = s.n_groups_m2;
+            s.act2.ent_dst_m = s.ent_dst_m2; s.act2.ent_tok_m = s.ent_tok_m2; s.act2.grp_ptr_m = s.grp_ptr_m2;
         }
         KC(cudaMalloc((void**) &s.eg_m, (size_t) NK * g.n_ff * 4));
         KC(cudaMalloc((void**) &s.eu_m, (size_t) NK * g.n_ff * 4));
         KC(cudaMalloc((void**) &s.eh_m, (size_t) NK * g.n_ff * 4));
         KC(cudaMalloc((void**) &s.ids_m, NK * 4));
+        if (pf_pipe_on()) KC(cudaMalloc((void**) &s.ids_m2, NK * 4));
         KC(cudaMalloc((void**) &s.wts_m, NK * 4));
         KC(cudaMalloc((void**) &s.grp_ptr_m, ((size_t) std::min<int64_t>(NK, g.n_expert) + 1) * sizeof(unsigned long long)));
+        if (pf_pipe_on()) KC(cudaMalloc((void**) &s.grp_ptr_m2, ((size_t) std::min<int64_t>(NK, g.n_expert) + 1) * sizeof(unsigned long long)));
         KC(cudaMalloc((void**) &s.grp_start_m, ((size_t) std::min<int64_t>(NK, g.n_expert) + 1) * 4));
+        if (pf_pipe_on()) KC(cudaMalloc((void**) &s.grp_start_m2, ((size_t) std::min<int64_t>(NK, g.n_expert) + 1) * 4));
         KC(cudaMalloc((void**) &s.n_groups_m, 4));
+        if (pf_pipe_on()) KC(cudaMalloc((void**) &s.n_groups_m2, 4));
     // Self-determinism probe (two runs, same binary/config: self-KL mean 9.67, argmax-agree 5/32).  The grouped
     // launch runs with grid_groups = 0, which the header documents as cap_groups (min(NK,n_expert)+1 = 385) block
     // rows, while k_group fills only the first *n_groups (~155) entries.  Zero the group tables so the surplus
@@ -2755,12 +2777,22 @@ void init_scratch(const Engine& e, Scratch& s) {
     KC(cudaMemset(s.grp_start_m, 0, ((size_t) std::min<int64_t>(NK, g.n_expert) + 1) * 4));
     KC(cudaMemset(s.n_groups_m, 0, 4));
         KC(cudaMalloc((void**) &s.ent_dst_m, NK * 4));
+        if (pf_pipe_on()) KC(cudaMalloc((void**) &s.ent_dst_m2, NK * 4));
         KC(cudaMalloc((void**) &s.ent_tok_m, NK * 4));
+        if (pf_pipe_on()) KC(cudaMalloc((void**) &s.ent_tok_m2, NK * 4));
         KC(cudaMalloc((void**) &s.xq8_m, strata::kernels::native_q8_1_bytes((int) g.n_embd, 1) * (size_t) T));
+        if (pf_pipe_on()) KC(cudaMalloc((void**) &s.xq8_m2, strata::kernels::native_q8_1_bytes((int) g.n_embd, 1) * (size_t) T));
         KC(cudaMalloc((void**) &s.scratch_m, strata::kernels::native_expert_scratch_bytes(NK, g.n_ff)));
         const size_t f16 = 2;
         KC(cudaMalloc((void**) &s.x16, (size_t) T * std::max<int64_t>(N, std::max<int64_t>(g.n_ff, (int64_t) hd)) * f16));
+        if (pf_pipe_on()) KC(cudaMalloc((void**) &s.x16_2, (size_t) T * std::max<int64_t>(N, std::max<int64_t>(g.n_ff, (int64_t) hd)) * f16));
         KC(cudaMalloc((void**) &s.q16, (size_t) T * hd * f16));
+        if (pf_pipe_on()) KC(cudaMalloc((void**) &s.q16_2, (size_t) T * hd * f16));
+        s.act1.x16 = s.x16; s.act1.q16 = s.q16; s.act1.xq8_m = s.xq8_m;
+        s.act1.ids_m = s.ids_m; s.act1.toks_d = s.toks_d;
+        s.act1.grp_start_m = s.grp_start_m; s.act1.n_groups_m = s.n_groups_m;
+        s.act1.ent_dst_m = s.ent_dst_m; s.act1.ent_tok_m = s.ent_tok_m; s.act1.grp_ptr_m = s.grp_ptr_m;
+
         KC(cudaMalloc((void**) &s.att16, (size_t) T * hd * f16));
         KC(cudaMalloc((void**) &s.k16, (size_t) g.n_head_kv * s.ctx * g.head_dim * f16));
         KC(cudaMalloc((void**) &s.v16, (size_t) g.n_head_kv * s.ctx * g.head_dim * f16));
