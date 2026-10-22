@@ -320,6 +320,9 @@ struct Engine {
         // S7: the PREFILL's per-layer segments, ns (the ATTN_PHASES gate): dense GEMMs, attention, the expert
         // leg (GPU grouped + CPU pool), and the layer's other kernels - the pp512 breakdown.
         long long pf_dense_ns = 0, pf_attn_ns = 0, pf_exp_ns = 0, pf_other_ns = 0, pf_layers = 0;
+        // The tail marks: the region between pf_other (the pool drain) and the next layer had NO mark, which is where
+        // pp512's ~1670 ms of unattributed time lives - the scatter + H2D, the shared expert, and the MoE sum + residual.
+        long long pf_post_ns = 0, pf_shx_ns = 0, pf_tail_ns = 0;
     };
     mutable Counters cnt;   // layer_step takes the Engine as const (like `mutable Pool pool`)
     bool counters = false;
@@ -2559,6 +2562,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                                  (int) s.pf_nblk, dup);
                 }
                 KC(cudaMemcpy(s.gout_m, s.ey_h, (size_t) NK * N * 4, cudaMemcpyHostToDevice));
+                pp_mark(e.cnt.pf_post_ns);   // the scatter + this H2D (NK x N x 4 = 31.5 MB at T=512)
             } else {
             // The mmvq fallback leg: per-token activation quantize, gate/up per selection, SwiGLU, h quantize,
             // down per selection.  This leg MUST stay inside the else.  The pool leg above already produced the
@@ -2600,9 +2604,11 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
             if (dense_f16_on() && wd.f16) e.gemm.f16((const uint16_t*) s.x16, wd.f16, s.sy_m, T, N, FS);
             else e.gemm.native((const uint16_t*) s.x16, wd.type, wd.d, s.sy_m, T, N, FS);
         }
+        pp_mark(e.cnt.pf_shx_ns);   // the shared expert's three gemvs + SwiGLU
         k_moe_sum_rows<<<dim3(T, (N + B - 1) / B), B>>>(s.moe_m, s.gout_m, s.wts_m, s.sy_m, K, N);
         k_rms_rows<<<T, kThreads>>>(s.moe_m, e.f32.at(L(l, "post_ffw_norm.weight")), s.moe_m, N, e.eps);
         k_add_rows<<<grid1((int64_t) T * N), kThreads>>>(s.x_m, s.moe_m, (int64_t) T * N);
+        pp_mark(e.cnt.pf_tail_ns);   // the MoE sum + post-ffw norm + residual
         KC(cudaGetLastError());
     }
     k_rms<<<1, kThreads>>>(s.x_m + (size_t) (T - 1) * N, e.f32.at("output_norm.weight"), s.h, N, e.eps);
@@ -2908,9 +2914,11 @@ void print_counters(Engine& e, const char* tag) {
     }
     if (e.cnt.pf_layers > 0) {
         const double n = (double) e.cnt.pf_layers;
-        std::fprintf(stderr, "CNT prefill phases: dense=%.1f ms attn=%.1f ms experts=%.1f ms other=%.1f ms (per layer)\n",
+        std::fprintf(stderr, "CNT prefill phases: dense=%.1f attn=%.1f experts=%.1f pool=%.1f post=%.1f shx=%.1f"
+                             " tail=%.1f ms (per layer)\n",
                      e.cnt.pf_dense_ns / 1e6 / n, e.cnt.pf_attn_ns / 1e6 / n, e.cnt.pf_exp_ns / 1e6 / n,
-                     e.cnt.pf_other_ns / 1e6 / n);
+                     e.cnt.pf_other_ns / 1e6 / n, e.cnt.pf_post_ns / 1e6 / n, e.cnt.pf_shx_ns / 1e6 / n,
+                     e.cnt.pf_tail_ns / 1e6 / n);
     }
     if (e.cnt.attn_sc_ns > 0)
         std::fprintf(stderr, "CNT prefill attn: scores=%.0f ms softmax=%.0f ms pv=%.0f ms\n",
