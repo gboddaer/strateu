@@ -1567,6 +1567,12 @@ struct ActSet {
     int *grp_start_m = nullptr, *n_groups_m = nullptr, *ent_dst_m = nullptr, *ent_tok_m = nullptr;
     unsigned long long *grp_ptr_m = nullptr;
     float *ey_h = nullptr;   // pinned host: the pool writes it, the H2D reads it
+    float *wts_m = nullptr;  // the router weights: PRE writes them, POST's MoE sum reads them
+
+    // A2b: the PUBLISHED ids, per chunk.  PRE writes them (the publish) and POST reads them four times - as a single
+    // global vector, chunk 2's publish overwrote chunk 1's before chunk 1's POST used them, which is exactly the
+    // deterministic id difference that survived F16=0 and STAGE=0 (8 uses).
+    std::vector<int> ids_host;
 };
 
 struct Scratch {
@@ -1647,6 +1653,7 @@ struct Scratch {
     int *grp_start_m2 = nullptr, *n_groups_m2 = nullptr, *ent_dst_m2 = nullptr, *ent_tok_m2 = nullptr;
     unsigned long long *grp_ptr_m2 = nullptr;
     float *ey_h2 = nullptr;   // A2b: the second chunk's pinned expert-output block
+    float *wts_m2 = nullptr;
     float *sg_m = nullptr, *su_m = nullptr, *sh_m = nullptr;
     float *gout_m = nullptr, *eg_m = nullptr, *eu_m = nullptr, *eh_m = nullptr;
     ActSet act1, act2;   // A2b: the two per-chunk activation sets (act2 only when STRATA_KOLIBRI_PF_PIPE is on)
@@ -2319,7 +2326,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                                                              A.router_m, (int) g.n_expert);
             }
             strata::kernels::native_router_sigmoid_logit_add(A.router_m, e.f32.at(L(l, "exp_probs_b.bias")),
-                                                             A.ids_m, s.wts_m, Tc, g_st);
+                                                             A.ids_m, A.wts_m, Tc, g_st);
         }
         if (e.hist_on || dec_res_on()) {   // coverage probe; also the touch counts the hot seed needs (K29)
             std::vector<int> hid((size_t) NKc);
@@ -2336,8 +2343,8 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
         // grouped kernel ignores them, the mmvq fallback reads them - so a wavefront has exactly one point at which a
         // chunk's PRE half is complete and its POST half may be scheduled against another chunk.  Two inner copies used
         // to do this per branch (:2321 and :2365); one copy of the same bytes earlier is byte-identical.
-        g_ids_host.resize((size_t) NKc);
-        KC(cudaMemcpy(g_ids_host.data(), A.ids_m, (size_t) NKc * sizeof(int), cudaMemcpyDeviceToHost));
+        A.ids_host.resize((size_t) NKc);
+        KC(cudaMemcpy(A.ids_host.data(), A.ids_m, (size_t) NKc * sizeof(int), cudaMemcpyDeviceToHost));
         };
         auto layer_post = [&] {
         if (b.native_ok && !(pool_all && e.cpu_threads > 0)) {
@@ -2358,7 +2365,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                 std::fill(rank, rank + g.n_expert, -1);
                 int nt = 0;
                 for (int i = 0; i < NKc; ++i) {
-                    const int id = g_ids_host[(size_t) i];
+                    const int id = A.ids_host[(size_t) i];
                     if (rank[id] < 0) {
                         if (nt >= s.stage_n) { nt = -1; break; }   // touched set exceeds the stage: table path
                         rank[id] = nt;
@@ -2368,7 +2375,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                     }
                 }
                 if (nt > 0) {
-                    for (int i = 0; i < NKc; ++i) s.stage_ids_h[(size_t) i] = rank[g_ids_host[(size_t) i]];
+                    for (int i = 0; i < NKc; ++i) s.stage_ids_h[(size_t) i] = rank[A.ids_host[(size_t) i]];
                     KC(cudaMemcpyAsync(s.stage_ids_m, s.stage_ids_h.data(), (size_t) NKc * sizeof(int),
                                        cudaMemcpyHostToDevice, g_st));
                     k_group<<<1, 1024>>>(s.stage_ids_m, NKc, K, s.stage_n, s.stage, (unsigned long long) b.stride,
@@ -2407,12 +2414,12 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                 // floor; per-entry reads re-stream 2.2 MB per row), all of an expert's rows in one call
                 std::vector<int32_t>& cnt = s.exp_cnt;
                 std::fill(cnt.begin(), cnt.begin() + g.n_expert + 1, 0);
-                for (int sel = 0; sel < NKc; ++sel) cnt[g_ids_host[(size_t) sel] + 1]++;
+                for (int sel = 0; sel < NKc; ++sel) cnt[A.ids_host[(size_t) sel] + 1]++;
                 for (int x = 0; x < (int) g.n_expert; ++x) cnt[x + 1] += cnt[x];
                 std::vector<int32_t>& ord = s.exp_ord;
                 {
                     std::vector<int32_t> cur(cnt.begin(), cnt.begin() + g.n_expert + 1);
-                    for (int sel = 0; sel < NKc; ++sel) ord[cur[g_ids_host[(size_t) sel]]++] = sel;
+                    for (int sel = 0; sel < NKc; ++sel) ord[cur[A.ids_host[(size_t) sel]]++] = sel;
                 }
                 // The shard count must equal the pool's LANE count, not --cpu-threads: the fan-out maps shard i
                 // to lane i (shard 0 = the host), so ns > lanes leaves some lanes with two shards and others
@@ -2644,7 +2651,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                 strata::kernels::native_quantize_q8_1(A.h_m + (size_t) t * N, g_q8, N, 1, g_st);
                 for (int k = 0; k < K; ++k) {
                     const int sel = t * K + k;
-                    const uint8_t* blob = b.table + (size_t) g_ids_host[(size_t) sel] * b.stride;
+                    const uint8_t* blob = b.table + (size_t) A.ids_host[(size_t) sel] * b.stride;
                     strata::kernels::native_mmvq(b.L.gu_type, blob, (const char*) g_q8, s.eg_m + (size_t) sel * FF,
                                                  N, FF, 1, g_st);
                     strata::kernels::native_mmvq(b.L.gu_type, blob + b.L.up_off, (const char*) g_q8,
@@ -2654,7 +2661,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
             k_swiglu_rows<<<grid1((int64_t) NKc * FF), kThreads>>>(s.eg_m, s.eu_m, s.eh_m, (int64_t) NKc * FF);
             for (int sel = 0; sel < NKc; ++sel) {
                 strata::kernels::native_quantize_q8_1(s.eh_m + (size_t) sel * FF, g_q8, FF, 1, g_st);
-                const uint8_t* blob = b.table + (size_t) g_ids_host[(size_t) sel] * b.stride + b.L.down_off;
+                const uint8_t* blob = b.table + (size_t) A.ids_host[(size_t) sel] * b.stride + b.L.down_off;
                 strata::kernels::native_mmvq(b.L.d_type, blob, (const char*) g_q8, A.gout_m + (size_t) sel * N,
                                              FF, N, 1, g_st);
             }
@@ -2674,7 +2681,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
             else e.gemm.native((const uint16_t*) A.x16, wd.type, wd.d, A.sy_m, Tc, N, FS);
         }
         pp_mark(e.cnt.pf_shx_ns);   // the shared expert's three gemvs + SwiGLU
-        k_moe_sum_rows<<<dim3(Tc, (N + B - 1) / B), B>>>(A.moe_m, A.gout_m, s.wts_m, A.sy_m, K, N);
+        k_moe_sum_rows<<<dim3(Tc, (N + B - 1) / B), B>>>(A.moe_m, A.gout_m, A.wts_m, A.sy_m, K, N);
         k_rms_rows<<<Tc, kThreads>>>(A.moe_m, e.f32.at(L(l, "post_ffw_norm.weight")), A.moe_m, N, e.eps);
         k_add_rows<<<grid1((int64_t) Tc * N), kThreads>>>(A.x_m, A.moe_m, (int64_t) Tc * N);
         pp_mark(e.cnt.pf_tail_ns);   // the MoE sum + post-ffw norm + residual
@@ -2800,6 +2807,7 @@ void init_scratch(const Engine& e, Scratch& s) {
         KC(cudaMalloc((void**) &s.ids_m, NK * 4));
         if (pf_pipe_on()) KC(cudaMalloc((void**) &s.ids_m2, NK * 4));
         KC(cudaMalloc((void**) &s.wts_m, NK * 4));
+        if (pf_pipe_on()) KC(cudaMalloc((void**) &s.wts_m2, NK * 4));
         KC(cudaMalloc((void**) &s.grp_ptr_m, ((size_t) std::min<int64_t>(NK, g.n_expert) + 1) * sizeof(unsigned long long)));
         if (pf_pipe_on()) KC(cudaMalloc((void**) &s.grp_ptr_m2, ((size_t) std::min<int64_t>(NK, g.n_expert) + 1) * sizeof(unsigned long long)));
         KC(cudaMalloc((void**) &s.grp_start_m, ((size_t) std::min<int64_t>(NK, g.n_expert) + 1) * 4));
@@ -2875,6 +2883,8 @@ void init_scratch(const Engine& e, Scratch& s) {
         if (pf_pipe_on()) KC(cudaHostAlloc((void**) &s.ey_h2, (size_t) ents * N * 4, cudaHostAllocDefault));
         s.act1.ey_h = s.ey_h;
         if (pf_pipe_on()) s.act2.ey_h = s.ey_h2;
+        s.act1.wts_m = s.wts_m;
+        if (pf_pipe_on()) s.act2.wts_m = s.wts_m2;
         if (expert_f16_n() > 0) {   // S7 increment B/C: resident-expert GEMM working set (device + pinned)
             const int64_t rrows = (int64_t) Scratch::kResBlkMax * Scratch::kResBlk;
             KC(cudaMalloc((void**) &s.res_x16, (size_t) rrows * N * 2));
