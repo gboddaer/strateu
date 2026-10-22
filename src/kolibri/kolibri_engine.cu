@@ -104,6 +104,9 @@ static inline bool env_on(const char* name) {
 
 // S8b/B1: the vectorized F32 decode gemv (the router).  Declared here because `gemv` (the dispatcher) is far above the
 // per-feature gates; bitwise by construction, env-gated until measured.
+// A2b: the two-chunk prefill wavefront.  Step 1 allocates the second activation set and changes no scheduling.
+static inline bool pf_pipe_on() { return env_on("STRATA_KOLIBRI_PF_PIPE"); }
+
 static inline bool dec_gemv_v4_on() {
     // ON by default: bitwise (oracle BITWISE PASS with it enabled, and the router feeds the ids), two-run measured at
     // tg 26.7 vs 25.1/25.2 for the scalar read.  STRATA_KOLIBRI_DEC_GEMV_V4=0 is the A/B arm.
@@ -1615,6 +1618,12 @@ struct Scratch {
     int* toks_d = nullptr;
     float *x_m = nullptr, *h_m = nullptr, *y_m = nullptr, *q_m = nullptr, *k_m = nullptr, *v_m = nullptr;
     float *att_m = nullptr, *router_m = nullptr, *moe_m = nullptr, *sy_m = nullptr;
+    // A2b step 1: the SECOND activation set, so two chunks can be in flight in the wavefront.  Allocated and unused at
+    // this step - the point is to prove the model still loads and that PF_HASH/oracle do not move with the memory merely
+    // committed (~85 MiB for the set + the second staging buffer, 37% of the 708 MiB the 32K config leaves free).
+    float *x_m2 = nullptr, *h_m2 = nullptr, *y_m2 = nullptr, *q_m2 = nullptr, *k_m2 = nullptr, *v_m2 = nullptr;
+    float *att_m2 = nullptr, *router_m2 = nullptr, *moe_m2 = nullptr, *sy_m2 = nullptr;
+    float *sg_m2 = nullptr, *su_m2 = nullptr, *sh_m2 = nullptr, *gout_m2 = nullptr;
     float *sg_m = nullptr, *su_m = nullptr, *sh_m = nullptr;
     float *gout_m = nullptr, *eg_m = nullptr, *eu_m = nullptr, *eh_m = nullptr;
     int *ids_m = nullptr, *grp_start_m = nullptr, *n_groups_m = nullptr, *ent_dst_m = nullptr, *ent_tok_m = nullptr;
@@ -2696,6 +2705,23 @@ void init_scratch(const Engine& e, Scratch& s) {
         KC(cudaMalloc((void**) &s.su_m, (size_t) T * g.n_ff_shexp * 4));
         KC(cudaMalloc((void**) &s.sh_m, (size_t) T * g.n_ff_shexp * 4));
         KC(cudaMalloc((void**) &s.gout_m, (size_t) NK * N * 4));
+        if (pf_pipe_on()) {   // A2b step 1
+            KC(cudaMalloc((void**) &s.x_m2, (size_t) T * N * 4));
+            KC(cudaMalloc((void**) &s.h_m2, (size_t) T * N * 4));
+            KC(cudaMalloc((void**) &s.y_m2, (size_t) T * N * 4));
+            KC(cudaMalloc((void**) &s.q_m2, (size_t) T * hd * 4));
+            KC(cudaMalloc((void**) &s.k_m2, (size_t) T * hkd * 4));
+            KC(cudaMalloc((void**) &s.v_m2, (size_t) T * hkd * 4));
+            KC(cudaMalloc((void**) &s.att_m2, (size_t) T * hd * 4));
+            KC(cudaMalloc((void**) &s.router_m2, (size_t) T * g.n_expert * 4));
+            KC(cudaMalloc((void**) &s.moe_m2, (size_t) T * N * 4));
+            KC(cudaMalloc((void**) &s.sy_m2, (size_t) T * N * 4));
+            KC(cudaMalloc((void**) &s.sg_m2, (size_t) T * g.n_ff_shexp * 4));
+            KC(cudaMalloc((void**) &s.su_m2, (size_t) T * g.n_ff_shexp * 4));
+            KC(cudaMalloc((void**) &s.sh_m2, (size_t) T * g.n_ff_shexp * 4));
+            KC(cudaMalloc((void**) &s.gout_m2, (size_t) NK * N * 4));
+            std::fprintf(stderr, "strata-kolibri: prefill pipeline: second activation set allocated (A2b step 1, unused)\n");
+        }
         KC(cudaMalloc((void**) &s.eg_m, (size_t) NK * g.n_ff * 4));
         KC(cudaMalloc((void**) &s.eu_m, (size_t) NK * g.n_ff * 4));
         KC(cudaMalloc((void**) &s.eh_m, (size_t) NK * g.n_ff * 4));
