@@ -2095,7 +2095,11 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
         Tc = (ci == 0) ? T : T2;
         p0c = (ci == 0) ? p0 : p02;
         const int NKc = Tc * K;   // A2b: NKc is per-chunk (it was T*K at function scope, stale for ci == 1)
-        if (l == 0) {   // each chunk embeds its own tokens at its layer 0, with its own set
+        // A2b: the embedding is PRE work, and it must run on the PRE pass ONLY.  Sitting above the half-calls it ran on
+        // BOTH passes, so on the POST pass it re-embedded the chunk over A.x_m and destroyed layer 0's attention residual
+        // (x_m = embed + att_m) before the MoE sum added into it - silently, and only when there were two chunks, which is
+        // why the one-chunk gate stayed green while the two-chunk KL ran to 0.72 (p06 3.16, p07 2.63) against a 0.0026 floor.
+        if (l == 0 && pass == 0) {   // each chunk embeds its own tokens at its layer 0, with its own set
             switch (emb.type) {
             case T_Q8_0: k_row_multi<T_Q8_0><<<dim3(Tc, 4), 128>>>(emb.d, emb.row_bytes, A.toks_d, N, A.x_m); break;
             case T_Q4_K: k_row_multi<T_Q4_K><<<dim3(Tc, 4), 128>>>(emb.d, emb.row_bytes, A.toks_d, N, A.x_m); break;
