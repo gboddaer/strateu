@@ -1566,6 +1566,7 @@ struct ActSet {
     int *ids_m = nullptr, *toks_d = nullptr;
     int *grp_start_m = nullptr, *n_groups_m = nullptr, *ent_dst_m = nullptr, *ent_tok_m = nullptr;
     unsigned long long *grp_ptr_m = nullptr;
+    float *ey_h = nullptr;   // pinned host: the pool writes it, the H2D reads it
 };
 
 struct Scratch {
@@ -1645,6 +1646,7 @@ struct Scratch {
     int *ids_m2 = nullptr, *toks_d2 = nullptr;
     int *grp_start_m2 = nullptr, *n_groups_m2 = nullptr, *ent_dst_m2 = nullptr, *ent_tok_m2 = nullptr;
     unsigned long long *grp_ptr_m2 = nullptr;
+    float *ey_h2 = nullptr;   // A2b: the second chunk's pinned expert-output block
     float *sg_m = nullptr, *su_m = nullptr, *sh_m = nullptr;
     float *gout_m = nullptr, *eg_m = nullptr, *eu_m = nullptr, *eh_m = nullptr;
     ActSet act1, act2;   // A2b: the two per-chunk activation sets (act2 only when STRATA_KOLIBRI_PF_PIPE is on)
@@ -2534,7 +2536,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                                 char* hqp = s.hq + (size_t) sel * b.fmt.h_bytes;
                                 strata::kernels::cpu::native_quant_h(b.fmt, ffs[k], hqp);
                                 hqs[k] = hqp;
-                                eys[k] = s.ey_h + (size_t) sel * N;
+                                eys[k] = A.ey_h + (size_t) sel * N;
                             }
                             const auto tC = std::chrono::steady_clock::now();
                             strata::kernels::cpu::native_down_rows(b.fmt, blob, hqs, mm, eys, 0, N);
@@ -2561,7 +2563,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                 pp_mark(e.cnt.pf_other_ns);   // S7: the layer's other kernels (the shared expert, the MoE sum, the norms)
         e.cnt.pf_layers++;
         // S7 increment C: the resident rows land in res_ey_h (block order, padded rows ignored); scatter
-                // them into s.ey_h at their selection rows.  Every selection row is covered exactly once, and the
+                // them into A.ey_h at their selection rows.  Every selection row is covered exactly once, and the
                 // existing H2D below ships the whole NK x N block unchanged.
                 if (b.f16 && s.pf_nblk > 0) {
                     KC(cudaStreamSynchronize(g_st));
@@ -2569,7 +2571,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                     for (int bi = 0; bi < s.pf_nblk; ++bi) {
                         const int lo = s.blk_lo[bi], mb = s.blk_m[bi];
                         for (int a = 0; a < mb; ++a)
-                            std::memcpy(s.ey_h + (size_t) ord[(size_t) lo + a] * N, s.res_ey_h + ((int64_t) bi * M + a) * N, (size_t) N * 4);
+                            std::memcpy(A.ey_h + (size_t) ord[(size_t) lo + a] * N, s.res_ey_h + ((int64_t) bi * M + a) * N, (size_t) N * 4);
                     }
                 }
                 // STREAM RACE (self-determinism probe: two runs, same binary/config, self-KL mean 9.67,
@@ -2584,7 +2586,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                     // line that differs names the exact chunk where the prefill stops being reproducible.  The dump
                     // instruments cannot do this - --dump-layers disables chunking entirely, so it never runs this code.
                     double hs = 0.0;
-                    for (int64_t q = 0; q < NK * N; ++q) hs += (double) s.ey_h[(size_t) q];
+                    for (int64_t q = 0; q < NK * N; ++q) hs += (double) A.ey_h[(size_t) q];
                     // The structural discriminators: if these differ between two identical runs the defect is in the
                     // cache BOOKKEEPING (which experts are resident, which slot each got); if they agree while the sum
                     // differs, the bookkeeping is fine and the arithmetic/GPU side is at fault.
@@ -2596,12 +2598,12 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                                  (int) l, (long long) e.pf_chunks, hs, s.pf_res.size(), s.pf_miss.size(),
                                  (int) s.pf_nblk, dup);
                 }
-                KC(cudaMemcpy(A.gout_m, s.ey_h, (size_t) NK * N * 4, cudaMemcpyHostToDevice));
+                KC(cudaMemcpy(A.gout_m, A.ey_h, (size_t) NK * N * 4, cudaMemcpyHostToDevice));
                 pp_mark(e.cnt.pf_post_ns);   // the scatter + this H2D (NK x N x 4 = 31.5 MB at T=512)
             } else {
             // The mmvq fallback leg: per-token activation quantize, gate/up per selection, SwiGLU, h quantize,
             // down per selection.  This leg MUST stay inside the else.  The pool leg above already produced the
-            // expert output (native_down_rows -> s.ey_h) and copied it into A.gout_m, and this leg writes
+            // expert output (native_down_rows -> A.ey_h) and copied it into A.gout_m, and this leg writes
             // A.gout_m from s.eg_m/s.eu_m, which the pool NEVER fills.  Measured (nsys, staged pp512, 24 workers):
             // 76,750 native_q4_k_mmvq launches = 6.10 s = 67% of all GPU kernel time and 42% of the pp512 wall,
             // all of it dead work, and it OVERWROTE the pool's result with stale-buffer garbage - the cause of
@@ -2831,6 +2833,9 @@ void init_scratch(const Engine& e, Scratch& s) {
         KC(cudaHostAlloc((void**) &s.ff, (size_t) ents * FF * 4, cudaHostAllocDefault));
         KC(cudaHostAlloc((void**) &s.hq, (size_t) ents * h_b, cudaHostAllocDefault));
         KC(cudaHostAlloc((void**) &s.ey_h, (size_t) ents * N * 4, cudaHostAllocDefault));
+        if (pf_pipe_on()) KC(cudaHostAlloc((void**) &s.ey_h2, (size_t) ents * N * 4, cudaHostAllocDefault));
+        s.act1.ey_h = s.ey_h;
+        if (pf_pipe_on()) s.act2.ey_h = s.ey_h2;
         if (expert_f16_n() > 0) {   // S7 increment B/C: resident-expert GEMM working set (device + pinned)
             const int64_t rrows = (int64_t) Scratch::kResBlkMax * Scratch::kResBlk;
             KC(cudaMalloc((void**) &s.res_x16, (size_t) rrows * N * 2));
