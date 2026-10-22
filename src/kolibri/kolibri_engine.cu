@@ -2304,6 +2304,12 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
         // The cache branch stays pool-side: routing the native_ok layers' grouped kernel through the fp16 cache
         // measured KL 0.13050 (gate FAIL) - that kernel is bitwise-equal to llama.cpp's arithmetic, and fp16
         // weights+activations deviate ~1e-3 per layer across 50 layers, which the KL-vs-llama clause forbids.
+        // **A2b: PRE ENDS HERE.**  The routed ids are published once, for every branch - the pool consumes them, the
+        // grouped kernel ignores them, the mmvq fallback reads them - so a wavefront has exactly one point at which a
+        // chunk's PRE half is complete and its POST half may be scheduled against another chunk.  Two inner copies used
+        // to do this per branch (:2321 and :2365); one copy of the same bytes earlier is byte-identical.
+        g_ids_host.resize((size_t) NK);
+        KC(cudaMemcpy(g_ids_host.data(), A.ids_m, (size_t) NK * sizeof(int), cudaMemcpyDeviceToHost));
         if (b.native_ok && !(pool_all && e.cpu_threads > 0)) {
             if (e.counters && e.slots > 0) {   // pricing only; --counters runs
                 std::vector<int> hid((size_t) NK);
@@ -2318,8 +2324,6 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
             // dead - the pool serves the misses from the pinned table) made pp512 3.8x SLOWER (17.8 s vs 4.7 s):
             // the staged path is load-bearing (it carries the group table the native grouped kernel needs).
             if (pf_stage && s.stage != nullptr && NK <= (int) s.stage_ids_h.size()) {
-                g_ids_host.resize((size_t) NK);
-                KC(cudaMemcpy(g_ids_host.data(), A.ids_m, (size_t) NK * sizeof(int), cudaMemcpyDeviceToHost));
                 int32_t* rank = s.stage_rank.data();
                 std::fill(rank, rank + g.n_expert, -1);
                 int nt = 0;
@@ -2362,8 +2366,6 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
                                                    s.scratch_m, A.gout_m, g_st);
             }
         } else {
-            g_ids_host.resize((size_t) NK);
-            KC(cudaMemcpy(g_ids_host.data(), A.ids_m, NK * sizeof(int), cudaMemcpyDeviceToHost));
             if (e.cpu_threads > 0) {   // pool_all reaches here for the native_ok layers too (the ids are copied above)   // the CPU pool: ggml's own expert arithmetic over the pinned blobs, the
                                        // chunk's NK entries split over the pool's threads (bandwidth-bound,
                                        // ~10x the launch-bound mmvq loop on this box)
