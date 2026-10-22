@@ -2069,6 +2069,12 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
     // so the GPU can run chunk c+1's PRE half while the host drains chunk c's pool.  The body below is untouched.
     const int n_ch = (T2 > 0 && pf_pipe_on()) ? 2 : 1;
     for (int64_t step = 0; step < g.n_layers + n_ch - 1; ++step) {
+    // **A2b: THE OVERLAP.**  With two chunks in flight each step runs TWO passes: every PRE (pure GPU enqueue) first,
+    // then every POST (the host-blocking pool drains).  While the host blocks in chunk c's pool the GPU is executing
+    // chunk c+1's PRE - the only overlap the dependency DAG permits.  No pair's own arithmetic changes: for a given
+    // (c, L) the order is still PRE then POST, on the same buffers (act1/act2 by parity).
+    const int n_pass = (n_ch == 2) ? 2 : 1;
+    for (int pass = 0; pass < n_pass; ++pass)
     for (int ci = 0; ci < n_ch; ++ci) {
         const int64_t l = step - ci;
         if (l < 0 || l >= g.n_layers) continue;
@@ -2674,8 +2680,8 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
         pp_mark(e.cnt.pf_tail_ns);   // the MoE sum + post-ffw norm + residual
         KC(cudaGetLastError());
         };
-        layer_pre();
-        layer_post();
+        if (pass == 0) layer_pre();
+        if (pass == 1 || n_ch == 1) layer_post();
     }
     }
     // the tail runs once, on the LAST chunk processed (chunk 2 when the wavefront is on)
@@ -2787,10 +2793,6 @@ void init_scratch(const Engine& e, Scratch& s) {
             std::fprintf(stderr, "strata-kolibri: prefill pipeline: second activation set allocated (A2b step 1, unused)\n");
             s.act2 = ActSet{s.x_m2, s.h_m2, s.y_m2, s.q_m2, s.k_m2, s.v_m2, s.att_m2, s.router_m2, s.moe_m2, s.sy_m2,
                             s.sg_m2, s.su_m2, s.sh_m2, s.gout_m2};
-            s.act2.x16 = s.x16_2; s.act2.q16 = s.q16_2; s.act2.xq8_m = s.xq8_m2;
-            s.act2.ids_m = s.ids_m2; s.act2.toks_d = s.toks_d2;
-            s.act2.grp_start_m = s.grp_start_m2; s.act2.n_groups_m = s.n_groups_m2;
-            s.act2.ent_dst_m = s.ent_dst_m2; s.act2.ent_tok_m = s.ent_tok_m2; s.act2.grp_ptr_m = s.grp_ptr_m2;
         }
         KC(cudaMalloc((void**) &s.eg_m, (size_t) NK * g.n_ff * 4));
         KC(cudaMalloc((void**) &s.eu_m, (size_t) NK * g.n_ff * 4));
@@ -2823,6 +2825,10 @@ void init_scratch(const Engine& e, Scratch& s) {
         if (pf_pipe_on()) KC(cudaMalloc((void**) &s.x16_2, (size_t) T * std::max<int64_t>(N, std::max<int64_t>(g.n_ff, (int64_t) hd)) * f16));
         KC(cudaMalloc((void**) &s.q16, (size_t) T * hd * f16));
         if (pf_pipe_on()) KC(cudaMalloc((void**) &s.q16_2, (size_t) T * hd * f16));
+            s.act2.x16 = s.x16_2; s.act2.q16 = s.q16_2; s.act2.xq8_m = s.xq8_m2;
+            s.act2.ids_m = s.ids_m2; s.act2.toks_d = s.toks_d2;
+            s.act2.grp_start_m = s.grp_start_m2; s.act2.n_groups_m = s.n_groups_m2;
+            s.act2.ent_dst_m = s.ent_dst_m2; s.act2.ent_tok_m = s.ent_tok_m2; s.act2.grp_ptr_m = s.grp_ptr_m2;
         s.act1.x16 = s.x16; s.act1.q16 = s.q16; s.act1.xq8_m = s.xq8_m;
         s.act1.ids_m = s.ids_m; s.act1.toks_d = s.toks_d;
         s.act1.grp_start_m = s.grp_start_m; s.act1.n_groups_m = s.n_groups_m;
@@ -3811,14 +3817,25 @@ int strata::kolibri::run(int argc, char** argv) {
                 T = (int) std::max<int64_t>(0, (int64_t) s.ctx - s.pos);
                 if (T <= 0) break;
             }
-            KC(cudaMemcpy(s.toks_d, ids.data() + i, (size_t) T * 4, cudaMemcpyHostToDevice));
-            forward_multi(e, s, T, s.pos);
+            KC(cudaMemcpy(s.act1.toks_d, ids.data() + i, (size_t) T * 4, cudaMemcpyHostToDevice));
+            // **A2b: peek the next chunk** so the wavefront has two in flight.  T2 == 0 leaves the single-chunk path
+            // byte-identical (which is what the gate checks); with T2 > 0 the diagonal runs the two-chunk schedule.
+            int T_next = 0;
+            const int64_t pos_next = s.pos + T;
+            if (pf_pipe_on() && i + T < n) {
+                int64_t t2 = std::min<int64_t>(pf_chunk_at(pos_next), n - (i + T));
+                if (pos_next + t2 > (int64_t) s.ctx) t2 = std::max<int64_t>(0, (int64_t) s.ctx - pos_next);
+                T_next = (int) t2;
+                if (T_next > 0)
+                    KC(cudaMemcpy(s.act2.toks_d, ids.data() + i + T, (size_t) T_next * 4, cudaMemcpyHostToDevice));
+            }
+            forward_multi(e, s, T, s.pos, T_next, pos_next);
             // P1 probe: a fence between chunks.  A single-chunk prefill is bit-exact and a two-chunk one is not, so
             // the race lives in the chunk-to-chunk handoff; this says whether the handoff is missing a fence (and if
             // it is, which producer needs it can then be found by removing the fence again and adding targeted waits).
             if (std::getenv("STRATA_KOLIBRI_PF_FENCE") != nullptr) KC(cudaStreamSynchronize(g_st));
-            s.pos += T;
-            i += T;
+            s.pos += T + T_next;
+            i += T + T_next;
             std::printf("PFchunk %lld/%lld %.0fms\n", (long long) i, (long long) n, ms_since(tp0));
             std::fflush(stdout);
         }
