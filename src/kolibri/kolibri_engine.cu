@@ -431,6 +431,7 @@ static int g_two_pass_max = 11000;
 cudaStream_t g_st = nullptr;   // the router kernels require a created stream (kolibriref does the same)
 // S6: the decode's coalesced score dot flag, mirrored to the device (the kernel body is device code).
 __device__ bool g_attn_coalesced = false;
+__device__ bool g_attn_pv4 = false;   // S8b: the PV 4-chain variant (host mirrors it at startup)
 /// S6: the decode's dense gemv from the PRE-DEQUANTIZED fp16 weights (STRATA_KOLIBRI_DENSE_F16): no per-token
 /// Q4_K dequant (the decode's pre-expert chain measured 0.9 ms/layer = 66%% of the decode's wall, at 36 GB/s
 /// effective = 6%% of the T4's bandwidth - the dequant, not the bandwidth).  The x vector is converted to fp16
@@ -1203,6 +1204,23 @@ __global__ void k_attn_prep_p(const float* qx, const float* kx, const float* vx,
 // mirror holds the same values and the dot keeps the scalar d order - it only makes the warp's K loads contiguous.
 // Allocated for the SLIDING layers only (26 MB total): those are the 39 layers that dominate short-context decode,
 // and their window is fixed at n_swa rows, so the mirror is small and cheap to rebuild every token.
+// S8b: the attention's PV pass is 43% of the decode's GPU time and each thread walks ~513 positions in ONE dependent
+// FMA chain.  Four interleaved accumulators (p = 4n+0..3) give the scheduler four independent chains over the SAME
+// products and the same V mirror; only the ORDER of the four partial sums changes, so this is a NUMERICS change -
+// env-gated and KL-gated (STRATA_KOLIBRI_ATTN_PV4).
+__host__ __device__ inline bool attn_pv4_on() {
+#if defined(__CUDA_ARCH__)
+    return g_attn_pv4;   // the host sets it once at startup, like g_attn_coalesced
+#else
+    // ON by default: four interleaved PV chains are worth +13% decode (tg 30.1/30.3 against 26.7/26.7 - the tg-short
+    // floor of 30, reached) and cost nothing measurable in accuracy: KL vs llama.cpp per prompt 0.00016-0.00740
+    // (baseline 0.00004-0.01045), worst answer-step 0.0147 against the 0.02 gate, and the plain-path oracle still
+    // prints BITWISE PASS because no generated id moves.  STRATA_KOLIBRI_ATTN_PV4=0 is the A/B arm.
+    const char* v = std::getenv("STRATA_KOLIBRI_ATTN_PV4");
+    return v == nullptr || (v[0] != 0 && std::atoi(v) != 0);
+#endif
+}
+
 static inline bool attn_kt_on() {
     // ON by default: unlike ATTN_COALESCED this is not a numerics change - the mirror holds the same values and the
     // dot keeps the scalar d order - and the oracle prints BITWISE PASS with it enabled (measured on this card).
@@ -1305,9 +1323,30 @@ __device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, 
     float sum = 0.f;
     for (int p = threadIdx.x; p < n_pos; p += blockDim.x) { sc[p] = expf(sc[p] - mx); sum += sc[p]; }
     sum = block_sum(sum, sh);
+    const bool pv4 = attn_pv4_on() && vtc != nullptr && D == 128;
     for (int i = threadIdx.x; i < D; i += blockDim.x) {
         float acc = 0.f;
-        if (vtc != nullptr) {   // K27: the transposed V mirror - same p order, contiguous addresses
+        if (pv4) {
+            // four interleaved chains over the SAME products, then one fixed reduction - only the order changes
+            const __half* vtbase = vtc + (size_t) kvh * D * rows;
+            float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+            int p = 0;
+            for (; p + 3 < n_pos; p += 4) {
+                const int64_t s0 = sliding ? (first + p) % swa : (first + p);
+                const int64_t s1 = sliding ? (first + p + 1) % swa : (first + p + 1);
+                const int64_t s2 = sliding ? (first + p + 2) % swa : (first + p + 2);
+                const int64_t s3 = sliding ? (first + p + 3) % swa : (first + p + 3);
+                a0 += sc[p] * __half2float(vtbase[(size_t) i * rows + s0]);
+                a1 += sc[p + 1] * __half2float(vtbase[(size_t) i * rows + s1]);
+                a2 += sc[p + 2] * __half2float(vtbase[(size_t) i * rows + s2]);
+                a3 += sc[p + 3] * __half2float(vtbase[(size_t) i * rows + s3]);
+            }
+            for (; p < n_pos; ++p) {
+                const int64_t gp = first + p, slot = sliding ? gp % swa : gp;
+                a0 += sc[p] * __half2float(vtbase[(size_t) i * rows + slot]);
+            }
+            acc = (a0 + a1) + (a2 + a3);
+        } else if (vtc != nullptr) {   // K27: the transposed V mirror - same p order, contiguous addresses
             const __half* vtbase = vtc + (size_t) kvh * D * rows;
             for (int p = 0; p < n_pos; ++p) {
                 const int64_t gp = first + p, slot = sliding ? gp % swa : gp;
@@ -3428,6 +3467,12 @@ int strata::kolibri::run(int argc, char** argv) {
     {   // S6: mirror the decode's coalesced-dot flag to the device (the kernel body is device code)
         const bool v = env_on("STRATA_KOLIBRI_ATTN_COALESCED");
         KC(cudaMemcpyToSymbol(g_attn_coalesced, &v, sizeof(bool)));
+    }
+    {   // S8b: and the PV 4-chain flag (a numerics change, so it is KL-gated rather than bitwise-gated).
+        // It must go through attn_pv4_on(), whose host branch carries the default-ON logic: mirroring env_on() directly
+        // made the "default" inert on the device side (measured: 26.7 with no env, 30.1 only when the env was set).
+        const bool v4 = attn_pv4_on();
+        KC(cudaMemcpyToSymbol(g_attn_pv4, &v4, sizeof(bool)));
     }
     KC(cudaMalloc(&g_q8, strata::kernels::native_q8_1_bytes((int) kActBuf, 1)));
     e.counters = counters != 0;   // before load(): the VRAM report is printed there
