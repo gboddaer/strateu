@@ -28,7 +28,7 @@ export STRATA_KOLIBRI_ROUTER_TK=3
 # difference between the three, so 16 is pinned as the middle register footprint (192 at TJ=32, 144 at TJ=16) - all
 # three are bitwise (identical ids against TK=0 with ATTN_FLASH on).
 export STRATA_KOLIBRI_ROUTER_TJ=16
-export STRATA_KOLIBRI_ATTN_MB=256
+export STRATA_KOLIBRI_ATTN_MB=512
 # K27: the transposed KV mirror for the sliding layers. ON by default (it is NOT a numerics change - same values,
 # same accumulation order, contiguous addresses - and the oracle prints BITWISE PASS with it). Measured: tg128
 # 22.8 -> 25.7 tok/s (+12.7%), tg after 32K 14.5 -> 15.5 (+7%), prefill untouched. STRATA_KOLIBRI_ATTN_KT=0 is the
