@@ -2089,9 +2089,28 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
         // diagonal driver will rebind them per (chunk, layer) pair.  Nothing else changes, so PF_HASH must stay identical.
         int Tc = T;
         int64_t p0c = p0;
+        // **A2b: the body in two halves.**  layer_pre is pure GPU enqueue (norm -> attention -> router -> publish);
+        // layer_post is the host-blocking half (expert leg, scatter/H2D, shared expert, MoE sum, residual).  Called
+        // back to back this is the old order, and the gate (ids first) is what proves it.
+        // A2b: hoisted OUT of layer_pre - layer_post needs both, and they are per-request/per-layer facts, not
+        // per-half state.
+        LayerBlobs& b = e.blobs[(size_t) l];   // non-const: the fp16 cache's LRU slot table is updated in the pool leg
+        // POOL_ALL: the pool for EVERY layer (the 25 "native" ones too).  Measured on this box: neutral at
+        // pp512 (the pool leg is small), -9% at 4K (the Q4_K grouped kernel's 8.6 s and the 98 GB of staging
+        // both vanish) and -17% at 32K (255.7 s vs 308.4 s).  The env value CAPS the rule: 0 = off, 1 = on
+        // always, 2 = on for a prefix >= 4K (the default: the win needs a long prefix).
+        static const int pool_all_mode = [] {
+            const char* v = std::getenv("STRATA_KOLIBRI_POOL_ALL");
+            if (!v || !v[0]) return 2;                       // the default: the prefix-dependent rule
+            const int m = std::atoi(v);
+            return m < 0 ? 0 : m;
+        }();
+        // The rule's threshold: the prompt's total length >= 1024 (POOL_ALL is neutral at pp512 - the pool leg
+        // is small - and wins from ~4K up: -9% at 4K, -17% at 32K).
+        const bool pool_all = pool_all_mode == 1 || (pool_all_mode >= 2 && e.pf_total >= 1024);
+        auto layer_pre = [&] {
         if (pph) { cudaStreamSynchronize(g_st); pp_t0 = std::chrono::steady_clock::now(); }
         const bool sliding = strata::core::is_swa_layer(g, l);
-        LayerBlobs& b = e.blobs[(size_t) l];   // non-const: the fp16 cache's LRU slot table is updated in the pool leg
         k_rms_rows<<<T, kThreads>>>(A.x_m, e.f32.at(L(l, "attn_norm.weight")), A.h_m, N, e.eps);
         strata::kernels::native_quantize_q8_1(A.h_m, A.xq8_m, N * Tc, 1, g_st);   // Tc contiguous rows = one column (q36)
         k_to_f16<<<grid1((int64_t) Tc * N), kThreads>>>((const float*) A.h_m, A.x16, (int64_t) Tc * N);
@@ -2304,19 +2323,6 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
         }
         strata::kernels::native_quantize_q8_1(A.h_m, A.xq8_m, N * Tc, 1, g_st);   // Tc contiguous rows = one column (q36)
         k_to_f16<<<grid1((int64_t) Tc * N), kThreads>>>((const float*) A.h_m, A.x16, (int64_t) Tc * N);   // ffn-norm h for the shared-FFN GEMMs (the router sgemm takes fp32 h_m directly)
-        // POOL_ALL: the pool for EVERY layer (the 25 "native" ones too).  Measured on this box: neutral at
-        // pp512 (the pool leg is small), -9% at 4K (the Q4_K grouped kernel's 8.6 s and the 98 GB of staging
-        // both vanish) and -17% at 32K (255.7 s vs 308.4 s).  The env value CAPS the rule: 0 = off, 1 = on
-        // always, 2 = on for a prefix >= 4K (the default: the win needs a long prefix).
-        static const int pool_all_mode = [] {
-            const char* v = std::getenv("STRATA_KOLIBRI_POOL_ALL");
-            if (!v || !v[0]) return 2;                       // the default: the prefix-dependent rule
-            const int m = std::atoi(v);
-            return m < 0 ? 0 : m;
-        }();
-        // The rule's threshold: the prompt's total length >= 1024 (POOL_ALL is neutral at pp512 - the pool leg
-        // is small - and wins from ~4K up: -9% at 4K, -17% at 32K).
-        const bool pool_all = pool_all_mode == 1 || (pool_all_mode >= 2 && e.pf_total >= 1024);
         // The cache branch stays pool-side: routing the native_ok layers' grouped kernel through the fp16 cache
         // measured KL 0.13050 (gate FAIL) - that kernel is bitwise-equal to llama.cpp's arithmetic, and fp16
         // weights+activations deviate ~1e-3 per layer across 50 layers, which the KL-vs-llama clause forbids.
@@ -2326,6 +2332,8 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
         // to do this per branch (:2321 and :2365); one copy of the same bytes earlier is byte-identical.
         g_ids_host.resize((size_t) NKc);
         KC(cudaMemcpy(g_ids_host.data(), A.ids_m, (size_t) NKc * sizeof(int), cudaMemcpyDeviceToHost));
+        };
+        auto layer_post = [&] {
         if (b.native_ok && !(pool_all && e.cpu_threads > 0)) {
             if (e.counters && e.slots > 0) {   // pricing only; --counters runs
                 std::vector<int> hid((size_t) NKc);
@@ -2665,6 +2673,9 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
         k_add_rows<<<grid1((int64_t) Tc * N), kThreads>>>(A.x_m, A.moe_m, (int64_t) Tc * N);
         pp_mark(e.cnt.pf_tail_ns);   // the MoE sum + post-ffw norm + residual
         KC(cudaGetLastError());
+        };
+        layer_pre();
+        layer_post();
     }
     }
     // the tail runs once, on the LAST chunk processed (chunk 2 when the wavefront is on)
