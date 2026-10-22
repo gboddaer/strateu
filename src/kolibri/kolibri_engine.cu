@@ -2043,11 +2043,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
 /// one grouped launch per layer (T*K entries), the Q6_K-down layers through the mmvq loop with host ids.
 /// Bitwise vs the per-token plain path is not expected (FP16 GEMM scores); the gates are the KL parity and the
 /// serve==tokens agreement.
-void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
-    // A2b step 2: the per-chunk activation set is an explicit object, not a set of Scratch fields, so a wavefront can hand
-    // either of two sets to the same layer body.  Step 2 keeps ONE chunk in flight and always uses act1, which is the same
-    // memory the layer used before - a pure aliasing change, so PF_HASH and the oracle must not move.
-    ActSet& A = s.act1;
+void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t p02 = 0) {
     const auto& g = e.g;
     const int N = (int) g.n_embd, K = (int) e.top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
     const int H = (int) g.n_head, HKV = (int) g.n_head_kv, D = (int) g.head_dim;
@@ -2056,13 +2052,6 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
     cublasHandle_t blas = e.blas;
     const float one = 1.0f, zero = 0.0f;
     const Dense& emb = e.dense.at("token_embd.weight");
-    switch (emb.type) {
-    case T_Q8_0: k_row_multi<T_Q8_0><<<dim3(T, 4), 128>>>(emb.d, emb.row_bytes, A.toks_d, N, A.x_m); break;
-    case T_Q4_K: k_row_multi<T_Q4_K><<<dim3(T, 4), 128>>>(emb.d, emb.row_bytes, A.toks_d, N, A.x_m); break;
-    case T_Q6_K: k_row_multi<T_Q6_K><<<dim3(T, 4), 128>>>(emb.d, emb.row_bytes, A.toks_d, N, A.x_m); break;
-    case T_F16: k_row_multi<T_F16><<<dim3(T, 4), 128>>>(emb.d, emb.row_bytes, A.toks_d, N, A.x_m); break;
-    default: std::fprintf(stderr, "strata-kolibri: token_embd type %d\n", emb.type); std::exit(1);
-    }
     const bool pph = attn_phases_on();   // S7: the prefill's per-layer phase marks (the same gate as the attn timers)
     std::chrono::steady_clock::time_point pp_t0{};
     auto pp_mark = [&](long long& acc) {
@@ -2072,7 +2061,29 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
         acc += std::chrono::duration_cast<std::chrono::nanoseconds>(n - pp_t0).count();
         pp_t0 = n;
     };
-    for (int64_t l = 0; l < g.n_layers; ++l) {
+    // A2b: the per-chunk parameters, rebound per (chunk, layer) pair inside the diagonal.
+    int Tc = T;
+    int64_t p0c = p0;
+    // **A2b: the diagonal.**  With one chunk (T2 == 0) this is exactly the old `for l` loop - same order, same values.  With two
+    // chunks in flight it walks (c, L) along c + L == step, rebinding the three per-chunk values (Tc, p0c, A) for each pair,
+    // so the GPU can run chunk c+1's PRE half while the host drains chunk c's pool.  The body below is untouched.
+    const int n_ch = (T2 > 0 && pf_pipe_on()) ? 2 : 1;
+    for (int64_t step = 0; step < g.n_layers + n_ch - 1; ++step) {
+    for (int ci = 0; ci < n_ch; ++ci) {
+        const int64_t l = step - ci;
+        if (l < 0 || l >= g.n_layers) continue;
+        ActSet& A = (ci == 0) ? s.act1 : s.act2;
+        Tc = (ci == 0) ? T : T2;
+        p0c = (ci == 0) ? p0 : p02;
+        if (l == 0) {   // each chunk embeds its own tokens at its layer 0, with its own set
+            switch (emb.type) {
+            case T_Q8_0: k_row_multi<T_Q8_0><<<dim3(Tc, 4), 128>>>(emb.d, emb.row_bytes, A.toks_d, N, A.x_m); break;
+            case T_Q4_K: k_row_multi<T_Q4_K><<<dim3(Tc, 4), 128>>>(emb.d, emb.row_bytes, A.toks_d, N, A.x_m); break;
+            case T_Q6_K: k_row_multi<T_Q6_K><<<dim3(Tc, 4), 128>>>(emb.d, emb.row_bytes, A.toks_d, N, A.x_m); break;
+            case T_F16: k_row_multi<T_F16><<<dim3(Tc, 4), 128>>>(emb.d, emb.row_bytes, A.toks_d, N, A.x_m); break;
+            default: std::fprintf(stderr, "strata-kolibri: token_embd type %d\n", emb.type); std::exit(1);
+            }
+        }
         // A2b: the chunk parameters are per-ITERATION now, not per-call: one chunk sets them once (identical values), and a
         // diagonal driver will rebind them per (chunk, layer) pair.  Nothing else changes, so PF_HASH must stay identical.
         int Tc = T;
@@ -2654,7 +2665,11 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0) {
         pp_mark(e.cnt.pf_tail_ns);   // the MoE sum + post-ffw norm + residual
         KC(cudaGetLastError());
     }
-    k_rms<<<1, kThreads>>>(A.x_m + (size_t) (T - 1) * N, e.f32.at("output_norm.weight"), s.h, N, e.eps);
+    }
+    // the tail runs once, on the LAST chunk processed (chunk 2 when the wavefront is on)
+    ActSet& Alast = (n_ch == 2) ? s.act2 : s.act1;
+    const int Tlast = (n_ch == 2) ? T2 : T;
+    k_rms<<<1, kThreads>>>(Alast.x_m + (size_t) (Tlast - 1) * N, e.f32.at("output_norm.weight"), s.h, N, e.eps);
     gemv_dec(e.dense.at("output.weight"), s.h, s.dec_h16, s.logits, 0);
     KC(cudaDeviceSynchronize());
 }
