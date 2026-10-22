@@ -1573,6 +1573,10 @@ struct ActSet {
     // global vector, chunk 2's publish overwrote chunk 1's before chunk 1's POST used them, which is exactly the
     // deterministic id difference that survived F16=0 and STAGE=0 (8 uses).
     std::vector<int> ids_host;
+    // A2b: the compacted SLIDING window, which k_kv_ring refills per chunk.  Shared, chunk 2 would
+    // re-describe the window chunk 1's attention was built on.
+    __half *k16 = nullptr;
+    __half *v16 = nullptr;
 };
 
 struct Scratch {
@@ -1654,6 +1658,8 @@ struct Scratch {
     unsigned long long *grp_ptr_m2 = nullptr;
     float *ey_h2 = nullptr;   // A2b: the second chunk's pinned expert-output block
     float *wts_m2 = nullptr;
+    __half *k16_2 = nullptr;
+    __half *v16_2 = nullptr;
     float *sg_m = nullptr, *su_m = nullptr, *sh_m = nullptr;
     float *gout_m = nullptr, *eg_m = nullptr, *eu_m = nullptr, *eh_m = nullptr;
     ActSet act1, act2;   // A2b: the two per-chunk activation sets (act2 only when STRATA_KOLIBRI_PF_PIPE is on)
@@ -2098,10 +2104,9 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
             default: std::fprintf(stderr, "strata-kolibri: token_embd type %d\n", emb.type); std::exit(1);
             }
         }
-        // A2b: the chunk parameters are per-ITERATION now, not per-call: one chunk sets them once (identical values), and a
-        // diagonal driver will rebind them per (chunk, layer) pair.  Nothing else changes, so PF_HASH must stay identical.
-        int Tc = T;
-        int64_t p0c = p0;
+        // A2b: Tc/p0c/NKc are rebound per (chunk, layer) pair ABOVE (just after `if (l < 0 ...) continue`).  They must NOT be
+        // redeclared here: `int Tc = T; int64_t p0c = p0;` used to shadow the rebind, so every chunk-2 pair silently ran with
+        // chunk 1's T and position p0 - which is what made the wavefront's ids differ while being perfectly deterministic.
         // **A2b: the body in two halves.**  layer_pre is pure GPU enqueue (norm -> attention -> router -> publish);
         // layer_post is the host-blocking half (expert leg, scatter/H2D, shared expert, MoE sum, residual).  Called
         // back to back this is the old order, and the gate (ids first) is what proves it.
@@ -2147,17 +2152,17 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
         const int P = sliding ? (int) std::min<int64_t>(p0c + Tc, g.n_swa) : (int) (p0c + Tc);
         const int64_t first = sliding ? p0c + Tc - P : 0;
         if (sliding)
-            k_kv_ring<<<grid1((int64_t) HKV * P * D), kThreads>>>(s.kc[l], s.vc[l], s.k16, s.v16, g.n_swa, P,
+            k_kv_ring<<<grid1((int64_t) HKV * P * D), kThreads>>>(s.kc[l], s.vc[l], A.k16, A.v16, g.n_swa, P,
                                                                   first, D, HKV);
         k_to_f16<<<grid1((int64_t) Tc * H * D), kThreads>>>(A.q_m, A.q16, (int64_t) Tc * H * D);
         if (attn_mma_on() && H == 48 && HKV == 4 && D == 128) {
             k_attn_flash_mma<<<dim3((unsigned) ((Tc + 15) / 16), (unsigned) (HKV * 4)), 128, 0, g_st>>>(
-                A.q16, sliding ? s.k16 : s.kc[l], sliding ? s.v16 : s.vc[l], A.att_m, (int) H,
+                A.q16, sliding ? A.k16 : s.kc[l], sliding ? A.v16 : s.vc[l], A.att_m, (int) H,
                 sliding ? (long long) P : (long long) s.ctx, (int) Tc, P, (int) p0c,
                 sliding ? (int64_t) g.n_swa : 0, (int) first, 1.0f / sqrtf((float) D));
         } else if (attn_flash_on() && H == 48 && HKV == 4 && D == 128) {
             k_attn_flash<<<dim3((unsigned) ((Tc + 7) / 8), (unsigned) HKV), 256, 0, g_st>>>(
-                A.q16, sliding ? s.k16 : s.kc[l], sliding ? s.v16 : s.vc[l], A.att_m, (int) H,
+                A.q16, sliding ? A.k16 : s.kc[l], sliding ? A.v16 : s.vc[l], A.att_m, (int) H,
                 sliding ? (long long) P : (long long) s.ctx, (int) Tc, P, (int) p0c,
                 sliding ? (int64_t) g.n_swa : 0, (int) first, 1.0f / sqrtf((float) D));
         } else {
@@ -2178,9 +2183,9 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
         if (attn_kg_on() && (int64_t) Tc * ldp <= attn_cap_floats()) {
             const int Bh = (int) std::max<int64_t>(1, std::min<int64_t>(G, attn_cap_floats() / ((size_t) Tc * ldp)));
             for (int kvh = 0; kvh < HKV; ++kvh) {
-                const __half* Kh = sliding ? s.k16 + (size_t) kvh * P * D
+                const __half* Kh = sliding ? A.k16 + (size_t) kvh * P * D
                                            : s.kc[l] + (size_t) kvh * s.ctx * D;
-                const __half* Vh = sliding ? s.v16 + (size_t) kvh * P * D
+                const __half* Vh = sliding ? A.v16 + (size_t) kvh * P * D
                                            : s.vc[l] + (size_t) kvh * s.ctx * D;
                 for (int hb = 0; hb < G; hb += Bh) {
                     const int nb = std::min(Bh, G - hb);
@@ -2209,7 +2214,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
         } else for (int t0 = 0; t0 < Tc; t0 += tq) {
             const int nt = std::min(tq, Tc - t0);
             for (int kvh = 0; kvh < HKV; ++kvh) {
-                const __half* Kh = sliding ? s.k16 + (size_t) kvh * P * D
+                const __half* Kh = sliding ? A.k16 + (size_t) kvh * P * D
                                                : s.kc[l] + (size_t) kvh * s.ctx * D;
                 const __half* Qh = A.q16 + ((size_t) t0 * H + kvh * G) * D;
                 float* Sh = s.att_s + (size_t) kvh * G * nt * ldp;
@@ -2229,7 +2234,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                                                         1.0f / sqrtf((float) D), sliding ? g.n_swa : 0, (int) first);
             ph_close(e.cnt.attn_sm_ns);
             for (int kvh = 0; kvh < HKV; ++kvh) {
-                const __half* Vh = sliding ? s.v16 + (size_t) kvh * P * D
+                const __half* Vh = sliding ? A.v16 + (size_t) kvh * P * D
                                                : s.vc[l] + (size_t) kvh * s.ctx * D;
                 const __half* Ph = s.p16 + (size_t) kvh * G * nt * ldp;
                 float* Oh = A.att_m + ((size_t) t0 * H + kvh * G) * D;
@@ -2845,6 +2850,10 @@ void init_scratch(const Engine& e, Scratch& s) {
         KC(cudaMalloc((void**) &s.att16, (size_t) T * hd * f16));
         KC(cudaMalloc((void**) &s.k16, (size_t) g.n_head_kv * s.ctx * g.head_dim * f16));
         KC(cudaMalloc((void**) &s.v16, (size_t) g.n_head_kv * s.ctx * g.head_dim * f16));
+        if (pf_pipe_on()) {
+            KC(cudaMalloc((void**) &s.k16_2, (size_t) g.n_head_kv * s.ctx * g.head_dim * f16));
+            KC(cudaMalloc((void**) &s.v16_2, (size_t) g.n_head_kv * s.ctx * g.head_dim * f16));
+        }
         // the scores slice is H * tq * ldp; the runtime tq uses the chunk's ldp (>= 512), so the worst case is
         // tq_w * 512 is the nt * ldp bound the buffer must cover (== the attn cap / H); nt * ldp <= tq_w * 512
         const size_t tq_w = std::max<int64_t>(1, (int64_t) (attn_cap_floats() / ((size_t) g.n_head * 512)));
@@ -2885,6 +2894,8 @@ void init_scratch(const Engine& e, Scratch& s) {
         if (pf_pipe_on()) s.act2.ey_h = s.ey_h2;
         s.act1.wts_m = s.wts_m;
         if (pf_pipe_on()) s.act2.wts_m = s.wts_m2;
+        s.act1.k16 = s.k16; s.act1.v16 = s.v16;
+        if (pf_pipe_on()) { s.act2.k16 = s.k16_2; s.act2.v16 = s.v16_2; }
         if (expert_f16_n() > 0) {   // S7 increment B/C: resident-expert GEMM working set (device + pinned)
             const int64_t rrows = (int64_t) Scratch::kResBlkMax * Scratch::kResBlk;
             KC(cudaMalloc((void**) &s.res_x16, (size_t) rrows * N * 2));
