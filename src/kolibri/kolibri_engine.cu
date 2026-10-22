@@ -102,6 +102,15 @@ static inline bool env_on(const char* name) {
     return v != nullptr && v[0] != 0 && std::atoi(v) != 0;
 }
 
+// S8b/B1: the vectorized F32 decode gemv (the router).  Declared here because `gemv` (the dispatcher) is far above the
+// per-feature gates; bitwise by construction, env-gated until measured.
+static inline bool dec_gemv_v4_on() {
+    // ON by default: bitwise (oracle BITWISE PASS with it enabled, and the router feeds the ids), two-run measured at
+    // tg 26.7 vs 25.1/25.2 for the scalar read.  STRATA_KOLIBRI_DEC_GEMV_V4=0 is the A/B arm.
+    const char* v = std::getenv("STRATA_KOLIBRI_DEC_GEMV_V4");
+    return v == nullptr || (v[0] != 0 && std::atoi(v) != 0);
+}
+
 // The same value-parse for a gate that is ON unless the env says otherwise (an unset gate must not silently
 // disable a default: "STRATA_KOLIBRI_PF_PIN=0" is the A/B arm, an absent variable is the shipped behaviour).
 static inline bool env_on_default_on(const char* name) {
@@ -460,6 +469,34 @@ __global__ void k_gemv(const uint8_t* W, size_t row_bytes, size_t expert_bytes, 
     acc = block_sum(acc, sh);
     if (threadIdx.x == 0) y[(size_t) sel * n_out + o] = acc;
 }
+// S8b/B1: the DECODE's F32 dense gemv - the router, 3.75 MiB/layer read on every token - runs at 57 GB/s (69 us a call,
+// 3.44 ms/token) against a 0.62 ms bandwidth floor, because k_gemv<T_F32> reads each 32-float chunk as 32 separate
+// 4-byte loads.  This reads the row as eight 16-byte float4 loads instead and keeps EVERYTHING else identical: the
+// chunk order (thread tid walks c = tid, tid+128, ... over n_in/32 chunks), the l = 0..31 ascending accumulation, and
+// the same 128-lane block_sum tree - so it is bitwise by construction, which the oracle checks.
+__global__ void k_gemv_f32_v4(const float* __restrict__ W, const float* __restrict__ x, int n_in, float* y, int n_out) {
+    __shared__ float sh[kThreads];
+    const int o = blockIdx.x;
+    const float* row = W + (size_t) o * (size_t) n_in;
+    float acc = 0.f;
+    for (int c = threadIdx.x; c < n_in / 32; c += blockDim.x) {
+        const float4* r4 = reinterpret_cast<const float4*>(row + 32 * c);
+        const float4* x4 = reinterpret_cast<const float4*>(x + 32 * c);
+        float v[32];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const float4 a = r4[k], b = x4[k];
+            v[4 * k + 0] = a.x * b.x;
+            v[4 * k + 1] = a.y * b.y;
+            v[4 * k + 2] = a.z * b.z;
+            v[4 * k + 3] = a.w * b.w;
+        }
+        for (int l = 0; l < 32; ++l) acc += v[l];   // same ascending order as k_gemv's acc += v[l] * xc[l]
+    }
+    acc = block_sum(acc, sh);
+    if (threadIdx.x == 0) y[o] = acc;
+}
+
 /// S7: the prefill router GEMM, tiled over 32 tokens per block.  nsys priced k_gemv<T_F32> at 19 ms x 100 =
 /// 1.94 s of the pp512 wall: 196k tiny blocks (one per expert x token), each reading the 10 KB row, launch-
 /// and latency-bound at 53 GFLOP/s.  Here one block per (expert, 32-token tile) loads the row ONCE and reuses
@@ -1454,6 +1491,11 @@ void gemv(const Dense& w, const float* x, float* y, const int* ids, int n_sel, s
         return;
     }
     const size_t row_bytes = w.row_bytes;
+    if (dec_gemv_v4_on() && w.type == T_F32 && n_sel == 1 && ids == nullptr && x_stride == 0) {
+        k_gemv_f32_v4<<<n_out, kThreads, 0, st>>>((const float*) W, x, n_in, y, n_out);
+        KC(cudaGetLastError());
+        return;
+    }
     switch (w.type) {
     case T_F32: k_gemv<T_F32><<<dim3(n_out, n_sel), kThreads, 0, st>>>(W, row_bytes, eb, ids, n_in, x, x_stride, y, n_out); break;
     case T_F16: k_gemv<T_F16><<<dim3(n_out, n_sel), kThreads, 0, st>>>(W, row_bytes, eb, ids, n_in, x, x_stride, y, n_out); break;
@@ -1641,6 +1683,7 @@ static inline bool dec_phases_on() {
 // fall to ~8 ms.  Off by default: it changes the decode's arithmetic (fp16 experts instead of the q8 pool), so it
 // needs the KL gate before it can be a default.
 static inline bool dec_res_on() { return env_on("STRATA_KOLIBRI_DEC_RES"); }
+
 
 // K30: run the decode's SHARED EXPERT during the CPU pool drain.  It depends only on `h` (already computed), so its
 // five launches can be enqueued before pool_experts and the GPU executes them while the host computes the routed
