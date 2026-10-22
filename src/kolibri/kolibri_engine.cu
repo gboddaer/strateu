@@ -1077,6 +1077,24 @@ template <int TY> __global__ void k_row_multi(const uint8_t* W, size_t row_bytes
     for (int c = blockIdx.y * blockDim.x + threadIdx.x; c < n / 32; c += 4 * blockDim.x) deq32<TY>(r, c, dst + 32 * c);
 }
 /// multi-token q/k/v prep: block (head, t); pos = p0 + t.  q rows T x H x D, k/v rows T x HKV x D.
+
+/// A2b/needle: the RoPE angle.  This target is built with `--use_fast_math`, so `cosf`/`sinf` become `__cosf`/`__sinf`,
+/// whose argument reduction degrades as |theta| grows - and theta = pos * base^(-2i/D) is ~1e5 radians at position 1e5.
+/// That is invisible at 32K and material at 98K, which is exactly where the 100K depth-90 needle parts from llama.cpp
+/// (measured: step 10 top-1 logit 14.30 vs the reference's 16.79 on token 122).  The gate computes the angle in double,
+/// the way the reference does, so the hypothesis can be tested end-to-end before it is believed.
+__device__ int g_rope_f64 = 0;
+__device__ inline void rope_cs_sn(int64_t pos, float base, int pp, int D, float& cs, float& sn) {
+    if (g_rope_f64) {
+        const double th = (double) pos * pow((double) base, -2.0 * (double) pp / (double) D);
+        cs = (float) cos(th); sn = (float) sin(th);
+    } else {
+        // the ORIGINAL expression, character for character: the gate-off arm must stay bitwise identical (PF_HASH)
+        const float theta = (float) pos * powf(base, -2.0f * (float) pp / (float) D);
+        cs = cosf(theta); sn = sinf(theta);
+    }
+}
+
 __global__ void k_attn_prep_multi(const float* qx, const float* kx, const float* vx, const float* qw, const float* kw,
                                   float* q, __half* kc, __half* vc, int H, int HKV, int D, int64_t p0, int64_t swa,
                                   int ctx, float base, float eps, bool rope) {
@@ -1103,8 +1121,8 @@ __global__ void k_attn_prep_multi(const float* qx, const float* kx, const float*
         float v = buf[i];
         if (rope) {
             const int pp = i < half ? i : i - half;
-            const float theta = (float) pos * powf(base, -2.0f * (float) pp / (float) D);
-            const float cs = cosf(theta), sn = sinf(theta);
+            float cs, sn;
+            rope_cs_sn(pos, base, pp, D, cs, sn);
             v = i < half ? buf[i] * cs - buf[i + half] * sn : buf[i - half] * sn + buf[i] * cs;
         }
         if (isq) dstq[i] = v; else dstk[i] = v;
@@ -1183,8 +1201,8 @@ __device__ void k_attn_prep_body(const float* qx, const float* kx, const float* 
         float v = buf[i];
         if (rope) {
             const int p = i < half ? i : i - half;
-            const float theta = (float) pos * powf(base, -2.0f * (float) p / (float) D);
-            const float cs = cosf(theta), sn = sinf(theta);
+            float cs, sn;
+            rope_cs_sn(pos, base, p, D, cs, sn);
             v = i < half ? buf[i] * cs - buf[i + half] * sn : buf[i - half] * sn + buf[i] * cs;
         }
         if (isq) dstq[i] = v; else dstk[i] = v;
@@ -2908,6 +2926,10 @@ void init_scratch(const Engine& e, Scratch& s) {
         if (pf_pipe_on()) s.act2.ey_h = s.ey_h2;
         s.act1.wts_m = s.wts_m;
         if (pf_pipe_on()) s.act2.wts_m = s.wts_m2;
+        // A2b/needle: the RoPE angle precision gate (see rope_cs_sn).  Mirrored through the ACCESSOR, not the raw
+        // env parse, so the device symbol and the host agree about the default.
+        { const int rf64 = env_on("STRATA_KOLIBRI_ROPE_F64") ? 1 : 0;
+          KC(cudaMemcpyToSymbol(g_rope_f64, &rf64, sizeof(int))); }
         // A2a: pinned ids + one event per chunk (both chunk 1's, always: the single-chunk path uses them too and
         // cudaMemcpyAsync + record + wait is bitwise the old blocking copy).
         KC(cudaHostAlloc((void**) &s.ids_h, (size_t) 8192 * K * sizeof(int), cudaHostAllocDefault));
