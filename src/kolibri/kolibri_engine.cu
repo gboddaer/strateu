@@ -3860,7 +3860,12 @@ int strata::kolibri::run(int argc, char** argv) {
         }
     }
     int tok = ids[0];
-    if (e.prefill > 0 && fl == nullptr) {   // chunked prefill: the whole prompt minus its last token (layer dumps stay per-token)
+    // Chunked prefill: the whole prompt minus its last token.  A layer dump used to force the per-token path here
+    // (`fl == nullptr`), which had two costs: the instrument became unusable at 100K (per-token prefill > 65 min) AND
+    // it measured a path the engine no longer ships.  It is not needed - the chunks fill the KV for ids[0..n-2] and
+    // the decode loop's first forward() below processes ids.back() WITH the dump, so the chunked path emits exactly
+    // the rows a layer-by-layer comparison wants: 1 (final prompt position) + n_gen (generated steps).
+    if (e.prefill > 0) {
         int64_t i = 0;
         const int64_t n = (int64_t) ids.size() - 1;
         e.pf_total = n;   // the POOL_ALL rule: one decision for the whole prompt
