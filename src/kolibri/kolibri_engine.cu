@@ -130,6 +130,20 @@ static inline int expert_f16_n() {
 // S7 prong A: the prefill scores-buffer cap, in floats (STRATA_KOLIBRI_ATTN_MB, MiB; default 48 = the old
 // kAttScoreFloats 12<<20).  The tq loop batches this many score elements at once; larger caps (e.g. 384) cut
 // the K/V re-read amplification and give cublas real M at deep prefixes.  Gate-off (default) = bitwise today.
+// P1b: the tiled path stores softmax probabilities as fp16 before the PV product.  At 32K+ keys each probability is
+// ~1e-5, where fp16 keeps barely three digits, so the PV sum loses precision that grows with the key count - measured
+// against the llama.cpp reference, the layer-1 relative divergence rises 0.0017 -> 0.020 -> 0.037 for 512 -> 8K -> 98.6K
+// tokens.  Scaling by a power of two before the store (and folding 1/S into the PV GEMM's alpha) preserves the fp16
+// mantissa at no cost: no extra pass, no extra memory.  Default 1 = today's behaviour, bit for bit.
+static inline float pv_scale() {
+    static const float s = [] {
+        const char* v = std::getenv("STRATA_KOLIBRI_PV_SCALE");
+        const float f = v ? (float) std::atof(v) : 1.0f;
+        return f > 0.f ? f : 1.0f;
+    }();
+    return s;
+}
+
 static inline int64_t attn_cap_floats() {
     static const int64_t mb = [] {
         const char* v = std::getenv("STRATA_KOLIBRI_ATTN_MB");
@@ -1025,7 +1039,7 @@ __global__ void k_kv_ring(const __half* kc, const __half* vc, __half* k16, __hal
 /// The prompt's causal softmax (window-masked for sliding layers: cells before pos0+t+1-swa are zero): row (h, t)
 /// of S (ld floats, P cells) -> softmax(S * scale) over [lo, pos0+t+1), FP16 out.  grid (T, H), block 256.
 __global__ void k_attn_softmax16(const float* S, __half* S16, int ld, int T, int P, int pos0, float scale,
-                                 int64_t swa, int first) {
+                                 int64_t swa, int first, float scl) {
     __shared__ float sh[kThreads];
     const int t = blockIdx.x, h = blockIdx.y;
     const float* row = S + ((size_t) h * T + t) * ld;
@@ -1040,7 +1054,7 @@ __global__ void k_attn_softmax16(const float* S, __half* S16, int ld, int T, int
     sum = block_sum(sum, sh);
     const float inv = 1.0f / sum;
     for (int p = threadIdx.x; p < P; p += blockDim.x)
-        out[p] = __float2half(p >= lo && p < n ? expf(row[p] * scale - mx) * inv : 0.f);
+        out[p] = __float2half(p >= lo && p < n ? expf(row[p] * scale - mx) * inv * scl : 0.f);
 }
 /// rms over T rows: row t of x -> row t of out.  grid (T), block kThreads.
 __global__ void k_rms_rows(const float* x, const float* w, float* out, int n, float eps) {
@@ -2228,11 +2242,12 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                     ph_close(e.cnt.attn_sc_ns);
                     k_attn_softmax16<<<dim3(Tc, nb), kThreads>>>(Sh, s.p16 + (size_t) (hb / Bh) * Tc * ldp,
                                                                 ldp, Tc, P, p0c, 1.0f / sqrtf((float) D),
-                                                                sliding ? g.n_swa : 0, (int) first);
+                                                                sliding ? g.n_swa : 0, (int) first, pv_scale());
                     ph_close(e.cnt.attn_sm_ns);
                     const __half* Ph = s.p16 + (size_t) (hb / Bh) * Tc * ldp;
                     float* Oh = A.att_m + (size_t) (kvh * G + hb) * D;
-                    if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, D, Tc, P, &one, Vh, CUDA_R_16F, D, 0,
+                    const float pv_alpha = 1.0f / pv_scale();   // undoes the fp16-mantissa-preserving scale above
+                    if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, D, Tc, P, &pv_alpha, Vh, CUDA_R_16F, D, 0,
                                                    Ph, CUDA_R_16F, ldp, (long long) Tc * ldp, &zero, Oh, CUDA_R_32F,
                                                    H * D, D, nb, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
                         CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "strata-kolibri: PV GEMM failed\n"); std::exit(1); }
@@ -2259,7 +2274,8 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
             }
             ph_close(e.cnt.attn_sc_ns);
             k_attn_softmax16<<<dim3(nt, H), kThreads>>>(s.att_s, s.p16, ldp, nt, P, (int) p0c + t0,
-                                                        1.0f / sqrtf((float) D), sliding ? g.n_swa : 0, (int) first);
+                                                        1.0f / sqrtf((float) D), sliding ? g.n_swa : 0, (int) first,
+                                                        1.0f);   // the big-T branch is unscaled (its PV alpha stays 1)
             ph_close(e.cnt.attn_sm_ns);
             for (int kvh = 0; kvh < HKV; ++kvh) {
                 const __half* Vh = sliding ? A.v16 + (size_t) kvh * P * D
