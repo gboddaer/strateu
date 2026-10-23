@@ -143,7 +143,11 @@ int main(int argc, char** argv) {
     // A long-context prompt must be prefilled in BATCHES: with n_batch = n_ubatch = n_ctx a 105K-token prompt makes
     // llama.cpp reserve a compute graph for a 105K batch (measured: "allocating 76463.15 MiB on device 0 ... failed to
     // allocate CUDA0 buffer of size 80177422080").  The context stays nctx; only the batch is bounded.
-    cp.n_batch = cp.n_ubatch = std::min(nctx, 2048);
+    // STRATA_DUMP_BATCH: the prefill batch width.  It changes only the ORDER of the fp accumulations, so running the same
+    // prompt at two widths measures the reference's own numerical stability - the ground truth for a marginal token at
+    // 98.6K is only usable if it does not move when nothing about the model changes.
+    const char* bt = std::getenv("STRATA_DUMP_BATCH");
+    cp.n_batch = cp.n_ubatch = bt ? std::min(nctx, std::atoi(bt)) : std::min(nctx, 2048);
     cp.op_offload = ngl > 0;   // --ngl 0 is the CPU backend: no prompt matmuls offloaded to a GPU either
     cp.cb_eval = on_tensor;
     cp.cb_eval_user_data = &cap;
@@ -178,7 +182,8 @@ int main(int argc, char** argv) {
     // 76 GB allocation failure).  Ingest it in bounded slices; the last slice carries the final token, whose logits are
     // what the first generated token needs.
     {
-        const size_t kSlice = 2048;
+        // derive the slice from the batch width: a slice wider than n_batch trips GGML_ASSERT(n_tokens_all <= n_batch)
+        const size_t kSlice = std::min<size_t>(2048, (size_t) cp.n_batch);
         for (size_t off = 0; off < ids.size(); off += kSlice) {
             const size_t m = std::min<size_t>(kSlice, ids.size() - off);
             // explicit batch: llama_batch_get_one marks no token for logits, so a chunked ingest ends with n_outputs=0
