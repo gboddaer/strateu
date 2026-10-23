@@ -61,6 +61,7 @@ std::vector<int> parse_ids(const std::string& s) {
 int main(int argc, char** argv) {
     std::string model, prompt, tokens, tokens_file, dump_layers, dump_logits, force, dump_full;
     int n_gen = 64, ngl = 99, n_cpu_moe = 0;
+    ggml_type kv_type = GGML_TYPE_F16;   // the default; --kv-type overrides it for the precision floor test
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string a = argv[i], v = argv[i + 1];
         if (a == "--model") model = v;
@@ -76,6 +77,15 @@ int main(int argc, char** argv) {
         else if (a == "--dump-logits") dump_logits = v;
         else if (a == "--force") force = v;
         else if (a == "--dump-full-logits") dump_full = v;
+        // --kv-type f32 runs the reference with fp32 K/V instead of the default fp16.  The floor test needs it: if the
+        // reference's own answer moves when its KV precision changes, then a marginal token at 98.6K is precision-bound
+        // for BOTH engines and the requirement has to be scoped accordingly; if it does not move, the defect is ours.
+        else if (a == "--kv-type") {
+            if (v == "f32") kv_type = GGML_TYPE_F32;
+            else if (v == "f16") kv_type = GGML_TYPE_F16;
+            else if (v == "bf16") kv_type = GGML_TYPE_BF16;
+            else { std::fprintf(stderr, "--kv-type takes f32, f16 or bf16\n"); return 2; }
+        }
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
     // STRATA_DUMP_NGL: the GPU layers when the caller asks for the GPU (--ngl > 0) but the file does not fit (the
@@ -128,6 +138,8 @@ int main(int argc, char** argv) {
     const char* cx = std::getenv("STRATA_DUMP_CTX");
     const int nctx = cx ? std::atoi(cx) : 4096;
     cp.n_ctx = nctx;
+    cp.type_k = kv_type;
+    cp.type_v = kv_type;
     // A long-context prompt must be prefilled in BATCHES: with n_batch = n_ubatch = n_ctx a 105K-token prompt makes
     // llama.cpp reserve a compute graph for a 105K batch (measured: "allocating 76463.15 MiB on device 0 ... failed to
     // allocate CUDA0 buffer of size 80177422080").  The context stays nctx; only the batch is bounded.
