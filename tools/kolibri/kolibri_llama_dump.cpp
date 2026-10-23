@@ -189,7 +189,11 @@ int main(int argc, char** argv) {
             }
         }
     }
-    write_layers((int) ids.size());
+    // BOUNDED: write only the LAST prompt position's per-layer hidden state.  Writing every prompt token at 98.6K is
+    // 98,591 x 50 x 2560 x 4 bytes = 50 GB, which is why a layer-by-layer comparison at 100K was impossible.  The lambda
+    // takes the batch's LAST rows, so n_tok = 1 is exactly the final prompt token - the state the first generated token
+    // is read from - and each generated step then appends one row via write_layers(1) below.
+    write_layers(1);
     for (int i = 0; i < n_gen; ++i) {
         const float* lg = llama_get_logits_ith(ctx, -1);
         int a = 0, c = -1;
