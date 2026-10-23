@@ -3142,7 +3142,7 @@ void print_counters(Engine& e, const char* tag) {
         // ~40/layer.  Uniform router touches give coverage ~K/n_expert; skew above that line is what makes the
         // cache pay.
         const int NE = (int) e.touch_hist[0].size();
-        const int ks[] = {16, 24, 32, 40, 48, 64, 96, 128, 192, 256};
+        const int ks[] = {16, 24, 32, 40, 48, 64, 80, 96, 128, 192, 256, 384};   // C0: 80 and 384 added
         std::fprintf(stderr, "CNT expert touch coverage (per-layer top-K, %d layers, %d experts):\n",
                      (int) e.touch_hist.size(), NE);
         for (int K : ks) {
@@ -3159,6 +3159,25 @@ void print_counters(Engine& e, const char* tag) {
             cov /= (double) e.touch_hist.size();
             std::fprintf(stderr, "  top-%d: %.1f%% covered (uniform would be %.1f%%)\n", K, 100.0 * cov,
                          100.0 * K / NE);
+        }
+        // C0 also wants the PER-LAYER spread: if the best s differs a lot between layers, per-layer slot allocation is a
+        // second-order win at zero VRAM, and a single averaged number would hide it.
+        for (int K : {24, 80}) {
+            if (K > NE) continue;
+            std::vector<double> per;
+            per.reserve(e.touch_hist.size());
+            for (auto& h : e.touch_hist) {
+                std::vector<uint64_t> t(h);
+                std::partial_sort(t.begin(), t.begin() + K, t.end(), std::greater<uint64_t>());
+                uint64_t tot = 0, top = 0;
+                for (int i = 0; i < NE; ++i) tot += h[(size_t) i];
+                for (int i = 0; i < K; ++i) top += t[(size_t) i];
+                per.push_back(tot ? (double) top / (double) tot : 0.0);
+            }
+            std::sort(per.begin(), per.end());
+            const double med = per[per.size() / 2];
+            std::fprintf(stderr, "  top-%d per-layer spread: min %.1f%% median %.1f%% max %.1f%% (n=%d)\n",
+                         K, 100.0 * per.front(), 100.0 * med, 100.0 * per.back(), (int) per.size());
         }
     }
     if (e.pf_chunks > 0) {
