@@ -652,7 +652,14 @@ __device__ float block_max(float v, float* sh) {
         if ((int) threadIdx.x < s) sh[threadIdx.x] = fmaxf(sh[threadIdx.x], sh[threadIdx.x + s]);
         __syncthreads();
     }
-    return sh[0];
+    const float r = sh[0];
+    // THE BARRIER IS LOAD-BEARING, and it is why this file was non-deterministic: the shared array is reused by the next
+    // helper (block_sum in k_attn_softmax16).  Without a barrier here, a thread that finishes this read can overwrite
+    // sh[0] in block_sum while another thread is still reading the max, so the softmax denominator/maximum changed from
+    // run to run.  compute-sanitizer racecheck pinned 50 hazards to k_attn_softmax16 before this line existed;
+    // block_sum already had the equivalent barrier, which is what made the asymmetry so easy to miss.
+    __syncthreads();
+    return r;
 }
 __global__ void k_pos_add(int* pos) { *pos += 1; }
 // S7 increment B: gather token rows of an FP16 matrix by index (the resident-expert GEMMs take the gathered
