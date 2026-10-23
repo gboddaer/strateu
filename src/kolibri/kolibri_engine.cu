@@ -1643,6 +1643,13 @@ struct Scratch {
     std::vector<char> kt_ready;
     // the CPU expert path's pinned host side: the layer's h, its quantized activations, the FF rows, the down rows
     float* h_host = nullptr; char* act = nullptr; float* ff = nullptr; char* hq = nullptr; float* ey_h = nullptr;
+    // A2b: the SECOND host working set.  Only ey_h was double-buffered; h_host/act/ff/hq were shared between the two
+    // in-flight chunks, which was latent while the input copy was BLOCKING (the blocking copy implicitly serialised
+    // everything) and became a real race the moment it was made asynchronous: chunk B's copy landed in chunk A's buffer
+    // before A's pool read it.  PF_HASH caught it (its lines differed run to run).  These pointers let the pool path take
+    // the buffer of the chunk it is actually computing.
+    float* h_host_b = nullptr; char* act_b = nullptr; float* ff_b = nullptr; char* hq_b = nullptr;
+    float* h_host_cur = nullptr; char* act_cur = nullptr; float* ff_cur = nullptr; char* hq_cur = nullptr;
     std::vector<int32_t> exp_cnt, exp_ord;   // prefill pool: the per-expert grouping
     std::vector<int32_t> pf_touch;           // touched experts, row count DESCENDING: the LPT deal (phase timers showed 84% worker idle)
     // S7 increment B: the resident-expert fp16 GEMM working set.  Picks whose expert is in the VRAM fp16 cache
@@ -2137,6 +2144,12 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
         const int64_t l = step - ci;
         if (l < 0 || l >= g.n_layers) continue;
         ActSet& A = (ci == 0) ? s.act1 : s.act2;
+        // A2b: the pool path reads its INPUT buffers through these, so each in-flight chunk owns its own (see the note
+        // at Scratch's h_host_b).  Chunk 0 uses the original set, so the single-chunk path is unchanged.
+        s.h_host_cur = (ci == 0) ? s.h_host : s.h_host_b;
+        s.act_cur    = (ci == 0) ? s.act    : s.act_b;
+        s.ff_cur     = (ci == 0) ? s.ff     : s.ff_b;
+        s.hq_cur     = (ci == 0) ? s.hq     : s.hq_b;
         Tc = (ci == 0) ? T : T2;
         p0c = (ci == 0) ? p0 : p02;
         const int NKc = Tc * K;   // A2b: NKc is per-chunk (it was T*K at function scope, stale for ci == 1)
@@ -2466,10 +2479,23 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
             if (e.cpu_threads > 0) {   // pool_all reaches here for the native_ok layers too (the ids are copied above)   // the CPU pool: ggml's own expert arithmetic over the pinned blobs, the
                                        // chunk's NKc entries split over the pool's threads (bandwidth-bound,
                                        // ~10x the launch-bound mmvq loop on this box)
-                KC(cudaMemcpy(s.h_host, A.h_m, (size_t) Tc * N * 4, cudaMemcpyDeviceToHost));
+                // A2a (second half): the pool's INPUT copy, made asynchronous for the same reason the ids publish was.
+                // The blocking form ran on the legacy default stream, which implicitly drained g_st - including the OTHER
+                // chunk's already-enqueued PRE work - so POST's drain always began with an empty device queue and the
+                // two-chunk wavefront bought nothing (measured: GPU 23% busy, no two kernels overlapping, 8K wall 53.7 s
+                // against a max(pool, GPU) ceiling of 32.5 s).  h_host is pinned, so this copy is genuinely asynchronous;
+                // A.ev is re-recorded here, AFTER the ids copy, so layer_post's single existing wait covers both copies
+                // and nothing else - the same doorbell shape, no new event and no changed wait semantics.
+                KC(cudaMemcpyAsync(s.h_host_cur, A.h_m, (size_t) Tc * N * 4, cudaMemcpyDeviceToHost, g_st));
+                KC(cudaEventRecord(A.ev, g_st));
+                // THE WAIT BELONGS HERE, not in layer_post: the quantization loop immediately below consumes h_host_cur, and
+                // an asynchronous copy hands it nothing.  Scoping the wait to THIS chunk's event is the whole point - it does
+                // not drain the device, so the other chunk's already-enqueued PRE work keeps running through it, which is
+                // exactly what the blocking (legacy-stream) form destroyed.
+                KC(cudaEventSynchronize(A.ev));
                 for (int t = 0; t < Tc; ++t)
-                    strata::kernels::cpu::native_quant_act(b.fmt, s.h_host + (size_t) t * N,
-                                                           s.act + (size_t) t * b.fmt.act_bytes);
+                    strata::kernels::cpu::native_quant_act(b.fmt, s.h_host_cur + (size_t) t * N,
+                                                           s.act_cur + (size_t) t * b.fmt.act_bytes);
                 // group the chunk's entries by expert: one blob read per expert (the box's RAM bandwidth is the
                 // floor; per-entry reads re-stream 2.2 MB per row), all of an expert's rows in one call
                 std::vector<int32_t>& cnt = s.exp_cnt;
@@ -2624,15 +2650,15 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                             const int mm = std::min(64, m - a);
                             for (int k = 0; k < mm; ++k) {
                                 const int sel = ord[(size_t) lo + a + k];
-                                acts[k] = s.act + (size_t) (sel / K) * b.fmt.act_bytes;
-                                ffs[k] = s.ff + (size_t) sel * FF;
+                                acts[k] = s.act_cur + (size_t) (sel / K) * b.fmt.act_bytes;
+                                ffs[k] = s.ff_cur + (size_t) sel * FF;
                             }
                             const auto tA = std::chrono::steady_clock::now();
                             strata::kernels::cpu::native_gu_rows(b.fmt, blob, acts, mm, ffs, 0, FF);
                             const auto tB = std::chrono::steady_clock::now();
                             for (int k = 0; k < mm; ++k) {
                                 const int sel = ord[(size_t) lo + a + k];
-                                char* hqp = s.hq + (size_t) sel * b.fmt.h_bytes;
+                                char* hqp = s.hq_cur + (size_t) sel * b.fmt.h_bytes;
                                 strata::kernels::cpu::native_quant_h(b.fmt, ffs[k], hqp);
                                 hqs[k] = hqp;
                                 eys[k] = A.ey_h + (size_t) sel * N;
@@ -2944,7 +2970,14 @@ void init_scratch(const Engine& e, Scratch& s) {
         KC(cudaHostAlloc((void**) &s.ff, (size_t) ents * FF * 4, cudaHostAllocDefault));
         KC(cudaHostAlloc((void**) &s.hq, (size_t) ents * h_b, cudaHostAllocDefault));
         KC(cudaHostAlloc((void**) &s.ey_h, (size_t) ents * N * 4, cudaHostAllocDefault));
-        if (pf_pipe_on()) KC(cudaHostAlloc((void**) &s.ey_h2, (size_t) ents * N * 4, cudaHostAllocDefault));
+        if (pf_pipe_on()) {
+            KC(cudaHostAlloc((void**) &s.ey_h2, (size_t) ents * N * 4, cudaHostAllocDefault));
+            KC(cudaHostAlloc((void**) &s.h_host_b, (size_t) rows * N * 4, cudaHostAllocDefault));
+            KC(cudaHostAlloc((void**) &s.act_b, (size_t) rows * act_b, cudaHostAllocDefault));
+            KC(cudaHostAlloc((void**) &s.ff_b, (size_t) ents * FF * 4, cudaHostAllocDefault));
+            KC(cudaHostAlloc((void**) &s.hq_b, (size_t) ents * h_b, cudaHostAllocDefault));
+        }
+        s.h_host_cur = s.h_host; s.act_cur = s.act; s.ff_cur = s.ff; s.hq_cur = s.hq;   // chunk 0 is the original set
         s.act1.ey_h = s.ey_h;
         if (pf_pipe_on()) s.act2.ey_h = s.ey_h2;
         s.act1.wts_m = s.wts_m;
