@@ -14,6 +14,17 @@ large, smart AI model that usually needs a server. It chats, writes code, reads 
 and coding agents. Nothing leaves your PC. It also runs **[Kolibri 1](docs/KOLIBRI1.md)** (Aleph Alpha's 78B
 German & English MoE, 3.46B active) on 56 GB of RAM: `./setup.sh --family kolibri`.
 
+## About this fork
+
+**strateu** is a measured fork of [Niko1221/Strata](https://github.com/Niko1221/Strata) focused on the
+**Kolibri 1** engine (`src/kolibri`). One week of measurements made the CUDA port **bitwise deterministic**
+(prefill racecheck-clean, two-run diffs 0.0) and **KL-gated against llama.cpp** (0.00132 on 109 answer steps,
+top-1 0.982, plain-path oracle BITWISE). On a 16 GB card it meets every campaign speed floor: about
+**154 tokens/s** prefill after a 32K prompt and **48 tokens/s** generation short and after 32K, with 100K
+needle recall 4/5 and both misses recorded (the llama.cpp reference is itself unstable at that length).
+The gates and speed config live in `tools/kolibri/`; every number is two-run with its box load stated, and the
+full evidence trail is [the campaign report](docs/strateu-campaign-report.md) and the ledgers under `docs/superpowers/plans/`.
+
 ## How fast is it?
 
 We measured it on two ordinary gaming PCs. A token is about ¾ of a word.
