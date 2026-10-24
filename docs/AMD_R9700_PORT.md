@@ -482,6 +482,26 @@ of that box's smaller CPU-vs-GPU divergence.
 | `pinned_shared_test` | `OK` - the pinned-allocation path the whole design rests on | **0** |
 | `file_expert_source_test` | `PASS` | **0** |
 
+## The parity harness's layer-error figure is an artifact - do not read it as a defect
+
+`parity.py` reports `layers max rel err 22.20, median ~1.15` on this box, which reads like the AMD path
+is 115% wrong per layer. It is not, and the KL proves it: 0.00182 with top-1 agreement 0.9884 is not
+reachable from layer outputs that badly off. The cause is in the dumps themselves - for `p00` the two
+layer files are **different lengths**:
+
+| file | bytes | positions at 50 layers x 2560 embd x f32 |
+|---|---|---|
+| `p00.strata.layers` | 60,928,000 | **119** |
+| `p00.llama.layers` | 32,768,000 | **64** |
+
+`strata-kolibriref` dumps prompt-plus-generated positions; `kolibri_llama_dump` dumps the generated
+ones. Both reshape cleanly on their own, so nothing raises, but the elementwise difference is then
+between tensors that do not correspond position-for-position, and a relative error on top of that is
+noise. The trustworthy outputs of that harness are the ones computed from aligned logits: the
+greedy-token agreement (5 of 8 at `--n 64`, 7 of 8 at `--n 24`) and everything `kl.py` derives. The
+layer columns should be treated as unmeasured until the two dumps are cut to the same position range
+- a harness fix, out of scope for the port, and deliberately not papered over here.
+
 ## Where the port stands (2026-10-24)
 
 Done and committed on `feat/amd_r9700`: launcher (`251a079c`), HIP build + load + ctest (`f901ca06`,
