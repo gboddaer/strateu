@@ -660,6 +660,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata_kolibri PRIVATE strata_prefill strata_kernels strata_warnings ${_strata_gpu_runtime_target})
   add_executable(strata-kolibri src/kolibri/kolibri_main.cpp)
   target_link_libraries(strata-kolibri PRIVATE strata_kolibri ${_strata_gpu_runtime_target})
+  # the prefill MoE combiner (plan docs/superpowers/plans/2026-10-24-kolibri-pf-partial-sums.md Task 1): the
+  # resident-row / CPU-partial / `-1`-padding mapping, unit-tested before it is wired into forward_multi.  It
+  # compiles pf_combine.cu on its own rather than linking strata_kolibri, because the test must not need any
+  # engine internals (no GGUF, no pool) - only the kernel and its launcher.
+  if(STRATA_BUILD_TESTS)
+    add_executable(pf_combine_test tests/kolibri/pf_combine_test.cpp src/kolibri/pf_combine.cu)
+    target_include_directories(pf_combine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/kolibri
+                                 ${_strata_gpu_include_directories})
+    target_link_libraries(pf_combine_test PRIVATE strata_warnings ${_strata_gpu_runtime_target})
+    add_test(NAME pf_combine_test COMMAND pf_combine_test)
+  endif()
   # the reference forward pass (plan T6): plain kernels + Strata native MMVQ/router, no graphs, no cache; the
   # routed experts (3-D tensors) live in managed memory so a 47 GB file runs on a 16 GB card (pages from RAM)
   add_executable(strata-kolibriref src/kolibri/kolibriref.cu)
