@@ -502,6 +502,22 @@ greedy-token agreement (5 of 8 at `--n 64`, 7 of 8 at `--n 24`) and everything `
 layer columns should be treated as unmeasured until the two dumps are cut to the same position range
 - a harness fix, out of scope for the port, and deliberately not papered over here.
 
+## CUDA is not behaviourally touched by the port - checked hunk by hunk
+
+The port's boundary is that the CUDA path keeps working exactly as before, so each of the four modified
+files was read rather than assumed (`git diff main..HEAD`, 41 insertions / 4 deletions total):
+
+| file | change | effect on a CUDA build |
+|---|---|---|
+| `include/strata/kernels/kolibri_window.hpp` | `#if defined(__CUDACC__)` -> `#if defined(__CUDACC__) \|\| defined(__HIPCC__)` for `STRATA_KOLIBRI_HD` | none - nvcc already defined `__CUDACC__`, so it takes the identical branch |
+| `src/kolibri/kolibri_engine.cu` (device guards) | `#if defined(__CUDA_ARCH__)` -> `... \|\| defined(__HIP_DEVICE_COMPILE__)` in `attn_pv4_on()` and `attn_coalesced_on()` | none - the CUDA device pass has `__CUDA_ARCH__`, the host pass has neither, so both passes pick the same branch as before |
+| `src/kolibri/kolibri_engine.cu` (MMA) | new `#if defined(__HIPCC__)` -> `STRATA_KOLIBRI_MMA_AVAILABLE 0`, `#else -> 1`, wrapping `mma168`, `attn_mma_on()`, `k_attn_flash_mma` and its launch site (`if (...) {...} else` + `#endif` + `if (attn_flash_on() ...)`) | none - CUDA compiles to `1`, so every one of those definitions and the original `if/else if` chain are compiled exactly as they were. The PTX `mma.sync.aligned.m16n8k8` path is NVIDIA-only and was never reachable on HIP; it is now gated rather than silently mis-selected |
+| `include/strata/hip_compat/cublas_v2.h`, `include/strata/hip_compat/cuda_runtime.h` | added `cublasSetAtomicsMode`/`cublasGemmBatchedEx` wrappers and three missing runtime shims | not reachable - that directory is put on the include path only by `cmake/hip_backend.cmake` and the `elseif(STRATA_ENABLE_HIP)` branch of `CMakeLists.txt:206`; a CUDA configure sets `_strata_gpu_include_directories` from `CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES` instead |
+
+So "byte-identical CUDA" holds in the sense that matters - a CUDA build compiles the same code and takes
+the same branches - while the shared sources necessarily differ in text, because a port that changed
+nothing could not compile on a second backend.
+
 ## Where the port stands (2026-10-24)
 
 Done and committed on `feat/amd_r9700`: launcher (`251a079c`), HIP build + load + ctest (`f901ca06`,
