@@ -105,7 +105,39 @@ not a loud one, so they are recorded:
 | `/tmp/ids64.txt` | a CUDA-box scratch file | regenerated from `tools/kolibri/oracle_ids512.txt`, which is **comma-separated**, so `tr ',' '\n'` - splitting it on spaces yields zero ids and the gate dies before its first run |
 | `pf_gate.sh --cpu-threads 24` | 27 pinnable cores | hardcoded 24; the engine caps it itself ("8 lane(s) = the host + 7 thread(s), 7 pinnable physical core(s), pinned (capped from --cpu-threads)"), so it is oversubscribed-but-correct here |
 
+## Where the port stands (2026-10-24)
+
+Done and committed on `feat/amd_r9700`: launcher (`251a079c`), HIP build + load + ctest (`f901ca06`,
+`f53f87a6`), `pf_gate` PASS and this log (`f86ff892`).
+
+Reproducing the gates on this box needs four env exports, because the harnesses default to the
+CUDA box: `KOLIBRI_MODEL=/fast/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf`,
+`KOLIBRI_BIN=$PWD/build/strata-kolibri`, `KOLIBRI_CM=$PWD/.venv/bin/cmake`, `HIP_VISIBLE_DEVICES=0`.
+The AMD oracle is recorded at `/tmp/kolibri_oracle.txt`, the pf_gate expectations at
+`/tmp/pf_gate_expect_{smoke,hash}.txt`, and the 64-id fixture at `/tmp/ids64.txt` (from
+`oracle_ids512.txt` split on commas). None of the three is in git yet - committing an AMD oracle
+file alongside `oracle_post_s2a.txt` is a decision for the maintainer, not a silent change.
+
+### In progress: the llama.cpp reference (task 5)
+
+The KL gate needs a llama.cpp that understands Kolibri 1, and neither candidate had one:
+
+- `~/develop/llama.cpp` **does** carry Kolibri support (`src/models/kolibri1.cpp`), and the
+  `kolibri1-llama.cpp.patch` beside the Q8_0 files does **not** apply to it - it is already applied
+  and has drifted (`conversion/base.py` hunk fails, `kolibri1.cpp` already exists). Do not re-apply it.
+- Its `build_rocm/` is from Oct 12 and has no kolibri object, and no dump tool.
+- The tree Strata fetches (`build/_deps/strata_llamacpp-src`) is upstream llama.cpp with **no**
+  Kolibri support, so it cannot be the reference.
+
+So a fresh ROCm build of the patched checkout is running into `~/develop/llama.cpp/build_rocm_strata`
+(leaving the user's `build_rocm` untouched), logging to `/tmp/llm_ref.log`. Next steps after it
+finishes: build `tools/kolibri/kolibri_llama_dump.cpp` against it (that is parity.py's `--dump`, with
+`--ref` the llama.cpp binary), then `parity.py` and `kl.py` for the KL number, then the needle
+fixtures for `needle_audit.py`. `parity.py` and `kl.py` both take `--ref BIN --dump BIN --model GGUF
+--out DIR` and pass `STRATA_DUMP_CTX=8192` and `GGML_CUDA_DISABLE_GRAPHS=1` themselves.
+
 ## Gates on the AMD path
+
 
 `pf_gate.sh` was recorded on this box (`--record`) and then run twice:
 
