@@ -85,3 +85,46 @@ short of 200, but the gap in the *use case* is 12%, not 33%, and it is the same 
 
 Also worth recording: the `prompt_ids` field is not accepted as a prompt by `/v1/chat/completions` (a request carrying 500 ids was
 answered as a 45-token chat prompt), so prompt-shape measurements through the API need real text.
+
+## ledger: campaign closed under amendment 5 - final floor table, deferrals with estimates, and the hand-off state
+
+*Replayed from worktree commit `a8b93011`.*
+
+
+## CAMPAIGN CLOSED (amendment 5) — final state, and what the next campaign inherits
+
+The goal owner re-scoped the pp-short floor to the measured cold-run figure and closed the campaign on this box.  Final
+ledger entry, so the next campaign starts from facts rather than from a summary of facts.
+
+**Floors, final (two runs each, load stated, deterministic binary):**
+
+| floor | target | measured | standing |
+|---|---|---|---|
+| pp short (512) | 200 | 149.7 / 151.9 cold; 176.2 / 170.8 warm (serve) | **met at the cold figure**; 200 and the 400 stretch deferred |
+| pp after 32K | 150 | 153.9 / 154.9 | met |
+| tg short | 30 | 48.0 / 48.3 | met, stretch 45-60 reached |
+| tg after 32K | 20 | 48.3 (28.9 at load 12.1) | met, 2.4x |
+
+Accuracy: KL **0.00132** on 109 answer steps (0.74x of llama.cpp's own CPU-vs-GPU floor, top-1 0.982); oracle **BITWISE**,
+re-anchored after each numerics change; prefill **bitwise deterministic** across runs with `racecheck` 0 hazards after the
+`block_max` barrier fix; needle **recall 4/5, exact 3/5** with both deviations recorded (amendment 4).
+
+**What is deferred, with its estimate and its gate order, in `docs/strateu-campaign-report.md` of the published export:**
+
+* **Option A** (the only route to 200): kernel parity test first, then a Q4_K-from-VRAM GEMM, then `C1` blob residency.
+  ~1 s of short-prompt fill and ~7 GB of VRAM; 2.5-4 focused days; ~60% odds of landing 200.
+* **Option C** (cheap partial): batched fill conversions + the MoE sum on the CPU; ~1 day; +10-20%; not the floor.
+* Five levers that must not be re-tried, with numbers: `DENSE_F16`, the router path, `RES_TOP` either way, per-layer
+  promotion budgets, overlap re-scoping (the `max(pool, GPU)` ceiling is unreachable - residual dependency).
+
+**State of the tree and the export at closure:**
+
+* worktree: `kolibri1-speed` clean, gates PASS (build / ids / PF_HASH 100 chunk-layers / oracle BITWISE).
+* export: `the published export`, branch `main`, tip `64ae7743`, 2,341 commits, 53.5 MB tracked, 35 MB `.git`,
+  report linked from `STRATEU.md`, zero private-path / hostname / >50 MB leaks. The earlier copy is at
+  `strateu-publish-previous` because the refresh regenerated the rewritten history (hashes differ; `--force-with-lease`
+  if an earlier push happened).
+* next box: AMD Radeon AI PRO R9700 (32 GB) - re-derive, do not inherit: the pool-beats-GPU verdict, decode residency at
+  0 of 0 picks, `DENSE_F16` being blocked, and the `ATTN_MB`/context limits. Re-anchor the floors against llama.cpp there.
+* open defect carried forward (off the shipped path): `RES_TOP=0` exits 1 with a misattributed
+  `dequant launch: invalid configuration argument`.
