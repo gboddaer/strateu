@@ -151,6 +151,21 @@ used for its recorded KL - it may live on the campaign box rather than here; (2)
 llama.cpp revision from around 2026-10-03 (the patch date) to build the full patch against; (3) a
 Kolibri-capable llama.cpp build supplied directly.
 
+## §9.3 verdicts, first pass (two runs each, 512-token prompt + 32 decode, ctx 8192, box 91 GiB free)
+
+| arm | wall run1 / run2 | what it says |
+|---|---|---|
+| shipped config (`POOL_ALL` default, `EXPERT_F16=24`, `RES_TOP=56`, `ATTN_MB=512`) | 29.1 s / 25.8 s | baseline |
+| `POOL_ALL=0` (GPU expert path) | 23.1 s / 23.2 s | **the pool is not the win here it was on the T4** - with the pool off the run was faster, and far more repeatable (0.1 s spread vs 3.3 s). On the T4 the pool won because the host streamed 43 GB/s against 5.7-6.1 GB/s of PCIe; a 32 GB card changes that ratio, which is exactly the sign §9.3 said to re-measure |
+| `ATTN_MB=1024` | 25.3 s / 25.2 s | fits and runs at 32 GB (rc 0) - the T4's OOM was at 100K context, so this is not yet the same claim; the 100K arm is still to run |
+| `DENSE_F16=1` | 25.3 s / 25.4 s | fits alongside the 24-slot expert cache (it OOMed on the T4) and is within noise of baseline here |
+
+**These are not verdicts yet.** The engine's per-phase counters did not reach the log (the `cnt:` grep
+matched nothing), so nothing attributes where the time goes, and a 512-token prompt with 32 decode
+tokens is not the decode shape the T4 numbers were taken on. The placement line above is a lead to
+chase with `--n` deep enough to be decode-dominated and the counters captured, not a conclusion.
+`RES_TOP`, `DEC_RES` and the residency hit-rate verdicts have not been touched.
+
 ## Where the port stands (2026-10-24)
 
 Done and committed on `feat/amd_r9700`: launcher (`251a079c`), HIP build + load + ctest (`f901ca06`,
