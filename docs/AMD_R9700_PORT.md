@@ -520,6 +520,28 @@ So "byte-identical CUDA" holds in the sense that matters - a CUDA build compiles
 the same branches - while the shared sources necessarily differ in text, because a port that changed
 nothing could not compile on a second backend.
 
+### Where the KL excess actually sits: per-step, not uniform
+
+`kl.py` leaves a per-step array behind (`/tmp/kl-amd/<tag>.kl.npz`, keys `answer`, `cpu`, `strata`),
+which says the gap is not a uniform drift - it is a handful of positions, and short-answer prompts
+amplify them because one bad step dominates a three-step mean.
+
+| prompt | answer steps | strata KL, first steps | floor KL, same steps | worst step overall |
+|---|---|---|---|---|
+| `p06` | 3 | 0.0484, 0.0025, 0.0259 | 0.0086, 0.0022, 0.0027 | strata 0.0833 / floor 0.0810 at step 4 |
+| `p07` | 4 | 0.0196, 0.0012, 0, 0 | 0.0026, 0.0018, 0, 0 | strata 0.0741 / floor 0.0526 at step 14 |
+| `p00` | 65 | 0.0013, 0.0001, 0.0227, 0, ... | 0.0118, 0.0001, 0.0157, 0, ... | strata 0.0243 (step 21) vs floor 0.0278 (step 38) |
+
+Two things follow. On `p06` the excess is at answer steps 0 and 2 - **5.6x and 9.6x the floor there** -
+while at the genuinely hard step (4) the two engines agree almost exactly (0.0833 against 0.0810), so
+that step is hard for the model, not a disagreement between engines. And `p00`, the one prompt with a
+long answer, has a strata worst-step (0.0243) **below** the floor's worst-step (0.0278).
+
+So the mean that misses the bound is carried by the short-answer prompts, where a single early step is
+divided by three or four rather than by sixty-five. That is where anyone closing the remaining gap
+should look - the first answer step of short answers - and it is a smaller and different problem than
+"the AMD path is uniformly less accurate", which these arrays rule out.
+
 ## Where the port stands
 
 Committed on `feat/amd_r9700` (23 commits, main untouched): the launcher (`251a079c`); the HIP build,
