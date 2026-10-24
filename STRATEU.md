@@ -6,6 +6,14 @@ Scope: run **European open models** with Strata's efficiency design. First targe
 Status: **v0.1.0-alpha**. Every number below was measured on one box (16 GB Tesla T4, sm_75, 755 GB DDR4),
 two runs where it matters, with the box load stated.
 
+**Read [`docs/strateu-campaign-report.md`](docs/strateu-campaign-report.md) before building or porting.**
+It carries the full measured state, the accuracy evidence, the limits of this configuration (CUDA-only,
+16 GB T4, pinned-RAM requirement, no cross-request KV reuse, and the long-context sensitivity of *both*
+engines), the dead ends that must not be re-tried, the two remaining work packages, and a
+bring-up checklist for moving to a different accelerator — the intended next target being an
+**AMD Radeon AI PRO R9700** (32 GB), where several of this box's verdicts must be re-derived rather than
+inherited.
+
 ## Platform support
 
 | backend | status |
