@@ -34,3 +34,30 @@ non-perturbing instrument currently attributes. The candidate levers are all ker
 GEMM, cheaper cache fills, fewer/bigger dequant launches), i.e. the kind of change that must be *built* and A/B-measured rather
 than located by a profiler at this workload size.  That is the honest state, and it is the point at which continuing costs more
 than the floor is worth without a direction from the goal owner.
+
+## per-layer promotion budgets: measured null at 512 tokens, reverted; five levers now dead at short context
+
+*Replayed from worktree commit `86da7f9e`.*
+
+
+## The fifth dead lever: per-layer promotion budgets do not pay (and the fill is not where the time is)
+
+C0's 24%-98% per-layer coverage spread suggested a data-driven promotion rule: in `seed_hot`, stop promoting once an expert
+would add less than a share of that layer's rows, so low-skew layers fill fewer slots and high-skew ones keep theirs.  Swept at
+512 tokens, two runs each, against the stock uniform budget:
+
+| promotion rule | wall | tok/s |
+|---|---|---|
+| stock (uniform `RES_TOP=24`) | 3,469 / 3,488 ms | 147.6 / 146.8 |
+| marginal share >= 0.5% | 3,404 / 3,431 ms | 150.4 / 149.2 |
+| marginal share >= 2% | 3,476 / 3,480 ms | 147.3 / 147.1 |
+
+All inside the run-to-run spread.  Reverted rather than kept: a cache-policy knob that buys nothing is complexity with a
+maintenance cost and a numerics surface (it changes which experts are resident, hence which arm serves a pick).  With this,
+**five levers are measured dead** at short context - `DENSE_F16`, the router path, `RES_TOP` (both directions), the
+marginal-share promotion rule, and re-scoping the overlap - and the only surviving wall-clock facts are the pool's 1.2 s of a
+3.4 s wall and the 3.9x that defaulting `POOL_ALL` recovered.
+
+`pp short` remains **150 tok/s against a floor of 200**.  Everything cheap has been tried and recorded; what remains is kernel
+work whose size cannot even be located with the profilers available on this box, because both of them perturb the workload
+they measure (nsys by 15x on a 15k-launch workload, the phase marks by doubling the pool's chunks).
