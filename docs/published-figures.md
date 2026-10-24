@@ -32,7 +32,7 @@ measurement** and the doc is stale.
 
 | figure | value | why it was withdrawn |
 |---|---|---|
-| decode short | ~~48.0 / 48.3 tok/s~~ | counter-derived: the reciprocal of the pool's per-token drain (20.70 ms), not a wall-clock token.  See #3. |
+| decode short | ~~48.0 / 48.3 tok/s~~ (quoted in prose as ~~48 tok/s~~) | counter-derived: the reciprocal of the pool's per-token drain (20.70 ms), not a wall-clock token.  See #3. |
 | decode after 32K | ~~48.3 tok/s, 2.4x the floor~~ | same error; the "stretch 45-60 reached" claim falls with it.  See #4. |
 | prefill short | ~~149.7 / 151.9 tok/s~~ | a loaded-box sample; superseded by #1 (157.0 / 160.3) with its load stated. |
 | prefill after 32K | ~~153.9 / 154.9 tok/s~~ | superseded by #2 (154.0 / 153.7) from the same corrected protocol. |
@@ -51,6 +51,20 @@ supersession note names them, (b) the plain-path / llama.cpp / upstream-README c
 | llama.cpp on this box | 126.1 tok/s, 157.5 tok/s, 19.1 tok/s, 21.2 tok/s | the reference engine (itself unstable at 98.6K - report §6.5) |
 | llama.cpp README (RTX 5070) | 723 tok/s, 18.0 tok/s | upstream marketing figure, not comparable to this box |
 | upstream "reads your prompt" claim | 60 tok/s | the upstream project's own number, quoted in `README.md`'s speed section |
-| rounded restatements of #1-#4 in prose | 160 tok/s, 158 tok/s, 162 tok/s, 154 tok/s, 169 tok/s, 157 tok/s, 30 tok/s, 13 tok/s | same measurements as the rows above, rounded in prose |
+| rounded restatements of #1-#4 and #13 in prose | 160 tok/s, 158 tok/s, 162 tok/s, 154 tok/s, 169 tok/s, 157 tok/s, 30 tok/s, 13 tok/s, 176 tok/s | same measurements as the rows above, rounded in prose |
 | plain path at 100K | 8.9 tok/s, 4 tok/s, 9 tok/s | the per-token path's 100K mean, for contrast (11,534 s) |
 | floor targets | 20 tok/s, 30 tok/s, 45 tok/s, 60 tok/s, 150 tok/s, 200 tok/s, 300 tok/s, 400 tok/s | **targets, not measurements** |
+
+## Dead-lever and projection figures (quoted in the report's §7/§8)
+
+Rows here are either measurements of a **rejected** configuration (kept so nobody re-tries it) or **projections**, which are
+labelled as such and are not measurements.
+
+| figure | value(s) | kind | ledger row |
+|---|---|---|---|
+| `DENSE_F16` with the expert cache released | 80.4 tok/s, 80.0 tok/s (control 80.5 tok/s, 80.8 tok/s) | measured, rejected (neutral) | §7.1 `DENSE_F16` null |
+| `RES_TOP` sweep at 512 tokens | 122 tok/s (8 slots, -20%), 152 tok/s (24, shipped), 151 tok/s (56) | measured, swept | §7.3 `RES_TOP` |
+| slots path vs CPU pool, decode | 16.1 tok/s vs 22.7 tok/s | measured, rejected | §9.3 re-derive list |
+| Option A arithmetic best case | 270 tok/s | **projection** | §8.1 Option A |
+| Option A realistic outcome | 185 tok/s to 200 tok/s | **projection** | §8.1 Option A |
+| Option C expected gain | 165 tok/s to 180 tok/s | **projection** | §8.2 Option C |
