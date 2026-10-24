@@ -272,6 +272,31 @@ saying whether its load time was subtracted, and the AMD numbers here are quoted
 reason. Decode at long context is not measured yet - each such run is ~16 min - so the CUDA row
 "tg 128 after 32K, 12.3 tok/s" has no AMD counterpart yet.
 
+## §9.3 verdicts, remaining arms (two runs each, same box and load as above)
+
+Short shape is `n=257` on the 512-token prompt, so arms compare against the baseline's 39.3 / 39.3 s.
+
+| arm | wall run1 / run2 | verdict |
+|---|---|---|
+| baseline (`RES_TOP=56`) | 39.3 s / 39.3 s | - |
+| `ROPE_F64=1` | 39.6 s / 39.5 s | no measurable cost at this shape (prefill 51.5 vs 51.7 tok/s). RoPE in fp64 is free here, so there is no accuracy-vs-speed trade to argue on this card - it can stay on if it is more accurate |
+| `RES_TOP=24` (vs 56) | 39.3 s / 39.3 s | identical to within 0.01 s - the prefill promotion ceiling makes no difference once residency is off, which is consistent with the `DEC_RES` result above |
+| `DENSE_F16=1` | 39.8 s / 39.9 s | +1.4% over baseline, within run-to-run spread |
+| `RES_TOP=0` | **fails** | `dequant launch: invalid configuration argument` - a zero-sized launch, reproduced on a second run. Not a configuration: the engine has no guard for a zero promotion ceiling. Its 15.3 s wall is time-to-failure, and it emits no `gen:` line, so anyone reading a timing table must not treat it as a fast arm |
+
+Long context, 99,299-token fixture, ctx 105024:
+
+| measurement | run1 | run2 |
+|---|---|---|
+| decode at 100K (`ATTN_MB=1024`), 128 tokens | **6.7 tok/s** (18.9 s) | - |
+| `DENSE_F16=1` alongside the 24-slot expert cache | 942.7 s, rc 0, 8 tokens | 958.0 s, rc 0, 8 tokens |
+
+Decode falls from 15.8 tok/s at short context to 6.7 tok/s at 100K - attention over 99K tokens more
+than doubles the per-token cost, and that is the number the CUDA record's "tg 128 after 32K, 12.3
+tok/s" has been waiting for an AMD counterpart of. `DENSE_F16` next to the expert cache at 100K runs
+cleanly at 942.7 / 958.0 s, against the T4 record where that combination OOMed: at 32 GB with the
+expert table in host RAM there is room the T4 did not have.
+
 ## Where the port stands (2026-10-24)
 
 Done and committed on `feat/amd_r9700`: launcher (`251a079c`), HIP build + load + ctest (`f901ca06`,
