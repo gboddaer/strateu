@@ -398,6 +398,35 @@ So the KL result stands as measured: **0.00182 on the answer steps against a bou
 bound sits *below* the noise floor of the reference it is measured against on this box, which is
 recorded as a deviation rather than argued away.
 
+### The plain-kernel reference path gets to 0.84x of the floor; neither path reaches 0.00132
+
+`strata-kolibriref` also takes `--kernels plain` (the straightforward reference kernels rather than
+Strata's fused ones), which is the configuration `oracle.sh` gates on. Re-measured against the same
+cached llama.cpp logits:
+
+| reference configuration | answers mean KL | median | p99 | top-1 | ratio to floor |
+|---|---|---|---|---|---|
+| llama.cpp CPU vs llama.cpp GPU (the floor) | 0.00187 | 0.000261 | 0.0172 | 0.9884 | 1.00 |
+| `--kernels strata` (shipped fast path) | 0.00182 | 0.000086 | 0.0253 | 0.9884 | 0.97 |
+| **`--kernels plain`** | **0.00158** | 0.000086 | 0.0264 | 0.9942 | **0.84** |
+
+So the AMD path can be brought to 0.84x of its own reference's noise floor - closer to llama.cpp-GPU
+than llama.cpp-CPU is, by 16% - and the bound of 0.00132 is still not reached on either configuration.
+The reason is structural rather than a defect to chase: **the bound sits below the floor of the
+instrument it is measured against on this box** (0.00187 here). On the Tesla-T4 box the same floor was
+0.00178 and Strata scored 0.00132, i.e. 0.74x of that floor - the absolute number was only ever
+achievable because that box's CPU-vs-GPU divergence happened to be smaller. The floor is a property of
+the box (this CPU against this GPU, their respective rounding), so an absolute KL bound silently
+imports the old box's numerics, which is the exact thing §9.3 forbids inheriting.
+
+A second incomparability, recorded so nobody over-reads the table: the campaign's 0.00132 came from a
+7-prompt set with 109 answer steps; this box's parity fixture is 8 prompts with 344 answer steps.
+Different step populations, different means.
+
+The honest summary line for the AMD path is therefore **0.00182 shipped / 0.00158 plain, at 0.97x and
+0.84x of this box's own floor**, with the criterion's absolute bound of 0.00132 unmet and the reason
+given above - not a claim that the bound was met.
+
 ## Where the port stands (2026-10-24)
 
 Done and committed on `feat/amd_r9700`: launcher (`251a079c`), HIP build + load + ctest (`f901ca06`,
