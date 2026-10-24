@@ -239,6 +239,39 @@ is only the answer's last line, which is why a PASS can display as `'Answer:'`).
 anyone reading the table: `needle_e90` uses `quartz-willow-107`, the word the campaign recorded as
 *llama.cpp's own wrong answer* on a different fixture - here it is the needle, and it was found.
 
+## Wall-clock rates on the AMD path (two runs each, box 90-91 GiB free, GPU idle at start)
+
+The engine prints no rate, so these are differences between runs that differ only in decode length,
+with the engine's own load line (13.4 s warm) subtracted for prefill. Shape: 512-token prompt
+(`oracle_ids512.txt`), ctx 8192, `--cpu-threads 8`, shipped config.
+
+| measurement | run1 | run2 |
+|---|---|---|
+| prefill, 512 tokens, load excluded | 43.4 tok/s (11.8 s) | 51.7 tok/s (9.9 s) |
+| prefill, 512 tokens, end to end (load included) | 20.3 tok/s | 22.0 tok/s |
+| decode, tokens 130-257 (the steady window) | **15.8 tok/s** (8.1 s) | **15.8 tok/s** (8.1 s) |
+| decode, tokens 2-129 (first window after prefill) | 21.3 tok/s | 16.2 tok/s |
+
+Long context, same engine, 8 decode tokens, load subtracted:
+
+| prompt | `ATTN_MB=512` | `ATTN_MB=1024` |
+|---|---|---|
+| 99,299 tokens (ctx 105024) | 102.3 / 100.8 tok/s | 105.2 / 105.8 tok/s |
+| 127,811 tokens (ctx 131072) | 94.1 / 94.2 tok/s | 100.4 / 100.8 tok/s |
+
+Two things follow. The **marginal prefill rate is ~105 tok/s**, and the short-prompt figure is low
+because roughly 6 s of fixed cost is spread over only 512 tokens - at 100K that same engine runs
+2.4x faster per token. And **`ATTN_MB=1024` is faster than 512 at both long contexts** (105.5 vs
+101.6 at 100K, 100.6 vs 94.2 at 128K), so on this card the larger attention slab is a win, not just
+a fit; the T4's OOM at 100K does not reproduce here, at 32 GB, with the expert table in host RAM.
+
+Against the CUDA record (`strateu-campaign-report.md`: prefill 157.0/160.3 tok/s at 512 tokens,
+decode 24.4/24.5 tok/s short context) the AMD path is about 3x slower on short prefill and about
+1.5x slower on decode. That comparison needs a caveat: the campaign's table says "wall clock" without
+saying whether its load time was subtracted, and the AMD numbers here are quoted both ways for that
+reason. Decode at long context is not measured yet - each such run is ~16 min - so the CUDA row
+"tg 128 after 32K, 12.3 tok/s" has no AMD counterpart yet.
+
 ## Where the port stands (2026-10-24)
 
 Done and committed on `feat/amd_r9700`: launcher (`251a079c`), HIP build + load + ctest (`f901ca06`,
