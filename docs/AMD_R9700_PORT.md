@@ -126,6 +126,31 @@ Resolved: the reference needs exactly **two** files applied over that checkout, 
 `llama_model_kolibri1`, duplicate case values), and `git apply --check` passes those hunks because it
 checks context, not meaning. `build_rocm_strata` builds clean with just the two.
 
+### BLOCKER: no llama.cpp on this box can run Kolibri 1, so the KL gate has no reference
+
+`kl.py`'s reference P is llama.cpp. Getting one to run Kolibri on `rizo` has failed in a chain of
+ways, all one root cause - `~/develop/llama.cpp` is at upstream `0a1ef309c`, which is **newer than
+the Kolibri patch** and has drifted under it:
+
+| attempt | result |
+|---|---|
+| as found | `unknown pre-tokenizer type: 'kolibri1'` (the `llama-vocab.cpp` half was missing) |
+| whole patch | `kolibri1.cpp` already exists, `conversion/base.py` hunk fails |
+| + `models.h`, `llama-model.cpp` | redefinition of `llama_model_kolibri1`, duplicate case values |
+| + `llama-graph.cpp` only | `llama-graph.cpp:2265: GGML_ASSERT(exp_probs_b != nullptr && "SIGMOID_LOGIT_ADD gating requires exp_probs_b")` |
+
+The last one is the real wall: the newer graph code never receives the router bias for this arch,
+which is what the patch's conversion/`tensor_mapping` half and an older graph API together provided.
+The patch's base commit `c222b50c1d4f...` is **not in this clone** (it is the patch author's fork), so
+the intended base revision cannot be checked out here. Current state of the user's tree: `llama-vocab.cpp`,
+`llama-hparams.h`, `llama-graph.cpp` modified by hand (revert with `git checkout --` on those three);
+`build_rocm_strata` builds clean but aborts at context init for Kolibri.
+
+What would unblock it, in order of preference: (1) the llama.cpp revision the CUDA campaign actually
+used for its recorded KL - it may live on the campaign box rather than here; (2) an upstream
+llama.cpp revision from around 2026-10-03 (the patch date) to build the full patch against; (3) a
+Kolibri-capable llama.cpp build supplied directly.
+
 ## Where the port stands (2026-10-24)
 
 Done and committed on `feat/amd_r9700`: launcher (`251a079c`), HIP build + load + ctest (`f901ca06`,
