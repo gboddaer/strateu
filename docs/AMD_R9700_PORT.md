@@ -454,6 +454,31 @@ agent produces no wavefront output on gfx1201 and so cannot be claimed as a pass
 generated ids plus `PF_HASH` over 100 chunk-layers is offered as reproducibility evidence and not
 dressed up as a race proof.
 
+### A fixture-shape hypothesis, tested and refuted
+
+The n=64 parity fixture never emits `<|im_end|>` inside 64 tokens, so `kl.py` counts **every** step as
+an answer step (`p00: 65 steps (65 answer)`) - including the late, most-divergent ones - while the
+campaign's population was 109 answer steps over 7 prompts (~16 each). That looked like the reason the
+AMD number sat above the bound, so it was tested: parity re-run at `--n 24` and KL recomputed on it.
+
+It made things **worse**: 155 answer steps, mean KL **0.00199** at **1.12x** a floor of 0.00178
+(the shipped-kernel n=64 figure was 0.00182 at 0.97x). The hypothesis is dead - truncating the
+generation does not buy accuracy, and the floor moves with the population too. Recorded because a
+plausible-sounding explanation that fails a test is worth more than an untested one, and because it
+means the 0.00132 bound survived three separate legitimate attempts to reach it:
+
+| attempt | answer-step KL | verdict |
+|---|---|---|
+| shipped fused kernels, committed fixture | 0.00182 (0.97x floor) | baseline |
+| `--act f32` | 0.00182 | inert - `kolibriref.cu:274` only consults `g_act_q8` where the path quantizes |
+| `--kernels plain` | **0.00158 (0.84x floor)** | real improvement, still above the bound |
+| terminating-answer fixture (`--n 24`) | 0.00199 (1.12x floor) | hypothesis refuted |
+
+The standing reading is unchanged and is a measurement, not an excuse: the bound sits below the floor
+of the instrument it is quoted against on this box (0.00178-0.00187 depending on population), so it
+cannot be met here by any engine that is not llama.cpp itself, and meeting it on the T4 was a property
+of that box's smaller CPU-vs-GPU divergence.
+
 ## Where the port stands (2026-10-24)
 
 Done and committed on `feat/amd_r9700`: launcher (`251a079c`), HIP build + load + ctest (`f901ca06`,
