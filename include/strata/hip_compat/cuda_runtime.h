@@ -102,6 +102,8 @@ hipError_t mem_get_info(size_t* free_bytes, size_t* total_bytes);
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 #define cudaMemset hipMemset
+#define cudaMallocManaged hipMallocManaged                 // (kolibriref's reference allocations)
+#define cudaMemAttachGlobal hipMemAttachGlobal          // cudaMallocManaged's flag (kolibriref's managed allocs)
 #define cudaMemsetAsync hipMemsetAsync
 #define cudaPeekAtLastError hipPeekAtLastError
 #define cudaRuntimeGetVersion hipRuntimeGetVersion
