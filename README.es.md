@@ -65,8 +65,8 @@ Este fork también midió **[Kolibri 1](docs/KOLIBRI1.md)** de Aleph Alpha (Q4_K
 
 | Prompt | Escribe respuestas | Lee tu prompt |
 | --- | ---: | ---: |
-| **corto (512 tokens)** | 24-25 tokens/s | 157-160 tokens/s (en caliente: 171-176) |
-| **32K tokens** | 12-13 tokens/s | 154 tokens/s |
+| **corto (512 tokens)** | 24-30 tokens/s (según afinidad NUMA) | 157-160 tokens/s (en caliente: 171-176) |
+| **32K tokens** | 12-14 tokens/s (según afinidad NUMA) | 154 tokens/s |
 | **100K tokens** | — | 97 tokens/s |
 
 Dos ejecuciones por número con el binario determinista bit a bit, carga de la máquina indicada; la fila de 100K es una única ejecución en frío. Especificación de

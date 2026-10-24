@@ -65,8 +65,8 @@ Este fork também mediu **[Kolibri 1](docs/KOLIBRI1.md)** da Aleph Alpha (Q4_K_M
 
 | Prompt | Escreve respostas | Lê seu prompt |
 | --- | ---: | ---: |
-| **curto (512 tokens)** | 24-25 tokens/s | 157-160 tokens/s (com servidor aquecido: 171-176) |
-| **32K tokens** | 12-13 tokens/s | 154 tokens/s |
+| **curto (512 tokens)** | 24-30 tokens/s (depende da ligação NUMA) | 157-160 tokens/s (com servidor aquecido: 171-176) |
+| **32K tokens** | 12-14 tokens/s (depende da ligação NUMA) | 154 tokens/s |
 | **100K tokens** | — | 97 tokens/s |
 
 Duas execuções por número no binário determinístico bit a bit, carga da máquina anotada; a linha de 100K vem de uma única execução a frio. Especificação da máquina

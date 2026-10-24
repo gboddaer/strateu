@@ -67,8 +67,8 @@ This fork also measured Aleph Alpha's **[Kolibri 1](docs/KOLIBRI1.md)** (Q4_K_M)
 
 | Prompt | Writes answers | Reads your prompt |
 | --- | ---: | ---: |
-| **short (512 tokens)** | 24-25 tokens/s | 157-160 tokens/s (warm server: 171-176) |
-| **32K tokens** | 12-13 tokens/s | 154 tokens/s |
+| **short (512 tokens)** | 24-30 tokens/s (NUMA binding) | 157-160 tokens/s (warm server: 171-176) |
+| **32K tokens** | 12-14 tokens/s (NUMA binding) | 154 tokens/s |
 | **100K tokens** | — | 97 tokens/s |
 
 Two runs each on the bitwise-deterministic binary, box load stated; the 100K row is a single cold run. Box spec, full tables and context:

@@ -35,6 +35,9 @@ runs as a staged pool-carried pipeline.
 
 ## What is measured
 
+Measurements follow [the measurement guideline](docs/MEASUREMENT_GUIDELINE.md): every rate is a
+wall-clock two-run with the harness recorded, cross-checked before it is published.
+
 | gate | target | measured | standing |
 |---|---|---|---|
 | prefill, 512-token prompt | 200 tok/s | **157.0 / 160.3** (wall clock) | not met |
