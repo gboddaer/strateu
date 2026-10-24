@@ -340,6 +340,10 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
         std::exit(1);
     }
     const int64_t row_bytes = cols / be * bb, gpr = cols / 32, total = rows * gpr;
+    // A zero-size conversion is legal and happens with STRATA_KOLIBRI_RES_TOP=0: the promotion count is then zero and the
+    // caller still reaches here.  Without this guard `grid` evaluates to 0 and the launch fails with "invalid configuration
+    // argument" - which is how RES_TOP=0 died with exit 1 rather than simply doing nothing.
+    if (total <= 0) return;
     if (ld <= 0) ld = cols;
     const unsigned grid = (unsigned) ((total + 255) / 256);
     const uint8_t* p = (const uint8_t*) blocks;
