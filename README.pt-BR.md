@@ -18,9 +18,9 @@ funciona com seus apps e agentes de programação. Nada sai do seu PC.
 **strateu** é um fork medido do [Niko1221/Strata](https://github.com/Niko1221/Strata), focado no motor
 **Kolibri 1** (`src/kolibri`). Uma semana de medições tornou o port CUDA **determinístico bit a bit** (o prefill
 passa no racecheck, diferença 0.0 entre duas execuções) e **verificado contra o llama.cpp por divergência KL**
-(0,00132 em 109 passos de resposta, top-1 0,982, oracle do caminho simples em BITWISE). Numa placa de 16 GB, atende
-todas as marcas de velocidade da semana: cerca de **154 tokens/s** de prefill após um prompt de 32K e
-**48 tokens/s** de geração, curto e após 32K; a agulha de 100K é recuperada em 4 de 5 casos, com as duas
+(0,00132 em 109 passos de resposta, top-1 0,982, oracle do caminho simples em BITWISE). Numa placa de 16 GB, medido a relógio (duas execuções cada): cerca de **154 tokens/s** de prefill após um
+prompt de 32K, **24-25 tokens/s** de geração curto e **12-13 tokens/s** após 32K
+(remedido após uma auditoria apontar cifras antes derivadas de contador). a agulha de 100K é recuperada em 4 de 5 casos, com as duas
 divergências registradas (a própria referência llama.cpp é instável nessa extensão). Os portões de qualidade e a
 configuração de velocidade ficam em `tools/kolibri/`; cada número vem de duas execuções com a carga da máquina
 anotada. A evidência completa: [o relatório da campanha](docs/strateu-campaign-report.md) e os registros em `docs/superpowers/plans/`.
@@ -65,8 +65,8 @@ Este fork também mediu **[Kolibri 1](docs/KOLIBRI1.md)** da Aleph Alpha (Q4_K_M
 
 | Prompt | Escreve respostas | Lê seu prompt |
 | --- | ---: | ---: |
-| **curto (512 tokens)** | 48 tokens/s | 150 tokens/s (com servidor aquecido: 171-176) |
-| **32K tokens** | 48 tokens/s | 154 tokens/s |
+| **curto (512 tokens)** | 24-25 tokens/s | 157-160 tokens/s (com servidor aquecido: 171-176) |
+| **32K tokens** | 12-13 tokens/s | 154 tokens/s |
 | **100K tokens** | — | 97 tokens/s |
 
 Duas execuções por número no binário determinístico bit a bit, carga da máquina anotada; a linha de 100K vem de uma única execução a frio. Especificação da máquina

@@ -18,9 +18,9 @@ fonctionne avec vos applications et vos agents de code. Rien ne quitte votre PC.
 **strateu** est un fork mesuré de [Niko1221/Strata](https://github.com/Niko1221/Strata), centré sur le moteur
 **Kolibri 1** (`src/kolibri`). Une semaine de mesures a rendu le port CUDA **déterministe au bit près** (le prefill
 passe racecheck, écart 0.0 entre deux exécutions) et **aligné sur llama.cpp par divergence KL** (0,00132 sur 109
-étapes de réponse, top-1 0,982, oracle du chemin simple BITWISE). Sur une carte de 16 Go, il atteint chaque jalon
-de vitesse de la semaine : environ **154 tokens/s** de prefill après un prompt de 32K et **48 tokens/s** de
-génération, court et après 32K ; l'aiguille de 100K est retrouvée dans 4 cas sur 5, les deux écarts étant
+étapes de réponse, top-1 0,982, oracle du chemin simple BITWISE). Sur une carte de 16 Go, mesuré au chronomètre (deux exécutions chacune) : environ **154 tokens/s** de prefill
+après un prompt de 32K, **24-25 tokens/s** de génération court et **12-13 tokens/s** après 32K
+(remesuré après qu'un audit a trouvé une erreur de dérivée de compteur). l'aiguille de 100K est retrouvée dans 4 cas sur 5, les deux écarts étant
 consignés (la référence llama.cpp est elle-même instable à cette longueur). Les portes de qualité et la
 configuration de vitesse sont dans `tools/kolibri/` ; chaque chiffre vient de deux exécutions avec la charge de la
 machine indiquée. La preuve complète : [le rapport de campagne](docs/strateu-campaign-report.md) et les registres sous `docs/superpowers/plans/`.
@@ -65,8 +65,8 @@ Ce fork a aussi mesuré **[Kolibri 1](docs/KOLIBRI1.md)** d'Aleph Alpha (Q4_K_M)
 
 | Prompt | Écrit ses réponses | Lit votre prompt |
 | --- | ---: | ---: |
-| **court (512 tokens)** | 48 tokens/s | 150 tokens/s (à chaud : 171-176) |
-| **32K tokens** | 48 tokens/s | 154 tokens/s |
+| **court (512 tokens)** | 24-25 tokens/s | 157-160 tokens/s (à chaud : 171-176) |
+| **32K tokens** | 12-13 tokens/s | 154 tokens/s |
 | **100K tokens** | — | 97 tokens/s |
 
 Deux exécutions par chiffre sur le binaire déterministe au bit près, charge de la machine annoncée ; la ligne 100K vient d’un seul exécution à froid. Spécification

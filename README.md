@@ -25,7 +25,7 @@ overlap is implemented and measured neutral: the per-layer residual dependency s
 Accuracy is instrumented: **KL vs llama.cpp** on every numerics change, a **bitwise plain-path oracle**, `racecheck`-clean
 determinism (two runs bitwise identical), and a **100K needle audit** scored against each fixture's own needle text, both
 misses recorded. Evidence, including what was measured **dead**, is in [the campaign report](docs/strateu-campaign-report.md)
-and [the findings log](docs/findings-log.md). This fork's speed figures are **provisional** pending wall-clock re-measurement.
+and [the findings log](docs/findings-log.md). Speed is wall-clock, two runs (load stated): about **154 tokens/s** prefill after a 32K prompt and **24-25 / 12-13 tokens/s** decode (short / after 32K) on a 16 GB card - re-measured after an audit caught a counter-derived reporting error; the 100K read is a mean.
 
 ## How fast is it?
 
@@ -67,8 +67,8 @@ This fork also measured Aleph Alpha's **[Kolibri 1](docs/KOLIBRI1.md)** (Q4_K_M)
 
 | Prompt | Writes answers | Reads your prompt |
 | --- | ---: | ---: |
-| **short (512 tokens)** | 48 tokens/s | 150 tokens/s (warm server: 171-176) |
-| **32K tokens** | 48 tokens/s | 154 tokens/s |
+| **short (512 tokens)** | 24-25 tokens/s | 157-160 tokens/s (warm server: 171-176) |
+| **32K tokens** | 12-13 tokens/s | 154 tokens/s |
 | **100K tokens** | — | 97 tokens/s |
 
 Two runs each on the bitwise-deterministic binary, box load stated; the 100K row is a single cold run. Box spec, full tables and context:
