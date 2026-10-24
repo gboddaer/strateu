@@ -479,6 +479,9 @@ of the instrument it is quoted against on this box (0.00178-0.00187 depending on
 cannot be met here by any engine that is not llama.cpp itself, and meeting it on the T4 was a property
 of that box's smaller CPU-vs-GPU divergence.
 
+| `pinned_shared_test` | `OK` - the pinned-allocation path the whole design rests on | **0** |
+| `file_expert_source_test` | `PASS` | **0** |
+
 ## Where the port stands (2026-10-24)
 
 Done and committed on `feat/amd_r9700`: launcher (`251a079c`), HIP build + load + ctest (`f901ca06`,
