@@ -12,6 +12,16 @@ NVIDIA 或 AMD 显卡（12 GB 及以上）· Windows 或 Linux · 免费开源</
 Strata 能在普通电脑上运行 **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**。这是一个又大又聪明的
 AI 模型，通常要用服务器才能跑。它能聊天、写代码、看图片，还能配合你的应用和编程智能体一起工作。所有数据都留在你的电脑上。
 
+## 关于这个分支
+
+**strateu** 是 [Niko1221/Strata](https://github.com/Niko1221/Strata) 的一个以实测为本的分支，工作重心是
+**Kolibri 1** 引擎（`src/kolibri`）。一周的测量让这个 CUDA 移植版本变得**逐位可复现**（prefill 通过 racecheck、
+两次运行差异为 0.0），并**用 KL 散度对标 llama.cpp**（109 个回答步骤为 0.00132，top-1 一致率 0.982，plain-path
+oracle 为 BITWISE）。在 16 GB 显卡上它达到了这一周实测的全部速度底线：32K 提示后的 prefill 约为
+**154 token/秒**，短上下文和 32K 之后的生成约为 **48 token/秒**；100K 长文本的“大海捞针”检索 5 例命中 4 例，
+两处偏差都已记录（在那个长度上 llama.cpp 参考实现本身也不稳定）。闸门和速度配置在 `tools/kolibri/`；每个数字
+都做两次运行并注明机器负载，完整证据链见[战役报告](docs/strateu-campaign-report.md)和 `docs/superpowers/plans/` 下的账目文件。
+
 ## 速度有多快？
 
 我们在两台普通的游戏电脑上做了测试。一个 token 大约相当于 ¾ 个英文单词。

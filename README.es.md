@@ -13,6 +13,19 @@ Strata ejecuta **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-
 modelo de IA grande e inteligente que normalmente necesita un servidor. Conversa, escribe código, entiende imágenes
 y funciona con tus aplicaciones y agentes de programación. Nada sale de tu PC.
 
+## Sobre este fork
+
+**strateu** es un fork medido de [Niko1221/Strata](https://github.com/Niko1221/Strata) centrado en el motor
+**Kolibri 1** (`src/kolibri`). Una semana de mediciones dejó el port CUDA **determinista bit a bit** (el prefill
+pasa racecheck, diferencia 0.0 entre dos ejecuciones) y **verificado contra llama.cpp por divergencia KL**
+(0,00132 en 109 pasos de respuesta, top-1 0,982, oracle del camino simple en BITWISE). En una tarjeta de 16 GB
+cumple todas las marcas de velocidad de la semana: unos **154 tokens/s** de prefill tras un prompt de 32K y
+**48 tokens/s** de generación, corto y tras 32K; la aguja de 100K se recupera en 4 de 5 casos y las dos
+desviaciones quedan registradas (la propia referencia llama.cpp es inestable a esa longitud). Las compuertas y la
+configuración de velocidad están en `tools/kolibri/`; cada número proviene de dos ejecuciones con la carga de la
+máquina indicada. La evidencia completa: [el informe de la campaña](docs/strateu-campaign-report.md) y los
+registros bajo `docs/superpowers/plans/`.
+
 ## ¿Qué velocidad tiene?
 
 Lo medimos en dos PC gaming normales. Un token equivale más o menos a ¾ de una palabra.
