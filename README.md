@@ -16,14 +16,16 @@ German & English MoE, 3.46B active) on 56 GB of RAM: `./setup.sh --family kolibr
 
 ## About this fork
 
-**strateu** is a measured fork of [Niko1221/Strata](https://github.com/Niko1221/Strata) focused on the
-**Kolibri 1** engine (`src/kolibri`). One week of measurements made the CUDA port **bitwise deterministic**
-(prefill racecheck-clean, two-run diffs 0.0) and **KL-gated against llama.cpp** (0.00132 on 109 answer steps,
-top-1 0.982, plain-path oracle BITWISE). On a 16 GB card it meets every campaign speed floor: about
-**154 tokens/s** prefill after a 32K prompt and **48 tokens/s** generation short and after 32K, with 100K
-needle recall 4/5 and both misses recorded (the llama.cpp reference is itself unstable at that length).
-The gates and speed config live in `tools/kolibri/`; every number is two-run with its box load stated, and the
-full evidence trail is [the campaign report](docs/strateu-campaign-report.md) and the ledgers under `docs/superpowers/plans/`.
+**strateu** forks [Strata](https://github.com/Niko1221/Strata) for **European open models**, starting with **Kolibri 1** (`src/kolibri`):
+50 layers x 384 experts, top-6 routing, 4:1 hybrid attention (513-token sliding rings on 40 layers, full attention on 10).
+CUDA today; AMD RDNA bring-up is the planned next step. All **19,200 experts stay pinned in host RAM** (42.90 GiB,
+repacked per-expert blobs) and only a bounded hot set is mirrored in VRAM; a **cache miss is computed in place by a CPU
+pool over the pinned table** - no PCIe round trip - and prefill runs as a staged, pool-carried pipeline. The GPU/pool
+overlap is implemented and measured neutral: the per-layer residual dependency serialises the two, recorded not papered over.
+Accuracy is instrumented: **KL vs llama.cpp** on every numerics change, a **bitwise plain-path oracle**, `racecheck`-clean
+determinism (two runs bitwise identical), and a **100K needle audit** scored against each fixture's own needle text, both
+misses recorded. Evidence, including what was measured **dead**, is in [the campaign report](docs/strateu-campaign-report.md)
+and [the findings log](docs/findings-log.md). This fork's speed figures are **provisional** pending wall-clock re-measurement.
 
 ## How fast is it?
 
