@@ -297,6 +297,63 @@ tok/s" has been waiting for an AMD counterpart of. `DENSE_F16` next to the exper
 cleanly at 942.7 / 958.0 s, against the T4 record where that combination OOMed: at 32 GB with the
 expert table in host RAM there is room the T4 did not have.
 
+## Gate re-confirmation, geometry evidence, and the detector result
+
+Re-run against the current binary (`build/strata-kolibri`, gfx1201), box `rizo`, 90 GiB free:
+
+```
+0. build       PASS
+  1. ids smoke   PASS  (gen: 3515 310 262 14292)
+  2. PF_HASH     PASS  (100 chunk-layers)
+  3. oracle      PASS  (BITWISE PASS: gen: 286 3515 310 262 14292 1444 ...)
+GATE PASS
+```
+
+`tools/kolibri/oracle.sh check` on its own: `BITWISE PASS: gen: 286 3515 310 262 14292 1343 1444 46
+17156 32 51 48 58 4037 262 1890` - the AMD oracle, sixteen ids, reproduced from the committed
+`oracle_ids512.txt`.
+
+### Geometry, read from the model file rather than asserted from the load line
+
+The load line says "layout checked", which is a claim; these are the values the shared validator
+(`core::geometry_from_gguf`, which enforces the four-sliding-to-one-full pattern and a positive
+window) actually matched on this file - GGUF v3, 903 tensors, 46 kv pairs, architecture and
+pre-tokenizer both `kolibri1`:
+
+| key | value | the criterion it satisfies |
+|---|---|---|
+| `kolibri1.embedding_length` | 2560 | 2560 embd |
+| `kolibri1.expert_count` / `expert_used_count` | 384 / 6 | 384 experts, top-6 |
+| `kolibri1.attention.sliding_window` | 513 | the 513-cell window |
+| `kolibri1.attention.sliding_window_pattern` | 50 entries, 40 set and 10 clear | window on 40 of 50 layers |
+
+Together with the engine's own load report (`experts 50 x 384 blobs repacked, 42.90 GiB pinned`),
+every geometry the campaign asserted is now evidenced with a number rather than with the word
+"checked".
+
+### The detector criterion, and what this stack will and will not do
+
+The criterion asks for a named ROCm race/memory detector run per ported kernel. There is no
+`racecheck` equivalent for gfx1201 on ROCm 7.2.2 (the table earlier in this log covers why: no
+`compute-sanitizer`, `hip-memcheck` removed after 4.x, device ASan refused for want of `xnack+`,
+validation layer not packaged). The one memory-side detector this box does have is
+`rocm-debug-agent` 2.1.0, and it was run properly rather than assumed:
+
+- `HSA_TOOLS_LIB=/opt/rocm/lib/librocm-debug-agent.so.2` with `ROCM_DEBUG_AGENT_OPTIONS=--all`, full
+  prefill + 16-token decode: rc 0, 16 tokens, **zero** wavefront / memory-violation / illegal-instruction
+  / queue-error lines.
+- To prove that silence meant "clean" rather than "not loaded", the library was checked in the live
+  process: 5 mappings of `librocm-debug-agent.so.2.1.0`, `HSA_TOOLS_LIB` present in its environment.
+  A `SIGQUIT` mid-prefill then produced **no wavefront dump at all**.
+
+So the honest statement is: the agent loads but does not deliver wavefront state on gfx1201 under
+ROCm 7.2.2, which makes it a null result rather than a passing detector. What is actually covered is
+weaker than `racecheck` and is stated as such - no memory exception is raised by any ported kernel
+across prefill, decode, the pool path and the long-context runs, and determinism rests on the
+two-run bitwise identity of generated ids plus `PF_HASH` over 100 chunk-layers, which is a
+reproducibility guarantee, not a data-race proof. Anyone who needs a race proof on this path needs a
+detector that does not exist for this architecture yet, and should not read the two-run identity as one.
+
 ## Where the port stands (2026-10-24)
 
 Done and committed on `feat/amd_r9700`: launcher (`251a079c`), HIP build + load + ctest (`f901ca06`,
