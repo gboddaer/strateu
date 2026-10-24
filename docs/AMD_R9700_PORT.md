@@ -215,6 +215,30 @@ p02 0.00208 [0.00208], p03 0.00044 [0.00069], p04 0.00045 [0.00035], p05 0.00100
 floor - and it is also one of the three prompts whose greedy answer diverged in parity, so the two
 observations are the same observation.
 
+## The 100K needle audit (task 5, second half) - recall 5/5
+
+The campaign's driver was never committed (`/tmp/needle_drive.py`, "regenerate rather than copy
+paths"), so the fixtures are rebuilt by `tools/kolibri/make_needle_fixtures.py`, which writes
+`/tmp/needle_<name>/{90_prompt.txt,90.ids}` - the two files `needle_audit.py` looks for. Five
+fixtures of ~99.3K tokens, needle at 5/25/50/75/90% depth, each needle word asserted to occur exactly
+once in its prompt, framing sentence in the form the audit's regex matches.
+
+`needle_audit.py --run` on the shipped path, box load 91 GiB free:
+
+| fixture | tokens | needle | result |
+|---|---|---|---|
+| `needle_a05` | 99,298 | `quartz-willow-884` | PASS |
+| `needle_b25` | 99,298 | `cobalt-orchard-311` | PASS |
+| `needle_c50` | 99,299 | `amber-glacier-742` | PASS |
+| `needle_d75` | 99,298 | `velvet-cedar-209` | PASS |
+| `needle_e90` | 99,298 | `quartz-willow-107` | PASS |
+
+`5 answer(s) audited, 0 not exact`. The gate is recall >= 4/5 and exact >= 3/5; this is 5/5 on both
+as the harness scores them (`needle in text` over the whole decoded generation - the line it prints
+is only the answer's last line, which is why a PASS can display as `'Answer:'`). Worth noting for
+anyone reading the table: `needle_e90` uses `quartz-willow-107`, the word the campaign recorded as
+*llama.cpp's own wrong answer* on a different fixture - here it is the needle, and it was found.
+
 ## Where the port stands (2026-10-24)
 
 Done and committed on `feat/amd_r9700`: launcher (`251a079c`), HIP build + load + ctest (`f901ca06`,
