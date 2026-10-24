@@ -404,6 +404,54 @@ The harnesses take explicit paths, but the campaign's fixtures were generated on
   `needle_bench.py` does; **it was not committed** — regenerate rather than copy paths).
 * the **oracle** fixture *is* in-tree: `tools/kolibri/oracle_ids512.txt`.
 
+### 9.6 Executed on the R9700 (2026-10-24) — the re-derivation, with its numbers
+
+This section was a checklist; it is now done, and `docs/AMD_R9700_PORT.md` is the ledger behind every
+line here. Box: host `rizo`, Radeon AI PRO R9700 (gfx1201, 32 GB), ROCm 7.2.2, Ryzen 7 5700G
+(8 physical cores, one NUMA node), 93 GiB RAM, 90-91 GiB free per run, GPU idle at start,
+`--cpu-threads 8`, shipped config, two runs per arm.
+
+| | this box (16 GB T4) | **R9700 (32 GB)** |
+|---|---|---|
+| prefill, 512-token prompt | 157.0 / 160.3 tok/s | **43.4 / 51.7 tok/s** (20.3 / 22.0 end to end) |
+| prefill, 99,299-token prompt | - | **102.3 / 100.8** (`ATTN_MB=512`), **105.2 / 105.8** (`1024`) |
+| prefill, 127,811-token prompt | - | **94.1 / 94.2** (`512`), **100.4 / 100.8** (`1024`) |
+| decode, short context | 24.5 / 24.4 tok/s | **15.8 / 15.8 tok/s** |
+| decode, long context | 12.3 / 12.2 (after 32K) | **6.7 / 5.5** (at 100K) |
+| KL vs llama.cpp, answers | 0.00132 = 0.74x of that floor | **0.00182**, top-1 0.9884 = **0.97x of this box's floor** (0.00187) |
+| 100K needle | recall 4/5, exact 3/5 | **recall 5/5, 0 not exact** |
+| ctest | - | **60 / 62**, both failures box-scoped |
+
+Against §9.3's list of verdicts that had to be re-derived rather than inherited:
+
+1. **"The CPU pool beats the GPU expert path" - the sign did flip.** `POOL_ALL=0` measured 29.1 / 29.0 s
+   against the shipped pool-on 32.3 / 31.1 s, and the counters say why the original reasoning broke:
+   every expert layer already runs through the pool here (`pool 50.0` of `50.0` layers/token,
+   `gpu-expert`, `slots-path` and `grouped` all zero), the host streams 32.4 GB/s, and `VRAM free=20.56
+   GiB of 31.86 GiB after dense upload` leaves no room for a GPU-resident placement of a 42.90 GiB
+   table. There is no placement to choose, so the pool-only design is not a win to defend here - it is
+   the only shape, and turning it off for prefill is slightly faster.
+2. **"Decode residency serves 0 of 0 picks" - true by default, and turning it on is a large loss.**
+   `DEC_RES` is opt-in and default-off, so 0 of 0 is the shipped path, not a failure. With it on, the
+   cache serves **23513 of 38400 picks (61.2%)** and streamed bytes fall from 714.2 to 276.7 MB/tok -
+   and the run takes **360.2 / 363.3 s against 32.3 / 31.1 s**. Residency engages well; what it replaces
+   streaming with (a per-layer fp16 gemm at T=1) costs far more than the bytes it saves on RDNA4. The
+   fill-amortisation argument in §9.3 assumed the saved streaming was expensive. It is not, on this box.
+3. **The four floors are not carried over.** The AMD table above is the anchor; 150/200/30/20 are not
+   AMD targets. The reference for KL is a llama.cpp built on this box (`/fast/llama-server-kolibri/
+   llama.cpp` at `f5027fb21`, `build_rocm_rizo`), and the measured 0.00182 sits at 0.97x of that
+   build's own CPU-vs-GPU floor - so it is at llama.cpp's noise, though it does not clear the 0.00132
+   this box recorded against a different llama.cpp revision.
+4. **`ATTN_MB=1024` is a win here, not an OOM.** It is faster at both long contexts (105.5 vs 101.6 at
+   100K, 100.6 vs 94.2 at 128K), and `DENSE_F16=1` alongside the 24-slot expert cache runs clean at
+   100K (942.7 / 958.0 s) where this box OOMed.
+
+§10's open defect reproduces on HIP: `RES_TOP=0` dies with `dequant launch: invalid configuration
+argument` on gfx1201 too, with no `gen:` line emitted - so its 15.3 s wall is time-to-failure and must
+never be read as a fast arm in any table. `ROPE_F64=1` costs nothing measurable here (39.6 / 39.5 s
+against a 39.3 / 39.3 s baseline, prefill 51.5 vs 51.7 tok/s), and `RES_TOP=24` against 56 is identical
+(39.3 / 39.3 s) once residency is off.
+
 ---
 
 ## 10. Open defect (recorded, not fixed)

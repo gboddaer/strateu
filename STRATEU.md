@@ -19,7 +19,31 @@ inherited.
 | backend | status |
 |---|---|
 | NVIDIA CUDA (sm_75 measured) | **supported, measured** |
-| AMD HIP / ROCm | **planned, untested** - upstream paths exist (`docs/AMD_HIP.md`), but this fork ships no AMD measurements and makes no AMD claims |
+| AMD HIP / ROCm | **supported, measured on a Radeon AI PRO R9700** (gfx1201, 32 GB, ROCm 7.2.2) - see [`docs/AMD_R9700_PORT.md`](docs/AMD_R9700_PORT.md) for every number and [`docs/AMD_HIP.md`](docs/AMD_HIP.md) for the build |
+
+### The AMD floor table
+
+Measured on host `rizo`: Ryzen 7 5700G (8 physical cores, one NUMA node), 93 GiB RAM, 90-91 GiB free
+per run, GPU idle at start, `--cpu-threads 8`, shipped config. Two runs each. Prefill subtracts the
+engine's own 13.4 s load line; the end-to-end row does not.
+
+| | CUDA box (16 GB T4) | **R9700 (32 GB)** |
+|---|---|---|
+| prefill, 512-token prompt | 157.0 / 160.3 tok/s | **43.4 / 51.7 tok/s** (20.3 / 22.0 end to end) |
+| prefill, 99,299-token prompt | - | **102.3 / 100.8 tok/s** (`ATTN_MB=512`), **105.2 / 105.8** (`ATTN_MB=1024`) |
+| prefill, 127,811-token prompt | - | **94.1 / 94.2** (`512`), **100.4 / 100.8** (`1024`) |
+| decode, short context | 24.5 / 24.4 tok/s | **15.8 / 15.8 tok/s** |
+| decode, long context | 12.3 / 12.2 tok/s (after 32K) | **6.7 / 5.5 tok/s** (at 100K) |
+| KL vs llama.cpp, answers | 0.00132 (0.74x of that box's floor) | **0.00182**, top-1 0.9884 - **0.97x of this box's floor** (0.00187) |
+| 100K needle | recall 4/5, exact 3/5 | **recall 5/5, 0 not exact** |
+| ctest | - | **60 / 62**, both failures box-scoped |
+| pinned expert table | 42.90 GiB, needs `RLIMIT_MEMLOCK` | **42.90 GiB, no root needed** |
+
+Three of the campaign's verdicts do not survive the move, and §9.3 said to expect that rather than
+inherit it: the CPU pool is no longer a win (`POOL_ALL=0` measured faster), decode residency engages
+well (61.2% of picks) and costs 11x, and `ATTN_MB=1024` is faster rather than an OOM. The full set of
+re-derived verdicts, with the counters behind them, is in
+[`docs/AMD_R9700_PORT.md`](docs/AMD_R9700_PORT.md).
 
 ## Quickstart
 

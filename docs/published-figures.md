@@ -26,9 +26,46 @@ measurement** and the doc is stale.
 | 14 | VRAM at 100K prefill | **peak 15,241 MiB** (`ATTN_MB=512`); `ATTN_MB=1024` OOMs | sampled `nvidia-smi` | 101,414-token prefill | "queued measurements settled" | report §6.2 |
 | 15 | pinned expert table | **42.90 GiB** | engine load report | n/a | "design" | STRATEU, report §2.1/§6.2 |
 | 16 | expert coverage, 512-token corpus | **top-24 50.4%, top-80 79.2%, top-128 90.4%** | `STRATA_KOLIBRI_EXPERT_HIST=1` + `--counters` | instrument-time (coverage, not a rate) | "C0 coverage curve" | report §7/§C0 |
-| 17 | expert coverage, 32K corpus | **top-24 42.9%, top-80 70.3%, top-128 83.0%** | same | instrument-time | "C0 coverage curve" | report §C0 |
+| 17 | expert coverage, 32K corpus | **top-24 42.9%, top-80 70.3%, top-128 83.0%** | `STRATA_KOLIBRI_EXPERT_HIST=1` + `--counters` | instrument-time | "C0 coverage curve" | report §C0 |
 
-## Retracted figures (must not be quoted again)
+## AMD Radeon AI PRO R9700 (gfx1201, 32 GB, ROCm 7.2.2) — re-derived, not inherited
+
+A different box, so a different floor table. Every row below is two-run wall clock from
+`docs/AMD_R9700_PORT.md` on host `rizo`: Ryzen 7 5700G (8 physical cores, 1 NUMA node), 93 GiB RAM,
+90-91 GiB free at the start of each run, GPU idle at the start, `--cpu-threads 8`, shipped config
+(`EXPERT_F16=24`, `RES_TOP=56`, `PF_STAGE=1`, router tiles) unless the row names a change. Prefill
+rows subtract the engine's own load line (13.4 s warm); the end-to-end row does not, and says so.
+
+| # | figure | value | method | load / scope | ledger row | quoted in |
+|---|---|---|---|---|---|---|
+| 18 | prefill, 512-token prompt | **43.4 / 51.7 tok/s** | wall clock, `n=1` run minus the engine's 13.4 s load line | load 90-91 GiB free | "Wall-clock rates on the AMD path" | STRATEU, report §9.6 |
+| 19 | prefill 512, end to end (load included) | **20.3 / 22.0 tok/s** | same runs, nothing subtracted | same | same | report §9.6 |
+| 20 | decode, short context | **15.8 / 15.8 tok/s** | wall clock, tokens 130-257 of an `n=257` run | same | same | STRATEU, report §9.6 |
+| 21 | prefill, 99,299-token prompt (ctx 105024) | **102.3 / 100.8 tok/s** (`ATTN_MB=512`); **105.2 / 105.8** (`ATTN_MB=1024`) | wall clock, load subtracted | same | "long context, same engine" | STRATEU, report §9.6 |
+| 22 | prefill, 127,811-token prompt (ctx 131072) | **94.1 / 94.2 tok/s** (`ATTN_MB=512`); **100.4 / 100.8** (`ATTN_MB=1024`) | wall clock, load subtracted | same | same | report §9.6 |
+| 23 | decode at 100K context | **6.7 / 5.5 tok/s** | wall clock, `n=129` minus `n=1` on the 99,299-token fixture, `ATTN_MB=1024` | same | "decode at 100K" | STRATEU, report §9.6 |
+| 24 | KL vs llama.cpp, answers | **0.00182** (top-1 0.9884, 344 answer steps) | `kl.py` against `/fast/llama-server-kolibri/llama.cpp` `f5027fb21`, built here as `build_rocm_rizo` | n/a (not a rate) | "The KL gate" | STRATEU, report §9.6 |
+| 25 | llama.cpp CPU-vs-GPU floor on the same set | **0.00187** (top-1 0.9884) | `kl.py` | n/a | same | report §9.6 |
+| 26 | 100K needle | **recall 5/5, 0 not exact** | `needle_audit.py --run`, five fixtures of ~99.3K tokens rebuilt by `tools/kolibri/make_needle_fixtures.py` | shipped path | "The 100K needle audit" | STRATEU, report §9.6 |
+| 27 | ctest on the HIP build | **60 / 62** | `ctest` on the gfx1201 build | the two failures are box-scoped: `ple_parity` (missing Qwen3.8 Q2_0 file) and `platform_memory_test` (POSIX `mlock` vs `ulimit -l` 8 MiB) | "HIP bring-up" | STRATEU, report §9.6 |
+| 28 | pinned expert table on AMD | **42.90 GiB, no root** | engine load report at `ulimit -l` 8 MiB | `hipHostMalloc` succeeds without `RLIMIT_MEMLOCK`; the T4-era pinning requirement does not carry over | "HIP bring-up" | report §9.6 |
+
+## Campaign-report figures outside the numbered table
+
+These are quoted in `docs/strateu-campaign-report.md` but are not headline rates, so they carry no
+numbered row. Listed here so the staleness checker accounts for them and a reader can tell what each
+one is: a rounded restatement, an instrument-time sweep, a forward estimate, or a withdrawn figure.
+None of them may be quoted as a headline measurement.
+
+| figure | value | what it actually is |
+|---|---|---|
+| decode short, rounded in prose | 48 tok/s | the **retracted** counter-derived figure (see Retracted figures); quoted only in the sentence that retracts it |
+| serve path, rounded in prose | 176 tok/s | rounded restatement of #13 (176.2 / 170.8 tok/s) |
+| cache neutrality sweep | 80.4 / 80.0 tok/s | §7 instrument-time A/B (6,366 / 6,397 ms against 6,357 / 6,337 ms), a neutrality check, not a floor |
+| `RES_TOP=8` sweep | 122 tok/s | §7 sweep arm showing the promotion budget's cost; superseded by the shipped `RES_TOP=56` |
+| §8.1 arithmetic best case | 270 tok/s | **estimate**, not a measurement - the paper ceiling §8.1 derives before discounting |
+| §8.2 expected gain | 180 tok/s | **estimate** of the +10-20% the cheap partial was expected to give |
+| pool vs GPU decode, this box | 16.1 tok/s | the GPU-expert-path arm §9.3 cites against the pool's 22.7 tok/s; the AMD re-derivation of this pair is #18-#20 and report §9.6 |
 
 | figure | value | why it was withdrawn |
 |---|---|---|
