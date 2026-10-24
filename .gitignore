@@ -76,3 +76,7 @@ data/kolibri-engine-*/
 *.gpu.full
 *.nsys-rep
 *.sqlite
+
+# plan-of-record: campaign plans and ledgers stay local, never in the published tree
+# (docs/strateu-campaign-report.md section 12)
+docs/superpowers/
