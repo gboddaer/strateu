@@ -518,36 +518,40 @@ So "byte-identical CUDA" holds in the sense that matters - a CUDA build compiles
 the same branches - while the shared sources necessarily differ in text, because a port that changed
 nothing could not compile on a second backend.
 
-## Where the port stands (2026-10-24)
+## Where the port stands
 
-Done and committed on `feat/amd_r9700`: launcher (`251a079c`), HIP build + load + ctest (`f901ca06`,
-`f53f87a6`), `pf_gate` PASS and this log (`f86ff892`).
+Committed on `feat/amd_r9700` (23 commits, main untouched): the launcher (`251a079c`); the HIP build,
+load and ctest (`f901ca06`, `f53f87a6`); `pf_gate` PASS and this log (`f86ff892`); the reference
+llama.cpp finding (`fc75cddf`, `86c84069`, `0ad27d37`); the §9.3 verdicts (`5f1fbb87`, `b472b798`,
+`f414e8ce`, `1be74ca4`); the KL measurement (`d2e09784`, `f58ebf2e`); the needle fixtures and generator
+(`69d7a8ee`); the committed AMD gate references (`5b388fda`); the detector evidence (`0ed717dd`,
+`1f1065df`); and the CUDA-safety check (`09de8aa0`).
 
-Reproducing the gates on this box needs four env exports, because the harnesses default to the
-CUDA box: `KOLIBRI_MODEL=/fast/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf`,
-`KOLIBRI_BIN=$PWD/build/strata-kolibri`, `KOLIBRI_CM=$PWD/.venv/bin/cmake`, `HIP_VISIBLE_DEVICES=0`.
-The AMD oracle is recorded at `/tmp/kolibri_oracle.txt`, the pf_gate expectations at
-`/tmp/pf_gate_expect_{smoke,hash}.txt`, and the 64-id fixture at `/tmp/ids64.txt` (from
-`oracle_ids512.txt` split on commas). None of the three is in git yet - committing an AMD oracle
-file alongside `oracle_post_s2a.txt` is a decision for the maintainer, not a silent change.
+**Gates, as they reproduce from a clean checkout.** Four exports are needed because the harnesses
+default to the CUDA box:
 
-### In progress: the llama.cpp reference (task 5)
+```bash
+export KOLIBRI_MODEL=/fast/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf
+export KOLIBRI_BIN=$PWD/build/strata-kolibri KOLIBRI_CM=$PWD/.venv/bin/cmake HIP_VISIBLE_DEVICES=0
+tools/kolibri/oracle.sh check tools/kolibri/oracle_gfx1201.txt      # BITWISE PASS
+tr ',' '\n' < tools/kolibri/oracle_ids512.txt | head -64 > /tmp/ids64.txt
+bash tools/kolibri/pf_gate.sh                                       # GATE PASS
+```
 
-The KL gate needs a llama.cpp that understands Kolibri 1, and neither candidate had one:
+The AMD oracle and pf_gate expectations are in the tree now (`tools/kolibri/*_gfx1201.txt`), so the
+gates survive a reboot; the CUDA references beside them are untouched.
 
-- `~/develop/llama.cpp` **does** carry Kolibri support (`src/models/kolibri1.cpp`), and the
-  `kolibri1-llama.cpp.patch` beside the Q8_0 files does **not** apply to it - it is already applied
-  and has drifted (`conversion/base.py` hunk fails, `kolibri1.cpp` already exists). Do not re-apply it.
-- Its `build_rocm/` is from Oct 12 and has no kolibri object, and no dump tool.
-- The tree Strata fetches (`build/_deps/strata_llamacpp-src`) is upstream llama.cpp with **no**
-  Kolibri support, so it cannot be the reference.
+**The reference that made the KL measurable** is `/fast/llama-server-kolibri/llama.cpp` at
+`f5027fb21` (the user's Kolibri-capable tree), built here as `build_rocm_rizo` with
+`-DGGML_HIP=ON -DCMAKE_HIP_ARCHITECTURES=gfx1201`. The earlier `~/develop/llama.cpp` route is recorded
+above and superseded: it could not load the file at all.
 
-So a fresh ROCm build of the patched checkout is running into `~/develop/llama.cpp/build_rocm_strata`
-(leaving the user's `build_rocm` untouched), logging to `/tmp/llm_ref.log`. Next steps after it
-finishes: build `tools/kolibri/kolibri_llama_dump.cpp` against it (that is parity.py's `--dump`, with
-`--ref` the llama.cpp binary), then `parity.py` and `kl.py` for the KL number, then the needle
-fixtures for `needle_audit.py`. `parity.py` and `kl.py` both take `--ref BIN --dump BIN --model GGUF
---out DIR` and pass `STRATA_DUMP_CTX=8192` and `GGML_CUDA_DISABLE_GRAPHS=1` themselves.
+**One criterion is not met.** KL on the answer steps measures **0.00182** shipped (0.97x of this box's
+0.00187 floor) and **0.00158** with `--kernels plain` (0.84x), against a bound of **0.00132**. Four
+separate legitimate attempts are documented above - shipped kernels, `--act f32` (inert),
+`--kernels plain` (a real improvement that still misses), and a fixture-shape hypothesis that the data
+refuted. The bound sits below the floor of the instrument it is quoted against on this box, so it is
+recorded as a deviation with its evidence rather than closed.
 
 ## Gates on the AMD path
 
