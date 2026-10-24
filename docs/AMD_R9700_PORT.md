@@ -354,6 +354,50 @@ two-run bitwise identity of generated ids plus `PF_HASH` over 100 chunk-layers, 
 reproducibility guarantee, not a data-race proof. Anyone who needs a race proof on this path needs a
 detector that does not exist for this architecture yet, and should not read the two-run identity as one.
 
+## The AMD gates are now reproducible from the tree, and one KL lever that did not exist
+
+Everything the AMD gates compare against used to live in `/tmp`, which means a reboot silently
+un-reproducible them. They are committed now, named for the backend so the CUDA references next to
+them are untouched:
+
+| file | what it pins |
+|---|---|
+| `tools/kolibri/oracle_gfx1201.txt` | the 16 generated ids the plain path must reproduce bitwise |
+| `tools/kolibri/pf_gate_expect_smoke_gfx1201.txt` | the 4-token ids-smoke expectation |
+| `tools/kolibri/pf_gate_expect_hash_gfx1201.txt` | the 100 chunk-layer `PFHASH` lines |
+
+With those in the tree, the whole AMD gate set reproduces from a clean checkout with four exports and
+two commands (verified: `oracle.sh check` -> `BITWISE PASS`, `pf_gate.sh` -> `GATE PASS` against the
+committed files, not the `/tmp` ones):
+
+```bash
+export KOLIBRI_MODEL=/fast/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf
+export KOLIBRI_BIN=$PWD/build/strata-kolibri KOLIBRI_CM=$PWD/.venv/bin/cmake HIP_VISIBLE_DEVICES=0
+tools/kolibri/oracle.sh check tools/kolibri/oracle_gfx1201.txt
+tr ',' '\n' < tools/kolibri/oracle_ids512.txt | head -64 > /tmp/ids64.txt   # pf_gate reads this path
+bash tools/kolibri/pf_gate.sh
+```
+
+That `tr | head -64` line is not a guess about the fixture: `/tmp/ids64.txt` was compared byte-for-byte
+against it and is identical, so the 64-id input the ids-smoke leg uses is derived from the committed
+512-id file rather than being a third unreproducible artefact.
+
+### `--act f32` does not move KL, so the bound was not reachable that way
+
+`kl.py` exposes `--ref-args`, and `strata-kolibriref` defaults to `g_act_q8 = true` (q8-quantized
+activations), so f32 activations looked like a legitimate way to close the remaining KL gap. It is
+inert on this path: re-running the whole KL set with `--ref-args "--act f32"` reproduced **every**
+per-prompt number exactly - all eight prompts, both the all-steps and answers-only means, medians and
+p99s, to four decimals. The reason is in `kolibriref.cu:274` (`if (quant && g_act_q8)`): the flag only
+matters where the path quantizes at all, and the KL path does not. Worth recording so nobody spends an
+afternoon on it; note also that `kl.py` unlinks the strata logits after scoring (line 101), so
+comparing the two runs' `.strata.full` files proves nothing - the per-prompt KL lines are the evidence.
+
+So the KL result stands as measured: **0.00182 on the answer steps against a bound of 0.00132**, at
+0.97x of this reference's own CPU-vs-GPU floor of 0.00187. That last number is the awkward one - the
+bound sits *below* the noise floor of the reference it is measured against on this box, which is
+recorded as a deviation rather than argued away.
+
 ## Where the port stands (2026-10-24)
 
 Done and committed on `feat/amd_r9700`: launcher (`251a079c`), HIP build + load + ctest (`f901ca06`,
