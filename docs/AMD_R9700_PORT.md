@@ -105,6 +105,20 @@ not a loud one, so they are recorded:
 | `/tmp/ids64.txt` | a CUDA-box scratch file | regenerated from `tools/kolibri/oracle_ids512.txt`, which is **comma-separated**, so `tr ',' '\n'` - splitting it on spaces yields zero ids and the gate dies before its first run |
 | `pf_gate.sh --cpu-threads 24` | 27 pinnable cores | hardcoded 24; the engine caps it itself ("8 lane(s) = the host + 7 thread(s), 7 pinnable physical core(s), pinned (capped from --cpu-threads)"), so it is oversubscribed-but-correct here |
 
+### Reference llama.cpp: what it took, and the current blocker
+
+`~/develop/llama.cpp` carries **part** of the Kolibri patch: `src/models/kolibri1.cpp` and
+`LLM_ARCH_KOLIBRI1` exist, but the `src/llama-vocab.cpp` half does not, so the reference refused the
+file with `error loading model vocabulary: unknown pre-tokenizer type: 'kolibri1'`. The whole-patch
+apply fails only because of `conversion/base.py` (drifted) and `src/models/kolibri1.cpp` (already
+present); applied per file, `src/llama-vocab.cpp`, `src/llama-arch.cpp`, `src/llama-model.cpp` and
+`src/models/models.h` each apply cleanly. That is what is being applied and rebuilt now into
+`build_rocm_strata` (log `/tmp/llm_patch.log`); `tools/kolibri/kolibri_llama_dump.cpp` is then
+rebuilt against it into `build/tools/kolibri_llama_dump` per the header comment in that file.
+`parity.py` takes `--ref build/strata-kolibriref --dump build/tools/kolibri_llama_dump --model GGUF
+--out DIR --n 64 --ngl 99 --cpu-moe 50`; its first attempt failed with "no gen" style rc 1 for
+exactly this vocabulary reason (`/tmp/parity-amd/p00.llama.log`).
+
 ## Where the port stands (2026-10-24)
 
 Done and committed on `feat/amd_r9700`: launcher (`251a079c`), HIP build + load + ctest (`f901ca06`,
