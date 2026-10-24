@@ -61,3 +61,27 @@ marginal-share promotion rule, and re-scoping the overlap - and the only survivi
 `pp short` remains **150 tok/s against a floor of 200**.  Everything cheap has been tried and recorded; what remains is kernel
 work whose size cannot even be located with the profilers available on this box, because both of them perturb the workload
 they measure (nsys by 15x on a 15k-launch workload, the phase marks by doubling the pool's chunks).
+
+## serve path at the pp-short shape: cold 150.6 / warm 176.2 tok/s, with cache_n 0 (one-time state, not KV reuse)
+
+*Replayed from worktree commit `9f892bc8`.*
+
+
+## The serve path at the floor's shape: cold 150.6, warm 176.2 tok/s
+
+Three identical 415-token chat requests through `run-kolibri1.sh` (ctx 8192, shipping config), reading the server's own
+`timings`:
+
+| request | prompt_ms | prompt tok/s |
+|---|---|---|
+| 1 (cold, first after load) | 2,756.3 | **150.6** |
+| 2 (warm) | 2,355.5 | **176.2** |
+| 3 | 2,430.1 | 170.8 |
+
+with `cache_n = 0` on all three, so this is **not** KV reuse - it is one-time process state (the expert-cache fill, cuBLAS
+handles, the pinned-table warm-up) amortising.  That matters for how the pp-short floor is read: the benchmark is a cold
+process, while the serve path - which is what the box is actually for - pays that once and then runs at ~176 tok/s.  Still
+short of 200, but the gap in the *use case* is 12%, not 33%, and it is the same fill that C1's blob residency would shrink 3.5x.
+
+Also worth recording: the `prompt_ids` field is not accepted as a prompt by `/v1/chat/completions` (a request carrying 500 ids was
+answered as a 45-token chat prompt), so prompt-shape measurements through the API need real text.
