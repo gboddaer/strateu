@@ -1,0 +1,15 @@
+strateu
+=======
+
+This project is a derivative work of Strata (https://github.com/Niko1221/Strata),
+Copyright (c) 2026 Niko1221 and the Strata contributors, licensed under the MIT License.
+The original LICENSE file is retained unmodified, as the MIT License requires.
+
+Changes in this repository (the "strateu" line of work) add and tune an engine path for
+Kolibri-1 (Qwen3-family Mixture-of-Experts, 50 layers x 384 experts), including:
+  * a chunked prefill carrying the routed experts through a CPU pool over a pinned table,
+  * a bounded VRAM residency cache for hot experts with the remainder computed in place,
+  * router tiling, transposed-KV attention and fused residual/norm kernels,
+  * measurement harnesses (oracle, PF checksums, KL vs llama.cpp, 100K needle audit).
+
+Upstream commits are preserved in this history so the derivation is auditable.

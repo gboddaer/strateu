@@ -4,7 +4,7 @@
 # Kept as a file: the nested quoting of a `nohup bash -c '...'` one-liner is a trap (it silently killed a
 # launch on 2026-10-18 by breaking on `","` inside a nested python -c).
 set -uo pipefail
-cd /data2/develop/strata-speed-wt
+cd $(dirname "$0")/../..
 M=${M:-/data4/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf}
 mkdir -p /tmp/kolibri_s3 /tmp/kolibri_s3_fp32
 

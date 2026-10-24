@@ -12,7 +12,7 @@ MODEL="${KOLIBRI_MODEL:-/data4/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf}"
 IDS512="${KOLIBRI_IDS512:-/tmp/bench_ids512.txt}"
 OUT="${1:-/tmp/kolibri_s0}"; mkdir -p "$OUT"
 export STRATA_DUMP_CTX=8192 GGML_CUDA_DISABLE_GRAPHS=1
-PY=/data2/develop/Strata/.venv/bin/python; [ -x "$PY" ] || PY=python3
+PY=python3; [ -x "$PY" ] || PY=python3
 command -v numactl >/dev/null || { echo "FATAL: numactl missing"; exit 1; }
 
 echo "== NUMA placement, plain path, pp512 + tg128 (ctx 8192); numactl wraps the engine via a shim =="

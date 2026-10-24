@@ -18,7 +18,7 @@ IDS512="${KOLIBRI_IDS512:-/tmp/bench_ids512.txt}"
 IDS32K="${KOLIBRI_IDS32K:-/tmp/bench_ids32k.txt}"
 OUT="${1:-/tmp/kolibri_s0}"; mkdir -p "$OUT"
 export STRATA_DUMP_CTX=8192 GGML_CUDA_DISABLE_GRAPHS=1
-PY=/data2/develop/Strata/.venv/bin/python
+PY=python3
 [ -x "$PY" ] || PY=python3
 
 require_bin() { [ -x "$1" ] || { echo "FATAL: missing binary $1"; exit 1; }; }

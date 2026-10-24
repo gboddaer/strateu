@@ -28,7 +28,7 @@ OUT="${1:-/tmp/kolibri_p1b}"; mkdir -p "$OUT"
 NUMA="${NUMA:-0}"
 SWEEP="${SWEEP:-6 12 24 48}"
 export STRATA_DUMP_CTX=8192 GGML_CUDA_DISABLE_GRAPHS=1
-PY=/data2/develop/Strata/.venv/bin/python
+PY=python3
 [ -x "$PY" ] || PY=python3
 
 for p in "$BIN" "$MODEL" "$IDS512"; do [ -e "$p" ] || { echo "FATAL: missing $p"; exit 1; }; done

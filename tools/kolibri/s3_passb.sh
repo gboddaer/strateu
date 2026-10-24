@@ -6,9 +6,9 @@
 # re-reads a script file as it executes, so editing a running script corrupts the run (observed
 # 2026-10-18 - a phantom "syntax error near '('" and a skipped pass).
 set -uo pipefail
-cd /data2/develop/strata-speed-wt
+cd $(dirname "$0")/../..
 M=${M:-/data4/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf}
-PY=/data2/develop/Strata/.venv/bin/python
+PY=python3
 OUT=/tmp/kolibri_s3
 CTX=${CTX:-33024}
 export STRATA_DUMP_CTX=8192 GGML_CUDA_DISABLE_GRAPHS=1

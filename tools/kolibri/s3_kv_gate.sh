@@ -21,7 +21,7 @@ set -uo pipefail
 OUT=${1:-/tmp/kolibri_s3}
 BIN=${2:-build/strata-kolibri}
 M=${M:-/data4/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf}
-PY=${PY:-/data2/develop/Strata/.venv/bin/python}
+PY=${PY:-python3}
 CTX=${CTX:-33024}
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 export STRATA_DUMP_CTX=8192 GGML_CUDA_DISABLE_GRAPHS=1

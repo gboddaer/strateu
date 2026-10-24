@@ -27,7 +27,7 @@ IDS32K="${KOLIBRI_IDS32K:-/tmp/bench_ids32k.txt}"
 OUT="${1:-/tmp/kolibri_s5}"; mkdir -p "$OUT"
 NUMA="${NUMA:-0}"
 export STRATA_DUMP_CTX=8192
-PY=/data2/develop/Strata/.venv/bin/python
+PY=python3
 [ -x "$PY" ] || PY=python3
 
 for p in "$BIN" "$MODEL" "$IDS512"; do [ -e "$p" ] || { echo "FATAL: missing $p"; exit 1; }; done

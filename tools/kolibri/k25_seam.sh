@@ -30,7 +30,7 @@ for MODE in two single; do
     --dump-logits /tmp/seam_${N}_$MODE.txt > /tmp/seam_${N}_$MODE.log 2>&1
   echo "exit=$? ; gen: $(grep -m1 '^gen:' /tmp/seam_${N}_$MODE.log | cut -c1-40)"
 done
-/data2/develop/Strata/.venv/bin/python - <<PY
+python3 - <<PY
 import numpy as np
 def last(f): return np.fromfile(f, dtype=np.float32)[-4:]
 a = last('/tmp/seam_${N}_single.txt'); b = last('/tmp/seam_${N}_two.txt')

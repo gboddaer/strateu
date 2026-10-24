@@ -65,3 +65,14 @@ build-vision-cuda12.bat
 # Kolibri 1 parity: the llama.cpp reference dumps (GBs of f32 layer outputs) stay out of git; the harness
 # regenerates them (tools/kolibri/parity.py --skip-ref reuses them)
 data/kolibri-ref/
+
+# strateu: generated artifacts, never source.  These classes once put 6.12 GB of layer dumps into history
+# (and 21 GB into /tmp), so the patterns are listed rather than left to operator discipline.
+data/kolibri-kl-*/
+data/kolibri-engine-*/
+*.layers
+*.full
+*.cpu.full
+*.gpu.full
+*.nsys-rep
+*.sqlite
