@@ -37,10 +37,10 @@ runs as a staged pool-carried pipeline.
 
 | gate | target | measured | standing |
 |---|---|---|---|
-| prefill, 512-token prompt | 200 tok/s | 149.7 / 151.9 cold, **176.2 warm** in the serve path | **below target** (see gaps) |
-| prefill after 32K of context | 150 tok/s | **153.9 / 154.9** | met |
-| decode, short context | 30 tok/s | **48.0 / 48.3** | met (45-60 stretch reached) |
-| decode after 32K | 20 tok/s | **48.3** (28.9 at load 12.1) | met, 2.4x |
+| prefill, 512-token prompt | 200 tok/s | **157.0 / 160.3** (wall clock) | not met |
+| prefill after 32K of context | 150 tok/s | **154.0 / 153.7** (wall clock) | met |
+| decode, short context | 30 tok/s | **24.5 / 24.4** (wall clock) | **not met** |
+| decode after 32K | 20 tok/s | **12.3 / 12.2** (wall clock) | **not met** |
 | KL vs llama.cpp (109 answer steps) | < 0.02 | **0.00132**, top-1 0.982 | met - 0.74x of llama.cpp's own CPU-vs-GPU floor |
 | plain-path oracle | bitwise | **BITWISE** | met, re-anchored after every numerics change |
 | prefill determinism | two runs identical | **bitwise identical**; `compute-sanitizer racecheck` 0 hazards | met (a missing `__syncthreads` in `block_max` was the cause) |

@@ -128,3 +128,48 @@ re-anchored after each numerics change; prefill **bitwise deterministic** across
   0 of 0 picks, `DENSE_F16` being blocked, and the `ATTN_MB`/context limits. Re-anchor the floors against llama.cpp there.
 * open defect carried forward (off the shipped path): `RES_TOP=0` exits 1 with a misattributed
   `dequant launch: invalid configuration argument`.
+
+## CORRECTION (post-audit): the decode figures were the pool's drain time, not wall-clock - two floors FAIL
+
+*Replayed from worktree commit `4ac4d787`.*
+
+## CORRECTION (post-audit): the decode figures were the pool's drain time, not wall-clock — two floors FAIL
+
+An independent audit rejected the completion claim, and it was right.  **I reported decode from the pool's own
+`ms/tok` counter instead of from wall clock.**  `714.2 MB/token / 34.5 GB/s = 20.70 ms`, and "20.72 ms/tok -> 48.3 tok/s"
+is its reciprocal; the number never measured a token, it measured the pool's slice of one.
+
+**Wall-clock re-measurement** (`tools/kolibri/bench.py`, the campaign's own harness, shipping config, load stated):
+
+| case | run 1 | run 2 | floor | verdict |
+|---|---|---|---|---|
+| pp 512 | 157.0 tok/s (3,261 ms) | 160.3 (3,194 ms) | 200 | unmet, as recorded |
+| pp 32768 | 154.0 (212,765 ms) | 153.7 (213,263 ms) | 150 | **met** |
+| tg 128 short | **24.5** (5,228 ms) | **24.4** (5,255 ms) | 30 | **UNMET** |
+| tg 128 after 32K | **12.3** (10,420 ms) | **12.2** (10,488 ms) | 20 | **UNMET** |
+
+Loads: 5.43/5.57 for the short pair; 7.49/14.10 for the after pair.  The audit's own runs (29.5-30.2 short, 13.4/13.5 after,
+at load 4.8-11.7 with `numactl` single-socket binding) bracket these: the spread between bindings is real, and neither
+binding reaches 30 at short context or 20 at 32K.
+
+**What this invalidates, beyond the floor table:**
+
+1. **The floor table in amendment 5 and everything published from it** - `docs/strateu-campaign-report.md`, `STRATEU.md`,
+   the `README.md` block.  Corrected below and in the export.
+2. **B0's conclusion that "the pool is 99% of the decode wall".**  The pool drain is ~20.7 ms of a ~41 ms token, i.e. ~50%,
+   and the other ~50% is the GPU legs plus the handoffs - serialised by the same residual dependency the overlap section
+   identified.  So the decode wall is the *sum*, which is why tg is 24.4 and not the 48 the drain alone would allow.
+3. **C0/C1's decode pricing** ("absorbed rows -> decode seconds").  With the pool at half the token, a cache hit cannot buy
+   the seconds the curve implied; the VRAM-headroom argument stands, the throughput argument does not.
+4. **The "stretch 45-60 reached" claim** in the floor table: unsupported, at either binding.
+5. **The claim that these were "two-run, load stated" numbers.**  They were two-run *counter* readings, which is not the same
+   thing; the wall-clock pair above is what that phrasing was supposed to mean.
+
+**What survives unchanged:** pp-32K 154.0/153.7 (met, and the audit's lower figure was a binding/load difference, not a
+method one); pp-512 157-160 (still short of 200, as recorded); KL 0.00132; oracle BITWISE; the barrier fix and its
+racecheck evidence; the needle audit and its deviations; every "measured dead" list, because those were all wall-clock A/B
+sweeps between configurations and their *differences* were real even where the absolute decode figure was not.
+
+**Process rule adopted:** a decode or prefill rate is only ever quoted from a wall-clock measurement of a token run
+(`bench.py` or the server's own `timings`), never from a phase counter, and the harness invocation is recorded with the
+number.  Counter-derived ms/tok is a *component* measurement and must be labelled as such.

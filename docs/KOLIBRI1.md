@@ -99,14 +99,16 @@ the DONE line for the decode rate) and the CLI (`--prefill --tokens-file`, the P
 POOL_ALL rule, with `numactl --cpunodebind=1 --membind=1` (the T4's DMA and the pool's workers on different
 memory controllers - measured: the same config at node-0 is 20% slower at 32K).
 
-| test | Strata kolibri1 (speed config) | Strata (the exactness-first plain path) | llama.cpp (same box) | llama.cpp README (RTX 5070) |
+All strateu rows are wall-clock measurements from `tools/kolibri/bench.py` on the shipped configuration; the earlier phase's
+counter-derived figures (129 tok/s at 32K, 21.2 tok/s decode) are superseded and removed.
+
+| test | strateu (shipping config, wall clock) | Strata (the exactness-first plain path) | llama.cpp (same box) | llama.cpp README (RTX 5070) |
 |------|------|------|------|------|
-| pp 512 (short) | **107 tok/s** (4,824 ms) | 10.0 tok/s | 126.1 tok/s | 723 tok/s |
-| pp 4,096 | **126 tok/s** (32,520 ms) | — | — | — |
-| pp 32,768 | **129 tok/s** (253.6 s) | 1.3 tok/s | 157.5 tok/s | — |
-| tg 128 (short) | **21.2 tok/s** (the pool route) | 9.3 tok/s | 19.1 tok/s | 18.0 tok/s |
-| tg 128 after 32K | 7.4 tok/s | 0.6 tok/s | 21.2 tok/s | — |
-| 100K needle | **passes verbatim** at depths 0/10/50/90 (6,899 s) | 8.9 tok/s mean (11,534 s) | — | — |
+| pp 512 (short) | **157.0 / 160.3 tok/s** | 10.0 tok/s | 159-169 tok/s | 723 tok/s |
+| pp 32,768 | **154.0 / 153.7 tok/s** | 1.3 tok/s | ~157 tok/s | - |
+| tg 128 (short) | **24.5 / 24.4 tok/s** | 9.3 tok/s | 19-30 tok/s (binding- and load-dependent) | 18.0 tok/s |
+| tg 128 after 32K | **12.3 / 12.2 tok/s** | 0.6 tok/s | ~13 tok/s | - |
+| 100K needle | **recall 4/5, exact 3/5** over five distractor-bearing fixtures (`tools/kolibri/needle_audit.py`); the reference is not usable as an oracle at this length | - | - | - |
 | KL vs llama.cpp (390 teacher-forced steps) | **0.00634** (ratio 3.77) | 0.00210-0.00648 | — | — |
 
 **Card classes - what carries over, and what does not.**  The placement sign (the findings register's
@@ -136,11 +138,13 @@ the placement flips), not a faster pool.
 - Q8_0 beyond a smoke run (parity is at Q4_K_M).
 - Speculative decoding: the model has no MTP layer; prompt-lookup drafting is future work.
 - Multi-GPU, images, the Intel Arc (SYCL) build (refused, like Qwen3.6's).
-- The two open speed floors on this box, with their measured gates: the prompt read at 32K is 129 tok/s
-  (llama.cpp on the same box: 157.5) and the decode is 21.2 tok/s (the floor is 30).  Both are priced in
-  `docs/superpowers/plans/2026-10-17-kolibri1-speed-ledger.md`: the decode's expert leg is at 93% of
-  pool_bench's ceiling for the same shape (so the lever is less expert traffic or a card class where the
-  placement sign flips), and the 32K attention runs at ~1 TFLOP/s against the T4's 32.5 TFLOPS fp32 peak
+- The three open speed floors on this box, wall-clock measured: prompt read short of 32K is 157-160 tok/s (floor 200);
+  prompt read at 32K is 154 tok/s (floor 150, met); decode is 24.5 tok/s short (floor 30) and 12.2 tok/s after 32K
+  (floor 20).  An earlier version of this file quoted 129 tok/s at 32K and 21.2 tok/s decode from a pre-router phase; those
+  are superseded.  The decode shortfall is structural - the CPU pool drain is about half a token and the GPU legs plus
+  handoffs the other half, serialised by the per-layer residual dependency - so the levers are less expert traffic,
+  speculation, or a card class where the placement sign flips, not another knob.
+- The 32K attention runs at ~1 TFLOP/s against the T4's 32.5 TFLOPS fp32 peak
   (neither a cublas re-tiling nor a tensor-core fused flash closed it - both measured and recorded).
 - A card class other than this one: every number above is measured on a Tesla T4 + 2x E5-2690 v4.  The
   card-class rule (the host's streaming bandwidth vs the GPU's PCIe read) is stated in the speed section

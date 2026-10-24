@@ -12,14 +12,22 @@ The engine runs **Kolibri-1 (Q4_K_M)** on a **16 GB** consumer-class GPU with al
 weights pinned in host RAM, a bounded VRAM residency cache, and **cache misses computed in place by a CPU
 pool over the pinned table** — the design goal of the fork. Prefill is a staged, pool-carried pipeline.
 
-**Three of four speed floors are met, and accuracy is intact:**
+**One of four speed floors is met.  Accuracy is intact, and the shortfall is quantified rather than glossed:**
 
 | floor | target | measured | verdict |
 |---|---|---|---|
-| prefill, 512-token prompt | 200 tok/s | **149.7 / 151.9** cold bench; **176.2 / 170.8** warm in the serve path | **not met** (see §8) |
-| prefill after 32K context | 150 tok/s | **153.9 / 154.9** | **met** |
-| decode, short context | 30 tok/s | **48.0 / 48.3** | **met** (45–60 stretch reached) |
-| decode after 32K context | 20 tok/s | **48.3** (28.9 at load 12.1) | **met**, 2.4× |
+| prefill, 512-token prompt | 200 tok/s | **157.0 / 160.3** (wall clock) | not met |
+| prefill after 32K context | 150 tok/s | **154.0 / 153.7** (wall clock) | **met** |
+| decode, short context | 30 tok/s | **24.5 / 24.4** (wall clock) | **not met** |
+| decode after 32K context | 20 tok/s | **12.3 / 12.2** (wall clock) | **not met** |
+
+> **Correction (post-audit).**  An earlier version of this table reported decode as **48.0/48.3 tok/s** and claimed the
+> 45-60 stretch.  Those figures were the reciprocal of the *pool's own* per-token drain time
+> (`714.2 MB/token / 34.5 GB/s = 20.70 ms`), not a wall-clock token measurement, and they were wrong.  The wall-clock
+> numbers above come from `tools/kolibri/bench.py` on the shipped config (loads 5.4-5.6 and 7.5-14.1); an independent
+> audit's runs (29.5-30.2 short, 13.4/13.5 after 32K, single-socket `numactl`, load 4.8-11.7) bracket them, so the binding
+> spread is real but neither binding reaches either decode floor.  Section 3.2 and the B0/C0 conclusions that rested on the
+> same confusion are corrected below.
 | KL vs llama.cpp (answers) | < 0.02 | **0.00132**, top-1 0.982 | **met**, 0.74× of llama.cpp's own CPU-vs-GPU floor |
 | oracle (plain path vs reference build) | bitwise | **BITWISE** | **met**, re-anchored after every numerics change |
 | prefill determinism | two runs identical | **bitwise identical**; `racecheck` 0 hazards | **met** |
@@ -34,9 +42,15 @@ layer and length (`POOL_ALL=1`) took the 512-token prefill from **38.9 → 150 t
 previous default silently routed short prompts to a GPU grouped-expert leg costing ~154 ms/layer against
 the pool's 24.5 ms.
 
-**What is not met** is the short-prompt prefill target (150 cold / 176 warm vs 200). Five cheap levers
-were measured dead (§7); the remaining ~1.33× needs kernel work (§8, Option A) that this box cannot even
-*locate* with its profilers, because both perturb the workload they measure (§6.6).
+**What is not met is three of the four floors:** short-prompt prefill (157-160 vs 200), decode short
+(24.5 vs 30) and decode after 32K (12.2 vs 20).  The two decode floors were briefly *reported* as met by mistake - the
+48 tok/s figure was the reciprocal of the pool's per-token drain time rather than a wall-clock token measurement, and an
+independent audit caught it (§3.2 and the correction note in §1).  The prefill floors are as measured: after-32K met at
+154, short short of 200.  For the short-prompt prefill, five cheap levers were measured dead (§7); the remaining ~1.25x
+needs kernel work (§8, Option A) that this box cannot even *locate* with its profilers, because both perturb the workload
+they measure (§6.6).  The decode shortfall is a different story: with the pool at roughly half a token, the rest is the GPU
+legs plus handoffs, serialised by the same residual dependency that makes the overlap neutral - so decode needs either that
+dependency broken (speculation or a different placement) or fewer bytes per token, not another knob.
 
 ---
 
@@ -89,18 +103,27 @@ box's pool bandwidth varies 20.5–34.5 GB/s with load and that moves decode by 
 The pool leg is **1.2 s of the 3.4 s** short-prompt wall (measured un-instrumented: 19 GB read at
 15.6 GB/s). At 8K the pool is ~60% of the wall.
 
-### 3.2 Decode
+### 3.2 Decode (wall clock, not counters)
 
-| context | ms/token | tok/s | pool bandwidth | load |
-|---|---|---|---|---|
-| 512-prompt | 20.7–20.8 | **48.0 / 48.3** | 34.3–34.5 GB/s | 1.4–3.3 |
-| 512-prompt | 33.7 | 29.7 | ~20.9 GB/s | 14.6 |
-| 32K | 20.7 | **48.3** | 34.5 GB/s | ~1.4 |
-| 32K | 34.6 | 28.9 | 20.7 GB/s | 12.1 |
+**A rate is only ever quoted here from a wall-clock token run.**  `bench.py`, shipping config, load stated:
 
-Decode is **pool-bandwidth-bound**: it streams 714 MB per token, so tok/s tracks GB/s almost exactly.
-`decode residency: 0 of 0 picks served from the fp16 cache` — decode deliberately takes everything from
-the pool, because the VRAM expert path measured *slower* here (16.1 vs 22.7 tok/s).
+| case | run 1 | run 2 | load |
+|---|---|---|---|
+| tg 128, short context | **24.5 tok/s** (5,228 ms) | **24.4** (5,255 ms) | 5.4 / 5.6 |
+| tg 128, after 32K | **12.3 tok/s** (10,420 ms) | **12.2** (10,488 ms) | 7.5 / 14.1 |
+
+Both are **below** their floors (30 and 20).  The pool's own drain time is ~20.7 ms of a ~41 ms token, i.e. **about half**,
+so the other half is the GPU legs plus the copy handoffs - serialised by the same per-layer residual dependency that makes the
+overlap neutral (section 7).  That is why decode cannot reach the reciprocal of the drain time: the token is the *sum*.
+
+Earlier component measurements, now labelled as components rather than rates:
+
+| context | pool drain | pool bandwidth | note |
+|---|---|---|---|
+| 512-prompt | 20.7-20.8 ms | 34.3-34.5 GB/s | roughly half of a decode token |
+| 512-prompt | 33.7 ms | ~20.9 GB/s | load 14.6 |
+| 32K | 20.7 ms | 34.5 GB/s | roughly half of a decode token |
+| 32K | 34.6 ms | 20.7 GB/s | load 12.1 |
 
 ### 3.3 Serve path (the shape that matters in practice)
 
@@ -169,7 +192,8 @@ not hidden: one is a one-letter miss where the reference is also wrong, the othe
 
 1× **Tesla T4, 16 GB, sm_75** (Turing: fp16 tensor cores, **no BF16/FP8**), 755 GB DDR4, 27 pinnable
 physical cores across 2 NUMA nodes, PCIe 3.0. The pool measures **34.5 GB/s** on a quiet box and
-**20.5 GB/s** under load — that spread alone moves decode between 28.9 and 48.3 tok/s, which is why the
+**20.5 GB/s** under load — that spread alone moves the pool's drain between 20.7 and 34.6 ms/token (a component, roughly half of a decode
+token), which is why the
 campaign's rule is *two runs and a stated load*.
 
 ### 6.2 Memory requirements (these bite first)
@@ -429,3 +453,43 @@ rather than a speculative patch.
   published (it contains internal hostnames and machine paths). If you want it on the new machine,
   copy it out-of-band; do not add it to the public history without sanitising it.
 * Licence: MIT, upstream copyright retained (`LICENSE`), attribution in `NOTICE`.
+
+---
+
+## 13. Post-audit corrections and gate accounting
+
+An independent audit rejected the first completion claim. Three of its findings are recorded here as corrections, because
+they change what this report is allowed to assert.
+
+### 13.1 The decode method error (fixed in §1 and §3.2)
+
+The decode rates first published here (48.0/48.3 tok/s, "stretch 45-60 reached") were the reciprocal of the **pool's own
+per-token drain time** - `714.2 MB/token / 34.5 GB/s = 20.70 ms` - not a wall-clock token measurement.  Wall-clock
+measurement with `bench.py` gives **24.5 / 24.4** (short) and **12.3 / 12.2** (after 32K).  Consequences recorded:
+
+* B0's conclusion that "the pool is 99% of the decode wall" is wrong: the drain is roughly **half** a token, and the other
+  half is the GPU legs plus the copy handoffs, serialised by the per-layer residual dependency.
+* C0/C1's decode *throughput* pricing (absorbed rows -> decode seconds) does not follow; the VRAM-headroom argument does.
+* The standing rule now in force: a rate is quoted only from a wall-clock token run (`bench.py`, or the server's own
+  `timings`), with the invocation recorded; counter-derived `ms/tok` is a component and is labelled as one.
+
+### 13.2 S8a's own gate: measured, and NOT met
+
+S8a (prefill pipelining) carried its own acceptance gate, distinct from the 150 tok/s floor: **32K wall <= 205 s
+(>= 160 tok/s)**.  Measured on the shipped binary, wall clock, two runs: **212,765 ms and 213,263 ms = 154.0 / 153.7 tok/s**.
+So the S8a gate is **not met**, while the 150 tok/s floor is met.  Both numbers are true; they are different targets, and
+conflating them was a reporting error in the earlier claim.  The stretch targets (300 tok/s at 32K, 400 at short) are unmet
+and unreachable by scheduling for the reason recorded in section 7.5 (the residual dependency forbids the overlap).
+
+### 13.3 `:2244`: what the record actually says
+
+An earlier caveat of mine said the illegal-memory-access crash was "never independently root-caused".  That understated the
+record: the private ledger carries a **named cause with a verified reproduction and guards** for it, and the blocking ids
+copy that crashed was subsequently replaced by A2a's asynchronous publish.  The accurate statement is: diagnosed, reproduced,
+guarded - and the crashing path retired.  No such fault has occurred in any run since, including a 101,414-token prefill,
+pool-all arms and 128-step decodes.
+
+### 13.4 What the audit changed, in one line
+
+The accuracy instrument (oracle BITWISE), the determinism fix, the prefill path and the after-32K prefill floor all hold up;
+the decode floors do not, and the documents now say so.
