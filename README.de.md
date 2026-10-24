@@ -67,11 +67,11 @@ mit 755 GB RAM für den Experten-Pool gemessen:
 
 | Prompt | Schreibt Antworten | Liest deinen Prompt |
 | --- | ---: | ---: |
-| **kurz (512 Token)** | 48 Token/s | 150 Token/s (warm: 176) |
+| **kurz (512 Token)** | 48 Token/s | 150 Token/s (warm: 171-176) |
 | **32K Token** | 48 Token/s | 154 Token/s |
 | **100K Token** | — | 97 Token/s |
 
-Zwei Läufe pro Zahl auf der bitweise deterministischen Binary, Systemlast angegeben. Box-Spec und volle
+Zwei Läufe pro Zahl auf der bitweise deterministischen Binary, Systemlast angegeben; die 100K-Zeile ist ein einzelner kalter Lauf. Box-Spec und volle
 Tabellen: [der Kampagnenbericht](docs/strateu-campaign-report.md).
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>

@@ -67,11 +67,11 @@ This fork also measured Aleph Alpha's **[Kolibri 1](docs/KOLIBRI1.md)** (Q4_K_M)
 
 | Prompt | Writes answers | Reads your prompt |
 | --- | ---: | ---: |
-| **short (512 tokens)** | 48 tokens/s | 150 tokens/s (warm server: 176) |
+| **short (512 tokens)** | 48 tokens/s | 150 tokens/s (warm server: 171-176) |
 | **32K tokens** | 48 tokens/s | 154 tokens/s |
 | **100K tokens** | — | 97 tokens/s |
 
-Two runs each on the bitwise-deterministic binary, box load stated. Box spec, full tables and context:
+Two runs each on the bitwise-deterministic binary, box load stated; the 100K row is a single cold run. Box spec, full tables and context:
 [the campaign report](docs/strateu-campaign-report.md).
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>

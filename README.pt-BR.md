@@ -65,11 +65,11 @@ Este fork também mediu **[Kolibri 1](docs/KOLIBRI1.md)** da Aleph Alpha (Q4_K_M
 
 | Prompt | Escreve respostas | Lê seu prompt |
 | --- | ---: | ---: |
-| **curto (512 tokens)** | 48 tokens/s | 150 tokens/s (com servidor aquecido: 176) |
+| **curto (512 tokens)** | 48 tokens/s | 150 tokens/s (com servidor aquecido: 171-176) |
 | **32K tokens** | 48 tokens/s | 154 tokens/s |
 | **100K tokens** | — | 97 tokens/s |
 
-Duas execuções por número no binário determinístico bit a bit, carga da máquina anotada. Especificação da máquina
+Duas execuções por número no binário determinístico bit a bit, carga da máquina anotada; a linha de 100K vem de uma única execução a frio. Especificação da máquina
 e tabelas completas: [o relatório da campanha](docs/strateu-campaign-report.md).
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>

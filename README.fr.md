@@ -65,11 +65,11 @@ Ce fork a aussi mesuré **[Kolibri 1](docs/KOLIBRI1.md)** d'Aleph Alpha (Q4_K_M)
 
 | Prompt | Écrit ses réponses | Lit votre prompt |
 | --- | ---: | ---: |
-| **court (512 tokens)** | 48 tokens/s | 150 tokens/s (à chaud : 176) |
+| **court (512 tokens)** | 48 tokens/s | 150 tokens/s (à chaud : 171-176) |
 | **32K tokens** | 48 tokens/s | 154 tokens/s |
 | **100K tokens** | — | 97 tokens/s |
 
-Deux exécutions par chiffre sur le binaire déterministe au bit près, charge de la machine annoncée. Spécification
+Deux exécutions par chiffre sur le binaire déterministe au bit près, charge de la machine annoncée ; la ligne 100K vient d’un seul exécution à froid. Spécification
 de la machine et tableaux complets : [le rapport de campagne](docs/strateu-campaign-report.md).
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>

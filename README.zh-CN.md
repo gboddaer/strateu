@@ -61,11 +61,11 @@ NVIDIA：Q2_0 用的是引擎 0.1.36，其他各行用的是 0.1.26（4K 回答�
 
 | 提示长度 | 写回答 | 读提示 |
 | --- | ---: | ---: |
-| **短（512 token）** | 48 token/秒 | 150 token/秒（服务已运行：176） |
+| **短（512 token）** | 48 token/秒 | 150 token/秒（服务已运行：171-176） |
 | **32K token** | 48 token/秒 | 154 token/秒 |
 | **100K token** | — | 97 token/秒 |
 
-每一项都在逐位可复现的构建上做两次运行并注明机器负载。机器规格与完整表格见
+每一项都在逐位可复现的构建上做两次运行并注明机器负载（100K 一行为单次冷启动运行）。机器规格与完整表格见
 [战役报告](docs/strateu-campaign-report.md)。
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="请我喝杯咖啡" height="50"></a><br>
