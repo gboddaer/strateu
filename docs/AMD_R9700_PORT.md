@@ -71,7 +71,58 @@ repacked, 42.90 GiB pinned; dense 1.62 GiB on the GPU; native expert kernels for
   the pinned table and the file's page cache together nearly fill RAM, so this box has no room for
   a second instance or a second large model.
 
+## Race and memory checking on ROCm 7.2.2 (a platform gap, recorded)
+
+The CUDA campaign's determinism insurance was `compute-sanitizer --tool racecheck`. **ROCm 7.2.2 has
+no equivalent for RDNA4**, measured rather than assumed:
+
+| what | state on this box |
+|---|---|
+| `hip-memcheck` | gone from ROCm after 4.x; not packaged here |
+| device ASan (`-fsanitize=address`) | refused: "not currently supported" for gfx1201, needs an `xnack+` arch |
+| `rocm-validation-layer` | not in this box's apt index |
+| `rocm-debug-agent` 2.1.0, `rocgdb` | installed - GPU faults produce an inspectable core dump, which is fault recovery, not race detection |
+| `rocprof`, `rocprof-compute`, `rocprofiler-sdk` 1.1.0 | installed - kernel timing and counters, no race or bounds checking |
+| `omnitrace`, `omniperf` | available in apt, not installed (needs sudo); profiling, not checking |
+| `valgrind` 3.24 | installed - host-side, which is where the CPU expert pool's races would be |
+
+So the gates actually run on this box are: two-run identical ids, two-run identical `PF_HASH`
+lines, a serialized-launch arm (`HIP_LAUNCH_BLOCKING=1`) to catch work that only looks ordered
+because launches overlap, and `rocgdb` + `rocm-debug-agent` if a kernel ever faults. For the CPU
+pool (`src/kernels/cpu/pool.cpp`, plain C++ threads) the host tools apply directly. This is weaker
+than `racecheck`, and it is stated as such rather than quietly substituted.
+
+## Harness artefacts that had to be re-pointed at this box
+
+The CUDA campaign left its harnesses pointing at its own machine. Each of these is a silent failure,
+not a loud one, so they are recorded:
+
+| harness | default on the CUDA box | what this box needs |
+|---|---|---|
+| `pf_gate.sh` `BIN` | `/tmp/kolibri_bench_node1.sh` | `KOLIBRI_BIN=$PWD/build/strata-kolibri`; without it the gate reports "no gen: line (the prefill did not run)" while the engine is fine |
+| `pf_gate.sh` `M`, `oracle.sh` `MODEL` | `/data4/models/...` | `KOLIBRI_MODEL=/fast/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf` |
+| `pf_gate.sh` expectations | `/tmp/pf_gate_expect_*.txt` | not in git; recorded on this box with `--record`, which is what the script is designed for |
+| `/tmp/ids64.txt` | a CUDA-box scratch file | regenerated from `tools/kolibri/oracle_ids512.txt`, which is **comma-separated**, so `tr ',' '\n'` - splitting it on spaces yields zero ids and the gate dies before its first run |
+| `pf_gate.sh --cpu-threads 24` | 27 pinnable cores | hardcoded 24; the engine caps it itself ("8 lane(s) = the host + 7 thread(s), 7 pinnable physical core(s), pinned (capped from --cpu-threads)"), so it is oversubscribed-but-correct here |
+
+## Gates on the AMD path
+
+`pf_gate.sh` was recorded on this box (`--record`) and then run twice:
+
+```
+  0. build       PASS
+  1. ids smoke   PASS  (gen: 3515 310 262 14292)
+  2. PF_HASH     PASS  (100 chunk-layers)
+  3. oracle      PASS  (BITWISE PASS: gen: 286 3515 310 262 14292 1343 1444 46 17156...)
+GATE PASS
+```
+
+Identical on both runs, including the 100 `PFHASH` chunk-layer checksums - so the prefill pool and
+the flash attention path are reproducible on gfx1201, which is the property `racecheck` was standing
+in for on the CUDA box. The plain-path oracle is bitwise against the oracle recorded here.
+
 ## Determinism and the oracle
+
 
 Two consecutive runs of the pinned plain-path command produced **identical ids**:
 
