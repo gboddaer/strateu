@@ -151,20 +151,35 @@ used for its recorded KL - it may live on the campaign box rather than here; (2)
 llama.cpp revision from around 2026-10-03 (the patch date) to build the full patch against; (3) a
 Kolibri-capable llama.cpp build supplied directly.
 
-## §9.3 verdicts, first pass (two runs each, 512-token prompt + 32 decode, ctx 8192, box 91 GiB free)
+## §9.3 decode-dominated verdicts, with the engine's own counters
 
-| arm | wall run1 / run2 | what it says |
+Shape: 512-token prompt, `--n 128` decode, ctx 8192, `--cpu-threads 8`, box 91 GiB free. Two clean
+runs per arm for wall clock; a third run per arm with `--counters` for attribution, because the
+engine's own comment at `kolibri_engine.cu:362` says counters add a 12 KB D2H and must never run in
+a timed run. Counters are the `--counters` flag, not an env var - the first sweep's `cnt:` grep
+matched nothing because there is no `cnt:` prefix; the lines are `CNT ...`.
+
+| arm | wall run1 / run2 | counters |
 |---|---|---|
-| shipped config (`POOL_ALL` default, `EXPERT_F16=24`, `RES_TOP=56`, `ATTN_MB=512`) | 29.1 s / 25.8 s | baseline |
-| `POOL_ALL=0` (GPU expert path) | 23.1 s / 23.2 s | **the pool is not the win here it was on the T4** - with the pool off the run was faster, and far more repeatable (0.1 s spread vs 3.3 s). On the T4 the pool won because the host streamed 43 GB/s against 5.7-6.1 GB/s of PCIe; a 32 GB card changes that ratio, which is exactly the sign §9.3 said to re-measure |
-| `ATTN_MB=1024` | 25.3 s / 25.2 s | fits and runs at 32 GB (rc 0) - the T4's OOM was at 100K context, so this is not yet the same claim; the 100K arm is still to run |
-| `DENSE_F16=1` | 25.3 s / 25.4 s | fits alongside the 24-slot expert cache (it OOMed on the T4) and is within noise of baseline here |
+| shipped config, pool on (default `POOL_ALL=1`) | 32.3 s / 31.1 s | `pool workers=8, streamed 714.2 MB/tok (91.42 GB), 32.4 GB/s`; `branches per tok: pool 50.0 gpu-expert 0.0 slots-path 0.0 grouped 0.0`; `decode residency: 0 of 0` |
+| `POOL_ALL=0` | 29.1 s / 29.0 s | same 714.2 MB/tok and 32.5 GB/s in decode; the difference shows in prefill (`pool=462 ms` vs `970 ms`) |
+| `DEC_RES=1` (fp16 residency on) | **360.2 s / 363.3 s** | `decode residency: 23513 of 38400 picks served from the fp16 cache (61.2%)`, streamed down to 276.7 MB/tok - and **11x slower** |
+| `DEC_RES=1 EXPERT_HIST=1` | 362.1 s / 363.7 s | same 61.2%; the history seed changes nothing here |
 
-**These are not verdicts yet.** The engine's per-phase counters did not reach the log (the `cnt:` grep
-matched nothing), so nothing attributes where the time goes, and a 512-token prompt with 32 decode
-tokens is not the decode shape the T4 numbers were taken on. The placement line above is a lead to
-chase with `--n` deep enough to be decode-dominated and the counters captured, not a conclusion.
-`RES_TOP`, `DEC_RES` and the residency hit-rate verdicts have not been touched.
+**Residency verdict.** On the T4, `DEC_RES` was the knob that kept hot experts VRAM-resident so the
+pool streamed less. On this box it does exactly that - 61.2% of decode picks served from the fp16
+cache, streamed bytes down from 714.2 to 276.7 MB/tok - and the run gets **11x slower** (360 s
+against 31 s). The streaming it saves is cheap here (32.4 GB/s from a host that is not competing with
+a 5.7 GB/s PCIe link); what it replaces it with is a per-layer fp16 gemm at T=1, and on RDNA4 that
+path costs far more than the bytes it avoids. So the AMD answer to §9.3's residency question is *off*,
+and the reason is not that residency fails to engage - it engages well - it is that the GPU-side
+alternative is the wrong trade on this card.
+
+**Placement verdict.** Every expert layer on AMD goes through the pool (`pool 50.0` of `50.0`
+layers/token; `gpu-expert`, `slots-path` and `grouped` all zero), and turning the pool off for
+prefill is slightly *faster* rather than the large loss it was on the T4. `VRAM free=20.56 GiB of
+31.86 GiB after dense upload` says why there is no room to change: the 42.90 GiB expert table cannot
+be resident, so there is no GPU-resident placement to choose.
 
 ## Where the port stands (2026-10-24)
 
