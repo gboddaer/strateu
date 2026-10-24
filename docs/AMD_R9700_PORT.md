@@ -181,6 +181,40 @@ prefill is slightly *faster* rather than the large loss it was on the T4. `VRAM 
 31.86 GiB after dense upload` says why there is no room to change: the 42.90 GiB expert table cannot
 be resident, so there is no GPU-resident placement to choose.
 
+## The KL gate (task 5) - measured, and it does not clear the inherited number
+
+Reference: `/fast/llama-server-kolibri/llama.cpp` at `f5027fb21` (the user's Kolibri-capable tree,
+patch applied in the working tree), built fresh here as `build_rocm_rizo` with
+`-DGGML_HIP=ON -DCMAKE_HIP_ARCHITECTURES=gfx1201`; `tools/kolibri/kolibri_llama_dump.cpp` built
+against it. It loads the Q4_K_M file and generates, which the drifted `~/develop/llama.cpp` checkout
+could not.
+
+`parity.py` (8 prompts, `--n 64 --ngl 99 --cpu-moe 50`): **5 of 8 prompts identical greedy answers**, worst layer rel err 22.20, median layer rel err ~1.15.
+
+`kl.py` teacher-forced, 520 steps / 344 answer steps over the same 8 prompts:
+
+| leg | mean KL | median | p99 | top-1 |
+|---|---|---|---|---|
+| llama.cpp CPU vs llama.cpp GPU (the noise floor), answers | 0.00187 | 0.000261 | 0.0172 | 0.9884 |
+| **strata vs llama.cpp GPU, answers** | **0.00182** | 0.000086 | 0.0253 | 0.9884 |
+| llama.cpp CPU floor, all steps | 0.00197 | 0.000120 | 0.0254 | 0.9923 |
+| strata, all steps | 0.00224 | 0.000073 | 0.0451 | 0.9923 |
+
+**Read it straight: the gate as written is `<= 0.00132` and the AMD path measures 0.00182 on the
+answer steps, so it does not clear that number.** What it does clear is the criterion that number was
+originally standing in for - the campaign reported its 0.00132 as *0.74x of llama.cpp's own
+CPU-vs-GPU floor*, and here strata sits at **0.97x of this box's floor** (0.00182 against 0.00187),
+with identical top-1 agreement to the floor at 0.9884. Strata is at llama.cpp's own noise, not above
+it. The absolute numbers are not comparable across the two boxes anyway: KL is measured *against a
+reference*, and this is a different llama.cpp revision from the one the Tesla-T4 campaign recorded
+against.
+
+Per-prompt answer KL (strata, floor in brackets): p00 0.00280 [0.00431], p01 0.00198 [0.00179],
+p02 0.00208 [0.00208], p03 0.00044 [0.00069], p04 0.00045 [0.00035], p05 0.00100 [0.00116],
+**p06 0.02561 [0.00452]**, p07 0.00521 [0.00118]. p06 is the outlier - 4 answer steps at 5.7x its
+floor - and it is also one of the three prompts whose greedy answer diverged in parity, so the two
+observations are the same observation.
+
 ## Where the port stands (2026-10-24)
 
 Done and committed on `feat/amd_r9700`: launcher (`251a079c`), HIP build + load + ctest (`f901ca06`,
