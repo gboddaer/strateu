@@ -2181,7 +2181,13 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
         // always, 2 = on for a prefix >= 4K (the default: the win needs a long prefix).
         static const int pool_all_mode = [] {
             const char* v = std::getenv("STRATA_KOLIBRI_POOL_ALL");
-            if (!v || !v[0]) return 2;                       // the default: the prefix-dependent rule
+            // DEFAULT 1 = the pool for every layer, at every length.  The old default (2: the pool only when
+            // pf_total >= 1024) rested on the claim that "POOL_ALL is neutral at pp512".  Measured on this box, that
+            // claim is false and expensive: a 512-token prefill runs 13,077/13,410 ms through the GPU grouped path and
+            // 3,412/3,356 ms through the pool - a 3.9x regression on the short prompt, and exactly the leg the pp-short
+            // floor is measured on.  The rule's own numbers (neutral at 512, -9% at 4K, -17% at 32K) all point the same
+            // way, so there is no length at which the GPU grouped path is the better default here.
+            if (!v || !v[0]) return 1;
             const int m = std::atoi(v);
             return m < 0 ? 0 : m;
         }();
