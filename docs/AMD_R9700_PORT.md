@@ -427,6 +427,33 @@ The honest summary line for the AMD path is therefore **0.00182 shipped / 0.0015
 0.84x of this box's own floor**, with the criterion's absolute bound of 0.00132 unmet and the reason
 given above - not a claim that the bound was met.
 
+## A memory detector that actually applies: valgrind over the ported host-side paths
+
+The GPU kernels have no `racecheck` equivalent on this architecture (above), but the CPU expert pool,
+the expert gather and the dequant the pool feeds are **host** code, and for host code `valgrind` is a
+real memory detector rather than a substitute. Run per ported path, `--error-exitcode=99
+--leak-check=summary --errors-for-leak-kinds=definite --error-limit=no`, box `rizo`, R9700 as the
+device (`HIP_VISIBLE_DEVICES=0`):
+
+| test | result | valgrind error lines |
+|---|---|---|
+| `native_expert_parity --bf16-embd` | `0 failures`; "97 gathered rows, 0 differ; dequant of 156160 values, 0 differ in any bit" | **0** |
+| `kolibri_router_parity` | `kolibri_router_parity OK` | **0** |
+| `s2_expert_grouped_parity` | `PASS` | **0** |
+| `expert_profile_version_test` | `OK` | **0** |
+
+Note on the first row: run bare, `native_expert_parity` exits 2 after printing a usage line - it wants
+`--bf16-embd`. That is an argument, not a failure, and it is worth writing down because "rc=2" in a
+sweep log reads like a defect. With the flag it runs clean.
+
+So the detector picture on the AMD path, stated precisely: **host-side ported code is valgrind-clean**
+(definite leaks and invalid accesses, four paths, zero errors); **GPU-side ported code raises no memory
+exception** under `rocm-debug-agent` across prefill, decode, pool and long-context runs, though that
+agent produces no wavefront output on gfx1201 and so cannot be claimed as a passing race check; and
+**no data-race detector exists for this architecture**, which is why the two-run bitwise identity of
+generated ids plus `PF_HASH` over 100 chunk-layers is offered as reproducibility evidence and not
+dressed up as a race proof.
+
 ## Where the port stands (2026-10-24)
 
 Done and committed on `feat/amd_r9700`: launcher (`251a079c`), HIP build + load + ctest (`f901ca06`,
