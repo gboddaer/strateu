@@ -62,6 +62,18 @@ Tabellen stehen in [DETAILS.md](docs/DETAILS.md#speed-measured). Eine Karte mit 
 RTX 3090 (24 GB) sollte etwa 100-140 Tokens pro Sekunde schreiben. Lange Chats und andere Karten:
 [Tempo jedes Modells](docs/MODELS.md#how-fast-is-each-size), [Ergebnisse aus der Community](docs/COMMUNITY_BENCHMARKS.md).
 
+Dieser Fork hat außerdem Aleph Alpha's **[Kolibri 1](docs/KOLIBRI1.md)** (Q4_K_M) auf einer **Tesla T4 (16 GB)**
+mit 755 GB RAM für den Experten-Pool gemessen:
+
+| Prompt | Schreibt Antworten | Liest deinen Prompt |
+| --- | ---: | ---: |
+| **kurz (512 Token)** | 48 Token/s | 150 Token/s (warm: 176) |
+| **32K Token** | 48 Token/s | 154 Token/s |
+| **100K Token** | — | 97 Token/s |
+
+Zwei Läufe pro Zahl auf der bitweise deterministischen Binary, Systemlast angegeben. Box-Spec und volle
+Tabellen: [der Kampagnenbericht](docs/strateu-campaign-report.md).
+
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
 <sub>Strata ist kostenlos. Wenn es auf deinem PC gut läuft, hält ein Kaffee die Arbeit daran am Laufen.</sub></p>
 
@@ -92,7 +104,7 @@ Die vollständige Liste: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
 Nutzt du einen KI-Coding-Assistenten (Claude Code, Cursor, Codex, GitHub Copilot, ...)? Füge dort diesen Text ein:
 
 ```text
-Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow docs/AI_SETUP.md in that repository.
+Set up Strateu on this PC for me: https://github.com/gboddaer/strateu - follow docs/AI_SETUP.md in that repository.
 ```
 
 Er prüft deine Grafikkarte, deinen RAM und deine Festplatte und wählt das passende Modell. Dann installiert und
@@ -101,7 +113,7 @@ startet er es und sagt dir, wie du deine Apps verbindest. KI-Tools können Strat
 
 ### Oder mach es selbst
 
-[Lade Strata herunter](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) und entpacke es (oder nutze
+[Lade Strateu herunter](https://github.com/gboddaer/strateu/archive/refs/heads/main.zip) und entpacke es (oder nutze
 `git clone`). **Windows:** Doppelklick auf **`START-HERE.bat`**. **Linux:** Führe im Strata-Ordner **`./setup.sh`** aus.
 
 **Mac (Apple Silicon, M1 bis M5, macOS 15 oder neuer):** Installiere einmal Apples Command Line Tools (`xcode-select --install` im Terminal; Xcode selbst brauchst du nicht). Öffne dann das Terminal im Strata-Ordner und führe **`./setup.sh`** aus. Es baut die Mac-Engine auf deinem Mac (etwa 7 Minuten), stellt dieselben Fragen, lädt das Modell und startet es. Beim nächsten Mal startet `./setup.sh` sofort. Welche Größe zu deinem Mac passt und wie schnell es ist: [docs/MAC.md](docs/MAC.md).

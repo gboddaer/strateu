@@ -57,6 +57,17 @@ NVIDIA：Q2_0 用的是引擎 0.1.36，其他各行用的是 0.1.26（4K 回答�
 100-140 个 token。长对话和其他显卡的数据：[各模型的速度](docs/MODELS.md#how-fast-is-each-size)、
 [社区测试结果](docs/COMMUNITY_BENCHMARKS.md)。
 
+本分支还在 **特斯拉 T4（16 GB，755 GB 内存承载专家池）** 上实测了 Aleph Alpha 的 **[Kolibri 1](docs/KOLIBRI1.md)**（Q4_K_M）：
+
+| 提示长度 | 写回答 | 读提示 |
+| --- | ---: | ---: |
+| **短（512 token）** | 48 token/秒 | 150 token/秒（服务已运行：176） |
+| **32K token** | 48 token/秒 | 154 token/秒 |
+| **100K token** | — | 97 token/秒 |
+
+每一项都在逐位可复现的构建上做两次运行并注明机器负载。机器规格与完整表格见
+[战役报告](docs/strateu-campaign-report.md)。
+
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="请我喝杯咖啡" height="50"></a><br>
 <sub>Strata 是免费的。如果它在你的电脑上跑得不错，请我喝杯咖啡，让这个项目继续下去。</sub></p>
 
@@ -87,7 +98,7 @@ NVIDIA：Q2_0 用的是引擎 0.1.36，其他各行用的是 0.1.26（4K 回答�
 你在用 AI 编程助手吗（Claude Code、Cursor、Codex、GitHub Copilot 等）？把下面这段粘贴给它：
 
 ```text
-Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow docs/AI_SETUP.md in that repository.
+Set up Strateu on this PC for me: https://github.com/gboddaer/strateu - follow docs/AI_SETUP.md in that repository.
 ```
 
 它会检查你的显卡、内存和硬盘，选出合适的模型。然后安装并启动它，再告诉你怎么连接你的应用。AI 工具也可以通过
@@ -95,7 +106,7 @@ Strata 的 [MCP 服务器](docs/MCP_SERVER.md)来安装、启动和停止 Strata
 
 ### 或者自己动手
 
-[下载 Strata](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) 并解压（或者用 `git clone`）。
+[下载 Strateu](https://github.com/gboddaer/strateu/archive/refs/heads/main.zip) 并解压（或者用 `git clone`）。
 **Windows：** 双击 **`START-HERE.bat`**。**Linux：** 在 Strata 文件夹里运行 **`./setup.sh`**。
 
 **Mac（Apple 芯片，M1 到 M5，macOS 15 或更新版本）：** 先安装一次 Apple 的 Command Line Tools（在终端里运行 `xcode-select --install`；不需要 Xcode 本身）。然后在 Strata 文件夹里打开终端，运行 **`./setup.sh`**。它会在你的 Mac 上编译 Mac 版引擎（大约 7 分钟），问同样的问题，下载模型并启动。下次运行 `./setup.sh` 会马上启动。哪个大小适合你的 Mac、速度如何：[docs/MAC.md](docs/MAC.md)。

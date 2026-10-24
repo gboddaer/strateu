@@ -60,6 +60,18 @@ NVIDIA: Q2_0 with engine 0.1.36, the other rows with 0.1.26 (4K answers, 32K pro
 about 100-140 tokens per second. Long chats and other cards: [speed of each model](docs/MODELS.md#how-fast-is-each-size),
 [community results](docs/COMMUNITY_BENCHMARKS.md).
 
+This fork also measured Aleph Alpha's **[Kolibri 1](docs/KOLIBRI1.md)** (Q4_K_M) on a **Tesla T4 (16 GB)** with
+755 GB of RAM holding the expert pool:
+
+| Prompt | Writes answers | Reads your prompt |
+| --- | ---: | ---: |
+| **short (512 tokens)** | 48 tokens/s | 150 tokens/s (warm server: 176) |
+| **32K tokens** | 48 tokens/s | 154 tokens/s |
+| **100K tokens** | — | 97 tokens/s |
+
+Two runs each on the bitwise-deterministic binary, box load stated. Box spec, full tables and context:
+[the campaign report](docs/strateu-campaign-report.md).
+
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
 <sub>Strata is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>
 
@@ -91,7 +103,7 @@ The full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
 Do you use an AI coding assistant (Claude Code, Cursor, Codex, GitHub Copilot, ...)? Paste this into it:
 
 ```text
-Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow docs/AI_SETUP.md in that repository.
+Set up Strateu on this PC for me: https://github.com/gboddaer/strateu - follow docs/AI_SETUP.md in that repository.
 ```
 
 It checks your graphics card, RAM and disk and picks the model that fits. Then it installs and starts it and tells
@@ -100,7 +112,7 @@ you how to connect your apps. AI tools can also install, start and stop Strata t
 
 ### Or do it yourself
 
-[Download Strata](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
+[Download Strateu](https://github.com/gboddaer/strateu/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
 **Windows:** double-click **`START-HERE.bat`**. **Linux:** run **`./setup.sh`** in the Strata folder.
 
 **Mac (Apple Silicon, M1 to M5, macOS 15 or newer):** install Apple's Command Line Tools once

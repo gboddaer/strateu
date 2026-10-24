@@ -60,6 +60,18 @@ NVIDIA の測定には、Q2_0 のみエンジン 0.1.36、それ以外は 0.1.26
 毎秒およそ 100-140 トークンの生成速度が見込めます。長いチャットや他のカードでの性能については、[モデルごとの速度](docs/MODELS.md#how-fast-is-each-size)や
 [コミュニティの測定結果](docs/COMMUNITY_BENCHMARKS.md)を参照してください。
 
+このフォークは、Aleph Alpha の **[Kolibri 1](docs/KOLIBRI1.md)**（Q4_K_M）を、エキスパートプールを保持する
+755 GB の RAM を載せた **Tesla T4（16 GB）** でも測定しました:
+
+| プロンプト | 生成速度 | 読み込み速度 |
+| --- | ---: | ---: |
+| **短い（512 トークン）** | 48 トークン/秒 | 150 トークン/秒（ウォーム状態: 176） |
+| **32K トークン** | 48 トークン/秒 | 154 トークン/秒 |
+| **100K トークン** | — | 97 トークン/秒 |
+
+数値はすべて逐ビット再現可能なバイナリでの 2 回実行で、負荷付きの記録です。ボックス仕様と全表は
+[キャンペーン報告](docs/strateu-campaign-report.md)にあります。
+
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
 <sub>Strata は無料で使えます。お使いの PC で快適に動いたら、コーヒー 1 杯分のご支援が開発を続ける励みになります。</sub></p>
 
@@ -90,7 +102,7 @@ NVIDIA の測定には、Q2_0 のみエンジン 0.1.36、それ以外は 0.1.26
 Claude Code、Cursor、Codex、GitHub Copilot などの AI コーディングアシスタントを使っている場合は、次の文を貼り付けてください。
 
 ```text
-Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow docs/AI_SETUP.md in that repository.
+Set up Strateu on this PC for me: https://github.com/gboddaer/strateu - follow docs/AI_SETUP.md in that repository.
 ```
 
 AI がグラフィックカード、RAM、ディスクを確認して、PC に合ったモデルを選びます。インストールと起動を行い、
@@ -99,7 +111,7 @@ AI ツールから Strata のインストール・起動・停止を行えます
 
 ### 自分でやる
 
-[Strata をダウンロード](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip)して展開します（`git clone` でも構いません）。
+[Strateu をダウンロード](https://github.com/gboddaer/strateu/archive/refs/heads/main.zip)して展開します（`git clone` でも構いません）。
 **Windows：** **`START-HERE.bat`** をダブルクリックします。**Linux：** Strata フォルダーで **`./setup.sh`** を実行します。
 
 **Mac（Apple シリコン、M1〜M5、macOS 15 以降）：** まず一度だけ Apple の Command Line Tools をインストールします（ターミナルで `xcode-select --install`。Xcode 本体は不要です）。次に Strata フォルダーでターミナルを開き、**`./setup.sh`** を実行します。Mac 用エンジンをお使いの Mac 上でビルドし（約 7 分）、同じ質問をしてからモデルをダウンロードして起動します。次回からは `./setup.sh` ですぐに起動します。どのサイズが Mac に合うかと速度：[docs/MAC.md](docs/MAC.md)。
