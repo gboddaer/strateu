@@ -23,8 +23,7 @@ de vitesse de la semaine : environ **154 tokens/s** de prefill après un prompt 
 génération, court et après 32K ; l'aiguille de 100K est retrouvée dans 4 cas sur 5, les deux écarts étant
 consignés (la référence llama.cpp est elle-même instable à cette longueur). Les portes de qualité et la
 configuration de vitesse sont dans `tools/kolibri/` ; chaque chiffre vient de deux exécutions avec la charge de la
-machine indiquée. La preuve complète : [le rapport de campagne](docs/strateu-campaign-report.md) et les registres
-sous `docs/superpowers/plans/`.
+machine indiquée. La preuve complète : [le rapport de campagne](docs/strateu-campaign-report.md) et les registres sous `docs/superpowers/plans/`.
 
 ## Quelle est sa vitesse ?
 

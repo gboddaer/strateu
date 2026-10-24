@@ -23,8 +23,7 @@ plain-path oracle は BITWISE）。16 GB の GPU で、この 1 週間で計測�
 32K プロンプト後の prefill が約 **154 トークン/秒**、短いコンテキストと 32K 以降の生成が約
 **48 トークン/秒**。100K 長文の「needle」検索は 5 例中 4 例で、2 つの不一致はすべて記録済みです
 （その長さでは llama.cpp 参考実装自身も不安定です）。ゲートと速度設定は `tools/kolibri/` にあり、
-数値はすべて 2 回実行・負荷付きの記録で、根拠は[キャンペーン報告](docs/strateu-campaign-report.md)と
-`docs/superpowers/plans/` の各レッジャーにあります。
+数値はすべて 2 回実行・負荷付きの記録で、根拠は[キャンペーン報告](docs/strateu-campaign-report.md)と `docs/superpowers/plans/` の各レッジャーにあります。
 
 ## どのくらい速い？
 

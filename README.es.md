@@ -23,8 +23,7 @@ cumple todas las marcas de velocidad de la semana: unos **154 tokens/s** de pref
 **48 tokens/s** de generación, corto y tras 32K; la aguja de 100K se recupera en 4 de 5 casos y las dos
 desviaciones quedan registradas (la propia referencia llama.cpp es inestable a esa longitud). Las compuertas y la
 configuración de velocidad están en `tools/kolibri/`; cada número proviene de dos ejecuciones con la carga de la
-máquina indicada. La evidencia completa: [el informe de la campaña](docs/strateu-campaign-report.md) y los
-registros bajo `docs/superpowers/plans/`.
+máquina indicada. La evidencia completa: [el informe de la campaña](docs/strateu-campaign-report.md) y los registros bajo `docs/superpowers/plans/`.
 
 ## ¿Qué velocidad tiene?
 

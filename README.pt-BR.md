@@ -23,8 +23,7 @@ todas as marcas de velocidade da semana: cerca de **154 tokens/s** de prefill ap
 **48 tokens/s** de geração, curto e após 32K; a agulha de 100K é recuperada em 4 de 5 casos, com as duas
 divergências registradas (a própria referência llama.cpp é instável nessa extensão). Os portões de qualidade e a
 configuração de velocidade ficam em `tools/kolibri/`; cada número vem de duas execuções com a carga da máquina
-anotada. A evidência completa: [o relatório da campanha](docs/strateu-campaign-report.md) e os registros em
-`docs/superpowers/plans/`.
+anotada. A evidência completa: [o relatório da campanha](docs/strateu-campaign-report.md) e os registros em `docs/superpowers/plans/`.
 
 ## Qual é a velocidade?
 
