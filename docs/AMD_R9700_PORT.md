@@ -83,6 +83,8 @@ no equivalent for RDNA4**, measured rather than assumed:
 | `rocm-validation-layer` | not in this box's apt index |
 | `rocm-debug-agent` 2.1.0, `rocgdb` | installed - GPU faults produce an inspectable core dump, which is fault recovery, not race detection |
 | `rocprof`, `rocprof-compute`, `rocprofiler-sdk` 1.1.0 | installed - kernel timing and counters, no race or bounds checking |
+| `HIP_MEM_CHECK=1` | inert, not off: a run under it finished in the normal 27 s with 4 tokens and zero violation lines, and the name appears nowhere in `/opt/rocm/include/hip` - the old `hipMemCheck` path is gone from this ROCm |
+
 | `omnitrace`, `omniperf` | available in apt, not installed (needs sudo); profiling, not checking |
 | `valgrind` 3.24 | installed - host-side, which is where the CPU expert pool's races would be |
 
