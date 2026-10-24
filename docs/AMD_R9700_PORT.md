@@ -119,6 +119,13 @@ rebuilt against it into `build/tools/kolibri_llama_dump` per the header comment 
 --out DIR --n 64 --ngl 99 --cpu-moe 50`; its first attempt failed with "no gen" style rc 1 for
 exactly this vocabulary reason (`/tmp/parity-amd/p00.llama.log`).
 
+Resolved: the reference needs exactly **two** files applied over that checkout, not the whole patch -
+`src/llama-vocab.cpp` (the `kolibri1` pre-tokenizer) and `src/llama-hparams.h` (the
+`LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID_LOGIT_ADD` enum). Applying `src/models/models.h` or
+`src/llama-model.cpp` on top duplicates what the checkout already has (redefinition of
+`llama_model_kolibri1`, duplicate case values), and `git apply --check` passes those hunks because it
+checks context, not meaning. `build_rocm_strata` builds clean with just the two.
+
 ## Where the port stands (2026-10-24)
 
 Done and committed on `feat/amd_r9700`: launcher (`251a079c`), HIP build + load + ctest (`f901ca06`,
