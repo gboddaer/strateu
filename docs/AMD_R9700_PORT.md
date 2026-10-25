@@ -597,6 +597,8 @@ reference. There is no untried legitimate lever left inside this harness.
 
 ### The KL measured on the shipped engine, not just the reference
 
+
+
 Every KL number above came from `strata-kolibriref`, the reference engine. The criterion is about the
 engine that ships, and `strata-kolibri` accepts `--tokens`, `--force` and `--dump-full-logits`, so
 `kl.py --ref build/strata-kolibri` measures it directly - the llama.cpp logits in `/tmp/kl-amd` are
@@ -623,6 +625,20 @@ prefill's 0.00146 - the same 5.2x speed difference measured in the rate table bu
 unlike `ROPE_F64`, which measured free, the pool is a genuine accuracy-for-speed trade and the choice
 should be made deliberately rather than inherited. The bound of 0.00132 is still met by none of these,
 so the deviation stands; but the closest the shipped engine gets is 0.78x of floor, not 0.97x.
+
+### `ROPE_F64` is free on speed and slightly *worse* on this gate
+
+The engine reads env knobs the reference binary does not, so `STRATA_KOLIBRI_ROPE_F64=1` is a lever
+that exists only on the shipped path - and it measured free on the clock, which made it the obvious
+candidate for closing the gap. It does not close it: same 344 answer steps, plain prefill, fp64 RoPE
+gives **0.00161 (0.86x)** against 0.00146 (0.78x) without it, and top-1 drops from 0.9942 to 0.9884.
+
+That is not a paradox, and it bounds what this gate can ever reward: KL here measures **agreement with
+llama.cpp**, not accuracy in any absolute sense. llama.cpp computes RoPE in its own precision, so
+making Strata's rotation more exact moves it further from the reference it is scored against. A
+configuration can be numerically better and score worse on this criterion - a second reason the
+absolute 0.00132 should not be read as a quality threshold; it is a similarity measurement against
+one particular reference build on one particular box.
 
 The standing reading is unchanged and is a measurement, not an excuse: the bound sits below the floor
 of the instrument it is quoted against on this box (0.00178-0.00187 depending on population), so it
