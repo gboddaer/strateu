@@ -17,8 +17,8 @@ AI 模型，通常要用服务器才能跑。它能聊天、写代码、看图�
 **strateu** 是 [Niko1221/Strata](https://github.com/Niko1221/Strata) 的一个以实测为本的分支，工作重心是
 **Kolibri 1** 引擎（`src/kolibri`）。一周的测量让这个 CUDA 移植版本变得**逐位可复现**（prefill 通过 racecheck、
 两次运行差异为 0.0），并**用 KL 散度对标 llama.cpp**（109 个回答步骤为 0.00132，top-1 一致率 0.982，plain-path
-oracle 为 BITWISE）。16 GB 显卡上的实测（每项两次、壁钟计时）：32K 提示后的 prefill 约为 **154 token/秒**；
-生成约为 **24-25 token/秒**（短）与 **12-13 token/秒**（32K 后）——审计发现此前误用计数器数值后重新测得；100K 长文本的“大海捞针”检索 5 例命中 4 例，
+oracle 为 BITWISE）。16 GB 显卡上的实测（每项两次、壁钟计时）：32K 提示后的 prefill 约为 **119-120 token/秒**；
+生成约为 **30 token/秒**（短）与 **13-14 token/秒**（32K 后）——审计发现此前误用计数器数值后重新测得；100K 长文本的“大海捞针”检索 5 例命中 4 例，
 两处偏差都已记录（在那个长度上 llama.cpp 参考实现本身也不稳定）。闸门和速度配置在 `tools/kolibri/`；每个数字
 都做两次运行并注明机器负载，完整证据链见[战役报告](docs/strateu-campaign-report.md)和 `docs/superpowers/plans/` 下的账目文件。
 
@@ -61,8 +61,8 @@ NVIDIA：Q2_0 用的是引擎 0.1.36，其他各行用的是 0.1.26（4K 回答�
 
 | 提示长度 | 写回答 | 读提示 |
 | --- | ---: | ---: |
-| **短（512 token）** | 24-30 token/秒（随 NUMA 绑定变化） | 157-160 token/秒（服务已运行：171-176） |
-| **32K token** | 12-14 token/秒（随 NUMA 绑定变化） | 154 token/秒 |
+| **短（512 token）** | 30 token/秒（随 NUMA 绑定变化） | 156-160 token/秒（启用 `PF_PARTIAL`：180-181，服务已运行 202） |
+| **32K token** | 13-14 token/秒（随 NUMA 绑定变化） | 119-120 token/秒 |
 | **100K token** | — | 97 token/秒 |
 
 每一项都在逐位可复现的构建上做两次运行并注明机器负载（100K 一行为单次冷启动运行）。机器规格与完整表格见

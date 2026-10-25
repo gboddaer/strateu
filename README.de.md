@@ -18,8 +18,8 @@ Bilder und arbeitet mit deinen Apps und Coding-Agents zusammen. Nichts verlässt
 **strateu** ist ein gemessener Fork von [Niko1221/Strata](https://github.com/Niko1221/Strata) mit dem Fokus auf die
 **Kolibri-1**-Engine (`src/kolibri`). Eine Messwoche hat den CUDA-Port **bitweise deterministisch** gemacht
 (Prefill besteht racecheck, Differenz zweier Läufe 0.0) und **per KL-Divergenz gegen llama.cpp abgeglichen**
-(0,00132 über 109 Antwortschritte, Top-1 0,982, Plain-Path-Oracle BITWISE). Auf einer 16-GB-Karte, mit Stoppuhr gemessen (je zwei Löufe): rund **154 Token/s** Prefill nach einem
-32K-Prompt, **24-25 Token/s** Generierung kurz und **12-13 Token/s** nach 32K
+(0,00132 über 109 Antwortschritte, Top-1 0,982, Plain-Path-Oracle BITWISE). Auf einer 16-GB-Karte, mit Stoppuhr gemessen (je zwei Löufe): rund **119-120 Token/s** Prefill nach einem
+32K-Prompt, **30 Token/s** Generierung kurz und **13-14 Token/s** nach 32K
 (neu gemessen, nachdem ein Audit einen zählerbasierten Berichtsfehler fand). Die 100K-Nadel wird in 4 von 5 Fällen gefunden (davon 3 exakt, einer um einen Buchstaben
 verkürzt), beide Abweichungen sind protokolliert (die llama.cpp-Referenz ist bei dieser Länge selbst nicht stabil). Gates und Speedkonfiguration
 liegen in `tools/kolibri/`; jede Zahl entstammt zwei Läufen mit angegebener Systemlast. Die komplette Beweiskette:

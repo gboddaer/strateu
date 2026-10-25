@@ -19,7 +19,7 @@ fonctionne avec vos applications et vos agents de code. Rien ne quitte votre PC.
 **Kolibri 1** (`src/kolibri`). Une semaine de mesures a rendu le port CUDA **déterministe au bit près** (le prefill
 passe racecheck, écart 0.0 entre deux exécutions) et **aligné sur llama.cpp par divergence KL** (0,00132 sur 109
 étapes de réponse, top-1 0,982, oracle du chemin simple BITWISE). Sur une carte de 16 Go, mesuré au chronomètre (deux exécutions chacune) : environ **119-120 tokens/s** de prefill
-après un prompt de 32K, **24-25 tokens/s** de génération court et **12-13 tokens/s** après 32K
+après un prompt de 32K, **30 tokens/s** de génération court et **13-14 tokens/s** après 32K
 (remesuré après qu'un audit a trouvé une erreur de dérivée de compteur). l'aiguille de 100K est retrouvée dans 4 cas sur 5, les deux écarts étant
 consignés (la référence llama.cpp est elle-même instable à cette longueur). Les portes de qualité et la
 configuration de vitesse sont dans `tools/kolibri/` ; chaque chiffre vient de deux exécutions avec la charge de la

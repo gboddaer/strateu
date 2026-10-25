@@ -19,8 +19,8 @@ Strata を使うと、**[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8
 **Kolibri 1** エンジン（`src/kolibri`）に重点を置いています。1 週間の計測により、この CUDA ポートは
 **ビット単位で再現可能**（prefill は racecheck を通過、2 回実行の差分は 0.0）になり、llama.cpp と
 **KL ダイバージェンスで突き合わせ**られました（109 回答ステップで 0.00132、top-1 一致率 0.982、
-plain-path oracle は BITWISE）。16 GB の GPU での壁時計実測（各 2 回）: 32K プロンプト後の prefill が約 **154 トークン/秒**、
-生成は短いコンテキストで約 **24-25 トークン/秒**、32K 以降で **12-13 トークン/秒**
+plain-path oracle は BITWISE）。16 GB の GPU での壁時計実測（各 2 回）: 32K プロンプト後の prefill が約 **119-120 トークン/秒**、
+生成は短いコンテキストで約 **30 トークン/秒**、32K 以降で **13-14 トークン/秒**
 （カウンタ値を誤引用した監査の指摘を受けた再測定値）。100K 長文の「needle」検索は 5 例中 4 例で、2 つの不一致はすべて記録済みです
 （その長さでは llama.cpp 参考実装自身も不安定です）。ゲートと速度設定は `tools/kolibri/` にあり、
 数値はすべて 2 回実行・負荷付きの記録で、根拠は[キャンペーン報告](docs/strateu-campaign-report.md)と `docs/superpowers/plans/` の各レッジャーにあります。
