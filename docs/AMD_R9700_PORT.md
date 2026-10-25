@@ -331,6 +331,14 @@ So every §9.3 short-shape verdict is measured against a baseline carrying a 3.8
 which is fine for comparing arms against each other but means those seconds are not the shipped
 default; the rate table above quotes the default and is the faster configuration by that margin.
 
+**`EXPERT_F16=24` also changes the answer, not just the clock.** Two runs each of bare default and
+`EXPERT_F16=24`, `--n 32` on the same 512-token prompt: each config reproduces itself exactly, but the
+two disagree from the **5th generated token** - bare gives `... 17156 32 50 55 58 4037 262 7771 ...`,
+`EXPERT_F16=24` gives `... 48590 32 49 45 50 54 1444 46 ...`. On this card the knob is neither free nor
+cosmetic: it costs 3.8 s at short shape and moves the greedy trajectory. The bitwise oracle and
+`pf_gate.sh` references were recorded on the bare default and pass there, which is the other reason
+the default is the configuration this ledger quotes.
+
 | arm | wall run1 / run2 | verdict |
 |---|---|---|
 | baseline (`RES_TOP=56`) | 39.3 s / 39.3 s | - |
