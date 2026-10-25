@@ -635,6 +635,12 @@ llama.cpp finding (`fc75cddf`, `86c84069`, `0ad27d37`); the §9.3 verdicts (`5f1
 against `oracle_gfx1201.txt` with the same result. The gate builds before it tests, so the PASS also
 re-confirms the HIP build is clean at this tip.
 
+`ctest --test-dir build` on the same tip: **60 of 62 passed** (59.73 s), the same two failures and the
+same five skips as the original run - `ple_parity` needs a Qwen file this box does not have, and
+`platform_memory_test` wants POSIX `mlock` against `ulimit -l` = 8 MiB. Neither is a Kolibri defect;
+both are box-scoped, and the count is quoted here rather than from memory because the criterion asks
+for it.
+
 **One figure to reconcile with the goal text.** The objective says a 42.4 GiB host expert table; the
 engine reports **42.90 GiB pinned** on this GGUF, which is the number used throughout this log. The
 difference is 0.5 GiB of rounding or a different file revision, not a discrepancy about what was
