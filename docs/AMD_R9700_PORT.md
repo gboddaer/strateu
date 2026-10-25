@@ -783,7 +783,10 @@ llama.cpp finding (`fc75cddf`, `86c84069`, `0ad27d37`); the §9.3 verdicts (`5f1
 `GATE PASS` with all four arms green - `build PASS`, `ids smoke PASS (gen: 3515 310 262 14292)`,
 `PF_HASH PASS (100 chunk-layers)`, `oracle PASS (BITWISE)` - and `oracle.sh check` was run separately
 against `oracle_gfx1201.txt` with the same result. The gate builds before it tests, so the PASS also
-re-confirms the HIP build is clean at this tip.
+re-confirms the HIP build is clean at this tip. Re-checked once more after the `needle_audit.py`
+change, which is the only non-docs edit since: `GATE PASS` (all four arms), `BITWISE PASS`, and
+`check_published_figures.py` passing at 82 values. Nothing imports `needle_audit.py` - the only other
+reference is a mention in `make_needle_fixtures.py` - so that edit is isolated from the gates.
 
 `ctest --test-dir build` on the same tip: **60 of 62 passed** (59.73 s), the same two failures and the
 same five skips as the original run - `ple_parity` needs a Qwen file this box does not have, and
