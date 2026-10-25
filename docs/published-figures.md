@@ -56,6 +56,58 @@ code now measures differently, the difference is box state and both numbers are 
 | 33 | 100K needle, campaign II build | **recall 4/5, exact 3/5** (exact PASS on 32k90, 64k90, anchor; d90b recalled one letter short `quart-willow-8` vs `quartz-willow-884`; d90 answered a different instruction) | `needle_audit.py` on the venv interpreter, five fixtures | shipped path; unchanged from #12 | "G5 (campaign II)" | STRATEU, KOLIBRI1 |
 | 34 | prefill 512, knob off, quiet box | **184.9 / 183.6 tok/s** with `PF_PARTIAL=1` against **159.0 / 158.8** off (+16.0%) | wall clock, `bench.py short` | load < 1 | "G1 (campaign II)" | report |
 
+
+The AMD R9700 table that follows numbers its own rows from 18; the two tables are per-box and number independently.
+
+## AMD Radeon AI PRO R9700 (gfx1201, 32 GB, ROCm 7.2.2) — re-derived, not inherited
+
+A different box, so a different floor table. Every row below is two-run wall clock from
+`docs/AMD_R9700_PORT.md` on host `rizo`: Ryzen 7 5700G (8 physical cores, 1 NUMA node), 93 GiB RAM,
+90-91 GiB free at the start of each run, GPU idle at the start, `--cpu-threads 8`, shipped config
+(`EXPERT_F16=24`, `RES_TOP=56`, `PF_STAGE=1`, router tiles) unless the row names a change. Prefill
+rows subtract the engine's own load line (13.4 s warm); the end-to-end row does not, and says so.
+
+| # | figure | value | method | load / scope | ledger row | quoted in |
+|---|---|---|---|---|---|---|
+| 18 | prefill, 512-token prompt, prefill pool ON, 8 threads | **87.8 / 85.4 tok/s** | wall clock, `--n 4` run minus the engine's 13.4 s load line, `--prefill` passed | idle, load average 0.08, 89 GiB free, 47 GiB buff/cache | "The prefill row was wrong before; re-derived as a four-arm sweep" | STRATEU, report §9.6 |
+| 19 | prefill 512, end to end (load included), pool ON, 8 threads | **26.3 / 26.2 tok/s** | same runs, nothing subtracted | same | same | report §9.6 |
+| 19a | prefill 512, prefill pool OFF, 8 threads | 16.8 / 16.8 tok/s | same shape with `--prefill` omitted (the pool is the 5.2x lever) | same | same | - |
+| 19b | prefill 512 end to end, pool OFF, 8 threads | 11.6 / 11.6 tok/s | same | same | same | - |
+| 19c | prefill 512, pool ON, 24 threads | 84.8 / 79.3 tok/s | same shape, `--cpu-threads 24` | same | same | - |
+| 19d | prefill 512 end to end, pool ON, 24 threads | 25.6 / 25.1 tok/s | same | same | same | - |
+| 19e | prefill 512, pool OFF, 24 threads | 7.1 / 7.3 tok/s | same shape, both arms off | same | same | - |
+| 19f | prefill 512 end to end, pool OFF, 24 threads | 6.0 / 6.1 tok/s | same | same | same | - |
+| 19g | decode, 253-token window, pool ON, 8 threads | 15.8 / 15.9 tok/s | `--n 257` wall minus `--n 4` wall | same | same | STRATEU, report §9.6 |
+| 19h | decode, pool OFF, 8 threads | 15.9 / 15.9 tok/s | same | same | same | - |
+| 19i | decode, pool ON, 24 threads | 7.6 / 7.6 tok/s | same; 24 lanes oversubscribe 8 physical cores | same | same | - |
+| 19j | decode, pool OFF, 24 threads | 8.7 / 8.7 tok/s | same | same | same | - |
+| 20 | decode, short context | **15.8 / 15.8 tok/s** | wall clock, tokens 130-257 of an `n=257` run | same | same | STRATEU, report §9.6 |
+| 21 | prefill, 99,299-token prompt (ctx 105024) | **102.3 / 100.8 tok/s** (`ATTN_MB=512`); **105.2 / 105.8** (`ATTN_MB=1024`) | wall clock, load subtracted | same | "long context, same engine" | STRATEU, report §9.6 |
+| 22 | prefill, 127,811-token prompt (ctx 131072) | **94.1 / 94.2 tok/s** (`ATTN_MB=512`); **100.4 / 100.8** (`ATTN_MB=1024`) | wall clock, load subtracted | same | same | report §9.6 |
+| 23 | decode at 100K context | **6.7 / 5.5 tok/s** | wall clock, `n=129` minus `n=1` on the 99,299-token fixture, `ATTN_MB=1024` | same | "decode at 100K" | STRATEU, report §9.6 |
+| 24 | KL vs llama.cpp, answers | **0.00182** (top-1 0.9884, 344 answer steps) | `kl.py` against `/fast/llama-server-kolibri/llama.cpp` `f5027fb21`, built here as `build_rocm_rizo` | n/a (not a rate) | "The KL gate" | STRATEU, report §9.6 |
+| 25 | llama.cpp CPU-vs-GPU floor on the same set | **0.00187** (top-1 0.9884) | `kl.py` | n/a | same | report §9.6 |
+| 26 | 100K needle | **recall 5/5, 0 not exact** | `needle_audit.py --run`, five fixtures of ~99.3K tokens rebuilt by `tools/kolibri/make_needle_fixtures.py` | shipped path | "The 100K needle audit" | STRATEU, report §9.6 |
+| 27 | ctest on the HIP build | **60 / 62** | `ctest` on the gfx1201 build | the two failures are box-scoped: `ple_parity` (missing Qwen3.8 Q2_0 file) and `platform_memory_test` (POSIX `mlock` vs `ulimit -l` 8 MiB) | "HIP bring-up" | STRATEU, report §9.6 |
+| 28 | pinned expert table on AMD | **42.90 GiB, no root** | engine load report at `ulimit -l` 8 MiB | `hipHostMalloc` succeeds without `RLIMIT_MEMLOCK`; the T4-era pinning requirement does not carry over | "HIP bring-up" | report §9.6 |
+
+## Campaign-report figures outside the numbered table
+
+These are quoted in `docs/strateu-campaign-report.md` but are not headline rates, so they carry no
+numbered row. Listed here so the staleness checker accounts for them and a reader can tell what each
+one is: a rounded restatement, an instrument-time sweep, a forward estimate, or a withdrawn figure.
+None of them may be quoted as a headline measurement.
+
+| figure | value | what it actually is |
+|---|---|---|
+| decode short, rounded in prose | 48 tok/s | the **retracted** counter-derived figure (see Retracted figures); quoted only in the sentence that retracts it |
+| serve path, rounded in prose | 176 tok/s | rounded restatement of #13 (176.2 / 170.8 tok/s) |
+| cache neutrality sweep | 80.4 / 80.0 tok/s | §7 instrument-time A/B (6,366 / 6,397 ms against 6,357 / 6,337 ms), a neutrality check, not a floor |
+| `RES_TOP=8` sweep | 122 tok/s | §7 sweep arm showing the promotion budget's cost; superseded by the shipped `RES_TOP=56` |
+| §8.1 arithmetic best case | 270 tok/s | **estimate**, not a measurement - the paper ceiling §8.1 derives before discounting |
+| §8.2 expected gain | 180 tok/s | **estimate** of the +10-20% the cheap partial was expected to give |
+| pool vs GPU decode, this box | 16.1 tok/s | the GPU-expert-path arm §9.3 cites against the pool's 22.7 tok/s; the AMD re-derivation of this pair is #18-#20 and report §9.6 |
+
 ## Retracted figures (must not be quoted again)
 
 | figure | value | why it was withdrawn |

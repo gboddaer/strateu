@@ -873,6 +873,15 @@ __global__ void __launch_bounds__(256) k_attn_flash(const __half* __restrict__ q
 // & {row gid+8, ...}; b = {k 2*tig..+1} x {n gid}; c = {row gid: n 2tig/+1; row gid+8: n 2tig/+1}.  The K/V
 // tiles are [key][dim] rows padded to 136 halves so the 272-B row steps walk the 32 smem banks.
 // env STRATA_KOLIBRI_ATTN_MMA=1.
+//
+// PTX-only.  mma.sync.aligned.m16n8k8 is an NVIDIA tensor-core instruction, so the helper, the kernel
+// that uses it and its launch are compiled for CUDA only.  On HIP the flag reads as off rather than
+// silently selecting a different kernel: the path is opt-in and off by default, so the AMD default path
+// loses nothing, and porting it to RDNA4 is a recorded deferral rather than a gap in what ships.
+#if defined(__HIPCC__)
+#define STRATA_KOLIBRI_MMA_AVAILABLE 0
+#else
+#define STRATA_KOLIBRI_MMA_AVAILABLE 1
 __device__ __forceinline__ void mma168(float* c, const uint32_t* a, const uint32_t* b) {
     asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
@@ -883,7 +892,9 @@ static inline bool attn_mma_on() {
     static const bool on = env_on("STRATA_KOLIBRI_ATTN_MMA");
     return on;
 }
+#endif
 
+#if STRATA_KOLIBRI_MMA_AVAILABLE
 __global__ void __launch_bounds__(128) k_attn_flash_mma(const __half* __restrict__ q16,
                                                         const __half* __restrict__ kcache,
                                                         const __half* __restrict__ vcache,
@@ -1037,6 +1048,7 @@ __global__ void __launch_bounds__(128) k_attn_flash_mma(const __half* __restrict
         }
     }
 }
+#endif  // STRATA_KOLIBRI_MMA_AVAILABLE
 
 /// S3: the KV cache is FP16 at the source, so a full-attention layer feeds the score/PV GEMMs straight from the
 
@@ -1265,7 +1277,9 @@ __global__ void k_attn_prep_p(const float* qx, const float* kx, const float* vx,
 // products and the same V mirror; only the ORDER of the four partial sums changes, so this is a NUMERICS change -
 // env-gated and KL-gated (STRATA_KOLIBRI_ATTN_PV4).
 __host__ __device__ inline bool attn_pv4_on() {
-#if defined(__CUDA_ARCH__)
+    // __CUDA_ARCH__ is nvcc's device-pass macro; HIP's device pass defines __HIP_DEVICE_COMPILE__
+    // instead, and without it the device pass falls into the host branch and calls getenv().
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
     return g_attn_pv4;   // the host sets it once at startup, like g_attn_coalesced
 #else
     // ON by default: four interleaved PV chains are worth +13% decode (tg 30.1/30.3 against 26.7/26.7 - the tg-short
@@ -1286,7 +1300,7 @@ static inline bool attn_kt_on() {
 }
 
 __host__ __device__ inline bool attn_coalesced_on() {
-#if defined(__CUDA_ARCH__)
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
     return g_attn_coalesced;   // the host sets it once at startup
 #else
     static const bool on = env_on("STRATA_KOLIBRI_ATTN_COALESCED");
@@ -2265,12 +2279,15 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
             k_kv_ring<<<grid1((int64_t) HKV * P * D), kThreads>>>(s.kc[l], s.vc[l], A.k16, A.v16, g.n_swa, P,
                                                                   first, D, HKV);
         k_to_f16<<<grid1((int64_t) Tc * H * D), kThreads>>>(A.q_m, A.q16, (int64_t) Tc * H * D);
+#if STRATA_KOLIBRI_MMA_AVAILABLE
         if (attn_mma_on() && H == 48 && HKV == 4 && D == 128) {
             k_attn_flash_mma<<<dim3((unsigned) ((Tc + 15) / 16), (unsigned) (HKV * 4)), 128, 0, g_st>>>(
                 A.q16, sliding ? A.k16 : s.kc[l], sliding ? A.v16 : s.vc[l], A.att_m, (int) H,
                 sliding ? (long long) P : (long long) s.ctx, (int) Tc, P, (int) p0c,
                 sliding ? (int64_t) g.n_swa : 0, (int) first, 1.0f / sqrtf((float) D));
-        } else if (attn_flash_on() && H == 48 && HKV == 4 && D == 128) {
+        } else
+#endif
+        if (attn_flash_on() && H == 48 && HKV == 4 && D == 128) {
             k_attn_flash<<<dim3((unsigned) ((Tc + 7) / 8), (unsigned) HKV), 256, 0, g_st>>>(
                 A.q16, sliding ? A.k16 : s.kc[l], sliding ? A.v16 : s.vc[l], A.att_m, (int) H,
                 sliding ? (long long) P : (long long) s.ctx, (int) Tc, P, (int) p0c,

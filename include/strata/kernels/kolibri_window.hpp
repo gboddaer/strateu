@@ -11,7 +11,10 @@
 // case p0=1024, T=512, swa=513 that the gates cannot reach.
 #include <cstdint>
 
-#if defined(__CUDACC__)
+// nvcc gives a plain host function implicit __host__ __device__ linkage when a kernel calls it; clang's HIP
+// front end does not, and says so ("reference to __host__ function ... in __global__ function").  So the
+// annotation is needed on both compilers, not just on CUDA.
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #define STRATA_KOLIBRI_HD __host__ __device__
 #else
 #define STRATA_KOLIBRI_HD

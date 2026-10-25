@@ -40,6 +40,7 @@ inline rocblas_status cublasGemmEx(rocblas_handle h, rocblas_operation trans_a,
         c, c_type, ldc, compute_type, algo, 0, 0);
 }
 #else
+#define CUBLAS_ATOMICS_NOT_ALLOWED HIPBLAS_ATOMICS_NOT_ALLOWED
 #define CUBLAS_COMPUTE_32F HIPBLAS_COMPUTE_32F
 #define CUBLAS_DEFAULT_MATH HIPBLAS_DEFAULT_MATH
 #define CUBLAS_GEMM_DEFAULT HIPBLAS_GEMM_DEFAULT
@@ -56,8 +57,21 @@ inline rocblas_status cublasGemmEx(rocblas_handle h, rocblas_operation trans_a,
 #define cublasSgemmStridedBatched hipblasSgemmStridedBatched
 #define cublasGemmStridedBatchedEx hipblasGemmStridedBatchedEx    // (the Qwen3.6 prompt attention, FP16)
 #define cublasHandle_t hipblasHandle_t
+#define cublasSetAtomicsMode hipblasSetAtomicsMode            // split-K atomics off (the determinism probe)
 #define cublasSetMathMode hipblasSetMathMode
 #define cublasSetStream hipblasSetStream
 #define cublasSetWorkspace hipblasSetWorkspace
 #define cublasStatus_t hipblasStatus_t
+
+// cuBLAS takes a batched GEMM's pointer arrays as `const void **`, hipBLAS as `const void * const *`.
+// Unwrapping the const once here keeps the cast out of every call site; the arrays are read-only either way.
+inline hipblasStatus_t cublasGemmBatchedEx(hipblasHandle_t h, hipblasOperation_t trans_a, hipblasOperation_t trans_b,
+    int m, int n, int k, const void* alpha, const void* const* aarray, hipDataType a_type, int lda,
+    const void* const* barray, hipDataType b_type, int ldb, const void* beta, void* const* carray,
+    hipDataType c_type, int ldc, int batch_count, hipblasComputeType_t compute_type, hipblasGemmAlgo_t algo) {
+    return hipblasGemmBatchedEx(h, trans_a, trans_b, m, n, k, alpha,
+                                const_cast<const void**>(aarray), a_type, lda,
+                                const_cast<const void**>(barray), b_type, ldb, beta,
+                                const_cast<void**>(carray), c_type, ldc, batch_count, compute_type, algo);
+}
 #endif

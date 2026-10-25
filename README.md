@@ -18,12 +18,14 @@ German & English MoE, 3.46B active) on 56 GB of RAM: `./setup.sh --family kolibr
 
 **strateu** forks [Strata](https://github.com/Niko1221/Strata) for **European open models**, starting with **Kolibri 1** (`src/kolibri`):
 50 layers x 384 experts, top-6 routing, 4:1 hybrid attention (513-token sliding rings on 40 layers, full attention on 10).
-CUDA today; AMD RDNA bring-up is the planned next step. All **19,200 experts stay pinned in host RAM** (42.90 GiB,
+CUDA and AMD HIP / ROCm, both measured - the AMD path on a Radeon AI PRO R9700 (gfx1201, 32 GB,
+ROCm 7.2.2), every number in [docs/AMD_R9700_PORT.md](docs/AMD_R9700_PORT.md). All **19,200 experts stay pinned in host RAM** (42.90 GiB,
 repacked per-expert blobs) and only a bounded hot set is mirrored in VRAM; a **cache miss is computed in place by a CPU
 pool over the pinned table** - no PCIe round trip - and prefill runs as a staged, pool-carried pipeline. The GPU/pool
 overlap is implemented and measured neutral: the per-layer residual dependency serialises the two, recorded not papered over.
 Accuracy is instrumented: **KL vs llama.cpp** on every numerics change, a **bitwise plain-path oracle**, `racecheck`-clean
-determinism (two runs bitwise identical), and a **100K needle audit** scored against each fixture's own needle text, both
+determinism on CUDA (two runs bitwise identical; the AMD path has no `racecheck` equivalent on RDNA4, and its host-side
+paths are valgrind-clean instead - recorded, not glossed), and a **100K needle audit** scored against each fixture's own needle text, both
 misses recorded. Evidence, including what was measured **dead**, is in [the campaign report](docs/strateu-campaign-report.md)
 and [the findings log](docs/findings-log.md). Speed is wall-clock, two runs (load stated): about **119-120 tokens/s** prefill after a 32K prompt and **30 / 13-14 tokens/s** decode (short / after 32K) on a 16 GB card - re-measured after an audit caught a counter-derived reporting error, and re-anchored again in campaign II on driver 580.196.07; the 100K read is a mean.
 

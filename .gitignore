@@ -34,6 +34,9 @@ td.log
 /mtp/
 /run-*.bat
 /run-*.sh
+# strateu: run-kolibri1.sh is the fork's own measured Kolibri-1 launcher (STRATEU.md documents it),
+# not a setup.py-generated script, so it is tracked unlike the run-*.sh files above.
+!run-kolibri1.sh
 /strata-*.json
 /strata-*.log
 /build-strata.bat
