@@ -322,6 +322,14 @@ configuration the rate table measures. Whether the pooled or the plain trajector
 llama.cpp is a KL question, and the KL runs in this ledger were done through `strata-kolibriref`, i.e.
 the plain path.
 
+**This is a known engine property, not an AMD regression.** `needle_audit.py`'s own docstring records
+it from the CUDA campaign: the reference's "whole continuation changes when only the prefill batch
+width changes - a semantic no-op that merely reorders fp accumulations." That is the same mechanism
+measured here - batching reorders fp accumulation, greedy decoding amplifies a last-bit difference
+into a different token, and after 10 tokens the trajectories have diverged. So the finding is the AMD
+instance of a documented CUDA-era sensitivity, and it needs no CUDA re-run to interpret; it also
+explains why the needle audit scores against the needle text rather than against llama.cpp tokens.
+
 **Decode is unchanged** - 15.8 tok/s here and 15.8 tok/s in the old row - so the box and the build are
 behaving identically and only the prefill isolation was wrong.
 
