@@ -370,6 +370,10 @@ struct Engine {
     // timed run that did not ask for counters.
     long long pf_hit_entries = 0, pf_entry_n = 0, pf_uniq_sum = 0, pf_cov_chunks = 0;
     long long pf_f16_promotes = 0;   // S7 increment B: fp16 cache promotions (LRU churn measure)
+    // G4 prerequisite: the fill gate ("fill bytes per prompt <= 2.5 GB, from 7.9") had NO counter behind it - the
+    // engine counted promotions but never the bytes they moved, so the gate could not be measured, only argued.
+    // This counts bytes actually written into the resident slots (gate + up + down planes, FP16).
+    long long pf_fill_bytes = 0;
     // S7 expert-cache coverage probe (STRATA_KOLIBRI_EXPERT_HIST=1): per-layer counts of routed touches per expert
     // id, over the whole run.  The fp16 VRAM cache fits ~2036 of 19,200 experts (10.6%); whether it pays is
     // decided by the touch SKEW - top-K coverage of this histogram is the cache's hit-rate curve.
@@ -2624,7 +2628,11 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                             strata::kernels::dequant_f16(b.L.gu_type, blob + b.L.up_off, 0, FF, N, out + (int64_t) FF * N, g_st);
                             strata::kernels::dequant_f16(b.L.d_type, blob + b.L.down_off, 0, N, FF, out + 2 * (int64_t) FF * N, g_st);
                             b.f16_slot_id[slot] = x;
-                            if (e.counters) ++e.pf_f16_promotes;
+                            if (e.counters) {
+                                ++e.pf_f16_promotes;
+                                // three FP16 planes: gate FF x N, up FF x N, down N x FF
+                                e.pf_fill_bytes += 3LL * FF * N * 2;
+                            }
                         }
                         b.f16_slot_last[slot] = s.pf_clock;
                         s.pf_res.push_back(x);
@@ -3340,7 +3348,13 @@ void print_counters(Engine& e, const char* tag) {
                      " (%.1f ms/chunk, %.1f GB/s)%s\n",
                      e.pf_chunks, (double) e.pf_experts / e.pf_chunks, gb, gb * 1e3 / e.pf_chunks, ms, ms / e.pf_chunks,
                      ms > 0 ? gb / (ms / 1000.0) : 0.0,
-                     e.pf_f16_promotes > 0 ? (std::string(" promotes=") + std::to_string(e.pf_f16_promotes)).c_str() : "");
+                     [&] {
+                         if (e.pf_f16_promotes <= 0) return std::string();
+                         char buf[96];
+                         std::snprintf(buf, sizeof buf, " promotes=%lld fill=%.2f GB",
+                                       e.pf_f16_promotes, double(e.pf_fill_bytes) / 1e9);
+                         return std::string(buf);
+                     }().c_str());
         // The leg's honest rate: rows and GFLOP/s against the CPU pool's measured roof (226 GFLOP/s).  Every
         // earlier reading of this leg quoted GB/s, which measures the bytes it streamed rather than the arithmetic
         // it did - and the arithmetic is what binds once the fp16 cache is doing its job.
