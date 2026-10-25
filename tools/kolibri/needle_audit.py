@@ -83,7 +83,12 @@ def run_ours(fixture, gguf, n, ctx, timeout, flash=False):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fixtures", nargs="*")
-    ap.add_argument("--gguf", default="/data4/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf")
+    # default unchanged when KOLIBRI_MODEL is unset; on boxes where the model lives elsewhere the
+    # env is already how every other kolibri tool is pointed, and without this the audit fails per
+    # fixture with a load error and then prints "0 answer(s) audited, N not exact", which reads as
+    # a recall regression rather than a path problem.
+    ap.add_argument("--gguf", default=os.environ.get("KOLIBRI_MODEL")
+                    or "/data4/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf")
     ap.add_argument("--run", action="store_true")
     ap.add_argument("--flash", action="store_true", help="score the ATTN_FLASH path instead of the shipped tiled one")
     ap.add_argument("--include", default="")

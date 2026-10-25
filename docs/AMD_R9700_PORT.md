@@ -132,8 +132,13 @@ not read `KOLIBRI_MODEL` - so `--run` with the environment set as usual fails pe
 `load failed: cannot open /data4/...` and then reports `0 answer(s) audited, 6 not exact`. That is a
 silent-looking failure: the audit still prints a verdict line, and "6 not exact" reads like a recall
 regression when it is really six failed loads. On this box the audit must be invoked as
-`needle_audit.py --run --gguf /fast/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf`. Worth fixing
-upstream as an env fallback, but that changes shared harness, so it is recorded rather than changed.
+`needle_audit.py --run --gguf /fast/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf`. **Now fixed
+opt-in:** `--gguf` defaults to `os.environ.get("KOLIBRI_MODEL") or <the old path>`, so the env every
+other kolibri tool already uses is honoured here too. Checked three ways - `py_compile` clean; with
+the env unset the resolved default is the identical original string, so CUDA behaviour is unchanged;
+with the env set the audit runs clean (rc=0). What was *not* re-run is a full six-fixture audit
+through the env path, since the explicit `--gguf` run above already produced the 6/6 verdict and the
+only changed expression is the default.
 
 
 
