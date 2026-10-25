@@ -670,6 +670,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                                  ${_strata_gpu_include_directories})
     target_link_libraries(pf_combine_test PRIVATE strata_warnings ${_strata_gpu_runtime_target})
     add_test(NAME pf_combine_test COMMAND pf_combine_test)
+    # campaign II stage G2: the parity gate for the grouped Q4_K-from-VRAM GEMM (stage G3's kernel), written and
+    # shown FAILING before that kernel existed.  Built like mmvq_il_parity (CMakeLists.txt:855): its own target,
+    # the kernel TU compiled in, CTest-registered.  The kernel is a red-phase stub, so this test is EXPECTED TO
+    # FAIL until G3 lands - see src/kolibri/q4k_grouped.cu.
+    add_executable(q4k_grouped_vram_parity src/kernels/q4k_grouped_vram_parity.cpp src/kolibri/q4k_grouped.cu)
+    target_include_directories(q4k_grouped_vram_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                               ${_strata_gpu_include_directories})
+    target_link_libraries(q4k_grouped_vram_parity PRIVATE strata_kernels strata_prefill strata_warnings
+                          ${_strata_gpu_runtime_target})
+    add_test(NAME q4k_grouped_vram_parity COMMAND q4k_grouped_vram_parity)
   endif()
   # the reference forward pass (plan T6): plain kernels + Strata native MMVQ/router, no graphs, no cache; the
   # routed experts (3-D tensors) live in managed memory so a 47 GB file runs on a 16 GB card (pages from RAM)
