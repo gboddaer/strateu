@@ -255,12 +255,12 @@ config. Box idle at start: load average 0.08, 89 GiB free, 47 GiB in buff/cache.
 | decode, tokens 130-257 (the steady window) | **15.8 tok/s** (8.1 s) | **15.8 tok/s** (8.1 s) |
 | decode, tokens 2-129 (first window after prefill) | 21.3 tok/s | 16.2 tok/s |
 
-### The prefill row was wrong before, and the pool state is why
+### The prefill row was wrong before; re-derived as a four-arm sweep
 
-An earlier version of this table recorded prefill as 43.4 / 51.7 tok/s, derived from an `n=1` run minus
-the load line **with the prefill pool state unstated**. That row matches no arm measured below and is
-superseded; the figures above are the re-measurement. The sweep is four arms, two runs per arm, same
-prompt and ctx, raw wall clock:
+An earlier version of this table recorded prefill as 43.4 / 51.7 tok/s, derived from `--n 1` runs in
+the §9.3 sweep minus the load line. That row matches no arm measured below and is superseded; the
+figures above are the re-measurement. The sweep is four arms, two runs per arm, same prompt and ctx,
+raw wall clock:
 
 | arm | `--n 4` wall | `--n 257` wall | prefill (load excluded) | prefill end to end | decode |
 |---|---|---|---|---|---|
@@ -269,12 +269,20 @@ prompt and ctx, raw wall clock:
 | `--prefill`, 24 threads | 19.961 / 20.384 s | 52.754 / 54.050 s | 84.8 / 79.3 tok/s | 25.6 / 25.1 tok/s | 7.6 / 7.6 tok/s |
 | pool off, 24 threads | 85.744 / 83.977 s | 112.624 / 115.049 s | 7.1 / 7.3 tok/s | 6.0 / 6.1 tok/s | 8.7 / 8.7 tok/s |
 
-Three things follow, none of them visible in a single-arm table.
+Four things the single-arm table hides.
+
+**Why the old row was slow is not the flag.** The old sweep script is still on disk and it passed
+`--prefill` too, so the pool was on in those runs as well - the flag does not explain the 2x gap
+(11.8 / 9.9 s then against 5.86 / 6.00 s now). What differs is box state and derivation: those `--n 1`
+runs followed 100K-token arms in the same sweep, which stream the 42.9 GiB expert table and evict
+part of it, and an `--n 1` wall leaves no second decode length to cross-check against. The four arms
+above ran back to back on an idle box with 47 GiB resident, each prefill figure checked against its
+own `--n 257` partner.
 
 **The prefill pool is the largest single lever on this box**: 87.8 tok/s with `--prefill` against
 16.8 tok/s without, **5.2x** on the same prompt. The engine prints which pool it used (`prefill pool:
 8 lane(s) = the host + 7 thread(s), 7 pinnable physical core(s), pinned`), so a prefill figure that
-does not say whether the pool was on is ambiguous - which is exactly what happened to the old row.
+does not say whether the pool was on is ambiguous, and every rate row in this ledger now says so.
 
 **`--cpu-threads 24` halves decode**: 15.8 tok/s at 8 threads against 7.6 tok/s at 24. The box is a
 Ryzen 7 5700G - 8 physical cores - so 24 lanes oversubscribe and the decode loop pays for it.
@@ -282,9 +290,7 @@ Ryzen 7 5700G - 8 physical cores - so 24 lanes oversubscribe and the decode loop
 the script's own comment already files the `--cpu-threads` choice with the traps of that class.
 
 **Decode is unchanged** - 15.8 tok/s here and 15.8 tok/s in the old row - so the box and the build are
-behaving identically and only the prefill isolation was wrong. The old 11.8 / 9.9 s sits between the
-pool-on (5.8-6.0 s) and pool-off (30.5 s) arms, which is what a partially faulted 42.9 GiB expert
-table would look like; these runs were taken warm, with 47 GiB resident, and are the ones to quote.
+behaving identically and only the prefill isolation was wrong.
 
 Long context, same engine, 8 decode tokens, load subtracted:
 
@@ -293,11 +299,16 @@ Long context, same engine, 8 decode tokens, load subtracted:
 | 99,299 tokens (ctx 105024) | 102.3 / 100.8 tok/s | 105.2 / 105.8 tok/s |
 | 127,811 tokens (ctx 131072) | 94.1 / 94.2 tok/s | 100.4 / 100.8 tok/s |
 
-Two things follow. The **marginal prefill rate is ~105 tok/s**, and the short-prompt figure is low
-because roughly 6 s of fixed cost is spread over only 512 tokens - at 100K that same engine runs
-2.4x faster per token. And **`ATTN_MB=1024` is faster than 512 at both long contexts** (105.5 vs
+Two things follow. The **marginal prefill rate is ~105 tok/s**, which against the corrected
+short-prompt figure of 87.8 tok/s is only **1.2x**, not the 2.4x an earlier version of this section
+claimed - that ratio was computed against the superseded 43.4 tok/s row and is wrong in the same
+direction. The fixed cost a short prompt pays is therefore about 1 s (5.86 s measured for 512 tokens
+against 4.88 s at the marginal rate), not the ~6 s previously stated: short-prompt prefill on this
+box is close to its marginal rate, and there is little fixed cost left to amortise once the prefill
+pool is on. And **`ATTN_MB=1024` is faster than 512 at both long contexts** (105.5 vs
 101.6 at 100K, 100.6 vs 94.2 at 128K), so on this card the larger attention slab is a win, not just
 a fit; the T4's OOM at 100K does not reproduce here, at 32 GB, with the expert table in host RAM.
+These long-context rows were taken with the same shape as the §9.3 arms, prefill pool on.
 
 Against the CUDA record (`strateu-campaign-report.md`: prefill 157.0/160.3 tok/s at 512 tokens,
 decode 24.4/24.5 tok/s short context) the AMD path is about 1.8x slower on short prefill (87.8 against 157.0, pool on) and about

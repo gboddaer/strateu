@@ -38,7 +38,7 @@ rows subtract the engine's own load line (13.4 s warm); the end-to-end row does 
 
 | # | figure | value | method | load / scope | ledger row | quoted in |
 |---|---|---|---|---|---|---|
-| 18 | prefill, 512-token prompt, prefill pool ON, 8 threads | **87.8 / 85.4 tok/s** | wall clock, `--n 4` run minus the engine's 13.4 s load line, `--prefill` passed | idle, load average 0.08, 89 GiB free, 47 GiB buff/cache | "The prefill row was wrong before, and the pool state is why" | STRATEU, report §9.6 |
+| 18 | prefill, 512-token prompt, prefill pool ON, 8 threads | **87.8 / 85.4 tok/s** | wall clock, `--n 4` run minus the engine's 13.4 s load line, `--prefill` passed | idle, load average 0.08, 89 GiB free, 47 GiB buff/cache | "The prefill row was wrong before; re-derived as a four-arm sweep" | STRATEU, report §9.6 |
 | 19 | prefill 512, end to end (load included), pool ON, 8 threads | **26.3 / 26.2 tok/s** | same runs, nothing subtracted | same | same | report §9.6 |
 | 19a | prefill 512, prefill pool OFF, 8 threads | 16.8 / 16.8 tok/s | same shape with `--prefill` omitted (the pool is the 5.2x lever) | same | same | - |
 | 19b | prefill 512 end to end, pool OFF, 8 threads | 11.6 / 11.6 tok/s | same | same | same | - |
