@@ -557,6 +557,10 @@ So the KL result stands as measured: **0.00182 on the answer steps against a bou
 bound sits *below* the noise floor of the reference it is measured against on this box, which is
 recorded as a deviation rather than argued away.
 
+*(Superseded as the headline: 0.00182 is the **reference-engine** figure. Measured on the shipped
+engine the answer-step KL is **0.00146 plain prefill / 0.00162 pooled**, i.e. **0.78x** of the same
+floor - see "The KL measured on the shipped engine" below. The bound is unmet either way.)*
+
 ### The plain-kernel reference path gets to 0.84x of the floor; neither path reaches 0.00132
 
 `strata-kolibriref` also takes `--kernels plain` (the straightforward reference kernels rather than
@@ -584,7 +588,8 @@ Different step populations, different means.
 
 The honest summary line for the AMD path is therefore **0.00182 shipped / 0.00158 plain, at 0.97x and
 0.84x of this box's own floor**, with the criterion's absolute bound of 0.00132 unmet and the reason
-given above - not a claim that the bound was met.
+given above - not a claim that the bound was met. On the shipped engine rather than the reference the
+figures are **0.00146 plain / 0.00162 pooled (0.78x / 0.86x)**, which is the line to quote.
 
 ## A memory detector that actually applies: valgrind over the ported host-side paths
 
