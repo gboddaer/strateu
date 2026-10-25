@@ -353,3 +353,52 @@ hot-seed path costs 10% of pp for -3% tg, and the size that would free the VRAM 
 would have to replace.  G4b's diagnosis stands - the after-32K wall is 1.28 GB/token of PCIe at 0% residency - but
 closing it needs two things this campaign does not have: **hotness-based blob residency** and a **blob multiply
 that is not slower than FP16**, i.e. the fused Q4_K kernel G3 could not deliver.
+
+## G5 (campaign II) — the floor table, re-anchored on what this box actually does today
+
+Every figure is a two-run wall clock from `tools/kolibri/bench.py --bin /tmp/kolibri_bench_pub.sh`, run under
+`numactl --cpunodebind=1 --membind=1`, on kernel `6.1.0-52-amd64`, driver `580.196.07`, with
+`STRATA_KOLIBRI_PF_PARTIAL=1` and `STRATA_KOLIBRI_EXPERT_F16=24`.  Box load is the 1-minute average read from
+`/proc/loadavg` immediately before each run.
+
+| campaign floor | run 1 | run 2 | load (run 1 / run 2) | status |
+|---|---|---|---|---|
+| pp-512 >= 200 tok/s | 179.8 | 181.0 | 1.32 / 2.50 | **not met - ceiling 181.0** |
+| pp-32K >= 150 tok/s | 125.7 | 122.1 | 0.06 / 9.02 | **not met - ceiling 125.7** |
+| tg-128 short >= 30 tok/s | 30.0 | 30.3 | 1.32 / 2.50 | **MET** |
+| tg-128 after 32K >= 20 tok/s | 13.3 | 13.4 | 0.06 / 9.02 | **not met - ceiling 13.4** |
+
+Accuracy on the same build: oracle **BITWISE PASS** (`pf_gate`: ids smoke PASS, PF_HASH PASS 100 chunk-layers,
+oracle BITWISE), KL **0.00133** with the knob on against **0.00123** with it off, both under the llama.cpp-CPU noise
+floor of **0.00178** (the literal <=0.00132 in the original contract is marginally exceeded; the recorded ruling in
+bf6c3f58 supersedes it and the gap sits inside the noise floor).  Needle recall **3/5** - see below.
+
+**Each unmet floor, with its price.**
+
+*pp-512: 181.0 against a floor of 200.* G1 landed and is worth +16% (159.0/158.8 -> 184.9/183.6 when measured on a
+quiet box; 179.8/181.0 here at load 1.3-2.5).  The remaining 19 tok/s is not in the plumbing: the expert GEMM is
+4.18 ms/layer on the FP16-resident leg and the gate for the compressed leg was 2.6 ms/layer, which needs a fused
+Q4_K tensor-core kernel that does not exist on CUDA (G3, skipped at c77adbfd - the Q4_K-from-VRAM arm measured
+9.99 ms/layer, 2.39x slower than the FP16 leg it would have to replace).  Price: a hand-written `mma.m16n8k16`
+kernel for sm_75, days of work with profiling between attempts.
+
+*pp-32K: 125.7 against a floor of 150.* This floor was anchored on a box state that no longer exists.  Knob-off
+today measures 119.6/119.4 where the same prompt measured 154 before the driver moved from 580.178 to 580.196;
+pp-512 is unaffected (159 against 157/160), which is what identifies it as box drift and not as the change.  The
+change never made pp-32K worse in any pair (on >= off every time, 124.7/159.0 against 119.6/119.4).  Price: none
+payable in code - the floor has to be re-anchored to the box, which is what this table does.
+
+*tg-128 after 32K: 13.4 against a floor of 20.* G4b attributed the wall completely: **0% decode residency, 1.28 GB
+of PCIe per token** (488.7 MB d2h + 789.5 MB h2d), with the CPU pool drain accounting for only 12.86 ms of the
+74.6-75.2 ms token.  It is bandwidth, not kernel speed.  Closing it needs two things this campaign does not have -
+hotness-based blob residency (the existing `--expert-slots` decides residency by expert id and measured -17% of tg,
+G4 at ca1fbd44) and a blob multiply that is not slower than FP16 (the missing fused kernel again).
+
+**Needle recall is 3/5 on this box, and it is not a campaign regression.**  Scored with
+`tools/kolibri/needle_audit.py` on the five fixtures, our build: `needle_32k90` (33,364 tok) PASS,
+`needle_64k90` (65,876 tok) PASS, `needle_anchor` (101,416 tok) PASS, `needle_d90` (98,591 tok) FAIL,
+`needle_d90b` (98,591 tok) FAIL.  Two things make this a standing property of the fixture set rather than of this
+work: the default path is byte-identical to main (oracle BITWISE above), so nothing in campaign II can have moved
+it; and the pre-campaign arms sitting in `needle_d90b` from Oct 23 - `audit_fixed_gen`, `audit_simt_gen`,
+`flash_gen` - fail the same fixture with the same truncated answer (`quart-willow-8`).  The >=4/5 gate is therefore
+recorded as **not met on this box**, with the failures predating the campaign.
