@@ -25,7 +25,7 @@ overlap is implemented and measured neutral: the per-layer residual dependency s
 Accuracy is instrumented: **KL vs llama.cpp** on every numerics change, a **bitwise plain-path oracle**, `racecheck`-clean
 determinism (two runs bitwise identical), and a **100K needle audit** scored against each fixture's own needle text, both
 misses recorded. Evidence, including what was measured **dead**, is in [the campaign report](docs/strateu-campaign-report.md)
-and [the findings log](docs/findings-log.md). Speed is wall-clock, two runs (load stated): about **154 tokens/s** prefill after a 32K prompt and **24-25 / 12-13 tokens/s** decode (short / after 32K) on a 16 GB card - re-measured after an audit caught a counter-derived reporting error; the 100K read is a mean.
+and [the findings log](docs/findings-log.md). Speed is wall-clock, two runs (load stated): about **119-120 tokens/s** prefill after a 32K prompt and **30 / 13-14 tokens/s** decode (short / after 32K) on a 16 GB card - re-measured after an audit caught a counter-derived reporting error, and re-anchored again in campaign II on driver 580.196.07; the 100K read is a mean.
 
 ## How fast is it?
 
@@ -67,8 +67,8 @@ This fork also measured Aleph Alpha's **[Kolibri 1](docs/KOLIBRI1.md)** (Q4_K_M)
 
 | Prompt | Writes answers | Reads your prompt |
 | --- | ---: | ---: |
-| **short (512 tokens)** | 24-30 tokens/s (NUMA binding) | 157-160 tokens/s (warm server: 171-176) |
-| **32K tokens** | 12-14 tokens/s (NUMA binding) | 154 tokens/s |
+| **short (512 tokens)** | 30 tokens/s (NUMA binding) | 156-160 tokens/s (opt-in `PF_PARTIAL`: 180-181, warm server 202) |
+| **32K tokens** | 13-14 tokens/s (NUMA binding) | 119-120 tokens/s |
 | **100K tokens** | — | 97 tokens/s |
 
 Two runs each on the bitwise-deterministic binary, box load stated; the 100K row is a single cold run. Box spec, full tables and context:

@@ -96,3 +96,5 @@ labelled as such and are not measurements.
 | Option A arithmetic best case | 270 tok/s | **projection** | §8.1 Option A |
 | Option A realistic outcome | 185 tok/s to 200 tok/s | **projection** | §8.1 Option A |
 | Option C expected gain | 165 tok/s to 180 tok/s | **projection** | §8.2 Option C |
+| pp-512 gap left after campaign II | 19 tok/s | **derived**, not measured: the difference between #19's 181.0 and the 200 target | "G5 (campaign II)" |
+| fused-kernel traffic estimate | 1.2-1.3 ms/layer against a 2.6 ms/layer gate | **projection** from byte math (82 MB read per projection at the rate the pool already sustains), never measured | "G3 (campaign II)" |
