@@ -28,6 +28,34 @@ measurement** and the doc is stale.
 | 16 | expert coverage, 512-token corpus | **top-24 50.4%, top-80 79.2%, top-128 90.4%** | `STRATA_KOLIBRI_EXPERT_HIST=1` + `--counters` | instrument-time (coverage, not a rate) | "C0 coverage curve" | report §7/§C0 |
 | 17 | expert coverage, 32K corpus | **top-24 42.9%, top-80 70.3%, top-128 83.0%** | same | instrument-time | "C0 coverage curve" | report §C0 |
 
+## Campaign II figures (branch `kolibri2-speed`, Tesla T4, driver 580.196.07, kernel 6.1.0-52-amd64)
+
+Same harness and binding as #1-#4 (`bench.py`, `numactl --cpunodebind=1 --membind=1`, `--cpu-threads 24`,
+`STRATA_KOLIBRI_EXPERT_F16=24`).  Two groups: the **default path**, which is byte-identical to `main` (the campaign's
+knob is opt-in), and the path with **`STRATA_KOLIBRI_PF_PARTIAL=1`**, which is the campaign's actual speed change.
+Rows #1-#4 above stay in the table because they are what `main` measured on the box's *earlier* state; where the same
+code now measures differently, the difference is box state and both numbers are shown with their date.
+
+| # | figure | value | method | load / scope | ledger row | quoted in |
+|---|---|---|---|---|---|---|
+| 18 | prefill 512, default path (knob off) | **156.0 / 159.6 tok/s** | wall clock, `bench.py short` | load 0.88 / 3.03 | "G1 (campaign II)" | STRATEU, KOLIBRI1 |
+| 19 | prefill 512, `PF_PARTIAL=1` | **179.8 / 181.0 tok/s** | wall clock, `bench.py short`; cross-checked 181.7 cold / 201.8 tok/s serve-path tok/s | load 1.32 / 2.50 | "G1 (campaign II)" | STRATEU, KOLIBRI1 |
+| 20 | prefill 512, serve path, `PF_PARTIAL=1` | **181.7 cold / 201.8 tok/s** (warm) | engine serve-pipe `DONE` timings, separate process | load 0.72 / 2.67 | "G1 (campaign II)" | STRATEU, KOLIBRI1 |
+| 21 | prefill after 32K, default path | **119.6 / 119.4 tok/s** | wall clock, `bench.py after` | load stated in ledger | "G5 (campaign II)" | STRATEU, KOLIBRI1 |
+| 22 | prefill after 32K, `PF_PARTIAL=1` | **125.7 / 122.1 tok/s** | wall clock, `bench.py after` | load 0.06 / 9.02 | "G5 (campaign II)" | STRATEU, KOLIBRI1 |
+| 23 | decode short, `PF_PARTIAL=1` | **30.0 / 30.3 tok/s** | wall clock, `bench.py short`; serve path 30.2 / 30.1 tok/s | load 1.32 / 2.50 | "G5 (campaign II)" | STRATEU, KOLIBRI1 |
+| 24 | decode after 32K, default path | **13.4 / 13.5 tok/s** | wall clock, `bench.py after` | load stated in ledger | "G4b (campaign II)" | STRATEU, KOLIBRI1 |
+| 25 | decode after 32K, `PF_PARTIAL=1` | **13.3 / 13.4 tok/s** | wall clock, `bench.py after` | load 0.06 / 9.02 | "G5 (campaign II)" | STRATEU, KOLIBRI1 |
+| 26 | KL vs llama.cpp, knob off / on | **0.00123 / 0.00133** (llama.cpp CPU-vs-GPU floor 0.00178) | `kl.py`, `ATTN_FLASH=1` both arms | n/a (not a rate) | "G1 (campaign II)" | STRATEU, KOLIBRI1 |
+| 27 | expert GEMM, FP16-resident leg | **4.18 ms/layer** | `--counters` per-layer, instrument-time (a component, not a rate) | n/a | "G3 (campaign II)" | report |
+| 28 | expert GEMM, Q4_K-from-VRAM arm | **9.99 ms/layer** (2.39x the FP16 leg; gate was 2.6) | same harness as #27 | n/a | "G3 (campaign II)" | report |
+| 29 | decode PCIe traffic after 32K | **1.28 GB/token** (488.7 MB d2h + 789.5 MB h2d), 0% residency | `--counters`, instrument-time (a component) | n/a | "G4b (campaign II)" | STRATEU, KOLIBRI1 |
+| 30 | expert-cache fill per 512-token prompt | **12.20 GB** (1551 promotions) | `--counters` `fill=`, instrument-time | n/a | "G4 arithmetic" | report |
+| 31 | decode short with `--expert-slots 8 / 16` | **25.0 / 25.1 tok/s** (vs 30.3 without) | wall clock, `bench.py short` | load 4.73 / 6.67 | "G4 (campaign II)" | report |
+| 32 | decode short with `STRATA_KOLIBRI_DEC_RES=1` | **29.5 / 29.2 tok/s**, prefill 144.9 / 141.8 tok/s | wall clock, `bench.py short` | load 3.79 / 4.48 | "G4 (campaign II)" | report |
+| 33 | 100K needle, campaign II build | **recall 4/5, exact 3/5** (exact PASS on 32k90, 64k90, anchor; d90b recalled one letter short `quart-willow-8` vs `quartz-willow-884`; d90 answered a different instruction) | `needle_audit.py` on the venv interpreter, five fixtures | shipped path; unchanged from #12 | "G5 (campaign II)" | STRATEU, KOLIBRI1 |
+| 34 | prefill 512, knob off, quiet box | **184.9 / 183.6 tok/s** with `PF_PARTIAL=1` against **159.0 / 158.8** off (+16.0%) | wall clock, `bench.py short` | load < 1 | "G1 (campaign II)" | report |
+
 ## Retracted figures (must not be quoted again)
 
 | figure | value | why it was withdrawn |
@@ -51,7 +79,7 @@ supersession note names them, (b) the plain-path / llama.cpp / upstream-README c
 | llama.cpp on this box | 126.1 tok/s, 157.5 tok/s, 19.1 tok/s, 21.2 tok/s | the reference engine (itself unstable at 98.6K - report §6.5) |
 | llama.cpp README (RTX 5070) | 723 tok/s, 18.0 tok/s | upstream marketing figure, not comparable to this box |
 | upstream "reads your prompt" claim | 60 tok/s | the upstream project's own number, quoted in `README.md`'s speed section |
-| rounded restatements of #1-#4 and #13 in prose | 160 tok/s, 158 tok/s, 162 tok/s, 154 tok/s, 169 tok/s, 157 tok/s, 30 tok/s, 13 tok/s, 176 tok/s | same measurements as the rows above, rounded in prose |
+| rounded restatements of #1-#4, #13 and #18-#25 in prose | 160 tok/s, 158 tok/s, 162 tok/s, 154 tok/s, 169 tok/s, 157 tok/s, 30 tok/s, 13 tok/s, 176 tok/s, 156 tok/s, 180 tok/s, 181 tok/s, 126 tok/s, 122 tok/s, 120 tok/s, 119 tok/s, 13.5 tok/s, 202 tok/s, 16 tok/s, 25 tok/s, 29 tok/s, 145 tok/s | same measurements as the rows above, rounded in prose |
 | plain path at 100K | 8.9 tok/s, 4 tok/s, 9 tok/s | the per-token path's 100K mean, for contrast (11,534 s) |
 | floor targets | 20 tok/s, 30 tok/s, 45 tok/s, 60 tok/s, 150 tok/s, 200 tok/s, 300 tok/s, 400 tok/s | **targets, not measurements** |
 
@@ -68,3 +96,5 @@ labelled as such and are not measurements.
 | Option A arithmetic best case | 270 tok/s | **projection** | §8.1 Option A |
 | Option A realistic outcome | 185 tok/s to 200 tok/s | **projection** | §8.1 Option A |
 | Option C expected gain | 165 tok/s to 180 tok/s | **projection** | §8.2 Option C |
+| pp-512 gap left after campaign II | 19 tok/s | **derived**, not measured: the difference between #19's 181.0 and the 200 target | "G5 (campaign II)" |
+| fused-kernel traffic estimate | 1.2-1.3 ms/layer against a 2.6 ms/layer gate | **projection** from byte math (82 MB read per projection at the rate the pool already sustains), never measured | "G3 (campaign II)" |

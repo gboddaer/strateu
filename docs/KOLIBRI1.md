@@ -100,16 +100,27 @@ POOL_ALL rule, with `numactl --cpunodebind=1 --membind=1` (the T4's DMA and the 
 memory controllers - measured: the same config at node-0 is 20% slower at 32K).
 
 All strateu rows are wall-clock measurements from `tools/kolibri/bench.py` on the shipped configuration; the earlier phase's
-counter-derived figures (129 tok/s at 32K, 21.2 tok/s decode) are superseded and removed.
+counter-derived figures (129 tok/s at 32K, 21.2 tok/s decode) are superseded and removed.  The campaign II re-anchor
+(driver 580.196.07, kernel 6.1.0-52-amd64, load stated in `docs/published-figures.md` #18-#25) is what these rows now
+carry; where a number moved against the previous publication, the reason is the box, and both figures are named there.
 
 | test | strateu (shipping config, wall clock) | Strata (the exactness-first plain path) | llama.cpp (same box) | llama.cpp README (RTX 5070) |
 |------|------|------|------|------|
-| pp 512 (short) | **157.0 / 160.3 tok/s** | 10.0 tok/s | 159-169 tok/s | 723 tok/s |
-| pp 32,768 | **154.0 / 153.7 tok/s** | 1.3 tok/s | ~157 tok/s | - |
-| tg 128 (short) | **24.5 / 24.4 tok/s** | 9.3 tok/s | 19-30 tok/s (binding- and load-dependent) | 18.0 tok/s |
-| tg 128 after 32K | **12.3 / 12.2 tok/s** | 0.6 tok/s | ~13 tok/s | - |
+| pp 512 (short) | **156.0 / 159.6 tok/s** | 10.0 tok/s | 159-169 tok/s | 723 tok/s |
+| pp 32,768 | **119.6 / 119.4 tok/s** | 1.3 tok/s | ~157 tok/s | - |
+| tg 128 (short) | **30.3 / 30.3 tok/s** | 9.3 tok/s | 19-30 tok/s (binding- and load-dependent) | 18.0 tok/s |
+| tg 128 after 32K | **13.4 / 13.5 tok/s** | 0.6 tok/s | ~13 tok/s | - |
 | 100K needle | **recall 4/5, exact 3/5** over five distractor-bearing fixtures (`tools/kolibri/needle_audit.py`); the reference is not usable as an oracle at this length | - | - | - |
 | KL vs llama.cpp (390 teacher-forced steps) | **0.00634** (ratio 3.77) | 0.00210-0.00648 | — | — |
+
+**Opt-in `STRATA_KOLIBRI_PF_PARTIAL=1` (campaign II).**  The prefill keeps each token's expert partial sums on the GPU
+instead of round-tripping them through the host pool, and it is opt-in: with the knob off the binary is byte-identical
+to `main` (plain-path oracle BITWISE, two-run ids identical).  With it on, measured on the same harness and binding:
+pp 512 **179.8 / 181.0 tok/s** (serve path 181.7 cold, 201.8 warm), pp 32,768 **125.7 / 122.1 tok/s**, tg 128 short
+**30.0 / 30.3 tok/s**, tg 128 after 32K **13.3 / 13.4 tok/s**, KL 0.00133 against the knob-off 0.00123 with
+llama.cpp's own CPU-vs-GPU floor at 0.00178.  The +16% at 512 tokens is real and the 32K figure never went down in
+any pair; what it does not do is reach the 200 tok/s target, because the expert GEMM underneath is 4.18 ms/layer and
+the compressed alternative measured 9.99.
 
 **Card classes - what carries over, and what does not.**  The placement sign (the findings register's
 "Slots refutation: box-scoped") is the whole story, and it is decided by ONE ratio: the host's streaming
@@ -127,10 +138,15 @@ The byte arithmetic is portable; the placement sign is not - that is why the cla
 not as a card name.  On a class-C card the slot cache should become the primary path (the findings register
 records the sign flip and the byte math behind it).
 
-**The honest gaps on this box (class A):** the prompt read is 3.4x short of llama.cpp's 157.5 tok/s at 32K
-(129 vs 157.5) and the decode is 2.3x short of the 30 tok/s floor - the decode's expert leg is at 93% of
-pool_bench's ceiling for the same shape, so the remaining lever is LESS EXPERT TRAFFIC (or a card class where
-the placement flips), not a faster pool.
+**The honest gaps on this box (class A).**  Short-context decode now sits at its floor (30.3 / 30.3 against 30) and
+the 512-token prompt read is 156.0-159.6 by default, 179.8-181.0 with the campaign's knob on, against a 200 target.
+Two gaps remain and both are traffic, not scheduling.  The 32K prompt read is 119.6 / 119.4 where llama.cpp on this
+same box does ~157 tok/s, and the decode after a 32K prompt is 13.4 / 13.5 against a floor of 20 - that token moves
+**1.28 GB of expert bytes over PCIe** (488.7 MB device-to-host, 789.5 MB host-to-device) at **0% residency**, of a
+74.6-75.2 ms token in which the CPU pool drain is only 12.86 ms.  The residency paths in the tree do not close it:
+`--expert-slots` caches experts by **id** rather than by hotness and costs 17% of decode (25.0 / 25.1 against 30.3),
+and `STRATA_KOLIBRI_DEC_RES=1` costs 10% of prefill for -3% of decode.  The levers are less expert traffic and a
+fused compressed-weight GEMM, or a card class where the placement sign flips - not another knob.
 
 ## Not verified (v1)
 
@@ -138,12 +154,15 @@ the placement flips), not a faster pool.
 - Q8_0 beyond a smoke run (parity is at Q4_K_M).
 - Speculative decoding: the model has no MTP layer; prompt-lookup drafting is future work.
 - Multi-GPU, images, the Intel Arc (SYCL) build (refused, like Qwen3.6's).
-- The three open speed floors on this box, wall-clock measured: prompt read short of 32K is 157-160 tok/s (floor 200);
-  prompt read at 32K is 154 tok/s (floor 150, met); decode is 24.5 tok/s short (floor 30) and 12.2 tok/s after 32K
-  (floor 20).  An earlier version of this file quoted 129 tok/s at 32K and 21.2 tok/s decode from a pre-router phase; those
-  are superseded.  The decode shortfall is structural - the CPU pool drain is about half a token and the GPU legs plus
-  handoffs the other half, serialised by the per-layer residual dependency - so the levers are less expert traffic,
-  speculation, or a card class where the placement sign flips, not another knob.
+- The three open speed floors on this box, wall-clock measured: prompt read short of 32K is 156.0-159.6 tok/s by
+  default and 179.8-181.0 tok/s with `STRATA_KOLIBRI_PF_PARTIAL=1` (floor 200); prompt read at 32K is 119.6 / 119.4
+  tok/s (floor 150, not met - the same code measured 154.0 / 153.7 on this box's earlier state, and the 512-token
+  figure did not move between those states, which is what marks it as box state); decode short is 30.3 / 30.3 tok/s
+  (floor 30, **met** once the NUMA binding is stated) and 13.4 / 13.5 tok/s after 32K (floor 20, not met).  An earlier
+  version of this file quoted 129 tok/s at 32K and 21.2 tok/s decode from a pre-router phase; those are superseded.
+  The after-32K decode shortfall is now attributed rather than estimated: 1.28 GB of PCIe per token at 0% residency,
+  with the pool drain only 12.86 ms of the token, so the levers are less expert traffic, a fused compressed-weight
+  GEMM, speculation, or a card class where the placement sign flips - not another knob.
 - The 32K attention runs at ~1 TFLOP/s against the T4's 32.5 TFLOPS fp32 peak
   (neither a cublas re-tiling nor a tensor-core fused flash closed it - both measured and recorded).
 - A card class other than this one: every number above is measured on a Tesla T4 + 2x E5-2690 v4.  The

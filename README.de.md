@@ -67,8 +67,8 @@ mit 755 GB RAM für den Experten-Pool gemessen:
 
 | Prompt | Schreibt Antworten | Liest deinen Prompt |
 | --- | ---: | ---: |
-| **kurz (512 Token)** | 24-30 Token/s (NUMA-Bindung) | 157-160 Token/s (warm: 171-176) |
-| **32K Token** | 12-14 Token/s (NUMA-Bindung) | 154 Token/s |
+| **kurz (512 Token)** | 30 Token/s (NUMA-Bindung) | 156-160 Token/s (opt-in `PF_PARTIAL`: 180-181, warm 202) |
+| **32K Token** | 13-14 Token/s (NUMA-Bindung) | 119-120 Token/s |
 | **100K Token** | — | 97 Token/s |
 
 Zwei Läufe pro Zahl auf der bitweise deterministischen Binary, Systemlast angegeben; die 100K-Zeile ist ein einzelner kalter Lauf. Box-Spec und volle

@@ -16,6 +16,7 @@
 // table - the GPU is the expert cache, the model is bigger than any PC's VRAM (Q4_K_M: 42.6 GiB of experts,
 // 3.5 GiB of dense).  --load-only runs just the load and reports.
 #include "strata/kolibri/engine.hpp"
+#include "pf_combine.hpp"   // G1: the prefill MoE combiner (src/kolibri/pf_combine.cu)
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
@@ -106,6 +107,12 @@ static inline bool env_on(const char* name) {
 // per-feature gates; bitwise by construction, env-gated until measured.
 // A2b: the two-chunk prefill wavefront.  Step 1 allocates the second activation set and changes no scheduling.
 static inline bool pf_pipe_on() { return env_on("STRATA_KOLIBRI_PF_PIPE"); }
+
+// G1 (plan docs/superpowers/plans/2026-10-24-kolibri-pf-partial-sums.md): the prefill partial-sum path.  Opt-in;
+// unset, every byte of the default path is what it was.  Refused together with PF_PIPE at startup (see the check
+// in the config print): the resident rows live in one Scratch-wide buffer (s.res_ey) and the partial ring is
+// per-ActSet, so two chunks in flight would share them - and PF_PIPE is exactly the two-chunks-in-flight mode.
+static inline bool pf_partial_on() { return env_on("STRATA_KOLIBRI_PF_PARTIAL"); }
 
 static inline bool dec_gemv_v4_on() {
     // ON by default: bitwise (oracle BITWISE PASS with it enabled, and the router feeds the ids), two-run measured at
@@ -363,6 +370,10 @@ struct Engine {
     // timed run that did not ask for counters.
     long long pf_hit_entries = 0, pf_entry_n = 0, pf_uniq_sum = 0, pf_cov_chunks = 0;
     long long pf_f16_promotes = 0;   // S7 increment B: fp16 cache promotions (LRU churn measure)
+    // G4 prerequisite: the fill gate ("fill bytes per prompt <= 2.5 GB, from 7.9") had NO counter behind it - the
+    // engine counted promotions but never the bytes they moved, so the gate could not be measured, only argued.
+    // This counts bytes actually written into the resident slots (gate + up + down planes, FP16).
+    long long pf_fill_bytes = 0;
     // S7 expert-cache coverage probe (STRATA_KOLIBRI_EXPERT_HIST=1): per-layer counts of routed touches per expert
     // id, over the whole run.  The fp16 VRAM cache fits ~2036 of 19,200 experts (10.6%); whether it pays is
     // decided by the touch SKEW - top-K coverage of this histogram is the cache's hit-rate curve.
@@ -1618,6 +1629,21 @@ struct ActSet {
     // re-describe the window chunk 1's attention was built on.
     __half *k16 = nullptr;
     __half *v16 = nullptr;
+
+    // G1 PF_PARTIAL (plan 2026-10-24-kolibri-pf-partial-sums.md Task 2).  The pool's miss contributions arrive as
+    // ONE weighted partial per token instead of the whole NKc x N block: p_h is a 2-slot pinned ring the host
+    // fills, p_m its device copy, and the resident rows stay in s.res_ey (block order) mapped by rr_sel_m.
+    //
+    // The ring is not the safety argument.  p_done[sl] is recorded on the default stream right after that slot's
+    // H2D and waited on before the host writes the slot again, so correctness does not depend on the ring being
+    // big enough - it only buys the host a slot of slack so the wait is normally a no-op.  (racecheck cannot see
+    // a host-vs-DMA race: it observes device memory only.)
+    float* p_h[2] = {nullptr, nullptr};
+    cudaEvent_t p_done[2] = {nullptr, nullptr};
+    int p_flip = 0;
+    float* p_m = nullptr;     // device partial, Tc x N
+    int* rr_sel_m = nullptr;  // device: block row -> selection index (t*K+k), -1 for a padded row
+    float* wts_h = nullptr;   // pinned: the router weights, D2H'd alongside the ids on g_st
 };
 
 struct Scratch {
@@ -1660,6 +1686,13 @@ struct Scratch {
     int32_t* res_tok = nullptr;              // device: token row per selection (gather index; -1 = padded)
     float* res_ey_h = nullptr;               // pinned: D2H staging in expert-grouped row order, scattered to ey_h
     std::vector<int32_t> res_tok_h, pf_res, pf_miss, pf_res_slot;
+    // G1 PF_PARTIAL: rr_sel_h is the host side of the block-row -> selection map (built in the same loop that
+    // fills res_tok_h, so the two cannot disagree); res_mark stamps which experts are resident THIS chunk-layer
+    // (generation-stamped, so nothing has to be cleared between layers - the P1 class of bug was a stale list).
+    std::vector<int32_t> rr_sel_h;
+    std::vector<int32_t> res_mark;
+    int32_t res_gen = 0;
+    bool pf_partial_used = false;   // set when this layer's expert leg took the partial path (read at the MoE sum)
     uint64_t pf_clock = 0;                   // LRU clock for the fp16 expert cache (one tick per layer-chunk)
     // S7 increment C: batched resident GEMMs.  Each expert's tokens are cut into blocks of kResBlk rows (last
     // block padded); one cublasGemmBatchedEx per slice per layer replaces ~155 launches.  Pointer arrays live on
@@ -2132,6 +2165,15 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
     // **A2b: the diagonal.**  With one chunk (T2 == 0) this is exactly the old `for l` loop - same order, same values.  With two
     // chunks in flight it walks (c, L) along c + L == step, rebinding the three per-chunk values (Tc, p0c, A) for each pair,
     // so the GPU can run chunk c+1's PRE half while the host drains chunk c's pool.  The body below is untouched.
+    if (pf_partial_on() && pf_pipe_on()) {
+        // Review Focus 4: the two are declared incompatible rather than silently degraded.  PF_PIPE is the
+        // two-chunks-in-flight mode; PF_PARTIAL keeps this layer's resident rows in one Scratch-wide buffer
+        // (s.res_ey) and its partial ring per-ActSet, so a second in-flight chunk would read the first one's.
+        std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_PF_PARTIAL and STRATA_KOLIBRI_PF_PIPE cannot be combined "
+                             "(the resident-row buffer is shared across chunks).  Unset one.\n");
+        std::fflush(stderr);
+        std::exit(1);
+    }
     const int n_ch = (T2 > 0 && pf_pipe_on()) ? 2 : 1;
     for (int64_t step = 0; step < g.n_layers + n_ch - 1; ++step) {
     // **A2b: THE OVERLAP.**  With two chunks in flight each step runs TWO passes: every PRE (pure GPU enqueue) first,
@@ -2422,6 +2464,10 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
         // implicitly drains g_st - including the other chunk's PRE - so POST's pool drain had no GPU work left to
         // overlap with (measured: 32K 220.9 s against a 117 s ceiling).
         KC(cudaMemcpyAsync(A.ids_h, A.ids_m, (size_t) NKc * sizeof(int), cudaMemcpyDeviceToHost, g_st));
+        if (pf_partial_on())
+            // G1: the host partial pass needs the router weights too.  Same stream as the ids, so the single
+            // g_st drain before that pass orders both - no second synchronisation point.
+            KC(cudaMemcpyAsync(A.wts_h, A.wts_m, (size_t) NKc * sizeof(float), cudaMemcpyDeviceToHost, g_st));
         KC(cudaEventRecord(A.ev, g_st));
         };
         auto layer_post = [&] {
@@ -2582,7 +2628,11 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                             strata::kernels::dequant_f16(b.L.gu_type, blob + b.L.up_off, 0, FF, N, out + (int64_t) FF * N, g_st);
                             strata::kernels::dequant_f16(b.L.d_type, blob + b.L.down_off, 0, N, FF, out + 2 * (int64_t) FF * N, g_st);
                             b.f16_slot_id[slot] = x;
-                            if (e.counters) ++e.pf_f16_promotes;
+                            if (e.counters) {
+                                ++e.pf_f16_promotes;
+                                // three FP16 planes: gate FF x N, up FF x N, down N x FF
+                                e.pf_fill_bytes += 3LL * FF * N * 2;
+                            }
                         }
                         b.f16_slot_last[slot] = s.pf_clock;
                         s.pf_res.push_back(x);
@@ -2606,8 +2656,14 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                         const uint16_t* xe = b.f16 + (size_t) slot * f16_stride;
                         for (int off = 0; off < m; off += M) {
                             const int mb = std::min(M, m - off);
-                            for (int a = 0; a < mb; ++a) s.res_tok_h[(size_t) nblk * M + a] = ord[(size_t) lo + off + a] / K;
-                            for (int a = mb; a < M; ++a) s.res_tok_h[(size_t) nblk * M + a] = -1;
+                            for (int a = 0; a < mb; ++a) {
+                                s.res_tok_h[(size_t) nblk * M + a] = ord[(size_t) lo + off + a] / K;
+                                s.rr_sel_h[(size_t) nblk * M + a] = ord[(size_t) lo + off + a];   // G1: full selection index
+                            }
+                            for (int a = mb; a < M; ++a) {
+                                s.res_tok_h[(size_t) nblk * M + a] = -1;
+                                s.rr_sel_h[(size_t) nblk * M + a] = -1;                            // G1: padding
+                            }
                             s.pa_g_h[nblk] = xe;
                             s.pa_u_h[nblk] = xe + (int64_t) FF * N;
                             s.pa_d_h[nblk] = xe + 2 * (int64_t) FF * N;
@@ -2638,7 +2694,19 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                     k_swiglu_rows<<<grid1(rows * FF), kThreads>>>(s.res_g, s.res_u, s.res_h, rows * FF);
                     k_to_f16<<<grid1(rows * FF), kThreads>>>(s.res_h, (__half*) s.res_h16, rows * FF);
                     e.gemm.f16_batched(s.pa_d, s.pb_h, s.pc_ey, M, N, FF, nblk);
-                    KC(cudaMemcpyAsync(s.res_ey_h, s.res_ey, (size_t) rows * N * 4, cudaMemcpyDeviceToHost, g_st));
+                    if (pf_partial_on()) {
+                        // G1: the resident rows STAY in s.res_ey.  Today this D2H lands rows*N floats (~27 MB at
+                        // ~85% coverage) that the host scatters and then ships straight back up as part of the
+                        // 31.5 MB block; here only the 64 KB selection map goes down, and the rows never leave.
+                        KC(cudaMemcpyAsync(A.rr_sel_m, s.rr_sel_h.data(), (size_t) rows * 4, cudaMemcpyHostToDevice, g_st));
+                        // G1 CNT coverage: the prefill staging legs were invisible to the byte counters, so the
+                        // "CNT bytes reconcile with the wall delta" gate could not be run on them.  Counted here,
+                        // under the same e.counters guard as the decode legs, so a rate run stays untouched.
+                        if (e.counters) { ++e.cnt.h2d_n; e.cnt.h2d_bytes += (long long) rows * 4; }
+                    } else {
+                        KC(cudaMemcpyAsync(s.res_ey_h, s.res_ey, (size_t) rows * N * 4, cudaMemcpyDeviceToHost, g_st));
+                        if (e.counters) { ++e.cnt.d2h_n; e.cnt.d2h_bytes += (long long) rows * N * 4; }
+                    }
                 }
                 const std::vector<int32_t>& pool_list = b.f16 ? s.pf_miss : s.pf_touch;
                 const auto pf_t0 = std::chrono::steady_clock::now();
@@ -2696,7 +2764,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
         // S7 increment C: the resident rows land in res_ey_h (block order, padded rows ignored); scatter
                 // them into A.ey_h at their selection rows.  Every selection row is covered exactly once, and the
                 // existing H2D below ships the whole NKc x N block unchanged.
-                if (b.f16 && s.pf_nblk > 0) {
+                if (b.f16 && s.pf_nblk > 0 && !pf_partial_on()) {
                     KC(cudaStreamSynchronize(g_st));
                     constexpr int M = Scratch::kResBlk;
                     for (int bi = 0; bi < s.pf_nblk; ++bi) {
@@ -2729,7 +2797,40 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                                  (int) l, (long long) e.pf_chunks, hs, s.pf_res.size(), s.pf_miss.size(),
                                  (int) s.pf_nblk, dup);
                 }
-                KC(cudaMemcpy(A.gout_m, A.ey_h, (size_t) NKc * N * 4, cudaMemcpyHostToDevice));
+                if (pf_partial_on() && b.f16) {
+                    // The pool has returned (e.pool.run waits for every shard), so A.ey_h's MISS rows are final and
+                    // its RESIDENT rows are stale from an earlier chunk-layer by design - never read.  A selection
+                    // is a miss iff its expert is not resident, decided from the published ids and NOT from the
+                    // block bookkeeping, which is the P1 bug surface.
+                    const int flip = A.p_flip;
+                    if (A.p_done[flip] != nullptr) KC(cudaEventSynchronize(A.p_done[flip]));
+                    float* ph = A.p_h[flip];
+                    std::memset(ph, 0, (size_t) Tc * N * 4);
+                    if ((int) s.res_mark.size() < (int) g.n_expert) s.res_mark.assign(g.n_expert, -1);
+                    const int32_t gen = ++s.res_gen;
+                    for (size_t ri = 0; ri < s.pf_res.size(); ++ri) s.res_mark[s.pf_res[ri]] = gen;
+                    for (int t = 0; t < Tc; ++t) {
+                        float* dst = ph + (size_t) t * N;
+                        for (int k = 0; k < K; ++k) {
+                            const int sel = t * K + k;
+                            if (s.res_mark[A.ids_h[sel]] == gen) continue;   // resident: already on device
+                            const float w = A.wts_h[sel];
+                            const float* src = A.ey_h + (size_t) sel * N;
+                            for (int i = 0; i < N; ++i) dst[i] += w * src[i];
+                        }
+                    }
+                    // On the DEFAULT stream, because the combine consumes it there.  Enqueuing this on g_st and
+                    // consuming it on the default stream is exactly the cross-stream pattern the note above
+                    // names as the self-determinism race.
+                    KC(cudaMemcpyAsync(A.p_m, ph, (size_t) Tc * N * 4, cudaMemcpyHostToDevice));
+                    if (e.counters) { ++e.cnt.h2d_n; e.cnt.h2d_bytes += (long long) Tc * N * 4; }
+                    if (A.p_done[flip] != nullptr) KC(cudaEventRecord(A.p_done[flip]));
+                    A.p_flip ^= 1;
+                    s.pf_partial_used = true;
+                } else {
+                    KC(cudaMemcpy(A.gout_m, A.ey_h, (size_t) NKc * N * 4, cudaMemcpyHostToDevice));
+                    if (e.counters) { ++e.cnt.h2d_n; e.cnt.h2d_bytes += (long long) NKc * N * 4; }
+                }
                 pp_mark(e.cnt.pf_post_ns);   // the scatter + this H2D (NKc x N x 4 = 31.5 MB at Tc=512)
             } else {
             // The mmvq fallback leg: per-token activation quantize, gate/up per selection, SwiGLU, h quantize,
@@ -2773,7 +2874,15 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
             else e.gemm.native((const uint16_t*) A.x16, wd.type, wd.d, A.sy_m, Tc, N, FS);
         }
         pp_mark(e.cnt.pf_shx_ns);   // the shared expert's three gemvs + SwiGLU
-        k_moe_sum_rows<<<dim3(Tc, (N + B - 1) / B), B>>>(A.moe_m, A.gout_m, A.wts_m, A.sy_m, K, N);
+        if (s.pf_partial_used) {
+            // G1: one combine over shared-expert row + the pool's partial + the resident rows that never left
+            // the device, replacing both the 31.5 MB H2D and k_moe_sum_rows for this layer.
+            strata::kolibri::pf_combine_rows(A.moe_m, A.sy_m, A.p_m, s.res_ey, A.rr_sel_m, A.wts_m,
+                                             Tc, s.pf_nblk * Scratch::kResBlk, K, N, 0);
+            s.pf_partial_used = false;
+        } else {
+            k_moe_sum_rows<<<dim3(Tc, (N + B - 1) / B), B>>>(A.moe_m, A.gout_m, A.wts_m, A.sy_m, K, N);
+        }
         k_rms_rows<<<Tc, kThreads>>>(A.moe_m, e.f32.at(L(l, "post_ffw_norm.weight")), A.moe_m, N, e.eps);
         k_add_rows<<<grid1((int64_t) Tc * N), kThreads>>>(A.x_m, A.moe_m, (int64_t) Tc * N);
         pp_mark(e.cnt.pf_tail_ns);   // the MoE sum + post-ffw norm + residual
@@ -3014,6 +3123,19 @@ void init_scratch(const Engine& e, Scratch& s) {
             KC(cudaMalloc((void**) &s.res_ey, (size_t) rrows * N * 4));
             KC(cudaMalloc((void**) &s.res_tok, (size_t) rrows * 4));
             KC(cudaHostAlloc((void**) &s.res_ey_h, (size_t) rrows * N * 4, cudaHostAllocDefault));
+            s.rr_sel_h.resize((size_t) rrows);
+            // G1 PF_PARTIAL: the partial ring + its device copy + the selection map.  Allocated only under the
+            // knob, so the default path's memory footprint is untouched as well as its bytes.
+            if (pf_partial_on()) {
+                const int64_t pc = Scratch::kTmax;
+                KC(cudaHostAlloc((void**) &s.act1.p_h[0], (size_t) pc * N * 4, cudaHostAllocDefault));
+                KC(cudaHostAlloc((void**) &s.act1.p_h[1], (size_t) pc * N * 4, cudaHostAllocDefault));
+                KC(cudaHostAlloc((void**) &s.act1.wts_h, (size_t) pc * K * 4, cudaHostAllocDefault));
+                KC(cudaMalloc((void**) &s.act1.p_m, (size_t) pc * N * 4));
+                KC(cudaMalloc((void**) &s.act1.rr_sel_m, (size_t) rrows * 4));
+                KC(cudaEventCreateWithFlags(&s.act1.p_done[0], cudaEventDisableTiming));
+                KC(cudaEventCreateWithFlags(&s.act1.p_done[1], cudaEventDisableTiming));
+            }
             s.res_tok_h.resize((size_t) rrows);
             const int nb = Scratch::kResBlkMax;
             KC(cudaMalloc((void**) &s.pa_g, (size_t) nb * 8)); KC(cudaMalloc((void**) &s.pa_u, (size_t) nb * 8));
@@ -3226,7 +3348,13 @@ void print_counters(Engine& e, const char* tag) {
                      " (%.1f ms/chunk, %.1f GB/s)%s\n",
                      e.pf_chunks, (double) e.pf_experts / e.pf_chunks, gb, gb * 1e3 / e.pf_chunks, ms, ms / e.pf_chunks,
                      ms > 0 ? gb / (ms / 1000.0) : 0.0,
-                     e.pf_f16_promotes > 0 ? (std::string(" promotes=") + std::to_string(e.pf_f16_promotes)).c_str() : "");
+                     [&] {
+                         if (e.pf_f16_promotes <= 0) return std::string();
+                         char buf[96];
+                         std::snprintf(buf, sizeof buf, " promotes=%lld fill=%.2f GB",
+                                       e.pf_f16_promotes, double(e.pf_fill_bytes) / 1e9);
+                         return std::string(buf);
+                     }().c_str());
         // The leg's honest rate: rows and GFLOP/s against the CPU pool's measured roof (226 GFLOP/s).  Every
         // earlier reading of this leg quoted GB/s, which measures the bytes it streamed rather than the arithmetic
         // it did - and the arithmetic is what binds once the fp16 cache is doing its job.

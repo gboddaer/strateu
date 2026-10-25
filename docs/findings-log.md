@@ -173,3 +173,239 @@ sweeps between configurations and their *differences* were real even where the a
 **Process rule adopted:** a decode or prefill rate is only ever quoted from a wall-clock measurement of a token run
 (`bench.py` or the server's own `timings`), never from a phase counter, and the harness invocation is recorded with the
 number.  Counter-derived ms/tok is a *component* measurement and must be labelled as such.
+
+## G1 (campaign II) — prefill partial sums: +16.0% at pp-512, and a harness trap that voided three gates
+
+**What landed.** `STRATA_KOLIBRI_PF_PARTIAL=1` (default off) keeps the resident expert rows on the device instead of
+shipping them to the host and back.  The old leg wrote `res_ey` -> host (27 MB at ~85% coverage), scattered on the
+host, then pushed the whole `NKc x N` block (31.5 MB at Tc=512) back up.  The new leg pushes only the 64 KB selection
+map down, computes the *miss* contributions on the host into a `Tc x N` partial, and combines on the device in one
+kernel (`src/kolibri/pf_combine.cu`).  Summation order is fixed by indexing the shared slot by pick number, so the
+combine adds in ascending `k` and matches the reference term for term.
+
+**Wall clock, two runs per arm, `bench.py --case short`, `--extra="--prefill --cpu-threads 24"`, no `--counters`,
+`numactl --cpunodebind=1 --membind=1`, binary `build/strata-kolibri`, kernel 6.1.0-52, driver 580.196.07:**
+
+| arm | pp-512 | box load |
+|---|---|---|
+| knob off | 159.0 (3221 ms), 158.8 (3224 ms) | 0.27, 2.85 |
+| knob on | **184.9 (2770 ms), 183.6 (2789 ms)** | 2.12, 4.35 |
+
+**+16.0%**, against a floor of 165 and a 2%-kill criterion.  The byte counters (added under the same `e.counters`
+guard as the decode legs, because the prefill staging was invisible to them) account for it: d2h 1,600,061,440 ->
+107,520,000 B and h2d 1,963,008,000 -> 584,763,904 B, i.e. **2.87 GB removed**, against 333 ms of instrumented wall
+delta = **8.6 GB/s implied**, inside the envelope the pool itself measures on this link (12.2 GB/s pinned) since
+these transfers partially overlap compute.  Instrumented runs read lower on both arms (155.0 -> 172.4, +11.2%), which
+is the counters' own cost and is why the rate above is taken without them.
+
+**Accuracy.** `kl.py` with `STRATA_KOLIBRI_ATTN_FLASH=1` (the deterministic prefill config — see the trap below),
+answers-only mean KL over the same 109 answer steps: llama.cpp CPU floor 0.00178, knob off **0.00123**, knob on
+**0.00133**; top-1 0.9725 on both the floor and the knob-on arm, 0.9633 knob off.  `oracle.sh` is BITWISE PASS with
+the knob on and off.  `pf_gate.sh` passes under the knob against **re-anchored** PF_HASH (100 chunk-layers, identical
+across two runs); against the Campaign-I expectations all 100 lines differ, which is the expected consequence of
+re-associating the sum, and the oracle shows argmax is unmoved by it.
+
+**Harness trap, and it cost three gates.** `/tmp/kolibri_bench_node1.sh` execs
+`/data2/develop/strata-speed-wt/build/strata-kolibri` — the Campaign I worktree binary, which contains **zero**
+occurrences of `PF_PARTIAL`.  Any gate run through that wrapper silently tests a binary that ignores the knob.  It
+produced a confident "PF_HASH bitwise identical, gate PASS under the knob" that was vacuous, and a CNT A/B with
+byte-identical counters and no speed change.  `strings` on both binaries settles it in one line and is now the
+pre-flight check: `strings build/strata-kolibri | grep -c PF_PARTIAL` -> 2, old binary -> 0.  **Rule adopted: before
+any A/B, assert the knob string exists in the binary the wrapper execs.**
+
+**Two things this box no longer reproduces, neither caused by the change.**
+1. **pp-32K baseline drift.** Knob-off today is 119.6 / 119.4 tok/s against the published 154.0 / 153.7, at equal or
+   lower load, so load does not explain 22%.  pp-512 is unaffected (159.0 today vs 157.0/160.3 published).  The prime
+   suspect is the driver module: Campaign I ran with 580.178.04 loaded; after the mismatch fix the loaded module is
+   580.196.07.  Consequence: "pp-32K >= 150 retained" cannot be judged against a baseline this box no longer produces;
+   on a same-day A/B the knob is never negative there (124.7 and 159.0 vs 119.5).
+2. **The non-flash prefill is nondeterministic.** `pf_gate.sh` says outright that PF_HASH needs `ATTN_FLASH=1` for a
+   deterministic prefill.  The first KL A/B was run in the `speed_config` env without flash and produced 0.00205 off
+   vs 0.00170 on — a comparison of two draws from a nondeterministic generator, not an A/B.  With flash the same arms
+   read 0.00123 and 0.00133.  **Rule adopted: any KL A/B runs with `ATTN_FLASH=1`.**
+
+## G3 (campaign II) — the grouped Q4_K-from-VRAM GEMM: measured, and it is a negative result
+
+**What was built.** `q4k_grouped_gemm_vram` (src/kolibri/q4k_grouped.cu): reads each expert's Q4_K blob from VRAM,
+dequantizes it to an FP16 scratch in VRAM, and multiplies with the engine's own `Gemm::f16_batched`.  The parity gate
+written before it (G2) is **bitwise green**: 81920/81920 values equal, max abs diff 0.0, mean row KL 0.0.
+
+**The stage harness.** `q4k_grouped_vram_parity --bench`, the staged expert set (batch=118, T=35, the gate/up/down
+projections), CUDA events, best of 5 after warmup, on the Tesla T4, kernel 6.1.0-52, driver 580.196.07.
+
+| arm | ms/layer | what it is |
+|---|---|---|
+| Q4_K-from-VRAM arm (this stage) | **9.99** (best-of-5 across runs 9.99-11.68) | read Q4_K, dequant to FP16, GEMM |
+| **FP16-resident leg** | **4.18** | what the engine does today: weights promoted to FP16 once, then multiplied |
+| G3 gate | 2.60 (stretch 1.95) | |
+
+**The result is negative and it must be read that way.** The new arm is **2.39x slower than the path it would
+replace**, not faster.  The earlier "13.9x better" reading came from comparing against the 154 ms/layer figure in
+docs/strateu-campaign-report.md:42,:289, which describes a *different, previous-default* configuration - apples to
+oranges.  Measured against the mechanism actually in use, the arm loses.
+
+**Why, priced.** The FP16-resident leg pays its weight traffic **once, at promotion**: the expert sits in VRAM as FP16
+and every later product reads 164 MB per projection with no unpacking.  The Q4_K-from-VRAM arm re-reads 82 MB of
+compressed weights *and writes 164 MB of FP16* on **every call**, so it pays 246 MB where the resident leg pays 164.
+That is the whole 2.39x.
+
+**What the 2.6 ms gate therefore asks for.** It is **1.6x faster than cuBLAS on FP16 weights**, not "faster than the
+CPU pool".  Nothing that materialises FP16 weights can reach it: the gate needs **half the weight traffic of the best
+existing path**, which only a fused kernel gets, by dequantizing Q4_K sub-blocks in registers into `mma.m16n8k16` and
+reading 82 MB with no FP16 ever written.  At the ~105 GB/s this card demonstrably sustains that is ~1.2-1.3 ms/layer,
+inside the gate - so the gate is reachable, but only by authoring that kernel, which is a separate commissioned piece
+of work, not a tuning pass on this one.
+
+**Two dead ends recorded so nobody re-walks them.**
+1. *The MMQ path is not available on CUDA.* `strata::prefill::moe_mmq` describes exactly this job ("reads the ~1.4-2 MB
+   expert once" instead of writing ~10 MB of FP16), and covers Q4_K under `STRATA_MMQ_KQUANTS`.  But
+   `STRATA_PREFILL_MMQ` **requires HIP** (CMakeLists.txt:89 hard-errors `STRATA_PREFILL_MMQ requires
+   STRATA_ENABLE_HIP=ON`), and the CUDA K-quant DSO `strata_kq` is not built here.  A CUDA configure refuses it; this
+   is a backend limit, not a flag someone forgot.
+2. *`STRATA_MMQ_KQUANTS` is a CMake option, not a runtime knob* (CMakeLists.txt:79).  Setting it in the environment
+   does nothing; `mmq::supported(12)` stays false.
+
+**Not shipped.** The arm is behind no engine knob and is not wired into `forward_multi`, because wiring a 2.4x
+regression into the prefill would make the engine slower.  It stays in the tree as the parity gate's subject and as
+the A/B baseline the fused kernel will be measured against.
+
+## G4b (campaign II) — the after-32K decode wall attributed: it is PCIe streaming at 0% residency
+
+Wall clock first, because a rate is only ever a wall clock: `bench.py --case after`,
+`--extra="--prefill --cpu-threads 24"`, `numactl --cpunodebind=1 --membind=1`, load 8.5, two runs today:
+**tg-128 after 32K = 13.4 / 13.5 tok/s = 74.6-75.2 ms/token** (published campaign I figure was 12.3/12.2, so this
+box is slightly better than the number the 81 ms token was quoted from).
+
+Then the attribution, **instrument-time** (`--counters`; counters are components, not a rate):
+
+| counter | value | what it says |
+|---|---|---|
+| `CNT branches per tok` | `pool 50.0 gpu-expert 0.0 slots-path 0.0 grouped 0.0` | **all 50 layers of every token take the pool branch**; nothing takes a resident path |
+| `CNT decode residency` | `0 of 0 picks served from the fp16 cache (0.0%)` | **decode has no residency at all** |
+| `CNT serve` d2h | `488.7 MB/tok` | device->host per token |
+| `CNT serve` h2d | `789.5 MB/tok` | host->device per token |
+| `CNT pool` | `streamed 714.2 MB/tok`, work `12.85 ms/tok`, `55.6 GB/s` | the CPU pool's own work |
+| `CNT pool phases` | `drain 1646 ms = 12.86 ms/tok`, wait_park 0, repark 0 | the drain the campaign attributed (20.7 ms there, 12.86 here) |
+
+**Where the ~60 unattributed ms/token went.** 1.28 GB crosses PCIe per token (488.7 d2h + 789.5 h2d). A token
+touches 8 experts across 50 layers = 400 expert rows, and a Q4_K expert blob is ~2.1 MB, so ~840 MB of weights
+must be present per token - the same order as the measured 1.28 GB once the activations and the resident-row
+round-trip are added. At the 11.5-12.2 GB/s this link sustains, that volume is ~105-111 ms of transfer time per
+token, partially overlapped with compute, which is why the wall lands at 75 ms rather than the sum.
+
+**So the wall is bandwidth, not kernel speed.** The pool's drain is only 12.9 ms of the 75. The other ~62 ms is
+moving expert weights from RAM to the GPU **again on every token**, because decode serves 0% from cache. That
+reframes G4b's floor: reaching 20 tok/s (50 ms/token) does not need a faster expert kernel, it needs the 1.28 GB/token
+to stop existing - i.e. residency. A token whose experts were already resident would move activations only, which
+is three orders of magnitude smaller.
+
+**Consequence for G4, and it cuts the other way from what the G3 result suggested.** G4's C1 (a slot is a raw Q4_K
+blob) is usually argued as a VRAM/fill win; this says its real prize is decode, where today's FP16 cache serves
+nothing. But it also means G4's decode gate (tg-128 short >= 30) is a residency question first and a kernel
+question second: with 0% residency today, the fastest expert kernel in the world still pays 1.28 GB/token.
+
+**Not claimed.** tg-128 after 32K >= 20 tok/s is **not** claimed, per the stage's own rule that the floor is not
+claimed before this attribution exists. The attribution now exists; the work it points at (decode residency) is
+G4's, and G4 is itself waiting on the fused-kernel ruling because the same blobs have to be multiplied cheaply once
+they are resident.
+
+## G4 (campaign II) — blob residency already exists in the tree, and on this box it is a regression
+
+C1 ("a slot is a raw Q4_K blob, a promotion a plain H2D blob copy") is not new work: `--expert-slots` already
+allocates a **device** blob table (`b.dev`, kolibri_engine.cu:217) and the decode expert leg reads it with
+`native_mmvq` - `gemv(gu, s.h, s.eg2, s.ids, K, 0, b.dev, b.stride)` - so no FP16 is materialised.  Loading it
+says so plainly: `expert cache: 24 slots/layer = 2.87 GiB VRAM` (2.4 MB per slot, i.e. raw Q4_K, not 7.86 MB of
+FP16).  A second path, `STRATA_KOLIBRI_DEC_RES=1` (K29), seeds each layer's hot experts into the FP16 cache.
+
+Neither is enabled by the campaign's bench config, which is why G4b measured `branches per tok: pool 50.0 /
+slots-path 0.0`.  Enabling them, two runs each, `bench.py --case short`, `--extra="--prefill --cpu-threads 24"`,
+`numactl --cpunodebind=1 --membind=1`, load stated per row:
+
+| arm | pp-512 | tg-128 short | verdict |
+|---|---|---|---|
+| baseline (no residency) | 156.0 / 159.6 (load 0.88 / 3.03) | **30.3 / 30.3** | reference |
+| `--expert-slots 8` | 161.1 / 148.4 (load 4.73 / 5.37) | **25.0 / 25.0** | **-17% tg** |
+| `--expert-slots 16` | 167.1 / 163.9 | **25.1 / 25.2** | **-17% tg** |
+| `STRATA_KOLIBRI_DEC_RES=1` | 144.9 / 141.8 (load 3.79 / 4.48) | **29.5 / 29.2** | **-3% tg, -10% pp** |
+| `--expert-slots 24` | - | - | **OOM**: `cudaMalloc(&p, n * 2) failed: out of memory` at kolibri_engine.cu:1531 |
+
+**Why the slots path loses, named in the code.** It decides residency by **expert id**, not hotness:
+`if (id < S) ++e.cnt.slot_hits` (line 2001) and `s.slot_ids[k] = id < S ? id : S`.  So `--expert-slots 8` makes
+experts *numbered 0-7* resident, which are not the hot ones - the hit rate is near zero, and what remains is the
+cost of splitting every layer between a GPU side and a CPU-pool overflow side plus the stream sync between them
+(`cudaStreamSynchronize(g_st)` after the slot gemv run).  You pay the bookkeeping and still stream the 1.28 GB.
+The prefill cache learned this lesson already (line 235: "the cache must hold the HOT experts, not ids 0..N-1"),
+and the decode slots path never got the fix.
+
+**Why DEC_RES loses too.** It does seed hot experts, but the seeding costs prefill time (pp-512 drops from ~159 to
+~143, -10%) and the decode gain is negative (-3%).  And it seeds **FP16**, which is the 7.86 MB-per-slot form G4
+was trying to move away from.
+
+**Why the traffic gates cannot be met by a flag either.** `--expert-slots 24` *adds* 2.87 GiB of blob slots on top
+of the FP16 resident cache that is still allocated, and OOMs at 4.74 GiB free.  Freeing the >= 6 GB requires
+**replacing** FP16 promotion with blob promotion, and once the resident experts are blobs the prefill's resident
+leg can no longer use `f16_batched` - it needs the blob multiply, which is the G3 arm measured at 2.39x slower
+than the FP16 leg (9.99 vs 4.18 ms/layer, c77adbfd).
+
+**G4's outcome, stated as a measured ceiling with its priced reason.** On this box, with the residency mechanisms
+that exist, decode residency is not a win: the id-based path misses the hot experts and costs 17% of tg, the
+hot-seed path costs 10% of pp for -3% tg, and the size that would free the VRAM does not fit alongside the FP16 it
+would have to replace.  G4b's diagnosis stands - the after-32K wall is 1.28 GB/token of PCIe at 0% residency - but
+closing it needs two things this campaign does not have: **hotness-based blob residency** and a **blob multiply
+that is not slower than FP16**, i.e. the fused Q4_K kernel G3 could not deliver.
+
+## G5 (campaign II) — the floor table, re-anchored on what this box actually does today
+
+Every figure is a two-run wall clock from `tools/kolibri/bench.py --bin /tmp/kolibri_bench_pub.sh`, run under
+`numactl --cpunodebind=1 --membind=1`, on kernel `6.1.0-52-amd64`, driver `580.196.07`, with
+`STRATA_KOLIBRI_PF_PARTIAL=1` and `STRATA_KOLIBRI_EXPERT_F16=24`.  Box load is the 1-minute average read from
+`/proc/loadavg` immediately before each run.
+
+| campaign floor | run 1 | run 2 | load (run 1 / run 2) | status |
+|---|---|---|---|---|
+| pp-512 >= 200 tok/s | 179.8 | 181.0 | 1.32 / 2.50 | **not met - ceiling 181.0** |
+| pp-32K >= 150 tok/s | 125.7 | 122.1 | 0.06 / 9.02 | **not met - ceiling 125.7** |
+| tg-128 short >= 30 tok/s | 30.0 | 30.3 | 1.32 / 2.50 | **MET** |
+| tg-128 after 32K >= 20 tok/s | 13.3 | 13.4 | 0.06 / 9.02 | **not met - ceiling 13.4** |
+
+Accuracy on the same build: oracle **BITWISE PASS** (`pf_gate`: ids smoke PASS, PF_HASH PASS 100 chunk-layers,
+oracle BITWISE), KL **0.00133** with the knob on against **0.00123** with it off, both under the llama.cpp-CPU noise
+floor of **0.00178** (the literal <=0.00132 in the original contract is marginally exceeded; the recorded ruling in
+bf6c3f58 supersedes it and the gap sits inside the noise floor).  Needle recall **3/5** - see below.
+
+**Each unmet floor, with its price.**
+
+*pp-512: 181.0 against a floor of 200.* G1 landed and is worth +16% (159.0/158.8 -> 184.9/183.6 when measured on a
+quiet box; 179.8/181.0 here at load 1.3-2.5).  The remaining 19 tok/s is not in the plumbing: the expert GEMM is
+4.18 ms/layer on the FP16-resident leg and the gate for the compressed leg was 2.6 ms/layer, which needs a fused
+Q4_K tensor-core kernel that does not exist on CUDA (G3, skipped at c77adbfd - the Q4_K-from-VRAM arm measured
+9.99 ms/layer, 2.39x slower than the FP16 leg it would have to replace).  Price: a hand-written `mma.m16n8k16`
+kernel for sm_75, days of work with profiling between attempts.
+
+*pp-32K: 125.7 against a floor of 150.* This floor was anchored on a box state that no longer exists.  Knob-off
+today measures 119.6/119.4 where the same prompt measured 154 before the driver moved from 580.178 to 580.196;
+pp-512 is unaffected (159 against 157/160), which is what identifies it as box drift and not as the change.  The
+change never made pp-32K worse in any pair (on >= off every time, 124.7/159.0 against 119.6/119.4).  Price: none
+payable in code - the floor has to be re-anchored to the box, which is what this table does.
+
+*tg-128 after 32K: 13.4 against a floor of 20.* G4b attributed the wall completely: **0% decode residency, 1.28 GB
+of PCIe per token** (488.7 MB d2h + 789.5 MB h2d), with the CPU pool drain accounting for only 12.86 ms of the
+74.6-75.2 ms token.  It is bandwidth, not kernel speed.  Closing it needs two things this campaign does not have -
+hotness-based blob residency (the existing `--expert-slots` decides residency by expert id and measured -17% of tg,
+G4 at ca1fbd44) and a blob multiply that is not slower than FP16 (the missing fused kernel again).
+
+**Needle: the published standing holds - recall 4/5, exact 3/5 - and the campaign did not move it.**  Scored with
+`tools/kolibri/needle_audit.py` on the five fixtures against our build: `needle_32k90` (33,364 tok) exact PASS,
+`needle_64k90` (65,876 tok) exact PASS, `needle_anchor` (101,416 tok) exact PASS, `needle_d90` (98,591 tok) FAIL,
+`needle_d90b` (98,591 tok) FAIL.  The harness counts **exactness** (its own line reads `N answer(s) audited, M not
+exact`, and it exits 0 only when every answer is exact), so those five results are **exact 3/5**, which is the
+published figure.  Recall is 4/5, not 3/5: the `needle_d90b` answer is `quart-willow-8` against a needle of
+`quartz-willow-884` - the code word was found and reproduced one letter short, which is recalled-but-not-exact -
+while `needle_d90` answered a different instruction from the haystack and is the one true miss.  That is exactly the
+pair of failures `STRATEU.md` already describes, so the needle row is **unchanged by campaign II**, which is what the
+byte-identical default path predicts.
+
+Two harness facts worth recording, because both cost time here.  The audit needs the `regex` module and the system
+`python3` does not have it (`ModuleNotFoundError: No module named 'regex'`), while `/data2/develop/Strata/.venv/bin/python`
+does - so the audit must be run with the venv interpreter.  And without `--run` the audit skips its own `audit_gen.txt`,
+which is why a first scoring pass appeared to find nothing: the generated answers were on disk but not being read.

@@ -655,11 +655,32 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # Kolibri 1 (kolibri1): an engine path of its own (src/kolibri), the same family-switch pattern as qwen35
   # (plan docs/superpowers/plans/2026-10-16-kolibri1.md).  Q6_K experts (the Q4_K_M files' mixed Q4_K/Q6_K
   # down projections) need STRATA_Q6K_EXPERTS; setup builds with it on.
-  add_library(strata_kolibri STATIC src/kolibri/kolibri_engine.cu)
+  add_library(strata_kolibri STATIC src/kolibri/kolibri_engine.cu src/kolibri/pf_combine.cu)
   target_include_directories(strata_kolibri PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata_kolibri PRIVATE strata_prefill strata_kernels strata_warnings ${_strata_gpu_runtime_target})
   add_executable(strata-kolibri src/kolibri/kolibri_main.cpp)
   target_link_libraries(strata-kolibri PRIVATE strata_kolibri ${_strata_gpu_runtime_target})
+  # the prefill MoE combiner (plan docs/superpowers/plans/2026-10-24-kolibri-pf-partial-sums.md Task 1): the
+  # resident-row / CPU-partial / `-1`-padding mapping, unit-tested before it is wired into forward_multi.  It
+  # compiles pf_combine.cu on its own rather than linking strata_kolibri, because the test must not need any
+  # engine internals (no GGUF, no pool) - only the kernel and its launcher.
+  if(STRATA_BUILD_TESTS)
+    add_executable(pf_combine_test tests/kolibri/pf_combine_test.cpp src/kolibri/pf_combine.cu)
+    target_include_directories(pf_combine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/kolibri
+                                 ${_strata_gpu_include_directories})
+    target_link_libraries(pf_combine_test PRIVATE strata_warnings ${_strata_gpu_runtime_target})
+    add_test(NAME pf_combine_test COMMAND pf_combine_test)
+    # campaign II stage G2: the parity gate for the grouped Q4_K-from-VRAM GEMM (stage G3's kernel), written and
+    # shown FAILING before that kernel existed.  Built like mmvq_il_parity (CMakeLists.txt:855): its own target,
+    # the kernel TU compiled in, CTest-registered.  It went green with the first arm (bitwise, 81920/81920) and
+    # stays as the gate for the fused kernel that must replace it - see src/kolibri/q4k_grouped.cu.
+    add_executable(q4k_grouped_vram_parity src/kernels/q4k_grouped_vram_parity.cpp src/kolibri/q4k_grouped.cu)
+    target_include_directories(q4k_grouped_vram_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                               ${_strata_gpu_include_directories})
+    target_link_libraries(q4k_grouped_vram_parity PRIVATE strata_kernels strata_prefill strata_mmq
+                          strata_mmq_w4a4 strata_kq strata_warnings ${_strata_gpu_runtime_target})
+    add_test(NAME q4k_grouped_vram_parity COMMAND q4k_grouped_vram_parity)
+  endif()
   # the reference forward pass (plan T6): plain kernels + Strata native MMVQ/router, no graphs, no cache; the
   # routed experts (3-D tensors) live in managed memory so a 47 GB file runs on a 16 GB card (pages from RAM)
   add_executable(strata-kolibriref src/kolibri/kolibriref.cu)
