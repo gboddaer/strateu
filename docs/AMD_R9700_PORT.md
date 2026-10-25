@@ -235,6 +235,15 @@ observations are the same observation.
 
 ## The 100K needle audit (task 5, second half) - recall 5/5
 
+**Reproducibility note.** The verdict below is recorded, but the generations it scored are ephemeral:
+re-running `needle_audit.py` without `--run` today finds all five fixtures and their needle words
+intact (`cobalt-orchard-311`, `amber-glacier-742`, `velvet-cedar-209`, `quartz-willow-107`,
+`granite-lantern-555`) but reports `0 answer(s) audited`, because the `audit_gen.txt` files lived in
+`/tmp` and are gone. The fixtures themselves (`90.ids`) are still there, so the audit reproduces with
+one command and no fixture regeneration - at roughly 16 min per 100K prefill, about 80 min for all
+five. Nothing numeric in the tree has changed since the run below, so this is a note about where the
+artifacts live, not a doubt about the result.
+
 The campaign's driver was never committed (`/tmp/needle_drive.py`, "regenerate rather than copy
 paths"), so the fixtures are rebuilt by `tools/kolibri/make_needle_fixtures.py`, which writes
 `/tmp/needle_<name>/{90_prompt.txt,90.ids}` - the two files `needle_audit.py` looks for. Five
