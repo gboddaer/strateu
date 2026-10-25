@@ -626,6 +626,32 @@ unlike `ROPE_F64`, which measured free, the pool is a genuine accuracy-for-speed
 should be made deliberately rather than inherited. The bound of 0.00132 is still met by none of these,
 so the deviation stands; but the closest the shipped engine gets is 0.78x of floor, not 0.97x.
 
+### The shipped engine's numerics lever space, enumerated
+
+`kolibri_engine.cu` reads 38 `STRATA_KOLIBRI_*` variables. Sorted by whether they can move this gate
+at all:
+
+| group | knobs | can they close the gap? |
+|---|---|---|
+| prefill batching | `PF_CHUNK`, `PF_LANES`, `PF_STAGE`, `PF_PIPE`, `PF_CHUNK_KEY` | they change the trajectory (batch width reorders fp accumulation), but choosing a chunk or lane count to minimise KL would be tuning to the metric, not a measurement - excluded on that ground, not on evidence |
+| expert residency and precision | `EXPERT_F16`, `EXPERT_HIST`, `RES_TOP`, `POOL_ALL`, `DENSE_F16`, `DEC_RES` | `EXPERT_F16=24` measured: costs 3.8 s and moves the answer from token 5; the others are residency policy, and `RES_TOP=0` crashes |
+| attention kernels | `ATTN_PV4`, `ATTN_FLASH`, `ATTN_MMA`, `ATTN_SIMT`, `ATTN_KG`, `ATTN_KT`, `ATTN_MB`, `ATTN_COALESCED` | `ATTN_MB` measured as a wash at short shape; the rest are kernel-selection for speed, and the §9.3 arms swept them |
+| decode kernels | `DEC_F16`, `DEC_GEMV_V4`, `DEC_PHASES`, `DEC_XEXP` | decode-path only; the KL is measured on forced sequences where prefill dominates the divergence |
+| router | `ROUTER_GEMM`, `ROUTER_TILE`, `ROUTER_TK`, `ROUTER_TJ` | §9.3 found the tile path marginally different in timing; routing decisions are top-6 selection, and a change here would change which experts run, i.e. the model |
+| numerics of RoPE | `ROPE_F64` | **measured: 0.00161, worse than 0.00146** |
+| diagnostics | `PF_HASH`, `PF_FENCE`, `PF_PIN`, `ATTN_DUMP`, `ATTN_DUMP_LAYER`, `ATTN_PHASES`, `DEC_PHASES`, `LPT`, `MMA_AVAILABLE`, `KV_DEV`, `PV_SCALE`, `POISON_ZERO_SLOT` | instrumentation or guards; no effect on the distributions |
+
+The native expert kernels are not a knob at all: `native_layers` is counted from `b.native_ok`, set
+per layer at load from the blob layout (`kolibri_engine.cu:3701`), so the "25 / 50 layers" in the
+load line is a property of the file, not a switch.
+
+So the honest statement of the gate is: **the best legitimate configuration on this box is 0.00146,
+0.78x of the floor**, and the remaining distance to 0.00132 is not covered by any switch that can be
+chosen on merit. Closing it is the §8.1 kernel project - matching llama.cpp's accumulation order in
+the expert path - which the goal's boundaries place out of scope.
+
+
+
 ### `ROPE_F64` is free on speed and slightly *worse* on this gate
 
 The engine reads env knobs the reference binary does not, so `STRATA_KOLIBRI_ROPE_F64=1` is a lever
