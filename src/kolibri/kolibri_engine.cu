@@ -2691,8 +2691,13 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                         // ~85% coverage) that the host scatters and then ships straight back up as part of the
                         // 31.5 MB block; here only the 64 KB selection map goes down, and the rows never leave.
                         KC(cudaMemcpyAsync(A.rr_sel_m, s.rr_sel_h.data(), (size_t) rows * 4, cudaMemcpyHostToDevice, g_st));
+                        // G1 CNT coverage: the prefill staging legs were invisible to the byte counters, so the
+                        // "CNT bytes reconcile with the wall delta" gate could not be run on them.  Counted here,
+                        // under the same e.counters guard as the decode legs, so a rate run stays untouched.
+                        if (e.counters) { ++e.cnt.h2d_n; e.cnt.h2d_bytes += (long long) rows * 4; }
                     } else {
                         KC(cudaMemcpyAsync(s.res_ey_h, s.res_ey, (size_t) rows * N * 4, cudaMemcpyDeviceToHost, g_st));
+                        if (e.counters) { ++e.cnt.d2h_n; e.cnt.d2h_bytes += (long long) rows * N * 4; }
                     }
                 }
                 const std::vector<int32_t>& pool_list = b.f16 ? s.pf_miss : s.pf_touch;
@@ -2810,11 +2815,13 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                     // consuming it on the default stream is exactly the cross-stream pattern the note above
                     // names as the self-determinism race.
                     KC(cudaMemcpyAsync(A.p_m, ph, (size_t) Tc * N * 4, cudaMemcpyHostToDevice));
+                    if (e.counters) { ++e.cnt.h2d_n; e.cnt.h2d_bytes += (long long) Tc * N * 4; }
                     if (A.p_done[flip] != nullptr) KC(cudaEventRecord(A.p_done[flip]));
                     A.p_flip ^= 1;
                     s.pf_partial_used = true;
                 } else {
                     KC(cudaMemcpy(A.gout_m, A.ey_h, (size_t) NKc * N * 4, cudaMemcpyHostToDevice));
+                    if (e.counters) { ++e.cnt.h2d_n; e.cnt.h2d_bytes += (long long) NKc * N * 4; }
                 }
                 pp_mark(e.cnt.pf_post_ns);   // the scatter + this H2D (NKc x N x 4 = 31.5 MB at Tc=512)
             } else {

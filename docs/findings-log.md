@@ -173,3 +173,53 @@ sweeps between configurations and their *differences* were real even where the a
 **Process rule adopted:** a decode or prefill rate is only ever quoted from a wall-clock measurement of a token run
 (`bench.py` or the server's own `timings`), never from a phase counter, and the harness invocation is recorded with the
 number.  Counter-derived ms/tok is a *component* measurement and must be labelled as such.
+
+## G1 (campaign II) — prefill partial sums: +16.0% at pp-512, and a harness trap that voided three gates
+
+**What landed.** `STRATA_KOLIBRI_PF_PARTIAL=1` (default off) keeps the resident expert rows on the device instead of
+shipping them to the host and back.  The old leg wrote `res_ey` -> host (27 MB at ~85% coverage), scattered on the
+host, then pushed the whole `NKc x N` block (31.5 MB at Tc=512) back up.  The new leg pushes only the 64 KB selection
+map down, computes the *miss* contributions on the host into a `Tc x N` partial, and combines on the device in one
+kernel (`src/kolibri/pf_combine.cu`).  Summation order is fixed by indexing the shared slot by pick number, so the
+combine adds in ascending `k` and matches the reference term for term.
+
+**Wall clock, two runs per arm, `bench.py --case short`, `--extra="--prefill --cpu-threads 24"`, no `--counters`,
+`numactl --cpunodebind=1 --membind=1`, binary `build/strata-kolibri`, kernel 6.1.0-52, driver 580.196.07:**
+
+| arm | pp-512 | box load |
+|---|---|---|
+| knob off | 159.0 (3221 ms), 158.8 (3224 ms) | 0.27, 2.85 |
+| knob on | **184.9 (2770 ms), 183.6 (2789 ms)** | 2.12, 4.35 |
+
+**+16.0%**, against a floor of 165 and a 2%-kill criterion.  The byte counters (added under the same `e.counters`
+guard as the decode legs, because the prefill staging was invisible to them) account for it: d2h 1,600,061,440 ->
+107,520,000 B and h2d 1,963,008,000 -> 584,763,904 B, i.e. **2.87 GB removed**, against 333 ms of instrumented wall
+delta = **8.6 GB/s implied**, inside the envelope the pool itself measures on this link (12.2 GB/s pinned) since
+these transfers partially overlap compute.  Instrumented runs read lower on both arms (155.0 -> 172.4, +11.2%), which
+is the counters' own cost and is why the rate above is taken without them.
+
+**Accuracy.** `kl.py` with `STRATA_KOLIBRI_ATTN_FLASH=1` (the deterministic prefill config — see the trap below),
+answers-only mean KL over the same 109 answer steps: llama.cpp CPU floor 0.00178, knob off **0.00123**, knob on
+**0.00133**; top-1 0.9725 on both the floor and the knob-on arm, 0.9633 knob off.  `oracle.sh` is BITWISE PASS with
+the knob on and off.  `pf_gate.sh` passes under the knob against **re-anchored** PF_HASH (100 chunk-layers, identical
+across two runs); against the Campaign-I expectations all 100 lines differ, which is the expected consequence of
+re-associating the sum, and the oracle shows argmax is unmoved by it.
+
+**Harness trap, and it cost three gates.** `/tmp/kolibri_bench_node1.sh` execs
+`/data2/develop/strata-speed-wt/build/strata-kolibri` — the Campaign I worktree binary, which contains **zero**
+occurrences of `PF_PARTIAL`.  Any gate run through that wrapper silently tests a binary that ignores the knob.  It
+produced a confident "PF_HASH bitwise identical, gate PASS under the knob" that was vacuous, and a CNT A/B with
+byte-identical counters and no speed change.  `strings` on both binaries settles it in one line and is now the
+pre-flight check: `strings build/strata-kolibri | grep -c PF_PARTIAL` -> 2, old binary -> 0.  **Rule adopted: before
+any A/B, assert the knob string exists in the binary the wrapper execs.**
+
+**Two things this box no longer reproduces, neither caused by the change.**
+1. **pp-32K baseline drift.** Knob-off today is 119.6 / 119.4 tok/s against the published 154.0 / 153.7, at equal or
+   lower load, so load does not explain 22%.  pp-512 is unaffected (159.0 today vs 157.0/160.3 published).  The prime
+   suspect is the driver module: Campaign I ran with 580.178.04 loaded; after the mismatch fix the loaded module is
+   580.196.07.  Consequence: "pp-32K >= 150 retained" cannot be judged against a baseline this box no longer produces;
+   on a same-day A/B the knob is never negative there (124.7 and 159.0 vs 119.5).
+2. **The non-flash prefill is nondeterministic.** `pf_gate.sh` says outright that PF_HASH needs `ATTN_FLASH=1` for a
+   deterministic prefill.  The first KL A/B was run in the `speed_config` env without flash and produced 0.00205 off
+   vs 0.00170 on — a comparison of two draws from a nondeterministic generator, not an A/B.  With flash the same arms
+   read 0.00123 and 0.00133.  **Rule adopted: any KL A/B runs with `ATTN_FLASH=1`.**
