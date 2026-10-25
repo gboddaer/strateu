@@ -100,9 +100,83 @@ double row_kl(const float* ref, const float* newv, int64_t n) {
     return kl;
 }
 
+/// Stage G3's own harness: per-layer time for the staged expert set, the shape the engine actually runs at
+/// pp-512 (docs/strateu-campaign-report.md: ~118 experts per chunk-layer, ~35 rows each, three projections).
+/// This is what the "<= 2.6 ms/layer" gate is measured with; the 154 ms it is compared against is the engine's own
+/// leg, quoted from the campaign report, not re-measured here.
+int bench(int iters) {
+    const int batch = 118;
+    const int64_t T = 35;
+    struct Proj { const char* name; int64_t N, K; };
+    const Proj proj[3] = {{"gate", 512, 2560}, {"up", 512, 2560}, {"down", 2560, 512}};
+    std::printf("q4k_grouped bench: batch=%d T=%lld, three projections, %d iterations\n", batch, (long long)T, iters);
+
+    uint64_t rng = 0x51ED27019C3A35B7ULL;
+    double total_ms = 0.0;
+    for (const auto& pr : proj) {
+        const int64_t wbytes = (pr.N * pr.K / kBlkVals) * kBlkBytes;
+        std::vector<void*> dW(batch), dX(batch); 
+        std::vector<float*> dY(batch);
+        std::vector<const uint8_t*> hWa(batch);
+        std::vector<const uint16_t*> hXa(batch);
+        std::vector<float*> hYa(batch);
+        auto blob = make_blob(pr.N, pr.K, rng);        // one blob reused across experts: bandwidth, not content
+        for (int b = 0; b < batch; ++b) {
+            check(cudaMalloc(&dW[b], size_t(wbytes)), "bench W");
+            check(cudaMemcpy(dW[b], blob.data(), size_t(wbytes), cudaMemcpyHostToDevice), "bench H2D W");
+            check(cudaMalloc(&dX[b], size_t(T) * pr.K * 2), "bench X");
+            check(cudaMemset(dX[b], 0x3f, size_t(T) * pr.K * 2), "bench X fill");
+            check(cudaMalloc(&dY[b], size_t(T) * pr.N * 4), "bench Y");
+            hWa[b] = (const uint8_t*)dW[b]; hXa[b] = (const uint16_t*)dX[b]; hYa[b] = dY[b];
+        }
+        const uint8_t* const* dWa; const uint16_t* const* dXa; float* const* dYa;
+        check(cudaMalloc((void**)&dWa, batch * 8), "bench Wa"),
+        check(cudaMalloc((void**)&dXa, batch * 8), "bench Xa"),
+        check(cudaMalloc((void**)&dYa, batch * 8), "bench Ya"),
+        check(cudaMemcpy((void*)dWa, hWa.data(), batch * 8, cudaMemcpyHostToDevice), "bench H2D Wa"),
+        check(cudaMemcpy((void*)dXa, hXa.data(), batch * 8, cudaMemcpyHostToDevice), "bench H2D Xa"),
+        check(cudaMemcpy((void*)dYa, hYa.data(), batch * 8, cudaMemcpyHostToDevice), "bench H2D Ya");
+
+        // warm up (allocates the scratch and inits cublas), then time the steady state only
+        for (int w = 0; w < 2; ++w) {
+            if (strata::kolibri::q4k_grouped_gemm_vram(dWa, dXa, dYa, T, pr.N, pr.K, batch, nullptr) != 0) {
+                std::fprintf(stderr, "FATAL bench: kernel refused the %s shape\n", pr.name);
+                return 2;
+            }
+        }
+        check(cudaDeviceSynchronize(), "bench warmup sync");
+        cudaEvent_t e0, e1;
+        cudaEventCreate(&e0);
+        cudaEventCreate(&e1);
+        float best = 1e30f;
+        for (int it = 0; it < iters; ++it) {
+            cudaEventRecord(e0);
+            strata::kolibri::q4k_grouped_gemm_vram(dWa, dXa, dYa, T, pr.N, pr.K, batch, nullptr);
+            cudaEventRecord(e1);
+            cudaEventSynchronize(e1);
+            float ms = 0.0f;
+            cudaEventElapsedTime(&ms, e0, e1);
+            if (ms < best) best = ms;
+        }
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+        std::printf("  %-5s N=%4lld K=%4lld : %7.3f ms  (%lld MB of Q4_K read)\n", pr.name,
+                    (long long)pr.N, (long long)pr.K, best, (long long)(batch * wbytes / (1024 * 1024)));
+        total_ms += best;
+        for (int b = 0; b < batch; ++b) { cudaFree(dW[b]); cudaFree(dX[b]); cudaFree(dY[b]); }
+        cudaFree((void*)dWa); cudaFree((void*)dXa); cudaFree((void*)dYa);
+    }
+    std::printf("  TOTAL per layer: %.3f ms   (gate 2.60, stretch 1.95, today's leg 154)\n", total_ms);
+    return 0;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
+        const int iters = argc > 2 ? std::atoi(argv[2]) : 5;
+        return bench(iters > 0 ? iters : 5);
+    }
     // The staged prefill's own expert shapes (docs/KOLIBRI1.md: n_embd 2560, FFN 512), T rows per expert and
     // `batch` experts per group - the down projection, which is the leg that costs the most bytes.
     const int64_t T = 4, N = 2560, K = 512;
