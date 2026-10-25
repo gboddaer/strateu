@@ -677,8 +677,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(q4k_grouped_vram_parity src/kernels/q4k_grouped_vram_parity.cpp src/kolibri/q4k_grouped.cu)
     target_include_directories(q4k_grouped_vram_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
                                ${_strata_gpu_include_directories})
-    target_link_libraries(q4k_grouped_vram_parity PRIVATE strata_kernels strata_prefill strata_warnings
-                          ${_strata_gpu_runtime_target})
+    target_link_libraries(q4k_grouped_vram_parity PRIVATE strata_kernels strata_prefill strata_mmq
+                          strata_mmq_w4a4 strata_kq strata_warnings ${_strata_gpu_runtime_target})
     add_test(NAME q4k_grouped_vram_parity COMMAND q4k_grouped_vram_parity)
   endif()
   # the reference forward pass (plan T6): plain kernels + Strata native MMVQ/router, no graphs, no cache; the

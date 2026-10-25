@@ -29,6 +29,7 @@
 #include "kolibri/q4k_grouped.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/prefill/gemm.hpp"
+#include "strata/prefill/moe_mmq.hpp"
 
 namespace {
 
@@ -173,6 +174,14 @@ int bench(int iters) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc > 1 && std::strcmp(argv[1], "--mmq") == 0) {
+        namespace mmq = strata::prefill::mmq;
+        std::printf("mmq built=%d supported(Q4_K)=%d fits(12,512)=%d fits(12,2560)=%d\n",
+                    (int)mmq::built(), (int)mmq::supported(12), (int)mmq::fits(12, 512), (int)mmq::fits(12, 2560));
+        std::printf("  matrix_bytes(12,512,2560)=%zu q8_bytes(35,2560)=%zu\n",
+                    mmq::matrix_bytes(12, 512, 2560), mmq::q8_bytes(35, 2560));
+        return 0;
+    }
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
         const int iters = argc > 2 ? std::atoi(argv[2]) : 5;
         return bench(iters > 0 ? iters : 5);
