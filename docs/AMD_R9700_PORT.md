@@ -595,6 +595,35 @@ measured above, `--act f32` proved inert, and the binary reads no environment va
 the `STRATA_KOLIBRI_*` knobs that move the shipped engine cannot change a KL number taken through the
 reference. There is no untried legitimate lever left inside this harness.
 
+### The KL measured on the shipped engine, not just the reference
+
+Every KL number above came from `strata-kolibriref`, the reference engine. The criterion is about the
+engine that ships, and `strata-kolibri` accepts `--tokens`, `--force` and `--dump-full-logits`, so
+`kl.py --ref build/strata-kolibri` measures it directly - the llama.cpp logits in `/tmp/kl-amd` are
+reused from cache, so only the strata side re-runs. Same 8 prompts, same 344 answer steps, same floor
+(0.00187), two configurations of the real engine:
+
+| configuration | answer-step KL | top-1 | ratio to this box's floor |
+|---|---|---|---|
+| llama.cpp CPU against llama.cpp GPU (the floor) | 0.00187 | 0.9884 | 1.00x |
+| `strata-kolibriref`, shipped fused kernels | 0.00182 | 0.9884 | 0.97x |
+| `strata-kolibriref`, `--kernels plain` | 0.00158 | 0.9942 | 0.84x |
+| **`strata-kolibri`, plain prefill** | **0.00146** | 0.9942 | **0.78x** |
+| `strata-kolibri`, pooled prefill (`--prefill`) | 0.00162 | 0.9942 | 0.86x |
+
+Two things follow, and both matter more than the original 0.00182 did.
+
+**On the ratio metric the AMD path is at parity with the CUDA campaign.** The T4 recorded 0.00132
+against a floor of 0.00178, which is 0.74x; the best AMD configuration is 0.00146 against a floor of
+0.00187, which is **0.78x**. Those are the same achievement to within 5%, and it is the honest way to
+state this gate: the absolute number cannot transfer between boxes, the ratio can.
+
+**The prefill pool has a measurable accuracy price.** Pooled prefill is 0.00162 against plain
+prefill's 0.00146 - the same 5.2x speed difference measured in the rate table buys a worse KL - so
+unlike `ROPE_F64`, which measured free, the pool is a genuine accuracy-for-speed trade and the choice
+should be made deliberately rather than inherited. The bound of 0.00132 is still met by none of these,
+so the deviation stands; but the closest the shipped engine gets is 0.78x of floor, not 0.97x.
+
 The standing reading is unchanged and is a measurement, not an excuse: the bound sits below the floor
 of the instrument it is quoted against on this box (0.00178-0.00187 depending on population), so it
 cannot be met here by any engine that is not llama.cpp itself, and meeting it on the T4 was a property
