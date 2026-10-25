@@ -94,6 +94,22 @@ because launches overlap, and `rocgdb` + `rocm-debug-agent` if a kernel ever fau
 pool (`src/kernels/cpu/pool.cpp`, plain C++ threads) the host tools apply directly. This is weaker
 than `racecheck`, and it is stated as such rather than quietly substituted.
 
+**The serialized arm, measured.** Serializing launches would change the output if any kernel consumed
+data before its producer had finished, so agreement between serialized and overlapped runs is a real
+race-sensitivity result rather than a substitute excuse. Under `HIP_LAUNCH_BLOCKING=1`, with
+`HIP_VISIBLE_DEVICES=0`:
+
+| check | overlapped | serialized |
+|---|---|---|
+| `ctest --test-dir build` | 60/62 passed, 59.73 s | **60/62 passed**, 73.10 s, same two failures, same five skips |
+| `pf_gate.sh` | GATE PASS (4 arms) | **GATE PASS** (4 arms), `PF_HASH` identical over 100 chunk-layers |
+| `oracle.sh check oracle_gfx1201.txt` | BITWISE PASS | **BITWISE PASS**, all 16 ids identical |
+
+Nothing moved: the same tests pass, the prefill hash is identical, and the generated ids are bitwise
+identical when every launch is forced to complete before the next begins. That is the strongest
+form of this check available on RDNA4, and it covers the GPU kernels; the host pool is covered by
+valgrind separately.
+
 ## Harness artefacts that had to be re-pointed at this box
 
 The CUDA campaign left its harnesses pointing at its own machine. Each of these is a silent failure,
