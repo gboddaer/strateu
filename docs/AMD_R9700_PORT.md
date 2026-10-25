@@ -321,6 +321,16 @@ reason. Decode at long context is not measured yet - each such run is ~16 min - 
 
 Short shape is `n=257` on the 512-token prompt, so arms compare against the baseline's 39.3 / 39.3 s.
 
+**What that baseline is, and what it costs.** It is not the bare default: the sweep set
+`EXPERT_F16=24`, `RES_TOP=56` and `ATTN_MB=512` explicitly. Re-running with exactly those three gives
+39.357 / 39.204 s, which reproduces the recorded 39.3 / 39.3 s to 0.1 s, so the baseline is now fully
+accounted for. Taken one at a time against the bare default (35.5 s, two runs, same shape):
+`EXPERT_F16=24` alone gives 39.394 / 39.338 s - **the whole 3.8 s** - while `RES_TOP=56` (35.524 /
+35.599 s) and `ATTN_MB=512` (35.345 / 35.487 s) are indistinguishable from the default at this shape.
+So every §9.3 short-shape verdict is measured against a baseline carrying a 3.8 s `EXPERT_F16` cost,
+which is fine for comparing arms against each other but means those seconds are not the shipped
+default; the rate table above quotes the default and is the faster configuration by that margin.
+
 | arm | wall run1 / run2 | verdict |
 |---|---|---|
 | baseline (`RES_TOP=56`) | 39.3 s / 39.3 s | - |
