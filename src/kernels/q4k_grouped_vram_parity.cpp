@@ -111,6 +111,7 @@ int bench(int iters) {
     struct Proj { const char* name; int64_t N, K; };
     const Proj proj[3] = {{"gate", 512, 2560}, {"up", 512, 2560}, {"down", 2560, 512}};
     std::printf("q4k_grouped bench: batch=%d T=%lld, three projections, %d iterations\n", batch, (long long)T, iters);
+    double f16_total = 0.0;
 
     uint64_t rng = 0x51ED27019C3A35B7ULL;
     double total_ms = 0.0;
@@ -164,10 +165,51 @@ int bench(int iters) {
         std::printf("  %-5s N=%4lld K=%4lld : %7.3f ms  (%lld MB of Q4_K read)\n", pr.name,
                     (long long)pr.N, (long long)pr.K, best, (long long)(batch * wbytes / (1024 * 1024)));
         total_ms += best;
+
+        // The fair A/B for this arm is NOT the 154 ms/layer in the campaign report (that was a different,
+        // previous-default configuration).  It is today's resident leg: FP16 weights already in VRAM, multiplied
+        // with no Q4_K read at all.  Timing that here makes the two numbers mean the same thing.
+        {
+            std::vector<void*> dWf(batch);
+            std::vector<const uint16_t*> hWf(batch);
+            for (int b = 0; b < batch; ++b) {
+                check(cudaMalloc(&dWf[b], size_t(pr.N) * pr.K * 2), "bench Wf16");
+                strata::kernels::dequant_f16(12, dW[b], 0, pr.N, pr.K, (uint16_t*)dWf[b], nullptr);
+                hWf[b] = (const uint16_t*)dWf[b];
+            }
+            const uint16_t* const* dWfa;
+            check(cudaMalloc((void**)&dWfa, batch * 8), "bench Wfa");
+            check(cudaMemcpy((void*)dWfa, hWf.data(), batch * 8, cudaMemcpyHostToDevice), "bench H2D Wfa");
+            strata::prefill::Gemm g;
+            std::string err;
+            if (!g.init(nullptr, pr.N * pr.K, err)) { std::fprintf(stderr, "FATAL bench gemm: %s\n", err.c_str()); return 2; }
+            for (int w = 0; w < 2; ++w) g.f16_batched(dWfa, dXa, dYa, T, pr.N, pr.K, batch);
+            check(cudaDeviceSynchronize(), "bench f16 warmup");
+            cudaEventCreate(&e0);
+            cudaEventCreate(&e1);
+            float best_f16 = 1e30f;
+            for (int it = 0; it < iters; ++it) {
+                cudaEventRecord(e0);
+                g.f16_batched(dWfa, dXa, dYa, T, pr.N, pr.K, batch);
+                cudaEventRecord(e1);
+                cudaEventSynchronize(e1);
+                float ms = 0.0f;
+                cudaEventElapsedTime(&ms, e0, e1);
+                if (ms < best_f16) best_f16 = ms;
+            }
+            cudaEventDestroy(e0);
+            cudaEventDestroy(e1);
+            std::printf("        vs f16-resident leg (today's shape, weights already FP16 in VRAM): %7.3f ms\n", best_f16);
+            f16_total += best_f16;
+            for (int b = 0; b < batch; ++b) cudaFree(dWf[b]);
+            cudaFree((void*)dWfa);
+        }
         for (int b = 0; b < batch; ++b) { cudaFree(dW[b]); cudaFree(dX[b]); cudaFree(dY[b]); }
         cudaFree((void*)dWa); cudaFree((void*)dXa); cudaFree((void*)dYa);
     }
     std::printf("  TOTAL per layer: %.3f ms   (gate 2.60, stretch 1.95, today's leg 154)\n", total_ms);
+    std::printf("  f16-resident leg per layer: %.3f ms  -> Q4_K-from-VRAM arm is %.2fx of it\n",
+                f16_total, total_ms / (f16_total > 0 ? f16_total : 1.0));
     return 0;
 }
 
