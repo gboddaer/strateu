@@ -23,16 +23,18 @@ inherited.
 
 ### The AMD floor table
 
-Measured on host `rizo`: Ryzen 7 5700G (8 physical cores, one NUMA node), 93 GiB RAM, 90-91 GiB free
-per run, GPU idle at start, `--cpu-threads 8`, shipped config. Two runs each. Prefill subtracts the
-engine's own 13.4 s load line; the end-to-end row does not.
+Measured on host `rizo`: Ryzen 7 5700G (8 physical cores, one NUMA node), 93 GiB RAM, 89-91 GiB free
+per run, GPU idle at start, `--cpu-threads 8` with the prefill pool on, **no `STRATA_KOLIBRI_*` env
+set** - the shipped default, which is 3.8 s faster at this shape than the §9.3 arm baseline that
+carries `EXPERT_F16=24`. Two runs each. Prefill subtracts the engine's own 13.4 s load line; the
+end-to-end row does not.
 
 | | CUDA box (16 GB T4) | **R9700 (32 GB)** |
 |---|---|---|
 | prefill, 512-token prompt | 157.0 / 160.3 tok/s | **87.8 / 85.4 tok/s** (26.3 / 26.2 end to end; prefill pool on, 8 threads) |
 | prefill, 99,299-token prompt | - | **102.3 / 100.8 tok/s** (`ATTN_MB=512`), **105.2 / 105.8** (`ATTN_MB=1024`) |
 | prefill, 127,811-token prompt | - | **94.1 / 94.2** (`512`), **100.4 / 100.8** (`1024`) |
-| decode, short context | 24.5 / 24.4 tok/s | **15.8 / 15.8 tok/s** |
+| decode, short context | 24.5 / 24.4 tok/s | **15.8 / 15.9 tok/s** |
 | decode, long context | 12.3 / 12.2 tok/s (after 32K) | **6.7 / 5.5 tok/s** (at 100K) |
 | KL vs llama.cpp, answers | 0.00132 (0.74x of that box's floor) | **0.00182**, top-1 0.9884 - **0.97x of this box's floor** (0.00187) |
 | 100K needle | recall 4/5, exact 3/5 | **recall 5/5, 0 not exact** |
