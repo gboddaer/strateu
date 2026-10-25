@@ -287,7 +287,24 @@ does not say whether the pool was on is ambiguous, and every rate row in this le
 **`--cpu-threads 24` halves decode**: 15.8 tok/s at 8 threads against 7.6 tok/s at 24. The box is a
 Ryzen 7 5700G - 8 physical cores - so 24 lanes oversubscribe and the decode loop pays for it.
 `pf_gate.sh` runs with `--cpu-threads 24`, which is harmless for a hash gate and a trap for timing;
-the script's own comment already files the `--cpu-threads` choice with the traps of that class.
+the script's own comment already files the `--cpu-threads` choice with the traps of that class. The
+split is measured, not assumed: at `--n 16` the same prompt gives byte-identical ids at 8 and at 24
+threads (`286 3515 310 262 14292 1343 1444 46 17156 32 50 55 58 4037 262 7771`), so lane count moves
+the clock and not the result. One caveat found while checking that: `--cpu-threads 1` does not work -
+it emits `51 51 51 51 ...` for all 16 tokens, a degenerate loop rather than an error, so the flag
+needs at least 2 lanes and a caller that passes 1 will get plausible-looking garbage.
+
+**The pooled prefill is not bitwise-equal to the plain path the oracle pins.** `oracle.sh` runs the
+plain path (no `--prefill`, default threads, `STRATA_DUMP_CTX=8192`) and reproduces
+`tools/kolibri/oracle_gfx1201.txt` bitwise - re-checked after these measurements. Adding `--prefill`
+to the same prompt and ctx agrees for the first 10 ids and then diverges: plain gives
+`... 17156 32 51 48 58 4037 262 1890`, pooled gives `... 17156 32 50 55 58 4037 262 7771`. Both gates
+still pass because each pins its own path (`pf_gate.sh` uses `--prefill` and compares against the
+`--prefill` reference it recorded), so nothing here is broken - but the 5.2x fast path changes the
+answer from the 11th token, and a reader should not assume the bitwise oracle certifies the
+configuration the rate table measures. Whether the pooled or the plain trajectory is closer to
+llama.cpp is a KL question, and the KL runs in this ledger were done through `strata-kolibriref`, i.e.
+the plain path.
 
 **Decode is unchanged** - 15.8 tok/s here and 15.8 tok/s in the old row - so the box and the build are
 behaving identically and only the prefill isolation was wrong.
