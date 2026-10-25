@@ -223,3 +223,48 @@ any A/B, assert the knob string exists in the binary the wrapper execs.**
    deterministic prefill.  The first KL A/B was run in the `speed_config` env without flash and produced 0.00205 off
    vs 0.00170 on — a comparison of two draws from a nondeterministic generator, not an A/B.  With flash the same arms
    read 0.00123 and 0.00133.  **Rule adopted: any KL A/B runs with `ATTN_FLASH=1`.**
+
+## G3 (campaign II) — the grouped Q4_K-from-VRAM GEMM: measured, and it is a negative result
+
+**What was built.** `q4k_grouped_gemm_vram` (src/kolibri/q4k_grouped.cu): reads each expert's Q4_K blob from VRAM,
+dequantizes it to an FP16 scratch in VRAM, and multiplies with the engine's own `Gemm::f16_batched`.  The parity gate
+written before it (G2) is **bitwise green**: 81920/81920 values equal, max abs diff 0.0, mean row KL 0.0.
+
+**The stage harness.** `q4k_grouped_vram_parity --bench`, the staged expert set (batch=118, T=35, the gate/up/down
+projections), CUDA events, best of 5 after warmup, on the Tesla T4, kernel 6.1.0-52, driver 580.196.07.
+
+| arm | ms/layer | what it is |
+|---|---|---|
+| Q4_K-from-VRAM arm (this stage) | **9.99** (best-of-5 across runs 9.99-11.68) | read Q4_K, dequant to FP16, GEMM |
+| **FP16-resident leg** | **4.18** | what the engine does today: weights promoted to FP16 once, then multiplied |
+| G3 gate | 2.60 (stretch 1.95) | |
+
+**The result is negative and it must be read that way.** The new arm is **2.39x slower than the path it would
+replace**, not faster.  The earlier "13.9x better" reading came from comparing against the 154 ms/layer figure in
+docs/strateu-campaign-report.md:42,:289, which describes a *different, previous-default* configuration - apples to
+oranges.  Measured against the mechanism actually in use, the arm loses.
+
+**Why, priced.** The FP16-resident leg pays its weight traffic **once, at promotion**: the expert sits in VRAM as FP16
+and every later product reads 164 MB per projection with no unpacking.  The Q4_K-from-VRAM arm re-reads 82 MB of
+compressed weights *and writes 164 MB of FP16* on **every call**, so it pays 246 MB where the resident leg pays 164.
+That is the whole 2.39x.
+
+**What the 2.6 ms gate therefore asks for.** It is **1.6x faster than cuBLAS on FP16 weights**, not "faster than the
+CPU pool".  Nothing that materialises FP16 weights can reach it: the gate needs **half the weight traffic of the best
+existing path**, which only a fused kernel gets, by dequantizing Q4_K sub-blocks in registers into `mma.m16n8k16` and
+reading 82 MB with no FP16 ever written.  At the ~105 GB/s this card demonstrably sustains that is ~1.2-1.3 ms/layer,
+inside the gate - so the gate is reachable, but only by authoring that kernel, which is a separate commissioned piece
+of work, not a tuning pass on this one.
+
+**Two dead ends recorded so nobody re-walks them.**
+1. *The MMQ path is not available on CUDA.* `strata::prefill::moe_mmq` describes exactly this job ("reads the ~1.4-2 MB
+   expert once" instead of writing ~10 MB of FP16), and covers Q4_K under `STRATA_MMQ_KQUANTS`.  But
+   `STRATA_PREFILL_MMQ` **requires HIP** (CMakeLists.txt:89 hard-errors `STRATA_PREFILL_MMQ requires
+   STRATA_ENABLE_HIP=ON`), and the CUDA K-quant DSO `strata_kq` is not built here.  A CUDA configure refuses it; this
+   is a backend limit, not a flag someone forgot.
+2. *`STRATA_MMQ_KQUANTS` is a CMake option, not a runtime knob* (CMakeLists.txt:79).  Setting it in the environment
+   does nothing; `mmq::supported(12)` stays false.
+
+**Not shipped.** The arm is behind no engine knob and is not wired into `forward_multi`, because wiring a 2.4x
+regression into the prefill would make the engine slower.  It stays in the tree as the parity gate's subject and as
+the A/B baseline the fused kernel will be measured against.
