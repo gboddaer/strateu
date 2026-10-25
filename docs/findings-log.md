@@ -268,3 +268,43 @@ of work, not a tuning pass on this one.
 **Not shipped.** The arm is behind no engine knob and is not wired into `forward_multi`, because wiring a 2.4x
 regression into the prefill would make the engine slower.  It stays in the tree as the parity gate's subject and as
 the A/B baseline the fused kernel will be measured against.
+
+## G4b (campaign II) — the after-32K decode wall attributed: it is PCIe streaming at 0% residency
+
+Wall clock first, because a rate is only ever a wall clock: `bench.py --case after`,
+`--extra="--prefill --cpu-threads 24"`, `numactl --cpunodebind=1 --membind=1`, load 8.5, two runs today:
+**tg-128 after 32K = 13.4 / 13.5 tok/s = 74.6-75.2 ms/token** (published campaign I figure was 12.3/12.2, so this
+box is slightly better than the number the 81 ms token was quoted from).
+
+Then the attribution, **instrument-time** (`--counters`; counters are components, not a rate):
+
+| counter | value | what it says |
+|---|---|---|
+| `CNT branches per tok` | `pool 50.0 gpu-expert 0.0 slots-path 0.0 grouped 0.0` | **all 50 layers of every token take the pool branch**; nothing takes a resident path |
+| `CNT decode residency` | `0 of 0 picks served from the fp16 cache (0.0%)` | **decode has no residency at all** |
+| `CNT serve` d2h | `488.7 MB/tok` | device->host per token |
+| `CNT serve` h2d | `789.5 MB/tok` | host->device per token |
+| `CNT pool` | `streamed 714.2 MB/tok`, work `12.85 ms/tok`, `55.6 GB/s` | the CPU pool's own work |
+| `CNT pool phases` | `drain 1646 ms = 12.86 ms/tok`, wait_park 0, repark 0 | the drain the campaign attributed (20.7 ms there, 12.86 here) |
+
+**Where the ~60 unattributed ms/token went.** 1.28 GB crosses PCIe per token (488.7 d2h + 789.5 h2d). A token
+touches 8 experts across 50 layers = 400 expert rows, and a Q4_K expert blob is ~2.1 MB, so ~840 MB of weights
+must be present per token - the same order as the measured 1.28 GB once the activations and the resident-row
+round-trip are added. At the 11.5-12.2 GB/s this link sustains, that volume is ~105-111 ms of transfer time per
+token, partially overlapped with compute, which is why the wall lands at 75 ms rather than the sum.
+
+**So the wall is bandwidth, not kernel speed.** The pool's drain is only 12.9 ms of the 75. The other ~62 ms is
+moving expert weights from RAM to the GPU **again on every token**, because decode serves 0% from cache. That
+reframes G4b's floor: reaching 20 tok/s (50 ms/token) does not need a faster expert kernel, it needs the 1.28 GB/token
+to stop existing - i.e. residency. A token whose experts were already resident would move activations only, which
+is three orders of magnitude smaller.
+
+**Consequence for G4, and it cuts the other way from what the G3 result suggested.** G4's C1 (a slot is a raw Q4_K
+blob) is usually argued as a VRAM/fill win; this says its real prize is decode, where today's FP16 cache serves
+nothing. But it also means G4's decode gate (tg-128 short >= 30) is a residency question first and a kernel
+question second: with 0% residency today, the fastest expert kernel in the world still pays 1.28 GB/token.
+
+**Not claimed.** tg-128 after 32K >= 20 tok/s is **not** claimed, per the stage's own rule that the floor is not
+claimed before this attribution exists. The attribution now exists; the work it points at (decode residency) is
+G4's, and G4 is itself waiting on the fused-kernel ruling because the same blobs have to be multiplied cheaply once
+they are resident.
