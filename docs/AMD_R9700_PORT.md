@@ -115,8 +115,12 @@ valgrind separately.
 `k_kv_ring`, `k_gather_f16`, `k_pos_add`, `k_swiglu`, `k_to_f16`, `k_group`, `k_kt_window` and friends),
 `kolibriref.cu` 19 launch sites and `attn_k_parity.cu` 4. The serialized arm above covers every kernel
 the **default inference path** launches, because the oracle, `pf_gate.sh` and the 60 passing ctest
-tests all run that path end to end. What it does not cover is kernels reachable only through opt-in
-paths (`--attn-bench`, `--grouped`, `--attn-2pass-max`, `--dump-layers`), and five ctest parity tests
+tests all run that path end to end. The opt-in paths were then run under the same serialization -
+`--grouped`, `--attn-2pass-max 64` and `--dump-layers`, two runs each - and all six returned rc=0 with
+byte-identical ids (`286 3515 310 262 14292 1343 1444 46`, the certified prefix) and a deterministic
+265,728,000-byte layer dump. So the only kernels still not covered by any detector arm are those
+behind `--attn-bench`, which is an unbounded benchmark harness rather than an inference path and was
+left alone. And five ctest parity tests
 are Skipped on this box rather than passing: `hip_prefill_wmma_gemm_parity`,
 `hip_prefill_hcd_exact_parity`, `hip_prefill_hipblaslt_gemm` (CUDA-only prefill parity) and
 `iq_parity_fixtures` / `iq_parity` (fixtures this box does not have). So the honest form of the
