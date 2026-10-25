@@ -191,7 +191,7 @@ patch applied in the working tree), built fresh here as `build_rocm_rizo` with
 against it. It loads the Q4_K_M file and generates, which the drifted `~/develop/llama.cpp` checkout
 could not.
 
-`parity.py` (8 prompts, `--n 64 --ngl 99 --cpu-moe 50`): **5 of 8 prompts identical greedy answers**, worst layer rel err 22.20, median layer rel err ~1.15.
+`parity.py` (8 prompts, `--n 64 --ngl 99 --cpu-moe 50`): **5 of 8 prompts identical greedy answers**, worst layer rel err 22.20, median layer rel err ~1.15. **The two layer figures are a dump-length artifact and mean nothing** - see "The parity harness's layer-error figure is an artifact" below; the greedy-answer count and the KL are the numbers that carry information.
 
 `kl.py` teacher-forced, 520 steps / 344 answer steps over the same 8 prompts:
 
