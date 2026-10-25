@@ -394,29 +394,18 @@ of PCIe per token** (488.7 MB d2h + 789.5 MB h2d), with the CPU pool drain accou
 hotness-based blob residency (the existing `--expert-slots` decides residency by expert id and measured -17% of tg,
 G4 at ca1fbd44) and a blob multiply that is not slower than FP16 (the missing fused kernel again).
 
-**Needle recall is 3/5 on this box, and it is not a campaign regression.**  Scored with
-`tools/kolibri/needle_audit.py` on the five fixtures, our build: `needle_32k90` (33,364 tok) PASS,
-`needle_64k90` (65,876 tok) PASS, `needle_anchor` (101,416 tok) PASS, `needle_d90` (98,591 tok) FAIL,
-`needle_d90b` (98,591 tok) FAIL.  Two things make this a standing property of the fixture set rather than of this
-work: the default path is byte-identical to main (oracle BITWISE above), so nothing in campaign II can have moved
-it; and the pre-campaign arms sitting in `needle_d90b` from Oct 23 - `audit_fixed_gen`, `audit_simt_gen`,
-`flash_gen` - fail the same fixture with the same truncated answer (`quart-willow-8`).  The >=4/5 gate is therefore
-recorded as **not met on this box**, with the failures predating the campaign.
+**Needle: the published standing holds - recall 4/5, exact 3/5 - and the campaign did not move it.**  Scored with
+`tools/kolibri/needle_audit.py` on the five fixtures against our build: `needle_32k90` (33,364 tok) exact PASS,
+`needle_64k90` (65,876 tok) exact PASS, `needle_anchor` (101,416 tok) exact PASS, `needle_d90` (98,591 tok) FAIL,
+`needle_d90b` (98,591 tok) FAIL.  The harness counts **exactness** (its own line reads `N answer(s) audited, M not
+exact`, and it exits 0 only when every answer is exact), so those five results are **exact 3/5**, which is the
+published figure.  Recall is 4/5, not 3/5: the `needle_d90b` answer is `quart-willow-8` against a needle of
+`quartz-willow-884` - the code word was found and reproduced one letter short, which is recalled-but-not-exact -
+while `needle_d90` answered a different instruction from the haystack and is the one true miss.  That is exactly the
+pair of failures `STRATEU.md` already describes, so the needle row is **unchanged by campaign II**, which is what the
+byte-identical default path predicts.
 
-## G2 (campaign II) — the parity gate for the grouped Q4_K-from-VRAM GEMM, written before the kernel existed
-
-`src/kernels/q4k_grouped_vram_parity.cpp`, CTest target `q4k_grouped_vram_parity`, built the way `mmvq_il_parity`
-is built, committed at `19f6321d` **before** any kernel existed, and recorded red first (`7d711cee`).  The red phase
-matters: a parity test that passes against nothing proves nothing, so the reference arm was checked to be non-trivial
-first - `sum |Y_0| = 385522.073` over the fixture, i.e. the reference output is real, not a zero buffer that any
-implementation would match.
-
-When the first arm landed (`b9693cfd`) it went **bitwise PASS** outright: **81920/81920 elements equal, max absolute
-difference 0.0, mean row KL 0.0**.  That is the strongest result of the campaign and it is worth being precise about
-what it does and does not say.  It says the dequant-and-multiply arithmetic in `q4k_grouped.cu` reproduces the
-reference exactly, bit for bit, on the fixture shapes.  It does **not** say the arm is fast - G3 measured it at
-9.99 ms/layer against a 4.18 ms/layer FP16-resident leg (`c77adbfd`), which is why the arm is in the tree as a gate
-and a baseline rather than wired into the engine.
-
-The gate stays registered in CTest.  Anyone who writes the fused tensor-core kernel later starts from a passing
-correctness harness and from the FP16 leg as the A/B arm, which is exactly what G3 lacked.
+Two harness facts worth recording, because both cost time here.  The audit needs the `regex` module and the system
+`python3` does not have it (`ModuleNotFoundError: No module named 'regex'`), while `/data2/develop/Strata/.venv/bin/python`
+does - so the audit must be run with the venv interpreter.  And without `--run` the audit skips its own `audit_gen.txt`,
+which is why a first scoring pass appeared to find nothing: the generated answers were on disk but not being read.
