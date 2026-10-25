@@ -554,6 +554,14 @@ means the 0.00132 bound survived three separate legitimate attempts to reach it:
 | `--kernels plain` | **0.00158 (0.84x floor)** | real improvement, still above the bound |
 | terminating-answer fixture (`--n 24`) | 0.00199 (1.12x floor) | hypothesis refuted |
 
+The lever space is enumerated, not assumed. `strata-kolibriref --help` and the flag list parsed in
+`kolibriref.cu` expose exactly two numerics switches - `--act q8|f32` and `--kernels strata|plain` -
+and everything else (`--model`, `--tokens`, `--tokens-file`, `--n`, `--ctx`, `--force`, `--dump-layers`,
+`--dump-logits`, `--dump-full-logits`) is input or instrumentation. Both numerics switches are
+measured above, `--act f32` proved inert, and the binary reads no environment variables at all, so
+the `STRATA_KOLIBRI_*` knobs that move the shipped engine cannot change a KL number taken through the
+reference. There is no untried legitimate lever left inside this harness.
+
 The standing reading is unchanged and is a measurement, not an excuse: the bound sits below the floor
 of the instrument it is quoted against on this box (0.00178-0.00187 depending on population), so it
 cannot be met here by any engine that is not llama.cpp itself, and meeting it on the T4 was a property
