@@ -258,16 +258,24 @@ p02 0.00208 [0.00208], p03 0.00044 [0.00069], p04 0.00045 [0.00035], p05 0.00100
 floor - and it is also one of the three prompts whose greedy answer diverged in parity, so the two
 observations are the same observation.
 
-## The 100K needle audit (task 5, second half) - recall 5/5
+## The 100K needle audit (task 5, second half) - recall 5/5, re-verified 6/6 live
 
-**Reproducibility note.** The verdict below is recorded, but the generations it scored are ephemeral:
-re-running `needle_audit.py` without `--run` today finds all five fixtures and their needle words
-intact (`cobalt-orchard-311`, `amber-glacier-742`, `velvet-cedar-209`, `quartz-willow-107`,
-`granite-lantern-555`) but reports `0 answer(s) audited`, because the `audit_gen.txt` files lived in
-`/tmp` and are gone. The fixtures themselves (`90.ids`) are still there, so the audit reproduces with
-one command and no fixture regeneration - at roughly 16 min per 100K prefill, about 80 min for all
-five. Nothing numeric in the tree has changed since the run below, so this is a note about where the
-artifacts live, not a doubt about the result.
+**Re-verified live on the final tip** (`--run --gguf /fast/models/...`, six fixtures, ~17 min each,
+box otherwise idle): **6 answers audited, 0 not exact**, every fixture PASS - `a05`
+(`quartz-willow-884`), `b25` (`cobalt-orchard-311`), `c50` (`amber-glacier-742`), `d75`
+(`velvet-cedar-209`), `e90` (`quartz-willow-107`), and `f128` at 127,811 tokens (`granite-lantern-555`).
+That clears the criterion (recall >= 4/5, exact >= 3/5) on a fresh run rather than on the recorded one
+above, and the generations now on disk are dated with this run, so the verdict is re-derivable until
+`/tmp` is cleared. The same display quirk applies as before: a PASS can print as just `Answer:` or
+stop mid-needle (`velvet-cedar-`) because the audit scores the needle's presence in the answer, not
+the printed excerpt.
+
+
+An earlier version of this note said the generations were missing and that `0 answer(s) audited` proved
+it. That diagnosis was wrong: the audit found the fixtures fine and reported zero answers because
+`--gguf` defaults to the CUDA box's `/data4/...` path (see "Harness artefacts" above), so every load
+failed. The six fixtures and their `90.ids` were intact throughout, and the run above reproduces the
+verdict in about 100 minutes with no fixture regeneration.
 
 The campaign's driver was never committed (`/tmp/needle_drive.py`, "regenerate rather than copy
 paths"), so the fixtures are rebuilt by `tools/kolibri/make_needle_fixtures.py`, which writes

@@ -37,7 +37,7 @@ end-to-end row does not.
 | decode, short context | 24.5 / 24.4 tok/s | **15.8 / 15.9 tok/s** |
 | decode, long context | 12.3 / 12.2 tok/s (after 32K) | **6.7 / 5.5 tok/s** (at 100K) |
 | KL vs llama.cpp, answers | 0.00132 (0.74x of that box's floor) | **0.00146** plain prefill / 0.00162 pooled, top-1 0.9942 - **0.78x of this box's floor** (0.00187), measured on `strata-kolibri` itself |
-| 100K needle | recall 4/5, exact 3/5 | **recall 5/5, 0 not exact** |
+| 100K needle | recall 4/5, exact 3/5 | **recall 6/6, 0 not exact** - re-verified live on six fixtures, longest 127,811 tokens |
 | ctest | - | **60 / 62**, both failures box-scoped |
 | pinned expert table | 42.90 GiB, needs `RLIMIT_MEMLOCK` | **42.90 GiB, no root needed** |
 
