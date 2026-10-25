@@ -126,6 +126,15 @@ them.**
 
 ## Harness artefacts that had to be re-pointed at this box
 
+**`needle_audit.py --gguf` defaults to the CUDA box's path.** Its default is
+`/data4/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf`, which does not exist here, and the script does
+not read `KOLIBRI_MODEL` - so `--run` with the environment set as usual fails per fixture with
+`load failed: cannot open /data4/...` and then reports `0 answer(s) audited, 6 not exact`. That is a
+silent-looking failure: the audit still prints a verdict line, and "6 not exact" reads like a recall
+regression when it is really six failed loads. On this box the audit must be invoked as
+`needle_audit.py --run --gguf /fast/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf`. Worth fixing
+upstream as an env fallback, but that changes shared harness, so it is recorded rather than changed.
+
 
 
 The CUDA campaign left its harnesses pointing at its own machine. Each of these is a silent failure,
