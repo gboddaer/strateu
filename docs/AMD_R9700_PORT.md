@@ -622,12 +622,23 @@ should look - the first answer step of short answers - and it is a smaller and d
 
 ## Where the port stands
 
-Committed on `feat/amd_r9700` (23 commits, main untouched): the launcher (`251a079c`); the HIP build,
+Committed on `feat/amd_r9700` (main untouched): the launcher (`251a079c`); the HIP build,
 load and ctest (`f901ca06`, `f53f87a6`); `pf_gate` PASS and this log (`f86ff892`); the reference
 llama.cpp finding (`fc75cddf`, `86c84069`, `0ad27d37`); the §9.3 verdicts (`5f1fbb87`, `b472b798`,
 `f414e8ce`, `1be74ca4`); the KL measurement (`d2e09784`, `f58ebf2e`); the needle fixtures and generator
 (`69d7a8ee`); the committed AMD gate references (`5b388fda`); the detector evidence (`0ed717dd`,
 `1f1065df`); and the CUDA-safety check (`09de8aa0`).
+
+**Gates re-verified on the final tree, after every rate correction in this log.** `pf_gate.sh` gives
+`GATE PASS` with all four arms green - `build PASS`, `ids smoke PASS (gen: 3515 310 262 14292)`,
+`PF_HASH PASS (100 chunk-layers)`, `oracle PASS (BITWISE)` - and `oracle.sh check` was run separately
+against `oracle_gfx1201.txt` with the same result. The gate builds before it tests, so the PASS also
+re-confirms the HIP build is clean at this tip.
+
+**One figure to reconcile with the goal text.** The objective says a 42.4 GiB host expert table; the
+engine reports **42.90 GiB pinned** on this GGUF, which is the number used throughout this log. The
+difference is 0.5 GiB of rounding or a different file revision, not a discrepancy about what was
+allocated - the load line is quoted verbatim wherever the figure appears.
 
 **Gates, as they reproduce from a clean checkout.** Four exports are needed because the harnesses
 default to the CUDA box:
