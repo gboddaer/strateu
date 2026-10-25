@@ -914,8 +914,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # the harness states the arithmetic EXACTLY, so it must not be built with the project's --use_fast_math: that
     # flag lets nvcc reassociate/contract the two loop shapes differently and the comparison then measures the
     # compiler instead of the layout (measured: 5/7 shapes matched with fast math on, and 2/7 differed in 1-6% of
-    # rows even with explicit __fmaf_rn in both loops).
-    target_compile_options(attn_k_parity PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math=false> )
+    # rows even with explicit __fmaf_rn in both loops).  The flag is applied per source file to the native_*.cu
+    # set only, so this target never inherits it; what it does need is nvcc's own no-contraction switch.  The
+    # previous spelling here was `--use_fast_math=false`, which nvcc rejects (it is a boolean flag, not a valued
+    # one), so the target could not be built at all and `ctest` reported attn_k_parity as "Not Run".
+    target_compile_options(attn_k_parity PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
     add_test(NAME attn_k_parity COMMAND attn_k_parity)
     # the prompt path's BF16 products against cuBLAS's own BF16 GEMM, within fp32 rounding (sm_7x runs them on the
     # FP16 tensor cores; GPU, synthetic, no model; --bench adds timings)
