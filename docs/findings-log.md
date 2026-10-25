@@ -308,3 +308,48 @@ question second: with 0% residency today, the fastest expert kernel in the world
 claimed before this attribution exists. The attribution now exists; the work it points at (decode residency) is
 G4's, and G4 is itself waiting on the fused-kernel ruling because the same blobs have to be multiplied cheaply once
 they are resident.
+
+## G4 (campaign II) — blob residency already exists in the tree, and on this box it is a regression
+
+C1 ("a slot is a raw Q4_K blob, a promotion a plain H2D blob copy") is not new work: `--expert-slots` already
+allocates a **device** blob table (`b.dev`, kolibri_engine.cu:217) and the decode expert leg reads it with
+`native_mmvq` - `gemv(gu, s.h, s.eg2, s.ids, K, 0, b.dev, b.stride)` - so no FP16 is materialised.  Loading it
+says so plainly: `expert cache: 24 slots/layer = 2.87 GiB VRAM` (2.4 MB per slot, i.e. raw Q4_K, not 7.86 MB of
+FP16).  A second path, `STRATA_KOLIBRI_DEC_RES=1` (K29), seeds each layer's hot experts into the FP16 cache.
+
+Neither is enabled by the campaign's bench config, which is why G4b measured `branches per tok: pool 50.0 /
+slots-path 0.0`.  Enabling them, two runs each, `bench.py --case short`, `--extra="--prefill --cpu-threads 24"`,
+`numactl --cpunodebind=1 --membind=1`, load stated per row:
+
+| arm | pp-512 | tg-128 short | verdict |
+|---|---|---|---|
+| baseline (no residency) | 156.0 / 159.6 (load 0.88 / 3.03) | **30.3 / 30.3** | reference |
+| `--expert-slots 8` | 161.1 / 148.4 (load 4.73 / 5.37) | **25.0 / 25.0** | **-17% tg** |
+| `--expert-slots 16` | 167.1 / 163.9 | **25.1 / 25.2** | **-17% tg** |
+| `STRATA_KOLIBRI_DEC_RES=1` | 144.9 / 141.8 (load 3.79 / 4.48) | **29.5 / 29.2** | **-3% tg, -10% pp** |
+| `--expert-slots 24` | - | - | **OOM**: `cudaMalloc(&p, n * 2) failed: out of memory` at kolibri_engine.cu:1531 |
+
+**Why the slots path loses, named in the code.** It decides residency by **expert id**, not hotness:
+`if (id < S) ++e.cnt.slot_hits` (line 2001) and `s.slot_ids[k] = id < S ? id : S`.  So `--expert-slots 8` makes
+experts *numbered 0-7* resident, which are not the hot ones - the hit rate is near zero, and what remains is the
+cost of splitting every layer between a GPU side and a CPU-pool overflow side plus the stream sync between them
+(`cudaStreamSynchronize(g_st)` after the slot gemv run).  You pay the bookkeeping and still stream the 1.28 GB.
+The prefill cache learned this lesson already (line 235: "the cache must hold the HOT experts, not ids 0..N-1"),
+and the decode slots path never got the fix.
+
+**Why DEC_RES loses too.** It does seed hot experts, but the seeding costs prefill time (pp-512 drops from ~159 to
+~143, -10%) and the decode gain is negative (-3%).  And it seeds **FP16**, which is the 7.86 MB-per-slot form G4
+was trying to move away from.
+
+**Why the traffic gates cannot be met by a flag either.** `--expert-slots 24` *adds* 2.87 GiB of blob slots on top
+of the FP16 resident cache that is still allocated, and OOMs at 4.74 GiB free.  Freeing the >= 6 GB requires
+**replacing** FP16 promotion with blob promotion, and once the resident experts are blobs the prefill's resident
+leg can no longer use `f16_batched` - it needs the blob multiply, which is the G3 arm measured at 2.39x slower
+than the FP16 leg (9.99 vs 4.18 ms/layer, c77adbfd).
+
+**G4's outcome, stated as a measured ceiling with its priced reason.** On this box, with the residency mechanisms
+that exist, decode residency is not a win: the id-based path misses the hot experts and costs 17% of tg, the
+hot-seed path costs 10% of pp for -3% tg, and the size that would free the VRAM does not fit alongside the FP16 it
+would have to replace.  G4b's diagnosis stands - the after-32K wall is 1.28 GB/token of PCIe at 0% residency - but
+closing it needs two things this campaign does not have: **hotness-based blob residency** and a **blob multiply
+that is not slower than FP16**, i.e. the fused Q4_K kernel G3 could not deliver.
