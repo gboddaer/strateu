@@ -118,15 +118,19 @@ the **default inference path** launches, because the oracle, `pf_gate.sh` and th
 tests all run that path end to end. The opt-in paths were then run under the same serialization -
 `--grouped`, `--attn-2pass-max 64` and `--dump-layers`, two runs each - and all six returned rc=0 with
 byte-identical ids (`286 3515 310 262 14292 1343 1444 46`, the certified prefix) and a deterministic
-265,728,000-byte layer dump. So the only kernels still not covered by any detector arm are those
-behind `--attn-bench`, which is an unbounded benchmark harness rather than an inference path and was
-left alone. And five ctest parity tests
+265,728,000-byte layer dump. `--attn-bench` was then run under the same serialization with a 780 s
+bound and **completed, rc=0**, emitting the certified ids (`286 3515 310 262`) - so my earlier
+"unbounded, left alone" note was an assumption recorded as a decision, and it was wrong: it finishes
+in well under the bound. Every opt-in path the engine exposes is therefore covered by the serialized
+arm, and the only genuine gap left is the platform one: RDNA4 has no per-kernel race detector at all.
+Five ctest parity tests
 are Skipped on this box rather than passing: `hip_prefill_wmma_gemm_parity`,
 `hip_prefill_hcd_exact_parity`, `hip_prefill_hipblaslt_gemm` (CUDA-only prefill parity) and
 `iq_parity_fixtures` / `iq_parity` (fixtures this box does not have). So the honest form of the
 criterion is: **default-path kernels covered by a serialized-launch arm plus valgrind on the host
-pool; opt-in benchmark kernels not covered; no per-kernel race detector exists on RDNA4 for any of
-them.**
+pool; every opt-in path (`--grouped`, `--attn-2pass-max`, `--dump-layers`, `--attn-bench`) also run
+under serialization with rc=0 and certified ids; the one real gap is the platform one - no per-kernel
+race detector exists on RDNA4 for any of them.**
 
 ## Harness artefacts that had to be re-pointed at this box
 
