@@ -245,14 +245,46 @@ anyone reading the table: `needle_e90` uses `quartz-willow-107`, the word the ca
 
 The engine prints no rate, so these are differences between runs that differ only in decode length,
 with the engine's own load line (13.4 s warm) subtracted for prefill. Shape: 512-token prompt
-(`oracle_ids512.txt`), ctx 8192, `--cpu-threads 8`, shipped config.
+(`oracle_ids512.txt`), ctx 8192, `--cpu-threads 8`, `--prefill` (the parallel prefill pool), shipped
+config. Box idle at start: load average 0.08, 89 GiB free, 47 GiB in buff/cache.
 
 | measurement | run1 | run2 |
 |---|---|---|
-| prefill, 512 tokens, load excluded | 43.4 tok/s (11.8 s) | 51.7 tok/s (9.9 s) |
-| prefill, 512 tokens, end to end (load included) | 20.3 tok/s | 22.0 tok/s |
+| prefill, 512 tokens, load excluded | **87.8 tok/s** (5.83 s) | **85.4 tok/s** (6.00 s) |
+| prefill, 512 tokens, end to end (load included) | 26.3 tok/s | 26.2 tok/s |
 | decode, tokens 130-257 (the steady window) | **15.8 tok/s** (8.1 s) | **15.8 tok/s** (8.1 s) |
 | decode, tokens 2-129 (first window after prefill) | 21.3 tok/s | 16.2 tok/s |
+
+### The prefill row was wrong before, and the pool state is why
+
+An earlier version of this table recorded prefill as 43.4 / 51.7 tok/s, derived from an `n=1` run minus
+the load line **with the prefill pool state unstated**. That row matches no arm measured below and is
+superseded; the figures above are the re-measurement. The sweep is four arms, two runs per arm, same
+prompt and ctx, raw wall clock:
+
+| arm | `--n 4` wall | `--n 257` wall | prefill (load excluded) | prefill end to end | decode |
+|---|---|---|---|---|---|
+| `--prefill`, 8 threads | 19.483 / 19.550 s | 35.527 / 35.423 s | **87.8 / 85.4 tok/s** | 26.3 / 26.2 tok/s | **15.8 / 15.9 tok/s** |
+| pool off, 8 threads | 44.089 / 44.215 s | 60.101 / 60.041 s | 16.8 / 16.8 tok/s | 11.6 / 11.6 tok/s | 15.9 / 15.9 tok/s |
+| `--prefill`, 24 threads | 19.961 / 20.384 s | 52.754 / 54.050 s | 84.8 / 79.3 tok/s | 25.6 / 25.1 tok/s | 7.6 / 7.6 tok/s |
+| pool off, 24 threads | 85.744 / 83.977 s | 112.624 / 115.049 s | 7.1 / 7.3 tok/s | 6.0 / 6.1 tok/s | 8.7 / 8.7 tok/s |
+
+Three things follow, none of them visible in a single-arm table.
+
+**The prefill pool is the largest single lever on this box**: 87.8 tok/s with `--prefill` against
+16.8 tok/s without, **5.2x** on the same prompt. The engine prints which pool it used (`prefill pool:
+8 lane(s) = the host + 7 thread(s), 7 pinnable physical core(s), pinned`), so a prefill figure that
+does not say whether the pool was on is ambiguous - which is exactly what happened to the old row.
+
+**`--cpu-threads 24` halves decode**: 15.8 tok/s at 8 threads against 7.6 tok/s at 24. The box is a
+Ryzen 7 5700G - 8 physical cores - so 24 lanes oversubscribe and the decode loop pays for it.
+`pf_gate.sh` runs with `--cpu-threads 24`, which is harmless for a hash gate and a trap for timing;
+the script's own comment already files the `--cpu-threads` choice with the traps of that class.
+
+**Decode is unchanged** - 15.8 tok/s here and 15.8 tok/s in the old row - so the box and the build are
+behaving identically and only the prefill isolation was wrong. The old 11.8 / 9.9 s sits between the
+pool-on (5.8-6.0 s) and pool-off (30.5 s) arms, which is what a partially faulted 42.9 GiB expert
+table would look like; these runs were taken warm, with 47 GiB resident, and are the ones to quote.
 
 Long context, same engine, 8 decode tokens, load subtracted:
 
@@ -268,7 +300,7 @@ because roughly 6 s of fixed cost is spread over only 512 tokens - at 100K that 
 a fit; the T4's OOM at 100K does not reproduce here, at 32 GB, with the expert table in host RAM.
 
 Against the CUDA record (`strateu-campaign-report.md`: prefill 157.0/160.3 tok/s at 512 tokens,
-decode 24.4/24.5 tok/s short context) the AMD path is about 3x slower on short prefill and about
+decode 24.4/24.5 tok/s short context) the AMD path is about 1.8x slower on short prefill (87.8 against 157.0, pool on) and about
 1.5x slower on decode. That comparison needs a caveat: the campaign's table says "wall clock" without
 saying whether its load time was subtracted, and the AMD numbers here are quoted both ways for that
 reason. Decode at long context is not measured yet - each such run is ~16 min - so the CUDA row
@@ -281,7 +313,7 @@ Short shape is `n=257` on the 512-token prompt, so arms compare against the base
 | arm | wall run1 / run2 | verdict |
 |---|---|---|
 | baseline (`RES_TOP=56`) | 39.3 s / 39.3 s | - |
-| `ROPE_F64=1` | 39.6 s / 39.5 s | no measurable cost at this shape (prefill 51.5 vs 51.7 tok/s). RoPE in fp64 is free here, so there is no accuracy-vs-speed trade to argue on this card - it can stay on if it is more accurate |
+| `ROPE_F64=1` | 39.6 s / 39.5 s | no measurable cost at this shape - 0.3 s over a 39.3 / 39.3 s baseline, inside run-to-run spread. RoPE in fp64 is free here, so there is no accuracy-vs-speed trade to argue on this card - it can stay on if it is more accurate |
 | `RES_TOP=24` (vs 56) | 39.3 s / 39.3 s | identical to within 0.01 s - the prefill promotion ceiling makes no difference once residency is off, which is consistent with the `DEC_RES` result above |
 | `DENSE_F16=1` | 39.8 s / 39.9 s | +1.4% over baseline, within run-to-run spread |
 | `RES_TOP=0` | **fails** | `dequant launch: invalid configuration argument` - a zero-sized launch, reproduced on a second run. Not a configuration: the engine has no guard for a zero promotion ceiling. Its 15.3 s wall is time-to-failure, and it emits no `gen:` line, so anyone reading a timing table must not treat it as a fast arm |

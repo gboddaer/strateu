@@ -413,7 +413,7 @@ line here. Box: host `rizo`, Radeon AI PRO R9700 (gfx1201, 32 GB), ROCm 7.2.2, R
 
 | | this box (16 GB T4) | **R9700 (32 GB)** |
 |---|---|---|
-| prefill, 512-token prompt | 157.0 / 160.3 tok/s | **43.4 / 51.7 tok/s** (20.3 / 22.0 end to end) |
+| prefill, 512-token prompt | 157.0 / 160.3 tok/s | **87.8 / 85.4 tok/s** (26.3 / 26.2 end to end; prefill pool on, 8 threads) |
 | prefill, 99,299-token prompt | - | **102.3 / 100.8** (`ATTN_MB=512`), **105.2 / 105.8** (`1024`) |
 | prefill, 127,811-token prompt | - | **94.1 / 94.2** (`512`), **100.4 / 100.8** (`1024`) |
 | decode, short context | 24.5 / 24.4 tok/s | **15.8 / 15.8 tok/s** |
@@ -449,7 +449,7 @@ Against §9.3's list of verdicts that had to be re-derived rather than inherited
 §10's open defect reproduces on HIP: `RES_TOP=0` dies with `dequant launch: invalid configuration
 argument` on gfx1201 too, with no `gen:` line emitted - so its 15.3 s wall is time-to-failure and must
 never be read as a fast arm in any table. `ROPE_F64=1` costs nothing measurable here (39.6 / 39.5 s
-against a 39.3 / 39.3 s baseline, prefill 51.5 vs 51.7 tok/s), and `RES_TOP=24` against 56 is identical
+against a 39.3 / 39.3 s baseline), and `RES_TOP=24` against 56 is identical
 (39.3 / 39.3 s) once residency is off.
 
 ---

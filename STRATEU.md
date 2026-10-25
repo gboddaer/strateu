@@ -29,7 +29,7 @@ engine's own 13.4 s load line; the end-to-end row does not.
 
 | | CUDA box (16 GB T4) | **R9700 (32 GB)** |
 |---|---|---|
-| prefill, 512-token prompt | 157.0 / 160.3 tok/s | **43.4 / 51.7 tok/s** (20.3 / 22.0 end to end) |
+| prefill, 512-token prompt | 157.0 / 160.3 tok/s | **87.8 / 85.4 tok/s** (26.3 / 26.2 end to end; prefill pool on, 8 threads) |
 | prefill, 99,299-token prompt | - | **102.3 / 100.8 tok/s** (`ATTN_MB=512`), **105.2 / 105.8** (`ATTN_MB=1024`) |
 | prefill, 127,811-token prompt | - | **94.1 / 94.2** (`512`), **100.4 / 100.8** (`1024`) |
 | decode, short context | 24.5 / 24.4 tok/s | **15.8 / 15.8 tok/s** |

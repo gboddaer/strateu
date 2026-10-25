@@ -38,8 +38,18 @@ rows subtract the engine's own load line (13.4 s warm); the end-to-end row does 
 
 | # | figure | value | method | load / scope | ledger row | quoted in |
 |---|---|---|---|---|---|---|
-| 18 | prefill, 512-token prompt | **43.4 / 51.7 tok/s** | wall clock, `n=1` run minus the engine's 13.4 s load line | load 90-91 GiB free | "Wall-clock rates on the AMD path" | STRATEU, report §9.6 |
-| 19 | prefill 512, end to end (load included) | **20.3 / 22.0 tok/s** | same runs, nothing subtracted | same | same | report §9.6 |
+| 18 | prefill, 512-token prompt, prefill pool ON, 8 threads | **87.8 / 85.4 tok/s** | wall clock, `--n 4` run minus the engine's 13.4 s load line, `--prefill` passed | idle, load average 0.08, 89 GiB free, 47 GiB buff/cache | "The prefill row was wrong before, and the pool state is why" | STRATEU, report §9.6 |
+| 19 | prefill 512, end to end (load included), pool ON, 8 threads | **26.3 / 26.2 tok/s** | same runs, nothing subtracted | same | same | report §9.6 |
+| 19a | prefill 512, prefill pool OFF, 8 threads | 16.8 / 16.8 tok/s | same shape with `--prefill` omitted (the pool is the 5.2x lever) | same | same | - |
+| 19b | prefill 512 end to end, pool OFF, 8 threads | 11.6 / 11.6 tok/s | same | same | same | - |
+| 19c | prefill 512, pool ON, 24 threads | 84.8 / 79.3 tok/s | same shape, `--cpu-threads 24` | same | same | - |
+| 19d | prefill 512 end to end, pool ON, 24 threads | 25.6 / 25.1 tok/s | same | same | same | - |
+| 19e | prefill 512, pool OFF, 24 threads | 7.1 / 7.3 tok/s | same shape, both arms off | same | same | - |
+| 19f | prefill 512 end to end, pool OFF, 24 threads | 6.0 / 6.1 tok/s | same | same | same | - |
+| 19g | decode, 253-token window, pool ON, 8 threads | 15.8 / 15.9 tok/s | `--n 257` wall minus `--n 4` wall | same | same | STRATEU, report §9.6 |
+| 19h | decode, pool OFF, 8 threads | 15.9 / 15.9 tok/s | same | same | same | - |
+| 19i | decode, pool ON, 24 threads | 7.6 / 7.6 tok/s | same; 24 lanes oversubscribe 8 physical cores | same | same | - |
+| 19j | decode, pool OFF, 24 threads | 8.7 / 8.7 tok/s | same | same | same | - |
 | 20 | decode, short context | **15.8 / 15.8 tok/s** | wall clock, tokens 130-257 of an `n=257` run | same | same | STRATEU, report §9.6 |
 | 21 | prefill, 99,299-token prompt (ctx 105024) | **102.3 / 100.8 tok/s** (`ATTN_MB=512`); **105.2 / 105.8** (`ATTN_MB=1024`) | wall clock, load subtracted | same | "long context, same engine" | STRATEU, report §9.6 |
 | 22 | prefill, 127,811-token prompt (ctx 131072) | **94.1 / 94.2 tok/s** (`ATTN_MB=512`); **100.4 / 100.8** (`ATTN_MB=1024`) | wall clock, load subtracted | same | same | report §9.6 |
