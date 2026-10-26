@@ -666,3 +666,21 @@ Two other audit points, recorded rather than argued away:
 * the "before" column of the agent-turn table is `STRATA_KOLIBRI_REUSE=0` on the fixed binary, not a rebuild of
   the pre-fix tree. That is a substitution, disclosed where the table is published: the pre-fix engine died on
   extending requests, so a pre-fix multi-turn run has no rate to report, only a crash.
+
+### "one-token tail with prompt_read 0" is unsatisfiable, and the measurement says why
+
+The plan's stage 1b asked for a one-token tail that matches a cold read with `prompt_read == 0`. Neither half is
+reachable, and both halves fail for a reason worth recording:
+
+* **`prompt_read` cannot be 0.** The DONE field counts every prompt token the request did not skip, and the reuse
+  guard requires `held < ids.size()`, so the final token is always fed - by the decode step, not the prefill.
+  What can be zero is the PREFILL, and that is what `tools/kolibri/no_prefill_check.py` asserts: reuse 640 of 640,
+  **0 PP lines**, prompt_read 1.
+* **That geometry cannot be bitwise.** Reaching it needs the rewind disabled, and the rewind is exactly what makes
+  a resumed read bitwise: without it the row at the reuse boundary keeps the previous request's single-token
+  decode result instead of being recomputed inside a prefill chunk. Measured with `STRATA_KOLIBRI_REUSE_ALIGN=0`:
+  cold `[4037 262 3480 262]` against warm `[4037 262 7771 11534]`.
+
+So the two requirements are mutually exclusive: with the rewind the prefill always reads at least one chunk, and
+without it the answer stops being bitwise. The delivered gate asserts the reachable properties and prints the
+cold/warm ids with that note rather than pretending the plan's number was met.
