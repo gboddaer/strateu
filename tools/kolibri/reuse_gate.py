@@ -179,13 +179,20 @@ def main():
         reused_n = field(reuse["done"], 8, int)
         read_n = field(reuse["done"], 14, int)
         prompt_ms = field(reuse["done"], 3, float)
-        # The reusable prefix is |pre|, not |pre|+1: the token the previous request produced was sampled and
-        # never fed, so it has no KV row and must be read again.  So the tail that gets read is
-        # own(1) + |tail|, and expecting |tail| alone is what a first version of this gate got wrong.
-        ok = (reused_n == len(pre) and read_n == len(tail) + 1
+        # The counts must add up, and the read must cover the tail plus the token the previous request
+        # produced (sampled, never fed, so it has no KV row) plus at most one CHUNK given back by the rewind
+        # that makes a resumed read bitwise-equal to a cold one.  Asserting that relationship rather than a
+        # fixed number is what keeps this stage honest as the rewind's granularity changes.
+        ext_len = len(pre) + 1 + len(tail)
+        tail_min = len(tail) + 1
+        ok = (reused_n is not None and read_n is not None
+              and reused_n + read_n == ext_len
+              and read_n >= tail_min
+              and read_n <= tail_min + 512
               and prompt_ms is not None and prompt_ms > 0.0)
         record(ok, f"2. accounting   {'PASS' if ok else 'FAIL'}  "
-                   f"(reused {reused_n} of {len(pre)}, read {read_n} of {len(tail) + 1}, prompt_ms {prompt_ms})")
+                   f"(reused {reused_n} + read {read_n} = {ext_len}; read between {tail_min} and {tail_min + 512}; "
+                   f"prompt_ms {prompt_ms})")
 
         # ---- stage 1b: one new token - nothing to prefill, and that must be correct --------------
         stage = "1b. bitwise-1"

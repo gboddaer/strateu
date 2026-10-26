@@ -3683,6 +3683,31 @@ int serve(Engine& e, Scratch& s) {
             // logits 6.8e-01 away in relative terms - structural, not round-off.  Zeroing the flags costs a
             // full window copy once per layer per request, which is what a cold request already pays.
             std::fill(s.kt_ready.begin(), s.kt_ready.end(), (char) 0);
+            // (1) Rewind to the start of the PREVIOUS request's last prefill chunk, so this request's first chunk
+            // starts exactly where a cold read's chunk starts and every row is computed by a GEMM of the same
+            // length.  Two boundaries matter: the row at the reuse boundary (a cold read computes it inside a
+            // large prefill GEMM, a resumed read inherits the previous request's single-token DECODE result) and
+            // the previous request's final chunk, which is SHORT because a prefill stops one token early - a
+            // 3,071-row prefill cuts as 11x256 + 255, so a cold read would then compute positions 2816..3071 in
+            // a 256-row chunk against the resumed arm's 255-row one.  Both differences are a few FP16 ulps and
+            // both disappear when the rows are recomputed in a chunk of the same length.  STRATA_KOLIBRI_REUSE_ALIGN=0
+            // turns it off for an A/B.  Cost: up to chunk-1 tokens read again.
+            if (std::getenv("STRATA_KOLIBRI_REUSE_ALIGN") == nullptr ||
+                std::atoi(std::getenv("STRATA_KOLIBRI_REUSE_ALIGN")) != 0) {
+                const int64_t prev_end = s.pos;   // tokens the previous request consumed (read before we move it)
+                g_pf_total = (int64_t) ids.size() - 1 - (int64_t) reuse;   // the rule keys on the prefix length
+                const int64_t chunk = (int64_t) pf_chunk_at((int64_t) reuse);
+                if (chunk > 1 && prev_end > 1) {
+                    const int64_t aligned = ((prev_end - 1) / chunk) * chunk;
+                    if (aligned > 0 && (size_t) aligned < reuse) reuse = (size_t) aligned;
+                }
+            }
+            // (2) THE PREFILL WRITES AT s.pos, so s.pos must be the reused length before the prefill runs.  After
+            // the previous request s.pos is one PAST the tokens it consumed (its last token went through the
+            // decode path), so leaving it alone made this request write its chunk that much too far: with a
+            // 513-id prefix the resumed prefill wrote 513..521 instead of 512..520, which left position 512
+            // holding the previous request's decode-written K/V and wrote 521 twice.  That was the actual bug.
+            s.pos = (int64_t) reuse;
         } else {
             reset_state(e, s);
             live.clear();
