@@ -538,3 +538,24 @@ Two defects had to be fixed before this number existed, and neither was visible 
 reuse path never set `s.pos`, so the prefill wrote its chunk one position too far (`ee12e9b7`), and a reusing
 request appended its prefix to `live` twice, so the next turn's prefix check failed and reuse worked every
 other turn (`a2996634`).
+
+### What the reuse work did NOT verify on this box
+
+Two gaps, stated so nobody reads the gate as covering them.
+
+**The gate's PF_HASH stage is default-path only.** Running `pf_gate.sh check` with `STRATA_KOLIBRI_PF_PARTIAL=1`
+reports `2. PF_HASH FAIL (differs from 100 recorded lines)` while `3. oracle PASS (BITWISE PASS)` and
+`4. reuse PASS`. That is the gate's reference being recorded on the default path, not a defect: the partial-sums
+knob deliberately changes how the expert leg accumulates, so its per-chunk checksums differ in the last bits while
+the generated ids stay bitwise - which is what Campaign II measured and why the knob is opt-in. `pf_gate` is
+therefore a default-path contract, and its reuse stage is meaningful on either path.
+
+**The full server path was not exercised end to end here.** `run-kolibri1.sh` is the AMD box's launcher: given
+`MODEL`, `CTX` and `PORT` overrides it still refuses this machine, because its card detection finds none
+(`no card matching 'Tesla' was found ... Cards present:`), so it never starts the server. What was verified
+instead, at the boundary that matters: the engine emits `RESUME <n>` before the first `PP` and fills the DONE
+reuse/read fields (measured directly over the protocol: a 522-id request extending a 512-id prefix prints
+`RESUME 512` then `PP 521 522` with the DONE carrying reused 512 / read 10), and `serve/server.py`'s parsing of
+exactly those two fields is covered by `serve/test_request_accounting.py`, which asserts
+`(timings["cache_n"], timings["prompt_n"]) == (5, original - 5)`. The launcher path on a box whose card it
+recognises still owes a two-turn `/v1/chat/completions` run asserting `cache_n > 0`.
