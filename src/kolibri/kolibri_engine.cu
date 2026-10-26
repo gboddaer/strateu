@@ -3604,8 +3604,20 @@ int serve(Engine& e, Scratch& s) {
         // token it had written after the bare prefix).
         const size_t held = std::min<size_t>(live.size(), (size_t) s.pos);
         size_t reuse = 0;
-        if (held > 0 && held < ids.size() && std::equal(live.begin(), live.begin() + held, ids.begin()))
+        if (held > 0 && held < ids.size() && std::equal(live.begin(), live.begin() + held, ids.begin())) {
             reuse = held;
+            // K27b rebuilds each layer's K/V transpose mirror ONCE per REQUEST, on the first decode token,
+            // on the documented assumption that this "also covers everything a prefill wrote".  reset_state()
+            // zeroes kt_ready for exactly that reason (see its K27b comment).  This path skips reset_state -
+            // that is the whole point of reusing - so the flags survived from the previous request and the
+            // first decode token appended ONE row (n_kt = 1, first_kt = s.pos) instead of rebuilding the
+            // window, leaving the rows THIS request's prefill had just written absent from the mirror, so
+            // attention read stale ones.  Measured 2026-10-25 on a 521-id prompt: cold [259 735 12416 46]
+            // against reused [259 923 262 1077] on every one of three processes, with the reused arm's
+            // logits 6.8e-01 away in relative terms - structural, not round-off.  Zeroing the flags costs a
+            // full window copy once per layer per request, which is what a cold request already pays.
+            std::fill(s.kt_ready.begin(), s.kt_ready.end(), (char) 0);
+        }
         else {
             reset_state(e, s);
             live.clear();

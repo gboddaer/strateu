@@ -179,9 +179,13 @@ def main():
         reused_n = field(reuse["done"], 8, int)
         read_n = field(reuse["done"], 14, int)
         prompt_ms = field(reuse["done"], 3, float)
-        ok = reused_n == len(pre) + 1 and read_n == len(tail) and prompt_ms is not None and prompt_ms > 0.0
+        # The reusable prefix is |pre|, not |pre|+1: the token the previous request produced was sampled and
+        # never fed, so it has no KV row and must be read again.  So the tail that gets read is
+        # own(1) + |tail|, and expecting |tail| alone is what a first version of this gate got wrong.
+        ok = (reused_n == len(pre) and read_n == len(tail) + 1
+              and prompt_ms is not None and prompt_ms > 0.0)
         record(ok, f"2. accounting   {'PASS' if ok else 'FAIL'}  "
-                   f"(reused {reused_n} of {len(pre) + 1}, read {read_n} of {len(tail)}, prompt_ms {prompt_ms})")
+                   f"(reused {reused_n} of {len(pre)}, read {read_n} of {len(tail) + 1}, prompt_ms {prompt_ms})")
 
         # ---- stage 1b: one new token - nothing to prefill, and that must be correct --------------
         stage = "1b. bitwise-1"
