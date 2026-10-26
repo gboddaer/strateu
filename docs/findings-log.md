@@ -409,3 +409,38 @@ Two harness facts worth recording, because both cost time here.  The audit needs
 `python3` does not have it (`ModuleNotFoundError: No module named 'regex'`), while `/data2/develop/Strata/.venv/bin/python`
 does - so the audit must be run with the venv interpreter.  And without `--run` the audit skips its own `audit_gen.txt`,
 which is why a first scoring pass appeared to find nothing: the generated answers were on disk but not being read.
+
+## The last prefill chunk rewrites K/V rows at 128-aligned positions (found during the reuse work)
+
+*Measured 2026-10-25/26 on the Tesla T4 box (driver 580.196.07, kernel 6.1.0-52-amd64, numactl node 1,
+`--prefill --cpu-threads 24`, ATTN_FLASH=1). Instrument: `STRATA_KOLIBRI_KV_DUMP` (added in `c978b540`),
+which records one layer's K and V at the first decode step of a request.*
+
+Working the prefix-reuse divergence backwards, layer 0's K/V was dumped for three requests in one process and
+compared row by row (513-row sliding ring, so rows 9..512 map to the same positions in every record):
+
+| comparison | rows that differ |
+|---|---|
+| two requests with the **identical** prompt `ids[:513]` | **none** (0 of 512) |
+| `pos=512` (turn 1) vs `pos=521` cold | 128, 256, 384, 512 |
+| `pos=512` (turn 1) vs `pos=521` reused | 128, 256, 384 (512 correctly identical) |
+
+Two readings matter here.
+
+1. **The engine is deterministic.** The same prompt twice in one process produces byte-identical K/V on every
+   row. So the differences below are not run-to-run noise.
+2. **Rows 128, 256 and 384 change when the final prefill chunk is processed**, even though that chunk writes
+   positions 513..520 and those rows sit far behind it. This happens in the *cold* arm as well as the reused
+   arm, so it is a property of the chunked prefill, not of the reuse path. Every affected row is a multiple of
+   128; no other row moves.
+
+Position 512 differing only in the cold arm is expected and is not a defect: the prefix request writes it
+through the single-token decode path, a cold read writes it inside a prefill chunk.
+
+Consequence for the reuse work: a resumed read cannot be made bitwise-equal to a cold read while the last
+prefill chunk perturbs 128-aligned K/V rows, because the two arms cut their final chunk differently (9 rows
+against 8). The reuse path's own state handover was separately wrong and is fixed in `aa9f0e0e` (a stale K/V
+transpose mirror), which moved the divergence from 6.8e-01 to 2.1e-02 relative at a 512 prefix.
+
+Not yet explained, and the next thing to look at: why a 128-row boundary is special in the K/V write, and
+whether the same perturbation happens for every chunk or only for the final one.
