@@ -291,30 +291,6 @@ def main():
         record(ok, f"4. cancelled    {'PASS' if ok else 'FAIL'}  "
                    f"(cancelled {cancelled}, both STOPs produced {cw['gen']}; after it, reused {re4} of at most "
                    f"{len(ext4)}; cold {cold4['gen']} vs warm {warm4['gen']})")
-        # ---- stage 5 (opt-in mode): a prompt that matches for a while then diverges ------------
-        # STRATA_KOLIBRI_REUSE_PREFIX=1 reuses the longest common prefix instead of demanding a full match, which
-        # is what a real client needs: re-rendering the conversation as text lets a BPE merge across the turn
-        # boundary rewrite the prompt's last token or two.  Covered here because it is a separate code path;
-        # skipped unless the caller opts in, since it needs its own engine process with the knob set.
-        if os.environ.get("STRATA_KOLIBRI_REUSE_PREFIX", "0") != "0":
-            stage = "5. prefix"
-            eng5 = Engine(a.bin, a.model, a.ctx, a.cpu_threads, {"STRATA_KOLIBRI_REUSE_PREFIX": "1"})
-            try:
-                prev = short_pre[:600]
-                nxt = short_pre[:598] + [1234, 5678] + short_pre[600:640]   # agrees on 598, then diverges
-                eng5.resetter(reset_token)
-                cold5 = eng5.send(nxt, 4)
-                eng5.resetter(reset_token)
-                eng5.send(prev, 1)
-                warm5 = eng5.send(nxt, 4)
-                re5 = field(warm5["done"], 8, int)
-                ok = cold5["gen"] == warm5["gen"] and len(cold5["gen"]) == 4 and re5 is not None and re5 > 0
-                record(ok, f"5. prefix       {'PASS' if ok else 'FAIL'}  "
-                           f"(reused {re5} of a 598-id common prefix; cold {cold5['gen']} vs warm {warm5['gen']})")
-            finally:
-                eng5.close()
-        else:
-            record(True, "5. prefix       SKIP  (set STRATA_KOLIBRI_REUSE_PREFIX=1 to exercise the opt-in mode)")
     except EngineHung as e:
         record(False, f"{stage:14s} FAIL  ({e}) - the engine stopped answering; failing instead of hanging")
     finally:

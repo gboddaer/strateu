@@ -82,6 +82,16 @@ else
     echo "  0c. no-prefill FAIL"; sed 's/^/     /' /tmp/pf_gate_noprefill.txt | head -4; rc=1
 fi
 
+# 0d: the opt-in longest-common-prefix mode.  Own process for the same reason as 0c, and it runs even in the
+# default configuration - the knob is set for the child only - so the opt-in code path cannot rot unnoticed.
+if [ "$MODE" = record ]; then
+    echo "  0d. prefix     SKIP  (record mode)"
+elif KOLIBRI_BIN="$BIN" KOLIBRI_MODEL="$M" python3 tools/kolibri/prefix_mode_check.py >/tmp/pf_gate_prefix.txt 2>&1; then
+    echo "  0d. prefix     PASS  ($(grep 'prefix mode:' /tmp/pf_gate_prefix.txt | sed 's/^ *//'))"
+else
+    echo "  0d. prefix     FAIL"; sed 's/^/     /' /tmp/pf_gate_prefix.txt | head -4; rc=1
+fi
+
 run_smoke || exit 2
 if [ "$MODE" = record ]; then cp "$SMOKE" "$EXP_SMOKE"; else
     if cmp -s "$SMOKE" "$EXP_SMOKE"; then echo "  1. ids smoke   PASS  ($(cat "$SMOKE"))"
