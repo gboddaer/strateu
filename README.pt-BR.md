@@ -69,8 +69,26 @@ Este fork também mediu **[Kolibri 1](docs/KOLIBRI1.md)** da Aleph Alpha (Q4_K_M
 | **32K tokens** | 13-14 tokens/s (depende da ligação NUMA) | 119-120 tokens/s |
 | **100K tokens** | — | 97 tokens/s |
 
-Duas execuções por número no binário determinístico bit a bit, carga da máquina anotada; a linha de 100K vem de uma única execução a frio. Especificação da máquina
-e tabelas completas: [o relatório da campanha](docs/strateu-campaign-report.md).
+Duas execuções por número no binário determinístico bit a bit, carga da máquina anotada; a linha de 100K vem de
+uma única execução a frio. Essas linhas foram medidas com 256K de contexto e um cache de especialistas
+**dimensionado à mão**. A versão atual dimensiona o cache sozinha e pode posicionar os especialistas pela frequência
+com que o roteador os escolhe:
+
+- `--expert-slots auto` mede o espaço livre depois dos pesos densos, do KV e do scratch, e ficou com **75
+  slots/camada (8,49 GiB)** em **160K** de contexto, mantendo 700 MiB livres para o runtime do CUDA. Ele imprime a
+  taxa de troca implícita: 1 slot = 114 MiB = 5.857 tokens de contexto, porque contexto e cache disputam a mesma VRAM.
+- `--expert-slots-hot` preenche esses slots pela frequência de roteamento em vez do id do especialista, e
+  `--expert-slots-profile` leva o conjunto aprendido entre reinícios. Neste T4 a taxa de acerto foi de **21,4%**
+  (por id) para **33,4-34,2%** em três prompts diferentes, **37,9%** quando o mesmo prompt se repete e **31,4%** na
+  primeira requisição de uma partida a frio semeada por um perfil salvo - com **24,4-26,3 tokens/s** de decodificação
+  com sampling. Greedy é ~30% mais rápido e entra em laço neste modelo (`Chudnov Chudnov Chudnov ...`), por isso o
+  servidor faz sampling por padrão.
+- O motor aceita **160K** tokens de contexto; a configuração do cliente declara 128K, abaixo disso.
+
+A troca não custa nada no fluxo de tokens, mas custa tempo: promover 57 especialistas custou 6,5 GiB por PCIe em
+~690 ms, pagos entre requisições. A residência move bytes, nunca os altera - os ids gerados foram idênticos nas
+execuções por id, hot e auto. Especificação da máquina e tabelas completas:
+[o relatório da campanha](docs/strateu-campaign-report.md).
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
 <sub>O Strata é gratuito. Se ele roda bem no seu PC, um café ajuda a manter o trabalho nele.</sub></p>

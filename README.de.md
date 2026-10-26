@@ -71,8 +71,24 @@ mit 755 GB RAM für den Experten-Pool gemessen:
 | **32K Token** | 13-14 Token/s (NUMA-Bindung) | 119-120 Token/s |
 | **100K Token** | — | 97 Token/s |
 
-Zwei Läufe pro Zahl auf der bitweise deterministischen Binary, Systemlast angegeben; die 100K-Zeile ist ein einzelner kalter Lauf. Box-Spec und volle
-Tabellen: [der Kampagnenbericht](docs/strateu-campaign-report.md).
+Zwei Läufe pro Zahl auf der bitweise deterministischen Binary, Systemlast angegeben; die 100K-Zeile ist ein einzelner
+kalter Lauf. Diese Zeilen entstanden bei 256K Kontext mit einem **von Hand dimensionierten** Experten-Cache. Der
+aktuelle Stand dimensioniert den Cache selbst und kann Experten danach platzieren, wie oft der Router sie wählt:
+
+- `--expert-slots auto` misst den Platz, der nach den dichten Gewichten, dem KV und dem Scratch übrig ist, und nahm
+  bei **160K** Kontext **75 Slots/Layer (8,49 GiB)** mit 700 MiB Reserve für die CUDA-Laufzeit. Es druckt den
+  Tauschkurs: 1 Slot = 114 MiB = 5.857 Token Kontext, weil Kontext und Cache aus demselben VRAM kommen.
+- `--expert-slots-hot` füllt diese Slots nach Routing-Häufigkeit statt nach Experten-ID, und
+  `--expert-slots-profile` trägt den gelernten Satz über Neustarts. Auf dieser T4 stieg die Trefferquote von **21,4 %**
+  (nach ID) auf **33,4-34,2 %** bei drei verschiedenen Prompts, **37,9 %** beim Wiederholen desselben Prompts und
+  **31,4 %** beim ersten Request eines Kaltstarts aus einem gespeicherten Profil - für **24,4-26,3 Token/s**
+  Dekodieren mit Sampling. Greedy ist ~30 % schneller und läuft auf diesem Modell in Schleifen
+  (`Chudnov Chudnov Chudnov ...`), deshalb sampelt der Server standardmäßig.
+- Die Engine nimmt **160K** Kontext-Token; die Client-Konfiguration deklariert 128K, darunter.
+
+Der Tausch selbst ist im Token-Strom gratis, in der Zeit nicht: 57 Experten zu promoten kostete 6,5 GiB über PCIe in
+~690 ms, bezahlt zwischen Requests. Residency verschiebt Bytes, sie ändert sie nie - die generierten IDs waren im
+ID-, Hot- und Auto-Lauf identisch. Box-Spec und volle Tabellen: [der Kampagnenbericht](docs/strateu-campaign-report.md).
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
 <sub>Strata ist kostenlos. Wenn es auf deinem PC gut läuft, hält ein Kaffee die Arbeit daran am Laufen.</sub></p>

@@ -65,7 +65,20 @@ NVIDIA：Q2_0 用的是引擎 0.1.36，其他各行用的是 0.1.26（4K 回答�
 | **32K token** | 13-14 token/秒（随 NUMA 绑定变化） | 119-120 token/秒 |
 | **100K token** | — | 97 token/秒 |
 
-每一项都在逐位可复现的构建上做两次运行并注明机器负载（100K 一行为单次冷启动运行）。机器规格与完整表格见
+每一项都在逐位可复现的构建上做两次运行并注明机器负载（100K 一行为单次冷启动运行）。这些行是在 256K 上下文、**手工估算**的
+专家缓存下测得的。当前构建自己估算缓存，并且可以按路由器选中频次来放置专家：
+
+- `--expert-slots auto` 测量密权重、KV 与临时缓冲之后剩余的显存，在 **160K** 上下文下取 **75 个 slot/层
+  （8.49 GiB）**，为 CUDA 运行时留出 700 MiB。它还会打印隐含的换算率：1 个 slot = 114 MiB = 5,857 个上下文
+  token，因为上下文与缓存争用同一块显存。
+- `--expert-slots-hot` 按路由频次而不是专家 id 填充这些 slot，`--expert-slots-profile` 把学到的集合跨重启
+  保留。在这块 T4 上，命中率从 **21.4%**（按 id）提升到三个不同 prompt 的 **33.4-34.2%**、同一 prompt 重复时
+  的 **37.9%**，并用保存的 profile 预置冷启动后第一个请求为 **31.4%**——开启采样时解码 **24.4-26.3 token/秒**。
+  greedy 约快 30%，但在这个模型上会退化循环（`Chudnov Chudnov Chudnov ...`），所以服务器默认采样。
+- 引擎接受 **160K** 上下文 token；客户端配置声明 128K，低于该值。
+
+换入换出在 token 流里不花钱，但在时间上要花：晋升 57 个专家在 PCIe 上搬 6.5 GiB、约 690 ms，在请求之间付出。
+驻留只搬字节、从不改变字节——按 id、hot 与 auto 三种运行的生成 id 完全一致。机器规格与完整表格见
 [战役报告](docs/strateu-campaign-report.md)。
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="请我喝杯咖啡" height="50"></a><br>

@@ -69,8 +69,27 @@ Ce fork a aussi mesuré **[Kolibri 1](docs/KOLIBRI1.md)** d'Aleph Alpha (Q4_K_M)
 | **32K tokens** | 13-14 tokens/s (liaison NUMA) | 119-120 tokens/s |
 | **100K tokens** | — | 97 tokens/s |
 
-Deux exécutions par chiffre sur le binaire déterministe au bit près, charge de la machine annoncée ; la ligne 100K vient d’un seul exécution à froid. Spécification
-de la machine et tableaux complets : [le rapport de campagne](docs/strateu-campaign-report.md).
+Deux exécutions par chiffre sur le binaire déterministe au bit près, charge de la machine annoncée ; la ligne 100K
+vient d'un seul exécution à froid. Ces lignes ont été prises à 256K de contexte avec un cache d'experts
+**dimensionné à la main**. La version actuelle dimensionne le cache elle-même et peut placer les experts selon la
+fréquence à laquelle le routeur les choisit :
+
+- `--expert-slots auto` mesure la place restante après les poids denses, le KV et le scratch, puis prend
+  **75 slots/couche (8,49 Gio)** à **160K** de contexte, en gardant 700 Mio libres pour le runtime CUDA. Il imprime
+  le taux de change impliqué : 1 slot = 114 Mio = 5 857 tokens de contexte, car contexte et cache puisent dans la
+  même VRAM.
+- `--expert-slots-hot` remplit ces slots par fréquence de routage plutôt que par identifiant d'expert, et
+  `--expert-slots-profile` conserve l'ensemble appris d'un démarrage à l'autre. Sur cette T4, le taux de réussite est
+  passé de **21,4 %** (par id) à **33,4-34,2 %** sur trois prompts différents, **37,9 %** quand le même prompt se
+  répète et **31,4 %** sur la première requête d'un démarrage à froid amorcé par un profil enregistré - pour
+  **24,4-26,3 tokens/s** en décodage avec sampling. Greedy est ~30 % plus rapide et boucle sur ce modèle
+  (`Chudnov Chudnov Chudnov ...`), c'est pourquoi le serveur échantillonne par défaut.
+- Le moteur accepte **160K** tokens de contexte ; la configuration du client en déclare 128K, en dessous.
+
+L'échange est gratuit dans le flux de tokens mais pas en temps : promouvoir 57 experts a coûté 6,5 Gio sur PCIe en
+~690 ms, payés entre deux requêtes. La résidence déplace des octets, elle ne les change jamais - les ids générés
+étaient identiques dans les exécutions par id, hot et auto. Spécifications de la machine et tableaux complets :
+[le rapport de campagne](docs/strateu-campaign-report.md).
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
 <sub>Strata est gratuit. S'il tourne bien sur votre PC, un café aide à poursuivre le travail.</sub></p>
