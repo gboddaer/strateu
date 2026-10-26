@@ -3683,9 +3683,7 @@ int serve(Engine& e, Scratch& s) {
             // logits 6.8e-01 away in relative terms - structural, not round-off.  Zeroing the flags costs a
             // full window copy once per layer per request, which is what a cold request already pays.
             std::fill(s.kt_ready.begin(), s.kt_ready.end(), (char) 0);
-        }
-        }
-        else {
+        } else {
             reset_state(e, s);
             live.clear();
         }
