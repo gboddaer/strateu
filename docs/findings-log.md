@@ -731,3 +731,371 @@ never during one.  The generated ids were identical in the id-ordered, the hot a
 allocated, keeping `--vram-reserve-mib` (default 700) clear for the CUDA runtime.  At 160K it chose 75 slots/layer
 from 9,501 MiB free and printed the exchange rate: 1 slot = 114.4 MiB = 5,857 context tokens at 20.0 KB/token.
 Not measured: a session long enough for the hot set to drift, and any GPU other than this T4.
+
+## Dynamic expert cache 0.1 — the hit rate does not drift inside a request: flat in both phases, both arms, two prompts
+
+The plan (`docs/superpowers/plans/2026-10-26-kolibri-dynamic-expert-cache.md`) asked whether the resident set that the
+prompt's first tokens chose is still the right one at token 480, and named a stop rule: **flat in both phases, and the
+whole idea has nothing to capture.**  This is that measurement, and the answer is flat.
+
+**Provenance.**  T4 16 GB at PCI `82:00.0` (`numa_node 1`), driver 580.196.07, kernel 6.1.0-52-amd64, Kolibri-1-Q4_K_M,
+`--prefill --cpu-threads 24 --ctx 163840 --expert-slots auto` = 75 slots/layer (8.38 GiB), `GGML_CUDA_DISABLE_GRAPHS=1`,
+12,000-token prompts (24 prefill chunks of 512), 256 decode tokens.  Every cell below is **two runs**; the two runs
+produced byte-identical generated ids and byte-identical traces, so the table is one number and not an average of
+noise.  Co-running on the box: three idle QEMU guests, `btop`, the agent harness; load average 6.8-15.2 across the
+runs (the 1-minute average includes the previous engine run's own tail), and no other GPU tenant (`nvidia-smi`
+0 MiB before the first run).  Hit rates are counter ratios over routed picks, not rates.
+
+**The step's premise was wrong, and the reason is measurable.**  It said the prefill curve is free from the existing
+`PFHASH` lines.  It is not, for three separate reasons: (1) `PFHASH`'s `res`/`miss` are the **fp16 LRU cache's**
+(`b.f16_slot_id`, `STRATA_KOLIBRI_EXPERT_F16`), which is a different cache from the expert-slot map and is off by
+default, so on the shipped config those lines do not exist; (2) `PFHASH`'s `chunk=` is `e.pf_chunks`, which increments
+**per layer** (inside the pool block, under `--counters`), so "aggregate by chunk across layers" would have counted
+1200 pseudo-chunks in this run; (3) the prefill expert leg never consults `slot_of` — it is referenced only on the
+decode path — so there is no prefill hit rate to read.  Two gated instruments were added instead
+(`STRATA_KOLIBRI_SLOTTRACE`: one line per (chunk, layer) with that chunk's picks and how many land on a resident
+expert per `slot_of`; `STRATA_KOLIBRI_HITTRACE`: one line per decoded token with its own hit/miss split).  Both are
+off unless the variable is set, so the default path prints what it printed before.
+
+| arm (prompt A, 12K tokens) | phase | mean hit rate | slope | range |
+|---|---|---|---|---|
+| empty profile (id-ordered seed) | prefill, by 512-token chunk | 21.02% | -0.022%/chunk | 20.3-21.6% |
+| empty profile | decode, per 32 tokens | 20.07% | +0.051%/bucket | 19.6-20.4% |
+| seeded `/tmp/kolibri_hot.prof` | prefill, by chunk | 25.72% | -0.015%/chunk | 24.5-27.3% |
+| seeded | decode, per 32 tokens | 24.84% | -0.188%/bucket | 23.9-25.4% |
+
+| arm (prompt B, a different 12K prompt) | phase | mean | slope | range |
+|---|---|---|---|---|
+| empty profile | prefill | 20.70% | -0.018%/chunk | 20.1-21.4% |
+| empty profile | decode | 21.15% | +0.011%/bucket | 19.9-22.3% |
+| seeded | prefill | 26.39% | -0.022%/chunk | 24.2-29.1% |
+| seeded | decode | 23.93% | -0.643%/bucket | 21.4-26.9% |
+
+What the four cells say:
+
+* **No cell rises.**  The largest positive slope anywhere is +0.051 points per 32 tokens (0.4 points over 256 tokens),
+  which is the size of the noise between adjacent buckets.  There is no token 480 at which the resident set has
+  become wrong and a round would fix it.
+* **The only non-flat signal has the wrong sign.**  The seeded decode arm *declines*: 24.8% -> 22.4% over the 256
+  decoded tokens of prompt B (slope -0.64/bucket) and 25.4% -> 23.9% on prompt A.  The profile's set is hottest at
+  the start of a generation and cools.  A mid-request round buys nothing from a cooling curve; it would pay 11.7 ms
+  per expert to chase a target that is moving away.
+* **The empty arm can only be flat.**  By id, 75 of 384 is 19.5%, and the measured 20-21% is that floor plus router
+  skew — the set is not a bet on anything, so its flatness says nothing on its own.  The informative arm is the
+  seeded one, and it is flat too.
+* **The seeded arm's level differs from the published one** (25.7-26.4% here against 33.4-34.2% on the three
+  512-token prompts of the cache entry above).  Same profile, same slot count: the prompts differ.  The 12K pair
+  simply routes more diffusely, which is worth knowing before quoting either number.
+
+**Consequence.**  Chunk-boundary rounds (plan Phase 1B) lose their premise here: they existed to follow a rising
+prefill trajectory, and the prefill trajectory is flat to within 1.5 points over 24 chunks in both arms.  Per-layer
+residency (1A) is *not* killed by this measurement — its case is uneven demand *between* layers, not drift *within*
+a request — and 0.5 is where that is decided.
+
+Prefill throughput on these runs, for scale: 12,000 tokens in 138.6/142.1 s (86.6/84.4 tok/s) on prompt A and
+83.9-85.7 tok/s on prompt B, against the 512-token floor of 179.8 tok/s.  Not measured here: an agent-turn shape
+(six turns, growing prefix) and sampled rather than greedy decode; both are 0.4's.
+
+## Dynamic expert cache 0.2 — a swap round runs at ~10 GB/s whatever its size or shape, so batching does not close the gap, and at a token boundary even one expert costs 30% of a token
+
+The plan's round is "N experts across all 50 layers" (1 expert = 114.4 MiB).  This measures what such a round costs when
+it is inserted at the two boundaries a round could use, in the two shapes the plan proposes, synchronously and on a side
+stream joined at the next boundary.
+
+**Provenance.**  Same box and build as 0.1 above: T4 (`numa_node 1`), driver 580.196.07, kernel 6.1.0-52-amd64,
+`--expert-slots auto` = 75 slots/layer, `--prefill --cpu-threads 24`, profile-seeded, 2048-token prompt (8 chunks of
+256), 128 decode tokens, `GGML_CUDA_DISABLE_GRAPHS=1`.  **Two runs per shape**, four samples per cell (two rounds of each
+size per run at the chunk site, 64 per cell at the token site); the table reports medians of two runs.  Box load 3.9-8.6
+before the runs (three idle QEMU guests, `btop`, this agent), no other GPU tenant.  The probe
+(`STRATA_KOLIBRI_DYN_PROBE`, off unless set) copies into a private buffer, never into a slot, so a probe run cannot
+change a result; sizes 1/4/8/16 are cycled one per boundary.
+
+| experts | bytes | sync at a chunk boundary | sync at a token boundary | side stream, GPU time | GB/s |
+|---|---|---|---|---|---|
+| 1 | 120.0 MB | 12.4 ms | 12.3 ms | 12.4 ms | 9.7-10.2 |
+| 4 | 479.8 MB | 50.0 ms | 49.4 ms | 50.8 ms | 9.4-10.1 |
+| 8 | 959.6 MB | 100.5 ms | 98.6 ms | 101.5 ms | 9.5-9.8 |
+| 16 | 1919.2 MB | 201.9 ms | 198.5 ms | 202.1 ms | 9.5-9.8 |
+
+**Batching changes nothing.**  One copy per (layer, expert) — 50 x N copies of one stride — and one copy per layer of
+N x stride (consecutive expert blobs are contiguous in the pinned table) land in the same band: 12.4/49.0/98.8/198.1 ms
+against 12.4/50.0/100.5/201.9 ms, i.e. 9.9-10.3 GB/s against 9.8-10.2 GB/s.  Nor does size help: the rate is the same
+for a 120 MB round and a 1.9 GB one.  So the gap the plan hoped to recover (10.2 -> 12.2 GB/s) is **not** per-copy
+launch overhead on this path — a `cudaMemcpyAsync` from pinned host into a `cudaMalloc` device buffer sits at ~10 GB/s
+here at every size from 2.4 MB to 1.9 GB.  The 12.2 GB/s figure is the CPU pool's own benchmark of this link
+(`findings-log:197`), a different transfer shape, and it should not be used as a ceiling for this path.
+
+**The two sites differ by an order of magnitude, and only one of them can hide a round.**
+
+| round | as % of a 41 ms decode token (24.4 tok/s) | as % of a 2.8-3.3 s prefill chunk |
+|---|---|---|
+| 1 expert | **30%** | 0.4% |
+| 2 experts (`--dyn-budget` default) | **60%** (extrapolated from 1 by linearity; not measured) | 0.8% |
+| 4 experts | 120% | 1.5% |
+| 8 experts | 241% | 3.2% |
+| 16 experts | 484% | 6.1% |
+
+At a **chunk** boundary the side-stream join added **0.0 ms of wait in all 16 cells** — the copy has 2.9-3.4 s of the
+next chunk's work to land inside, and it needs at most 202 ms.  At a **token** boundary there is nothing to hide behind:
+`forward()` ends with `cudaDeviceSynchronize`, and even without it the next token's picks read the very slot table the
+round is writing, so the round is inserted latency, not overlap.  The probe's stream-mode "wait 0.0 ms" at the token
+site is *not* evidence of hiddenness — the probe's own synchronous round ran first and absorbed the wait; the clean
+number for that site is the synchronous column.
+
+**Consequence.**  The plan's decision gate asks for a round under 10% of a *token* with overlap.  At the token boundary
+that fails at every size, including the smallest (30%); the plan's own abandonment rule ("a round costing >20% of a
+token") fires there.  At the chunk boundary the cost test passes comfortably for every size — but 0.1 measured a flat
+prefill trajectory in both arms, so there is nothing for a chunk-boundary round to chase.  Between the two, 1B has a
+site where it is affordable and no reason to run, and a site where it has a reason and cannot afford it.
+
+## Dynamic expert cache 0.3 — residency DOES change values across the pool/GPU boundary: one expert's leg flips the generated ids at token 8, and the by-id vs profile pair already flips at token 5
+
+The plan states an invariant — "residency moves bytes, it does not change them" — and makes it the basis of every bitwise claim in the work.  This measures it per leg.  It does not hold for the pair that matters, and the published sentence that says it does was measured on too few tokens.
+
+**Provenance.**  Same box/build as 0.1/0.2.  `--dump-full-logits` on a 12,000-token prompt with 64 decoded tokens, `--prefill --cpu-threads 24` (the shipped server shape), `--ctx 163840`; unless stated, `--expert-slots auto` = 75 slots/layer.  Arms: **A** no cache at all (`--expert-slots 0`, every pick through the CPU pool), **B** id-seeded (experts 0-74 resident), **C** profile-seeded (`/tmp/kolibri_hot.prof`), **D** the same profile with **exactly one** entry changed — expert 298 (the hottest, 6,496 picks) replaced by 383 (count 0, never picked), so the only difference from C is that 298 is served from the pool instead of a slot.  Plus two controls: **B2** a repeat of B, and **P/Q** the same pair of residency arms with the CPU pool switched OFF (`--cpu-threads` omitted), on the 512-token prompt without `--prefill`.
+
+| comparison | what differs | max abs logit diff | mean abs diff at step 0 | first diverging generated id | argmax flips / 64 |
+|---|---|---|---|---|---|
+| B vs B2 | nothing (repeat run) | 0 | 0 | none | 0 |
+| **P vs Q** | residency, **no CPU pool**: slot blob vs pinned table, both `gemv` on fp32 h | **0 (bytewise)** | 0 | none | 0 |
+| A vs B | 75 residents vs none, pool on | 25.10 (step 61) | 0.237 | token 57 | 7 |
+| B vs C | id-seeded vs profile-seeded, pool on | 25.05 (step 61) | 0.477 | token 5 | 59 |
+| **C vs D** | **one expert (298): slot vs pool**, pool on | 23.98 (step 58) | 0.855 | **token 8** | 53 |
+
+Every row is one process per arm; the repeat arm (B2) reproduced B's dump byte for byte, so run-to-run determinism is not the explanation for any row.  Box load 2.3-5.6 before each run, three idle QEMU guests, no other GPU tenant (nvidia-smi 0 MiB).
+
+**The invariant holds between the two device legs and fails across the pool boundary.**  With the CPU pool off, moving 75 experts from the pinned table into VRAM slots changes nothing — P and Q are byte-identical over 64 dumped logit rows.  With the pool on, the same expert's bytes produce different logits depending on which side serves it, because the two sides do not do the same arithmetic: the slot leg runs `gemv(gu, s.h, ...)` on the **fp32** hidden state against the device blob (`:2100-2103`), while the pool leg ships `s.h` to the host, quantizes it with `native_quant_act(b.fmt, s.h_host, s.act)` to **q8_1** and runs `native_mmvq` (`:2141-2146`).  So the plan's sentence "both through `native_mmvq` on the same bytes" is not what the code does, and the leg hazard it names as "may round differently" is not a possibility — it is a measured, repeatable difference.
+
+**One expert is enough.**  Row C vs D is the plan's own 0.3 test: one expert forced slot-resident against the same expert forced pool-resident, everything else identical.  The logits differ from the very first generated position (mean |Δ| 0.855 over the 128,000-entry vocabulary), and greedy decoding amplifies that into a different generated id by token 8 and 53 of 64 argmax flips.  The amplification, not the first difference, is what makes this fatal for a bitwise gate: any residency change that crosses the pool boundary will eventually flip an id on a long enough generation.
+
+**Correction to "Expert-cache residency: by hotness instead of by id" (this log, earlier).**  That entry ends "The generated ids were identical in the id-ordered, the hot and a 75-slot `auto` run (`gen: 4688 4688 4688 4688`), so the change moves bytes without changing them."  The measurement was four generated ids on a 31-token prompt.  Re-run at the same shape — a 128-token prompt, 16 generated ids, the same by-id vs profile pair, pool on — the two arms differ from the **second** generated id (`58 127907 ...` against `58 4037 ...`).  The sentence should read: the two **device** legs are bitwise equal, and any residency change that moves a pick across the pool boundary changes the values.  The rest of that entry stands.
+
+**Consequence for the plan.**  The 0.3 gate is explicit — "id flips = in-request rounds are permanently off" — and it fires, on top of 0.1 (no trajectory) and 0.2 (30% of a token for one expert at a token boundary).  It also changes what Phase 1A can promise: "assert generated ids identical to the by-id run" is **not achievable** while the CPU pool serves the misses, because id-seeded and profile-seeded residency already disagree today.  The assertion 1A can carry is the one measured here: same residency, same ids (and the device legs are bitwise), with the cross-leg difference stated openly instead of asserted away.
+
+## Dynamic expert cache 0.5 — the same 75 slots buy 29.9% as one global set and 69.3% as 75 per-layer sets: per-layer residency is the branch
+
+The plan's Phase 1A is a per-layer residency map — 75 experts chosen for each of the 50 layers instead of one set of 75
+shared by all of them.  Storage is already per layer (`e.blobs.resize(n_layers)`, one `cudaMalloc` per layer); only the
+single global `slot_of` (`:3750`) forces one set everywhere.  This measures what the shape is worth, and the answer is
+large.
+
+**Provenance.**  Same box/build as 0.1-0.3: T4 (`numa_node 1`), driver 580.196.07, kernel 6.1.0-52-amd64,
+`--expert-slots auto` (75 slots/layer, 8.38 GiB), `--prefill --cpu-threads 24 --ctx 163840`, 12,000-token prompt A
+(two runs) and the unrelated 12,000-token prompt B (one), `GGML_CUDA_DISABLE_GRAPHS=1 STRATA_KOLIBRI_EXPERT_HIST=1
+STRATA_KOLIBRI_SLOTTRACE=1 --counters`.  The two runs of prompt A produced identical coverage lines to the last digit,
+so the table is one number per cell.  Box load 7.4-10.5 before the runs, three idle QEMU guests, no other GPU tenant.
+Coverage is the fraction of the layer's routed picks that the resident set serves — a counter ratio, not a rate.
+
+**Per-layer hit rate against today's single global set** (prompt A, profile-seeded, prefill):
+
+| statistic over the 50 layers | value |
+|---|---|
+| min | 12.7% (layer 26) |
+| q1 / median / q3 | 19.4% / 23.2% / 29.3% |
+| max | 78.0% (layer 1) |
+| spread max/min | 6.1x |
+| layers under 20% | 14 of 50 |
+
+The same table on prompt B: min 12.2%, median 20.1%, max 34.8%, spread 2.9x, 25 of 50 layers under 20%.  So the one
+global set is not "slightly wrong everywhere": it gives layers 0-1 three quarters of their picks and starves a third
+of the layers.  A per-layer budget would move the slots the starved layers are not using to the layers that want them,
+at zero VRAM.
+
+**The head-to-head, same VRAM, same touches.**  Both arms are oracles on this workload's own per-layer histograms (the
+quantity `--expert-slots-hot` already learns), so the comparison isolates the *shape* and nothing else:
+
+| arm | prompt A | prompt B |
+|---|---|---|
+| one global set of 75 experts (today's scheme: `hot_cnt` has no layer dimension) | **29.9%** | **29.6%** |
+| 75 experts chosen per layer | **69.3%** | **70.0%** |
+
+Per-layer top-K coverage for scale, averaged over the 50 layers (prompt A): top-64 65.2%, top-75 69.3%, top-80 71.0%,
+against the 19.5% uniform line for 75/384.  Per-layer spread at top-24: min 24.7%, median 41.8%, max 97.9%.
+
+**Verdict.**  Per-layer selection closes **56%** of the gap between the global set and a perfect one
+((69.3-29.9)/(100-29.9)), and 59% of the gap against the set that ships today ((69.3-25.7)/(100-25.7)) — the plan's own
+criterion ("per-layer selection capturing most of the gap the global set leaves") is met, and met by a wide margin on
+both prompts.  The 29.9% global figure is itself higher than the 25.7% the *shipped* profile achieves on the same prompt,
+which is the expected direction: the oracle global set knows this prompt, the shipped one was learned elsewhere.
+
+Two honest limits.  These are oracle ceilings on prefill touches, not the value a *learned* per-layer histogram will
+deliver: a stale per-layer set will land below 69.3%, and how far below is what the implementation's own measurement
+has to report.  And 0.1's flat trajectory is what makes a *learned* per-layer set plausible at all — the distribution
+does not drift inside a request, so a set learned from the previous request's histogram should still be approximately
+right for the next one.  If 0.1 had shown drift, this oracle would be measuring a ceiling nobody could reach.
+
+## Dynamic expert cache 0.4 — the baseline on this box today: 43.7 s against 113.3 s over six agent turns, 22.8% hit at 22.1 tok/s greedy, 15.9 tok/s end-to-end sampled
+
+Every later claim in this campaign is a comparison against these numbers, so they are stated here with their shape.
+
+**Provenance.**  Same box and build as 0.1-0.3: T4 16 GB (`numa_node 1`, `82:00.0`), driver 580.196.07, kernel
+6.1.0-52-amd64, `GGML_CUDA_DISABLE_GRAPHS=1`, `--prefill --cpu-threads 24`, `--expert-slots auto` = 75 slots/layer,
+`--ctx 163840` unless noted.  Three idle QEMU guests plus `btop` and this agent were co-resident throughout; load
+average 4.7-9.4 before the runs (1-minute figure, which includes the previous engine run's tail), and `nvidia-smi`
+showed no other GPU tenant.  Every row is two runs.
+
+**Agent turns** (`tools/kolibri/agent_bench.py`, six turns, 384 id-chunk per turn, 8 generated per turn, ctx 33024):
+
+| prefix reuse | run | wall over six turns | prompt tokens reused | prompt_ms per turn |
+|---|---|---|---|---|
+| on (default) | 1 | **43.7 s** | 5376 of 8184 | 5205, 7186, 5744, 7851, 5795, 8305 |
+| on (default) | 2 | **43.8 s** | 5376 of 8184 | 5594, 7254, 5725, 7813, 5808, 7969 |
+| `STRATA_KOLIBRI_REUSE=0` | 1 | **113.3 s** | 0 of 8184 | 5281, 10052, 15453, 21263, 26467, 32090 |
+| `STRATA_KOLIBRI_REUSE=0` | 2 | **116.2 s** | 0 of 8184 | 5285, 10414, 15792, 21504, 26815, 32821 |
+
+2.6x, and the read rate is flat across turns (66-77 tok/s) on both arms, which is what says the gain is the reuse and
+not a warm-up effect.  65.7% of the prompt tokens are reused; the rest is the new chunk plus the reply.
+
+**Engine's own decode, hot cache, greedy, 512-token fixture, 128 generated** (two processes, two requests each, the
+profile the finished server sessions had learned, `--counters`):
+
+| run | prompt_ms | pp tok/s | decode ms | decode tok/s | hits / picks | hit rate | expert PCIe |
+|---|---|---|---|---|---|---|---|
+| 1, request 1 | 7209 | 71.0 | 5786 | **22.12** | 8768 / 38400 | 22.8% | 554.5 MB/tok |
+| 1, request 2 | 6986 | 73.3 | 5777 | **22.16** | 8768 / 38400 | 22.8% | 554.5 MB/tok |
+| 2, request 1 | 9113 | 56.2 | 5894 | **21.72** | 8768 / 38400 | 22.8% | 554.5 MB/tok |
+| 2, request 2 | 8992 | 56.9 | 5883 | **21.76** | 8768 / 38400 | 22.8% | 554.5 MB/tok |
+
+Three things to read carefully.  The hit rate is identical across requests because the set was already the one this
+prompt had taught (`slots_reselect` had nothing left to move); it is the same-prompt-learned case, not a cold start.
+The two processes' **pp differs by 30%** (71.0/73.3 against 56.2/56.9 tok/s) on the same code, prompt and config —
+that is this box's prefill variance under a background load, and it is why a single run is not a rate.  And the pp here
+is **not** the 179.8 tok/s the release notes quote: that figure is `STRATA_KOLIBRI_PF_PARTIAL=1` (opt-in, `KOLIBRI1.md`
+:117).  With the knob off, on this box today, pp-512 is 56-73 tok/s.  Decode is likewise below the quoted 24.4 tok/s
+(21.7-22.2 measured), same reason and same direction.
+
+**The product path, sampled** (server on `:8080`, the config in `/tmp/kolibri_server.json`: temperature 0.7, top_p 0.9,
+min_p 0.02, top_k 20, rep 1.05, `STRATA_KOLIBRI_REUSE_PREFIX=1`), 942-token prompt, 128 generated, two requests:
+
+| request | wall | server tok/s (end-to-end) | hit rate |
+|---|---|---|---|
+| 1 | 21.2 s (cold: model already loaded, first request) | 15.8 | 25.9% |
+| 2 | 8.1 s | **15.9** | 24.0% |
+
+The server's number is end-to-end (it includes the prefill), so it is not comparable with the `decode tok/s` column
+above — which is exactly why the plan asked for both: the harness measures greedy decode, the product samples and pays
+prefill per turn.  Sampling costs ~28% of greedy decode here (15.9 against 22.1 is mostly the prefill, not the sampler:
+at 942 prompt tokens and 8.1 s, ~5.5 s of the request is decode = 23.2 tok/s, close to greedy).
+
+**What the numbers fix for the rest of this campaign.**  The hit-rate bar to beat on this box, measured the same way and
+on the same day, is 22.8% on the 512-token fixture with a learned set, not the 37.9% the release notes quote from a
+31-token prompt; and the decode bar is 21.7-22.2 tok/s greedy, 15.9 tok/s end-to-end sampled.  A per-layer cache that
+raises the hit rate has to do it against *these*, and its decode must not fall below them — the published figures are
+from a different config and would flatter or punish the change for reasons that have nothing to do with it.
+
+## Dynamic expert cache 1A — per-layer residency, opt-in: 34.8% -> 81.5% on the second request, 67.8% on a 12K prompt against a 69.3% oracle, at the same promotion bytes and no decode regression
+
+Phase 0's decision gate (below) chose 1A.  This is what it is worth, measured with the same instruments and the same
+box as the steps that chose it.
+
+**What was built** (`src/kolibri/kolibri_engine.cu`, `--expert-slots-per-layer` / `STRATA_KOLIBRI_SLOTS_PER_LAYER=1`,
+default **off**):
+
+* `slot_of` and `hot_cnt` gain a layer row: `n_layers x n_expert` entries instead of `n_expert`, indexed through
+  `Engine::hot_idx(l, id)` at the routing site and at the histogram increment.  With the knob off the index is `id` and
+  the arrays are `n_expert` long, so the default path evaluates exactly the code it did before.
+* `alloc_slots` seeds **per layer** (`seeds[l]`, each topped up in id order as before) and fills each layer's device
+  table from its own list; `slot_promote_layer` moves **one layer's** blob (one stride, 2.21 MB) as the per-layer
+  equivalent of `slot_promote`'s 50-layer move.
+* `slots_reselect` re-picks **per layer** from that layer's histogram row, keeps every still-hot expert's slot number
+  (the no-churn rule, unchanged), and publishes the new map before the synchronous copies.  The re-selection line
+  reports the per-layer map and its real byte count.
+* The profile grows a layer column (`# ... profile v2`, then `layer id count`) and **both formats are read**:
+  a v1 `id count` file seeds every layer with the same global order (exactly what the single-set cache did with it),
+  and a v2 file read with the knob **off** is reduced by summing counts over layers.  The knob-off writer still emits
+  v1, so that path's profile stays byte-identical too.
+
+**Provenance.**  T4 16 GB (`numa_node 1`, PCI `82:00.0`), driver 580.196.07, kernel 6.1.0-52-amd64,
+`GGML_CUDA_DISABLE_GRAPHS=1 --prefill --cpu-threads 24 --expert-slots auto` (75 slots/layer, 8.38 GiB), serve protocol,
+128 generated tokens per request, no prefix reuse.  Each session is a fresh process with an **empty** profile, so the
+first request starts from the id-ordered seed (20.2%) and the second is the first one that can show what was learned.
+**Two independent cold-start runs per arm**; the hit-rate columns reproduced to the digit, the decode columns did not
+(see the load line).  Box load 0.4-1.8 before each session, three idle QEMU guests, `btop` and this agent co-resident,
+`nvidia-smi` 0 MiB before every session.  Hit rates are counter ratios over routed picks; `pp` is the engine's own
+`prompt_ms`, `tok/s` its own `decode_ms`.
+
+| run | arm | req1 (id seed) | req2 (learned) | req3 | decode tok/s (req1/2/3) | pp tok/s |
+|---|---|---|---|---|---|---|
+| 1 | global set (knob off) | 20.2% | 34.8% | 34.5% | 22.49 / 22.58 / 22.23 | 68.6-73.3 |
+| 1 | **`--expert-slots-per-layer`** | 20.2% | **81.5%** | **89.4%** | 22.62 / 22.05 / 21.88 | 75.3-78.1 |
+| 2 | global set (knob off) | 20.2% | 34.8% | 34.5% | 17.30 / 17.35 / 17.20 | 68.4-71.9 |
+| 2 | **`--expert-slots-per-layer`** | 20.2% | **81.5%** | **89.4%** | 21.04 / 20.47 / 20.38 | 75.5-80.0 |
+
+| what | global set | per layer |
+|---|---|---|
+| experts made newly resident after request 1 | 56 | **2,783** (one layer each) |
+| bytes over PCIe for that re-selection | 6,406 MiB | **6,364 MiB** |
+| wall time for it | 680 / 726 ms | **682 / 689 ms** |
+| hit rate after it (req2) | 34.8% | **81.5%** |
+
+The promotion table is the change's whole economic case in one place: **the same bytes and the same milliseconds buy 50
+times as many promotions**, because a per-layer move is 2.21 MB against 114.4 MiB.  That is why the hit rate moves so
+much for free, and why 1A needed no mid-request machinery at all.
+
+**The 12K prompt, where the choice was actually made.**  Same prompt as 0.1 and 0.5, cold start, per-layer arm:
+**19.9% -> 67.8%** on the second request (19,200 picks each), with a re-selection of 2,721 layer-moves = 6,215 MiB in
+665 ms.  0.5's oracle for this prompt was 69.3%, so the *learned* map lands within **1.5 points of its own ceiling** —
+the gap that 0.5 predicted would be captured is captured.  For scale: the shipped global set on the same prompt was
+25.7% when seeded from an unrelated profile and 21.0% from the id seed (0.1).
+
+**Persistence.**  A second process loading the v2 profile written by the first run started at **84.7%** and reached
+**91.5%** on its second request — so the layer dimension survives a restart and a warm start does not have to relearn.
+
+**Decode does not regress, and does not improve either.**  Across both runs the per-layer arm reads 20.4-22.6 tok/s and
+the global arm 17.2-22.6; the two arms swapped places between runs and the values followed the box load, not the knob
+(run 2's global arm was measured at load 1.83 and the per-layer arm at load 0.97 twenty minutes later).  The honest
+statement is the one the box supports: **no regression attributable to the per-layer map** (the same binary, the same
+session shape, 22.1/22.2 in the 0.4 baseline), and no gain — on this box the CPU pool is the fast leg, so a hit that
+moves a pick from the pool to a VRAM slot buys PCIe traffic, not time.
+
+**What 1A does not claim.**  It does not make generated ids equal to the by-id run, and cannot: 0.3 measured that any
+residency change across the pool/GPU boundary flips ids, and the by-id vs profile pair already disagrees.  What holds is
+what the controls measured: same residency and same configuration give byte-identical output (repeat runs identical),
+and the two **device** legs are bitwise equal.  The knob adds no new leg, so it adds no new bitwise surface — it changes
+*which* picks take the existing ones, exactly as `--expert-slots-hot` already does.
+
+**Left alone on purpose.**  The invariant comment at `:3787-3788` is unchanged: it says the copies are synchronous and
+the slot contents must not change under a running kernel, and 1A keeps both true (this is between requests, with a
+`cudaDeviceSynchronize` before the copies).  The rewrite the plan asks for belongs to 1B, which is not being built
+(see the decision below).  Phase 2 and Phase 3 stay out of scope: no per-layer *budget* (each layer still gets the same
+75 slots), no decode-site or in-request rounds.
+
+## Dynamic expert cache — the decision, and the two numbers that could not be used
+
+The plan's gate between Phase 0 and Phase 1 reads: if 0.5 shows per-layer selection capturing most of the gap, build 1A;
+else if 0.2 shows a round under 10% of a token with overlap, build 1B; else stop.  With the five Phase 0 measurements
+in hand (`0.1`-`0.5` above), the gate resolves as follows.
+
+| step | measured | what it decides |
+|---|---|---|
+| 0.1 trajectory | flat in both phases, both arms, both prompts (prefill slope -0.015/-0.022 %/chunk; decode +0.011 down to -0.643 %/bucket) | there is no within-request drift for a round to follow |
+| 0.2 round cost | 12.3 ms per expert; **30% of a decode token** at a token boundary, 0.4% of a chunk at a chunk boundary; batching does not change the 9.8-10.3 GB/s rate | a token-site round fails the <10%-of-a-token test at every size, including 1 |
+| 0.3 leg sensitivity | one expert's slot-vs-pool change flips ids at token 8 (53/64 argmax flips); the by-id vs profile pair flips at token 5; the two device legs are bitwise | **in-request rounds are permanently off** (the plan's own rule) |
+| 0.4 baseline | 43.7 s vs 113.3 s over six agent turns; 22.1 tok/s greedy decode; 22.8% hit; 554.5 MB/tok | the bar this box can actually hold a change to |
+| 0.5 skew | per-layer 75 covers **69.3%** against **29.9%** for one global set of the same size, on the same touches and VRAM | 1A, and it is not close |
+
+**Decision: build 1A, do not build 1B.**  1A is in (`--expert-slots-per-layer`, default off) and measures 34.8% -> 81.5%
+on a repeated request and 19.9% -> 67.8% on the 12K prompt against a 69.3% oracle.  1B is not merely unbuilt, it is
+closed: 0.3 shows that a round which moves a pick across the pool/GPU boundary changes values and flips generated ids,
+so no bitwise gate could ever pass over it, and 0.1 shows there is no trajectory for it to chase in the first place.
+
+**Two quoted numbers could not be used as bars, and both for measurement reasons rather than convenience.**
+
+* **pp-512 179.8 / 181.0 tok/s and tg 30.3 tok/s are `STRATA_KOLIBRI_PF_PARTIAL=1` figures** (`KOLIBRI1.md:117`), an
+  opt-in that changes the prefill's partial-sum path.  On this tree that knob **does not run at all** with `--serve`:
+  `cudaMemcpyAsync(A.wts_h, A.wts_m, ...) failed: invalid argument` (`:2598`) at the FIRST prefill chunk, with
+  `--expert-slots auto --expert-slots-hot` **and without it** (measured 2026-10-26, both arms, twice).  So the figure
+  cannot be reproduced on this box today by any configuration of this change, and quoting it as a target would have
+  manufactured a failure.  The like-for-like numbers on the shipped config are 0.4's: **56-73 tok/s pp-512**,
+  **21.7-22.2 tok/s greedy decode**, 15.9 tok/s end-to-end sampled, 22.8% hit.  1A is measured against *those*.
+* **"generated ids identical to the by-id run" is not reachable**, and 0.3 says why: the CPU pool quantises the layer's
+  hidden state to q8_1 while the device legs use fp32, so any change to which experts are resident changes values on
+  any long generation.  The shipped `--expert-slots-hot` already violates the sentence this campaign started from; the
+  control that does hold, and is asserted instead, is: **same residency, same configuration -> byte-identical output**
+  (repeat runs identical, and slot blob vs pinned table bitwise-equal with the pool off).
+
+**Gate state on the final tree.**  `KOLIBRI_CM=... bash tools/kolibri/pf_gate.sh check` -> **GATE PASS**, with stage 3
+**BITWISE PASS** against the recorded oracle and the plain, no-prefill, prefix, ids-smoke, PF_HASH and reuse stages all
+green; `tools/kolibri/check_published_figures.py` -> all quoted rates live in `docs/published-figures.md` (122 values
+known).  The default path is therefore unchanged: with `--expert-slots-per-layer` absent, `slot_of` and `hot_cnt` are
+one row, `hot_idx` returns `id`, the profile is written as v1, and the oracle is bitwise.

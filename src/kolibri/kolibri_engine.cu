@@ -368,9 +368,21 @@ struct Engine {
     long long hot_picks_at_last = 0;
     long long hot_promotions = 0;   // blobs re-copied into the slots (each one is n_layers x stride of PCIe traffic)
     std::string hot_profile;        // --expert-slots-profile PATH: the learned hot set, read at load and saved after
-    std::vector<int> slot_of;       // expert id -> slot index, -1 = not resident (hot mode; empty in the id path)
-    mutable std::vector<long long> hot_cnt;  // per-expert routed-pick histogram: counted from layer_step, whose
-                                             // Engine is const (it reads the layer, it does not own the cache)
+    // --expert-slots-per-layer (opt-in, default OFF): ONE residency map per layer instead of one set shared by all 50.
+    // The storage was already per layer (`e.blobs`, one cudaMalloc each); only `slot_of` and the histogram forced one
+    // set everywhere.  Measured on this box (findings-log, "0.5"): the same 75 slots/layer cover 29.9% as one global
+    // set and 69.3% as 75 per-layer sets.  With the knob off, slot_of and hot_cnt are n_expert long and every index
+    // below is `id`, so the default path is byte-identical to the release before this.
+    int per_layer = 0;
+    // expert index into slot_of / hot_cnt: the layer's own row when per_layer, the single global row otherwise.
+    size_t hot_idx(int64_t l, int id) const {
+        return per_layer ? (size_t) (l * (int64_t) g.n_expert + id) : (size_t) id;
+    }
+    std::vector<int> slot_of;       // (per_layer ? layer*n_expert : n_expert) entries: expert -> slot, -1 = not resident
+                                    // (hot mode; empty in the id path)
+    mutable std::vector<long long> hot_cnt;  // (per_layer ? layer*n_expert : n_expert) routed-pick histogram: counted
+                                             // from layer_step, whose Engine is const (it reads the layer, it does not
+                                             // own the cache)
     int grouped = 0;                // --grouped: native_expert_grouped for the routed experts (one launch per layer)
     int graphs = 0;                 // --grouped + graphs (default on with --grouped): per-layer CUDA graphs
     int prefill = 0;                // --prefill: chunked prompt processing (GEMM projections, FP16 attention)
@@ -2084,7 +2096,9 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                 // which is the historical cache byte for byte.  The hot path asks the residency map instead, so a
                 // slot can hold any expert; -1 means "not resident" and the pick falls through to the pool/UVA leg.
                 int sidx;
-                if (e.hot_on && (int) e.slot_of.size() == (int) g.n_expert) sidx = e.slot_of[(size_t) id];
+                if (e.hot_on && (int) e.slot_of.size() ==
+                                    (e.per_layer ? (int) (g.n_layers * g.n_expert) : (int) g.n_expert))
+                    sidx = e.slot_of[e.hot_idx(l, id)];
                 else sidx = id < S ? id : -1;
                 s.slot_ids[k] = sidx >= 0 ? sidx : S;                                          // dev zero slot
                 s.ovf_ids[k] = sidx >= 0 ? (e.cpu_threads > 0 ? sidx : (int) g.n_expert) : id;  // pinned zero slot
@@ -2093,7 +2107,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                 // slot_bytes stays behind --counters because only the CNT report reads it.
                 if (sidx >= 0) ++e.cnt.slot_hits;
                 else { ++e.cnt.slot_miss; if (e.counters) e.cnt.slot_bytes += (long long) b.stride; }
-                if (e.hot_on) ++e.hot_cnt[(size_t) id];   // the histogram the reselection sorts on
+                if (e.hot_on) ++e.hot_cnt[e.hot_idx(l, id)];   // the histogram the reselection sorts on
             }
             g_ids_host = s.slot_ids;
             gemv(gu, s.h, s.eg2, s.ids, K, 0, b.dev, b.stride);   // K21: this gate gemv ran twice per layer
@@ -2587,6 +2601,31 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
         auto layer_post = [&] {
         // A2a: wait for THIS chunk's publish (and everything PRE enqueued before it), not for the device.
         KC(cudaEventSynchronize(A.ev));
+        // **0.1 PREFILL INSTRUMENT** (dynamic-expert-cache plan, step 0.1).  One stderr line per (chunk, layer) with
+        // this chunk's routed picks and how many of them land on a resident expert according to `slot_of` - the SAME
+        // question the decode counter answers, asked on the prefill side.  The step's premise was that this comes for
+        // free from PFHASH; it does not, and the reason is measured, not guessed:
+        //   * PFHASH's `res`/`miss` are the fp16 LRU cache's (`b.f16_slot_id`, STRATA_KOLIBRI_EXPERT_F16), a DIFFERENT
+        //     cache from the expert-slot map - and it is off by default, so on the shipped config those lines do not
+        //     exist at all;
+        //   * PFHASH's `chunk=` is `e.pf_chunks`, which increments PER LAYER (inside the pool block, under
+        //     --counters), so it is a (chunk,layer) counter and cannot be summed "across layers by chunk" as v2 said;
+        //   * the prefill expert leg never consults `slot_of` (it is referenced only on the decode path), so a
+        //     prefill hit rate has to be computed from the published ids, which is what this does.
+        // Gated, so the default path prints nothing new.
+        if (std::getenv("STRATA_KOLIBRI_SLOTTRACE") != nullptr) {
+            static long long slot_tr_chunk = -1;
+            if (l == 0) ++slot_tr_chunk;   // a new chunk starts at layer 0: the layer loop is the inner one
+            const bool map_ok = (int) e.slot_of.size() == (int) g.n_expert;
+            long long picks = 0, hits = 0;
+            for (int i = 0; i < NKc; ++i) {
+                ++picks;
+                if (map_ok && e.slot_of[(size_t) A.ids_h[(size_t) i]] >= 0) ++hits;
+            }
+            std::fprintf(stderr, "SLOTTRACE chunk=%lld l=%d picks=%lld hits=%lld\n", slot_tr_chunk, (int) l, picks,
+                         hits);
+            std::fflush(stderr);
+        }
         if (b.native_ok && !(pool_all && e.cpu_threads > 0)) {
             if (e.counters && e.slots > 0) {   // pricing only; --counters runs
                 const int* hid = A.ids_h;   // already published - this used to be a SECOND synchronous D2H of the same ids
@@ -3016,6 +3055,12 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
 
 void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
     if (e.counters) ++e.cnt.tok;   // every processed token (prompt + decode): the per-token normaliser
+    // **0.1 DECODE INSTRUMENT** (dynamic-expert-cache plan, step 0.1).  ONE stderr line per decoded token with that
+    // token's own routed-pick split, so the hit-rate-vs-token curve costs one printf and no new counter: the two
+    // counters it reads are the ones the DONE line already carries.  Gated, so with the variable unset the default
+    // path prints nothing new and the 16-field DONE/CNT contract is untouched.
+    const bool hit_trace = std::getenv("STRATA_KOLIBRI_HITTRACE") != nullptr;
+    const long long hit0 = e.cnt.slot_hits, miss0 = e.cnt.slot_miss;
     const auto& g = e.g;
     const int N = (int) g.n_embd, K = (int) e.top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
     const int H = (int) g.n_head, HKV = (int) g.n_head_kv, D = (int) g.head_dim;
@@ -3048,6 +3093,11 @@ void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
     gemv_dec(e.dense.at("output.weight"), s.h, s.dec_h16, s.logits, 0);
     KC(cudaDeviceSynchronize());
     ++s.pos;
+    if (hit_trace) {   // pos is 0-based after the increment: the first decoded token prints pos=1
+        const long long h = e.cnt.slot_hits - hit0, m = e.cnt.slot_miss - miss0;
+        std::fprintf(stderr, "HITTRACE pos=%lld hits=%lld miss=%lld\n", (long long) s.pos, h, m);
+        std::fflush(stderr);
+    }
 }
 
 void init_scratch(const Engine& e, Scratch& s) {
@@ -3418,7 +3468,7 @@ void print_counters(Engine& e, const char* tag) {
         // ~40/layer.  Uniform router touches give coverage ~K/n_expert; skew above that line is what makes the
         // cache pay.
         const int NE = (int) e.touch_hist[0].size();
-        const int ks[] = {16, 24, 32, 40, 48, 64, 80, 96, 128, 192, 256, 384};   // C0: 80 and 384 added
+        const int ks[] = {16, 24, 32, 40, 48, 64, 75, 80, 96, 128, 192, 256, 384};   // C0: 80 and 384 added; 75 = the shipped slot count
         std::fprintf(stderr, "CNT expert touch coverage (per-layer top-K, %d layers, %d experts):\n",
                      (int) e.touch_hist.size(), NE);
         for (int K : ks) {
@@ -3454,6 +3504,38 @@ void print_counters(Engine& e, const char* tag) {
             const double med = per[per.size() / 2];
             std::fprintf(stderr, "  top-%d per-layer spread: min %.1f%% median %.1f%% max %.1f%% (n=%d)\n",
                          K, 100.0 * per.front(), 100.0 * med, 100.0 * per.back(), (int) per.size());
+        }
+        // **0.5 HEAD-TO-HEAD (dynamic-expert-cache plan).**  The per-layer question in one pair of numbers: the SAME
+        // VRAM budget spent two ways on the same touches - one global set of S experts (what --expert-slots-hot
+        // learns today: `hot_cnt` has no layer dimension, so the same 75 experts sit in every layer) against S chosen
+        // per layer.  S = the shipped slot count, so the two arms buy the same number of slots; only the shape differs.
+        // The global set's coverage cannot be read off the per-layer top-K lines above, which is why it is computed
+        // here: a global set's picks in a layer are not that layer's top-K.
+        if (e.slots > 0) {
+            const int S = std::min((int) e.slots, NE);
+            std::vector<uint64_t> tot((size_t) NE, 0);
+            uint64_t all = 0;
+            for (auto& h : e.touch_hist)
+                for (int i = 0; i < NE; ++i) { tot[(size_t) i] += h[(size_t) i]; all += h[(size_t) i]; }
+            std::vector<uint64_t> gs(tot);
+            std::partial_sort(gs.begin(), gs.begin() + S, gs.end(), std::greater<uint64_t>());
+            uint64_t gtop = 0;
+            for (int i = 0; i < S; ++i) gtop += gs[(size_t) i];
+            double layered = 0;
+            for (auto& h : e.touch_hist) {
+                std::vector<uint64_t> t(h);
+                std::partial_sort(t.begin(), t.begin() + S, t.end(), std::greater<uint64_t>());
+                uint64_t tt = 0, tp = 0;
+                for (int i = 0; i < NE; ++i) tt += h[(size_t) i];
+                for (int i = 0; i < S; ++i) tp += t[(size_t) i];
+                if (tt > 0) layered += (double) tp / (double) tt;
+            }
+            layered /= (double) e.touch_hist.size();
+            std::fprintf(stderr,
+                         "CNT expert touch %d-slot head-to-head: ONE GLOBAL SET of %d experts covers %.1f%%; %d per"
+                         " layer covers %.1f%% (same VRAM, %d touches over %d layers)\n",
+                         e.slots, S, all > 0 ? 100.0 * (double) gtop / (double) all : 0.0, S, 100.0 * layered,
+                         (long long) all, (int) e.touch_hist.size());
         }
     }
     if (e.pf_chunks > 0) {
@@ -3644,63 +3726,108 @@ static void slot_promote(Engine& e, int id, int slot) {
                       cudaMemcpyHostToDevice));
 }
 
-// Write the learned hot set: "id count" lines under a commented header, via a temp file and a rename so a kill or a
-// full disk leaves the previous profile intact.
+// The same move for ONE layer: 1 memcpy of stride bytes (2.21 MB at this model), which is the per-layer map's whole
+// point - a promotion is a 50x cheaper bet than a whole-expert one, and it needs no mid-request machinery.
+static void slot_promote_layer(Engine& e, int64_t l, int id, int slot) {
+    LayerBlobs& b = e.blobs[(size_t) l];
+    KC(cudaMemcpy(b.dev + b.stride * (size_t) slot, b.table + b.stride * (size_t) id, b.stride,
+                  cudaMemcpyHostToDevice));
+}
+
+// Write the learned hot set, via a temp file and a rename so a kill or a full disk leaves the previous profile intact.
+// With --expert-slots-per-layer the file grows a layer column (`layer id count`, header v2); without it the file is
+// exactly what it was (`id count`, header v1), so the default path's profile stays byte-identical too.
 static void hot_profile_save(Engine& e) {
     if (!e.hot_on || e.hot_profile.empty() || e.slots <= 0) return;
     const int n_exp = (int) e.g.n_expert;
-    std::vector<int> order((size_t) n_exp);
-    for (int i = 0; i < n_exp; ++i) order[(size_t) i] = i;
-    const size_t keep = (size_t) std::min<int>(e.slots, n_exp);
-    std::partial_sort(order.begin(), order.begin() + keep, order.end(), [&](int a, int b) {
-        if (e.hot_cnt[(size_t) a] != e.hot_cnt[(size_t) b]) return e.hot_cnt[(size_t) a] > e.hot_cnt[(size_t) b];
-        return a < b;
-    });
+    const int n_lay = e.per_layer ? (int) e.g.n_layers : 1;
     const std::string tmp = e.hot_profile + ".tmp";
     std::FILE* f = std::fopen(tmp.c_str(), "w");
     if (f == nullptr) { std::fprintf(stderr, "strata-kolibri: cannot write profile %s\n", tmp.c_str()); return; }
-    std::fprintf(f, "# strata-kolibri expert-cache profile v1 slots=%d layers=%d stride_sum=%lld\n", e.slots,
-                 (int) e.g.n_layers, slots_sum_stride(e));
+    std::fprintf(f, "# strata-kolibri expert-cache profile v%d slots=%d layers=%d stride_sum=%lld\n",
+                 e.per_layer ? 2 : 1, e.slots, (int) e.g.n_layers, slots_sum_stride(e));
+    const size_t keep = (size_t) std::min<int>(e.slots, n_exp);
     size_t kept = 0;
-    for (size_t i = 0; i < keep; ++i) {
-        const int id = order[i];
-        if (e.hot_cnt[(size_t) id] == 0) break;   // never picked: writing zeros teaches the next run nothing
-        std::fprintf(f, "%d %lld\n", id, e.hot_cnt[(size_t) id]);
-        ++kept;
+    for (int li = 0; li < n_lay; ++li) {
+        std::vector<int> order((size_t) n_exp);
+        for (int i = 0; i < n_exp; ++i) order[(size_t) i] = i;
+        const size_t row = e.per_layer ? (size_t) li * (size_t) n_exp : 0;   // the profile's row for this layer
+        std::partial_sort(order.begin(), order.begin() + keep, order.end(), [&](int a, int b) {
+            const long long ca = e.hot_cnt[row + (size_t) a], cb = e.hot_cnt[row + (size_t) b];
+            if (ca != cb) return ca > cb;
+            return a < b;
+        });
+        for (size_t i = 0; i < keep; ++i) {
+            const int id = order[i];
+            const long long c = e.hot_cnt[row + (size_t) id];
+            if (c == 0) break;   // never picked: writing zeros teaches the next run nothing
+            if (e.per_layer) std::fprintf(f, "%d %d %lld\n", li, id, c);
+            else std::fprintf(f, "%d %lld\n", id, c);
+            ++kept;
+        }
     }
     std::fclose(f);
     if (std::rename(tmp.c_str(), e.hot_profile.c_str()) != 0)
         std::fprintf(stderr, "strata-kolibri: cannot replace profile %s\n", e.hot_profile.c_str());
-    std::fprintf(stderr, "strata-kolibri: hot profile: %zu of %d slots written to %s\n", kept, e.slots,
+    std::fprintf(stderr, "strata-kolibri: hot profile: %zu of %d slot(s) written to %s\n", kept, e.slots * n_lay,
                  e.hot_profile.c_str());
 }
 
-// Seed order from the profile: ids by descending saved count.  A profile saved with a bigger cache is trimmed to
-// this run's slot count; a shorter one is topped up in id order by alloc_slots.
-static std::vector<int> hot_profile_load(Engine& e) {
-    std::vector<int> seed;
-    if (!e.hot_on || e.hot_profile.empty()) return seed;
+// Seed order from the profile, one list per layer: ids by descending saved count, trimmed to this run's slot count and
+// topped up in id order by alloc_slots.  BOTH formats are read: a v1 file (`id count`) has no layer information, so it
+// seeds every layer with the same global order - which is exactly what the single-set cache did with it, so an old
+// profile keeps working and keeps meaning the same thing.
+static std::vector<std::vector<int>> hot_profile_load(Engine& e) {
+    const int n_exp = (int) e.g.n_expert;
+    const int n_lay = e.per_layer ? (int) e.g.n_layers : 1;
+    std::vector<std::vector<int>> seeds((size_t) n_lay);
+    if (!e.hot_on || e.hot_profile.empty()) return seeds;
     std::FILE* f = std::fopen(e.hot_profile.c_str(), "r");
-    if (f == nullptr) return seed;
+    if (f == nullptr) return seeds;
+    std::vector<std::vector<int>> ids((size_t) n_lay);
+    std::vector<char> seen((size_t) n_exp, 0);   // the global (knob-off) seed wants each id once
     char buf[512];
+    int layered = 0, flat = 0;
     while (std::fgets(buf, sizeof buf, f) != nullptr) {
         if (buf[0] == '#' || buf[0] == '\n') continue;
-        int id = -1;
+        int a = -1, b = -1;
         long long c = 0;
-        if (std::sscanf(buf, "%d %lld", &id, &c) != 2) continue;
-        if (id < 0 || id >= (int) e.g.n_expert) continue;
-        e.hot_cnt[(size_t) id] = c;
-        seed.push_back(id);
+        if (std::sscanf(buf, "%d %d %lld", &a, &b, &c) == 3) {   // v2: layer id count
+            if (b < 0 || b >= n_exp) continue;
+            if (e.per_layer) {
+                if (a < 0 || a >= n_lay) continue;
+                e.hot_cnt[(size_t) a * (size_t) n_exp + (size_t) b] = c;
+                ids[(size_t) a].push_back(b);
+            } else {   // knob off reading a per-layer file: the global histogram is the SUM over layers
+                e.hot_cnt[(size_t) b] += c;
+                if (!seen[(size_t) b]) { seen[(size_t) b] = 1; ids[0].push_back(b); }
+            }
+            ++layered;
+        } else if (std::sscanf(buf, "%d %lld", &a, &c) == 2) {   // v1: id count, one global order for every layer
+            if (a < 0 || a >= n_exp) continue;
+            for (int l = 0; l < n_lay; ++l) {
+                e.hot_cnt[(size_t) l * (size_t) n_exp + (size_t) a] = c;
+                ids[(size_t) l].push_back(a);
+            }
+            ++flat;
+        }
     }
     std::fclose(f);
-    std::stable_sort(seed.begin(), seed.end(), [&](int a, int b) {
-        if (e.hot_cnt[(size_t) a] != e.hot_cnt[(size_t) b]) return e.hot_cnt[(size_t) a] > e.hot_cnt[(size_t) b];
-        return a < b;
-    });
-    if ((int) seed.size() > e.slots) seed.resize((size_t) e.slots);
-    std::fprintf(stderr, "strata-kolibri: hot profile: %zu resident expert(s) seeded from %s\n", seed.size(),
-                 e.hot_profile.c_str());
-    return seed;
+    for (int l = 0; l < n_lay; ++l) {
+        std::vector<int>& s = ids[(size_t) l];
+        const size_t row = (size_t) l * (size_t) n_exp;
+        std::stable_sort(s.begin(), s.end(), [&](int x, int y) {
+            const long long cx = e.hot_cnt[row + (size_t) x], cy = e.hot_cnt[row + (size_t) y];
+            if (cx != cy) return cx > cy;
+            return x < y;
+        });
+        if ((int) s.size() > e.slots) s.resize((size_t) e.slots);
+        seeds[(size_t) l] = s;
+    }
+    std::fprintf(stderr, "strata-kolibri: hot profile: %zu resident expert(s) per layer seeded from %s (%d layered"
+                 " line(s), %d global)\n", seeds.empty() ? (size_t) 0 : seeds[0].size(), e.hot_profile.c_str(),
+                 layered, flat);
+    return seeds;
 }
 
 // Allocate the slot table and decide what starts in it.  Called AFTER init_scratch on purpose: the fit must see the
@@ -3734,27 +3861,36 @@ static void alloc_slots(Engine& e, int ctx) {
                      (double) ((long long) fb - reserve - stride_sum * (e.slots + 1)) / (1 << 20));
     }
     e.slots = std::min(e.slots, n_exp);
-    // What starts resident: the profile's hot set if there is one, else experts 0..S-1 (the id-ordered cache).
-    std::vector<int> seed;
+    // What starts resident: the profile's hot set if there is one, else experts 0..S-1 (the id-ordered cache).  Per
+    // layer when --expert-slots-per-layer, one shared list otherwise (seeds[l] is then the same list for every l).
+    const int n_lay = e.per_layer ? (int) e.g.n_layers : 1;
+    std::vector<std::vector<int>> seeds((size_t) n_lay);
     if (e.hot_on) {
-        e.hot_cnt.assign((size_t) n_exp, 0);
-        seed = hot_profile_load(e);
+        e.hot_cnt.assign((size_t) (e.per_layer ? (int64_t) n_lay * n_exp : n_exp), 0);
+        seeds = hot_profile_load(e);
     }
-    if (!e.hot_on || seed.empty()) {   // the historical seed, and also the top-up when a profile is short
-        std::vector<char> taken((size_t) n_exp, 0);
-        for (int id : seed) taken[(size_t) id] = 1;
-        for (int id = 0; id < n_exp && (int) seed.size() < e.slots; ++id)
-            if (!taken[(size_t) id]) seed.push_back(id);
+    for (int l = 0; l < n_lay; ++l) {
+        std::vector<int>& seed = seeds[(size_t) l];
+        if (!e.hot_on || seed.empty()) {   // the historical seed, and also the top-up when a profile is short
+            std::vector<char> taken((size_t) n_exp, 0);
+            for (int id : seed) taken[(size_t) id] = 1;
+            for (int id = 0; id < n_exp && (int) seed.size() < e.slots; ++id)
+                if (!taken[(size_t) id]) seed.push_back(id);
+        }
+        seed.resize((size_t) e.slots);
     }
-    seed.resize((size_t) e.slots);
-    e.slot_of.assign((size_t) n_exp, -1);
-    for (int s = 0; s < e.slots; ++s) e.slot_of[(size_t) seed[(size_t) s]] = s;
+    e.slot_of.assign((size_t) (e.per_layer ? (int64_t) n_lay * n_exp : n_exp), -1);
+    for (int l = 0; l < n_lay; ++l)
+        for (int s = 0; s < e.slots; ++s)
+            e.slot_of[(size_t) l * (size_t) n_exp + (size_t) seeds[(size_t) l][(size_t) s]] = s;
     const bool id_seed = !e.hot_on;
-    for (auto& b : e.blobs) {
+    for (int64_t l = 0; l < (int64_t) e.blobs.size(); ++l) {
+        LayerBlobs& b = e.blobs[(size_t) l];
         KC(cudaMalloc((void**) &b.dev, b.stride * (size_t) (e.slots + 1)));
         if (id_seed) {
             KC(cudaMemcpy(b.dev, b.table, b.stride * (size_t) e.slots, cudaMemcpyHostToDevice));   // as before
         } else {
+            const std::vector<int>& seed = seeds[(size_t) std::min<int64_t>(l, (int64_t) n_lay - 1)];
             for (int s = 0; s < e.slots; ++s)
                 KC(cudaMemcpy(b.dev + b.stride * (size_t) s, b.table + b.stride * (size_t) seed[(size_t) s],
                               b.stride, cudaMemcpyHostToDevice));
@@ -3786,6 +3922,13 @@ static void alloc_slots(Engine& e, int ctx) {
 // Re-pick which experts are resident and move the blobs that changed.  Called BETWEEN requests, never during one:
 // the copies are synchronous and the slot contents must not change under a running kernel.  Slots that stay
 // resident keep their number, so a steady workload settles and the PCIe traffic goes to zero.
+// **What residency does and does not preserve (measured, findings-log "0.3").**  Both device legs are bitwise: a pick
+// served from a VRAM slot and the same pick served from the pinned table run the same `gemv` on the same bytes (proven
+// with the CPU pool switched off: byte-identical logits).  The CPU POOL is not that leg - it quantizes the layer's
+// hidden state to q8_1 (`native_quant_act`) where the device reads fp32 - so a map that moves a pick between the pool
+// and a slot changes the values, and greedy decoding turns that into different generated ids within a few tokens.  That
+// is true of the global map today and of the per-layer map below; it is why no gate here may claim "ids unchanged"
+// across two different resident sets, only across two runs of the same one.
 static void slots_reselect(Engine& e) {
     if (!e.hot_on || e.slots <= 0) return;
     long long picks = 0;
@@ -3793,46 +3936,201 @@ static void slots_reselect(Engine& e) {
     if (picks - e.hot_picks_at_last < e.hot_min_picks) return;   // no churn on every token
     e.hot_picks_at_last = picks;
     const int n_exp = (int) e.g.n_expert, S = e.slots;
-    std::vector<int> order((size_t) n_exp);
-    for (int i = 0; i < n_exp; ++i) order[(size_t) i] = i;
+    const int n_lay = e.per_layer ? (int) e.g.n_layers : 1;
     const size_t keep = (size_t) std::min(S, n_exp);
-    std::partial_sort(order.begin(), order.begin() + keep, order.end(), [&](int a, int b) {
-        if (e.hot_cnt[(size_t) a] != e.hot_cnt[(size_t) b]) return e.hot_cnt[(size_t) a] > e.hot_cnt[(size_t) b];
-        return a < b;
-    });
-    std::vector<int> hot_ids;
-    for (size_t i = 0; i < keep; ++i) {
-        const int id = order[i];
-        if (e.hot_cnt[(size_t) id] == 0) break;   // nothing else has been picked yet
-        hot_ids.push_back(id);
+    // One pass per resident row.  With the knob off there is exactly one row and the loop is the historical single
+    // set, expert for expert; with --expert-slots-per-layer each layer re-picks from its own histogram row and pays
+    // one stride of PCIe per move instead of n_layers of them.
+    std::vector<std::vector<int>> want((size_t) n_lay, std::vector<int>((size_t) n_exp, -1));
+    std::vector<std::vector<int>> moved((size_t) n_lay);
+    for (int l = 0; l < n_lay; ++l) {
+        const size_t row = (size_t) l * (size_t) n_exp;
+        std::vector<int>& w = want[(size_t) l];
+        std::vector<int> order((size_t) n_exp);
+        for (int i = 0; i < n_exp; ++i) order[(size_t) i] = i;
+        std::partial_sort(order.begin(), order.begin() + keep, order.end(), [&](int a, int b) {
+            const long long ca = e.hot_cnt[row + (size_t) a], cb = e.hot_cnt[row + (size_t) b];
+            if (ca != cb) return ca > cb;
+            return a < b;
+        });
+        std::vector<int> hot_ids;
+        for (size_t i = 0; i < keep; ++i) {
+            const int id = order[i];
+            if (e.hot_cnt[row + (size_t) id] == 0) break;   // nothing else has been picked yet
+            hot_ids.push_back(id);
+        }
+        std::vector<char> taken((size_t) S, 0);
+        int next_free = 0;
+        for (int id : hot_ids) {   // keep the slot every still-hot expert already had: that is what stops the churn
+            const int s = (e.per_layer && !e.slot_of.empty()) ? e.slot_of[row + (size_t) id]
+                                                             : (e.slot_of.empty() ? -1 : e.slot_of[(size_t) id]);
+            if (s >= 0 && s < S) { w[(size_t) id] = s; taken[(size_t) s] = 1; }
+        }
+        for (int id : hot_ids) {
+            if (w[(size_t) id] >= 0) continue;
+            while (next_free < S && taken[(size_t) next_free]) ++next_free;
+            if (next_free >= S) break;
+            w[(size_t) id] = next_free;
+            taken[(size_t) next_free] = 1;
+        }
+        for (int id : hot_ids) {
+            const int s0 = e.slot_of.empty() ? -1 : e.slot_of[(e.per_layer ? row + (size_t) id : (size_t) id)];
+            if (w[(size_t) id] >= 0 && w[(size_t) id] != s0) moved[(size_t) l].push_back(id);
+        }
     }
-    std::vector<int> want((size_t) n_exp, -1);
-    std::vector<char> taken((size_t) S, 0);
-    int next_free = 0;
-    for (int id : hot_ids) {   // keep the slot every still-hot expert already had: that is what stops the churn
-        const int s = e.slot_of[(size_t) id];
-        if (s >= 0 && s < S) { want[(size_t) id] = s; taken[(size_t) s] = 1; }
+    size_t n_moved = 0;
+    long long moved_bytes = 0;
+    for (int l = 0; l < n_lay; ++l) {
+        n_moved += moved[(size_t) l].size();
+        moved_bytes += (long long) moved[(size_t) l].size() *
+                       (e.per_layer ? (long long) e.blobs[(size_t) l].stride : slots_sum_stride(e));
     }
-    for (int id : hot_ids) {
-        if (want[(size_t) id] >= 0) continue;
-        while (next_free < S && taken[(size_t) next_free]) ++next_free;
-        if (next_free >= S) break;
-        want[(size_t) id] = next_free;
-        taken[(size_t) next_free] = 1;
+    // Install the new maps first: from here a pick reads only slots that are about to be written, and the copies
+    // below are synchronous, so nothing observes a half-written one.
+    for (int l = 0; l < n_lay; ++l) {
+        if (e.per_layer) {
+            const size_t row = (size_t) l * (size_t) n_exp;
+            for (int id = 0; id < n_exp; ++id) e.slot_of[row + (size_t) id] = want[(size_t) l][(size_t) id];
+        } else {
+            e.slot_of = want[0];
+        }
     }
-    std::vector<int> moved;
-    for (int id : hot_ids)
-        if (want[(size_t) id] >= 0 && want[(size_t) id] != e.slot_of[(size_t) id]) moved.push_back(id);
-    if (moved.empty()) { e.slot_of = want; return; }
+    if (n_moved == 0) return;
     KC(cudaDeviceSynchronize());
     const auto t0 = Clock::now();
-    for (int id : moved) slot_promote(e, id, want[(size_t) id]);
-    e.slot_of = want;
-    e.hot_promotions += (long long) moved.size();
+    for (int l = 0; l < n_lay; ++l)
+        for (int id : moved[(size_t) l]) {
+            const int s = want[(size_t) l][(size_t) id];
+            if (e.per_layer) slot_promote_layer(e, l, id, s);
+            else slot_promote(e, id, s);
+        }
+    e.hot_promotions += (long long) n_moved;
     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
     std::fprintf(stderr, "strata-kolibri: hot slots: %zu expert(s) newly resident after %lld picks, %.0f MiB over"
-                 " PCIe in %.1f ms\n",
-                 moved.size(), picks, (double) moved.size() * slots_sum_stride(e) / (1 << 20), ms);
+                 " PCIe in %.1f ms%s\n",
+                 n_moved, picks, (double) moved_bytes / (1 << 20), ms,
+                 e.per_layer ? " (per-layer map)" : "");
+}
+
+// **0.2 PROBE — what one expert-swap round costs, at the boundaries a round could use.**  Measurement only, and gated
+// by `STRATA_KOLIBRI_DYN_PROBE=1`: the bytes land in a PRIVATE buffer, never in a slot, so a probe run cannot change a
+// result and an un-gated run takes no branch here at all.  It answers the two questions the plan's decision gate asks,
+// in the unit that decides them: does a round stay under 10% of a token once it can overlap, and does ONE COPY PER
+// BATCH close the 10.2 -> 12.2 GB/s gap that one copy per expert measures?
+//
+// Sizes are the plan's 1/4/8/16 experts per round, one per boundary, cycled, so one run covers all four at both sites.
+// A round moves N experts across all n_layers layers - the plan's unit: 1 expert = 50 x 2.21 MB = 114.4 MiB.
+//   "single" issues one copy per (layer, expert);
+//   "batch"  relies on consecutive expert blobs being contiguous in the pinned table and issues one copy per layer
+//            of N x stride (`STRATA_KOLIBRI_DYN_PROBE_BATCH=1`).
+// Each boundary prices both a SYNCHRONOUS round (inserted latency: drain, copy, drain) and a round launched on a side
+// stream and joined at the NEXT boundary (the `adapt_stream` shape) - where the number that matters is not the copy's
+// duration but the wait the join had to add, i.e. how much of it the previous boundary's work hid.
+struct DynProbe {
+    uint8_t* dst_sync = nullptr;   // separate buffers: the two rounds run on two streams and must not share a target
+    uint8_t* dst_side = nullptr;
+    size_t cap = 0;
+    cudaStream_t st = nullptr;
+    cudaEvent_t e0 = nullptr, e1 = nullptr;
+    int pending_n = 0;
+    const char* pending_site = nullptr;
+    double pending_launch = 0.0;
+    int call = 0;
+};
+static DynProbe& dyn_probe() {
+    static DynProbe p;
+    return p;
+}
+static bool dyn_probe_on() {
+    static const bool v = std::getenv("STRATA_KOLIBRI_DYN_PROBE") != nullptr;
+    return v;
+}
+static double dyn_now_ms() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+// Enqueue one round of `n` experts, every layer, into `dst`.  Both shapes move the same bytes; only the number of
+// cudaMemcpyAsync calls differs, which is the whole batching question.
+static void dyn_probe_issue(const Engine& e, cudaStream_t st, uint8_t* dst, int n, bool batch, size_t stride_max) {
+    for (const LayerBlobs& b : e.blobs) {
+        if (batch)
+            KC(cudaMemcpyAsync(dst, b.table, b.stride * (size_t) n, cudaMemcpyHostToDevice, st));
+        else
+            for (int k = 0; k < n; ++k)
+                KC(cudaMemcpyAsync(dst + (size_t) k * stride_max, b.table + (size_t) k * b.stride, b.stride,
+                                   cudaMemcpyHostToDevice, st));
+    }
+}
+static void dyn_probe_init(DynProbe& p, size_t stride_max) {
+    const size_t need = stride_max * 16;
+    if (p.cap < need) {
+        if (p.dst_sync != nullptr) KC(cudaFree(p.dst_sync));
+        if (p.dst_side != nullptr) KC(cudaFree(p.dst_side));
+        KC(cudaMalloc((void**) &p.dst_sync, need));
+        KC(cudaMalloc((void**) &p.dst_side, need));
+        p.cap = need;
+    }
+    if (p.st == nullptr) {
+        KC(cudaStreamCreate(&p.st));
+        KC(cudaEventCreate(&p.e0));
+        KC(cudaEventCreate(&p.e1));
+    }
+}
+// One boundary: join the round launched at the previous one, time a synchronous round, launch the next side-stream
+// round.  `boundary_ms` is the wall the boundary itself took (a chunk, or a token), i.e. what a side-stream round had
+// to hide behind.
+static void dyn_probe_step(const Engine& e, const char* site, double boundary_ms) {
+    if (!dyn_probe_on()) return;
+    static const int sizes[4] = {1, 4, 8, 16};
+    static const bool batch = [] {
+        const char* v = std::getenv("STRATA_KOLIBRI_DYN_PROBE_BATCH");
+        return v != nullptr && std::atoi(v) > 0;
+    }();
+    DynProbe& p = dyn_probe();
+    size_t stride_max = 0;
+    for (const LayerBlobs& b : e.blobs) stride_max = std::max(stride_max, b.stride);
+    dyn_probe_init(p, stride_max);
+    const double mb = (double) slots_sum_stride(e) / 1e6;   // one expert, all layers
+    if (p.pending_n > 0) {   // the side-stream round from the previous boundary, joined here
+        const double t_wait0 = dyn_now_ms();
+        KC(cudaEventSynchronize(p.e1));
+        const double wait = dyn_now_ms() - t_wait0;
+        float gpu = 0.f;
+        cudaEventElapsedTime(&gpu, p.e0, p.e1);
+        const double window = dyn_now_ms() - p.pending_launch;   // boundary work available to hide behind
+        std::fprintf(stderr,
+                     "DYNPROBE site=%s n=%d mode=stream batch=%d bytes_mb=%.1f gpu_ms=%.1f window_ms=%.1f wait_ms=%.1f\n",
+                     p.pending_site, p.pending_n, (int) batch, mb * p.pending_n, gpu, window, wait);
+        p.pending_n = 0;
+    }
+    const int n = sizes[p.call++ % 4];
+    KC(cudaStreamSynchronize(g_st));
+    const double t0 = dyn_now_ms();
+    dyn_probe_issue(e, g_st, p.dst_sync, n, batch, stride_max);
+    KC(cudaStreamSynchronize(g_st));
+    const double ms = dyn_now_ms() - t0;
+    std::fprintf(stderr, "DYNPROBE site=%s n=%d mode=sync batch=%d bytes_mb=%.1f ms=%.1f gbs=%.1f boundary_ms=%.1f\n", site, n,
+                 (int) batch, mb * n, ms, mb * n / ms, boundary_ms);
+    KC(cudaEventRecord(p.e0, p.st));
+    dyn_probe_issue(e, p.st, p.dst_side, n, batch, stride_max);
+    KC(cudaEventRecord(p.e1, p.st));
+    p.pending_n = n;
+    p.pending_site = site;
+    p.pending_launch = dyn_now_ms();
+}
+// Join the last round: the decode loop's final boundary has no successor to join it, and a measurement that is
+// launched and never joined is a number nobody reads.
+static void dyn_probe_finish(const Engine& e) {
+    if (!dyn_probe_on()) return;
+    DynProbe& p = dyn_probe();
+    if (p.pending_n == 0) return;
+    const double t_wait0 = dyn_now_ms();
+    KC(cudaEventSynchronize(p.e1));
+    const double wait = dyn_now_ms() - t_wait0;
+    float gpu = 0.f;
+    cudaEventElapsedTime(&gpu, p.e0, p.e1);
+    std::fprintf(stderr, "DYNPROBE site=%s n=%d mode=stream tail=1 bytes_mb=%.1f gpu_ms=%.1f wait_ms=%.1f\n",
+                 p.pending_site, p.pending_n, (double) slots_sum_stride(e) / 1e6 * p.pending_n, gpu, wait);
+    p.pending_n = 0;
 }
 
 /// The serve protocol (serve/server.py's engine lines, q36's shape): READY, then per request GEN <max_new>
@@ -4356,6 +4654,9 @@ int strata::kolibri::run(int argc, char** argv) {
     int n_gen = 8, ctx = 8192, cpu_threads = 0, slots = 0, grouped = 0, no_graph = 0, prefill = 0, counters = 0;
     // the expert cache's opt-in knobs (see alloc_slots / slots_reselect): off means the historical by-id cache
     int hot = env_on("STRATA_KOLIBRI_SLOTS_HOT") ? 1 : 0;
+    // --expert-slots-per-layer / STRATA_KOLIBRI_SLOTS_PER_LAYER=1: the opt-in per-layer residency map (Phase 1A of the
+    // dynamic-expert-cache plan).  Needs --expert-slots-hot; off by default, and off means nothing below is touched.
+    int per_layer = env_on("STRATA_KOLIBRI_SLOTS_PER_LAYER") ? 1 : 0;
     int reserve_mib = 700;                     // --vram-reserve-mib: the Qwen engine's own default
     std::string profile;                       // --expert-slots-profile: the learned hot set, read and written here
     int attn_bench = 0;             // K25 instrument: --attn-bench N launches the real attention kernel N times
@@ -4384,6 +4685,7 @@ int strata::kolibri::run(int argc, char** argv) {
         ++i;
     }
     else if (a == "--expert-slots-hot") hot = 1;
+        else if (a == "--expert-slots-per-layer") { hot = 1; per_layer = 1; }
     else if (a == "--expert-slots-profile" && i + 1 < argc) { hot = 1; profile = argv[++i]; }
     else if (a == "--vram-reserve-mib" && i + 1 < argc) reserve_mib = std::atoi(argv[++i]);
         else if (a == "--expert-vram" && i + 1 < argc) expert_vram = std::atoi(argv[++i]);
@@ -4483,6 +4785,12 @@ int strata::kolibri::run(int argc, char** argv) {
     // the KV and the activations already paid for.  -1 (auto) and 0 (no cache) both pass through here.
     e.slots = slots;
     e.hot_on = hot;
+    e.per_layer = (hot && per_layer) ? 1 : 0;
+    if (per_layer && !hot)
+        std::fprintf(stderr, "strata-kolibri: --expert-slots-per-layer needs --expert-slots-hot: ignored\n");
+    if (e.per_layer)
+        std::fprintf(stderr, "strata-kolibri: expert cache: PER-LAYER residency map (%d layers x %d experts), not one"
+                             " global set\n", (int) e.g.n_layers, (int) e.g.n_expert);
     e.hot_profile = profile;
     e.vram_reserve_mib = reserve_mib > 0 ? reserve_mib : 700;
     {
@@ -4656,6 +4964,7 @@ int strata::kolibri::run(int argc, char** argv) {
                 if (T_next > 0)
                     KC(cudaMemcpy(s.act2.toks_d, ids.data() + i + T, (size_t) T_next * 4, cudaMemcpyHostToDevice));
             }
+            const double dyn_t0 = dyn_probe_on() ? dyn_now_ms() : 0.0;
             forward_multi(e, s, T, s.pos, T_next, pos_next);
             // P1 probe: a fence between chunks.  A single-chunk prefill is bit-exact and a two-chunk one is not, so
             // the race lives in the chunk-to-chunk handoff; this says whether the handoff is missing a fence (and if
@@ -4665,6 +4974,7 @@ int strata::kolibri::run(int argc, char** argv) {
             i += T + T_next;
             std::printf("PFchunk %lld/%lld %.0fms\n", (long long) i, (long long) n, ms_since(tp0));
             std::fflush(stdout);
+            dyn_probe_step(e, "chunk", dyn_probe_on() ? dyn_now_ms() - dyn_t0 : 0.0);
         }
         if (pf_host_prev.valid) strata::kernels::cpu::restore_thread_affinity(pf_host_prev);
         tok = ids.back();
@@ -4684,6 +4994,7 @@ int strata::kolibri::run(int argc, char** argv) {
     std::vector<int> gen;
     std::printf("gen:");
     for (int i = 0; i < n_steps; ++i) {
+        const double dyn_t0 = dyn_probe_on() ? dyn_now_ms() : 0.0;
         forward(e, s, tok, fl ? layers.data() : nullptr);
         if (fl)
             for (int64_t l = 0; l < e.g.n_layers; ++l)
@@ -4698,7 +5009,9 @@ int strata::kolibri::run(int argc, char** argv) {
         if (ff) std::fwrite(lg.data(), 4, lg.size(), ff);
         gen.push_back(a);
         tok = i + 1 == n_steps ? a : (i < (int) forced.size() ? forced[i] : a);
+        if (dyn_probe_on()) dyn_probe_step(e, "token", dyn_now_ms() - dyn_t0);
     }
+    dyn_probe_finish(e);
     std::printf("\n");
     print_counters(e, "run");
     if (fl) std::fclose(fl);
