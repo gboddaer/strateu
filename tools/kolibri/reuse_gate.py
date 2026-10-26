@@ -224,6 +224,35 @@ def main():
                    f"(reused {reused_n} + read {read_n} = {ext_len}; read between {tail_min} and {tail_min + 512}; "
                    f"prompt_ms {prompt_ms})")
 
+        # ---- stage 1c: the geometry that reads NOTHING (reuse == ids.size()-1) ----------------------
+        # The plan asked for this as "one-token tail with prompt_read 0".  prompt_read cannot be 0: the DONE
+        # field counts EVERY prompt token the request did not skip, and the guard requires held < ids.size(), so
+        # the final token is always fed (by the decode step, not the prefill).  What zero means, and what is
+        # asserted here, is the PREFILL: with reuse == ids.size()-1 the chunked loop runs zero times, so no PP
+        # line is printed while the answer must still equal a cold read of the same prompt.  Needs its own
+        # engine because the rewind has to be off for the geometry to be reachable at all.
+        stage = "1c. no-prefill"
+        eng1c = Engine(a.bin, a.model, a.ctx, a.cpu_threads, {"STRATA_KOLIBRI_REUSE_ALIGN": "0"})
+        try:
+            pre1c = short_pre[:640]
+            eng1c.resetter(reset_token)
+            own1c = eng1c.send(pre1c, 1)["gen"][0]
+            ext1c = pre1c + [own1c]                      # exactly one token past what the engine held
+            eng1c.resetter(reset_token)
+            cold1c = eng1c.send(ext1c, 4)
+            eng1c.resetter(reset_token)
+            eng1c.send(pre1c, 1)
+            warm1c = eng1c.send(ext1c, 4)
+            re1c = field(warm1c["done"], 8, int)
+            read1c = field(warm1c["done"], 14, int)
+            ok = (re1c == len(pre1c) and len(warm1c["pp"]) == 0 and read1c == 1
+                  and cold1c["gen"] == warm1c["gen"] and len(cold1c["gen"]) == 4)
+            record(ok, f"1c. no-prefill  {'PASS' if ok else 'FAIL'}  "
+                       f"(reused {re1c}, {len(warm1c['pp'])} PP lines, prompt_read {read1c}, "
+                       f"cold {cold1c['gen']} vs warm {warm1c['gen']})")
+        finally:
+            eng1c.close()
+
         # ---- stage 1b: one new token - nothing to prefill, and that must be correct --------------
         stage = "1b. bitwise-1"
         eng.resetter(reset_token)
