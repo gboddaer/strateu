@@ -12,7 +12,8 @@ NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open
 Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** on a normal PC. This is a
 large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
 and coding agents. Nothing leaves your PC. It also runs **[Kolibri 1](docs/KOLIBRI1.md)** (Aleph Alpha's 78B
-German & English MoE, 3.46B active) on 56 GB of RAM: `./setup.sh --family kolibri`.
+German & English MoE, 3.46B active) on 56 GB of RAM: `./setup.sh --family kolibri` (Q4_K_M - the only size setup
+offers so far).
 
 ## About this fork
 
@@ -72,6 +73,16 @@ This fork also measured Aleph Alpha's **[Kolibri 1](docs/KOLIBRI1.md)** (Q4_K_M)
 | **short (512 tokens)** | 30 tokens/s (NUMA binding) | 156-160 tokens/s (opt-in `PF_PARTIAL`: 180-181, warm server 202) |
 | **32K tokens** | 13-14 tokens/s (NUMA binding) | 119-120 tokens/s |
 | **100K tokens** | — | 97 tokens/s |
+
+The same file on the integrated Radeon of a Ryzen AI Max+ 395 (Radeon 8060S, Strix Halo, `gfx1151`, HIP on
+ROCm 7.14.1) with 123 GiB of RAM holding the expert pool:
+
+| Prompt | Writes answers | Reads your prompt |
+| --- | ---: | ---: |
+| **short (512 tokens)** | 23.8 tokens/s | 168.5 tokens/s |
+| **32K tokens** | 9.8 tokens/s | 114.0 tokens/s |
+
+No 100K prompt was measured on the iGPU.
 
 Two runs each on the bitwise-deterministic binary, box load stated; the 100K row is a single cold run. Those rows were
 taken at a 256K context with a **hand-sized** expert cache. The current build sizes the cache itself and can place

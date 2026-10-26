@@ -11,7 +11,7 @@ Tarjeta gráfica NVIDIA o AMD (12 GB o más) · Windows o Linux · libre y de c�
 
 Strata ejecuta **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** en un PC normal. Es un
 modelo de IA grande e inteligente que normalmente necesita un servidor. Conversa, escribe código, entiende imágenes
-y funciona con tus aplicaciones y agentes de programación. Nada sale de tu PC.
+y funciona con tus aplicaciones y agentes de programación. Nada sale de tu PC. También ejecuta **[Kolibri 1](docs/KOLIBRI1.md)** (el MoE alemán e inglés de 78B de Aleph Alpha, 3,46B activos) con 56 GB de RAM: `./setup.sh --family kolibri` (Q4_K_M, el único tamaño que el setup ofrece por ahora).
 
 ## Sobre este fork
 
@@ -68,6 +68,15 @@ Este fork también midió **[Kolibri 1](docs/KOLIBRI1.md)** de Aleph Alpha (Q4_K
 | **corto (512 tokens)** | 30 tokens/s (según afinidad NUMA) | 156-160 tokens/s (`PF_PARTIAL` opcional: 180-181, en caliente 202) |
 | **32K tokens** | 13-14 tokens/s (según afinidad NUMA) | 119-120 tokens/s |
 | **100K tokens** | — | 97 tokens/s |
+
+El mismo archivo en la Radeon integrada de un Ryzen AI Max+ 395 (Radeon 8060S, Strix Halo, `gfx1151`, HIP sobre ROCm 7.14.1) con 123 GiB de RAM para el pool de expertos:
+
+| Prompt | Escribe respuestas | Lee tu prompt |
+| --- | ---: | ---: |
+| **corto (512 tokens)** | 23,8 tokens/s | 168,5 tokens/s |
+| **32K tokens** | 9,8 tokens/s | 114,0 tokens/s |
+
+No se midió ningún prompt de 100K en la iGPU.
 
 Dos ejecuciones por número con el binario determinista bit a bit, carga de la máquina indicada; la fila de 100K es
 una única ejecución en frío. Esas filas se tomaron con 256K de contexto y una caché de expertos **dimensionada a

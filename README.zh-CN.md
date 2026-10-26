@@ -10,7 +10,7 @@ NVIDIA 或 AMD 显卡（12 GB 及以上）· Windows 或 Linux · 免费开源</
 <a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">完整视频（49 秒）</a></sub></p>
 
 Strata 能在普通电脑上运行 **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**。这是一个又大又聪明的
-AI 模型，通常要用服务器才能跑。它能聊天、写代码、看图片，还能配合你的应用和编程智能体一起工作。所有数据都留在你的电脑上。
+AI 模型，通常要用服务器才能跑。它能聊天、写代码、看图片，还能配合你的应用和编程智能体一起工作。所有数据都留在你的电脑上。它还能在 56 GB 内存的电脑上运行 **[Kolibri 1](docs/KOLIBRI1.md)**（Aleph Alpha 的 78B 德语/英语 MoE，3.46B 激活）：`./setup.sh --family kolibri`（Q4_K_M，目前安装脚本只提供这一种规格）。
 
 ## 关于这个分支
 
@@ -64,6 +64,15 @@ NVIDIA：Q2_0 用的是引擎 0.1.36，其他各行用的是 0.1.26（4K 回答�
 | **短（512 token）** | 30 token/秒（随 NUMA 绑定变化） | 156-160 token/秒（启用 `PF_PARTIAL`：180-181，服务已运行 202） |
 | **32K token** | 13-14 token/秒（随 NUMA 绑定变化） | 119-120 token/秒 |
 | **100K token** | — | 97 token/秒 |
+
+同一个文件在 Ryzen AI Max+ 395 的集成 Radeon 上（Radeon 8060S，Strix Halo，`gfx1151`，基于 ROCm 7.14.1 的 HIP），用 123 GiB 内存承载专家池：
+
+| 提示长度 | 写回答 | 读提示 |
+| --- | ---: | ---: |
+| **短（512 token）** | 23.8 token/秒 | 168.5 token/秒 |
+| **32K token** | 9.8 token/秒 | 114.0 token/秒 |
+
+iGPU 上没有测过 100K 提示。
 
 每一项都在逐位可复现的构建上做两次运行并注明机器负载（100K 一行为单次冷启动运行）。这些行是在 256K 上下文、**手工估算**的
 专家缓存下测得的。当前构建自己估算缓存，并且可以按路由器选中频次来放置专家：
