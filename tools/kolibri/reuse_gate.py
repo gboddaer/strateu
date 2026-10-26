@@ -60,11 +60,12 @@ class EngineHung(Exception):
 class Engine:
     """One `--serve` process.  send() returns everything the engine said about one request."""
 
-    def __init__(self, bin_, model, ctx, threads):
+    def __init__(self, bin_, model, ctx, threads, extra_env=None):
         self.p = subprocess.Popen(
             [bin_, "--model", model, "--serve", "--ctx", str(ctx), "--prefill",
              "--cpu-threads", str(threads)],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
+            env=dict(os.environ, **(extra_env or {})))
         # A reader thread, not select(): select on a text-mode pipe waits on the OS fd while lines the
         # Python reader has already buffered sit in user space, so a ready answer reads as "silent".  The
         # first version of this gate timed out on a request the engine had answered in under a second.
@@ -247,11 +248,26 @@ def main():
         # for an engine whose prefix comparison was broken outright.
         base3 = short_pre + short_tail
         diverged = base3[:-1] + [(base3[-1] ^ 7)] + [short_pre[0]]
+        # The expectation depends on the mode, and saying so is the point: in the default STRICT mode a prompt
+        # that diverges must reset entirely, while in the opt-in longest-common-prefix mode it may reuse the part
+        # that genuinely matches - and then the thing to prove is that its answer still equals a cold read.
+        lcp = os.environ.get("STRATA_KOLIBRI_REUSE_PREFIX", "0") != "0"
+        eng.resetter(reset_token)
+        cold3 = eng.send(diverged, 1)
+        eng.resetter(reset_token)
+        eng.send(base3, 1)
         div = eng.send(diverged, 1)
         d_re, d_read = field(div["done"], 8, int), field(div["done"], 14, int)
-        ok = d_re == 0 and d_read == len(diverged)
-        record(ok, f"3. negative     {'PASS' if ok else 'FAIL'}  "
-                   f"(reused {d_re}, read {d_read} of {len(diverged)})")
+        if lcp:
+            ok = (d_re is not None and 0 < d_re <= len(base3) - 1
+                  and cold3["gen"] == div["gen"] and len(cold3["gen"]) == 1)
+            record(ok, f"3. negative     {'PASS' if ok else 'FAIL'}  "
+                       f"(prefix mode: reused {d_re} of a {len(base3) - 1}-id common prefix, "
+                       f"cold {cold3['gen']} vs warm {div['gen']})")
+        else:
+            ok = d_re == 0 and d_read == len(diverged)
+            record(ok, f"3. negative     {'PASS' if ok else 'FAIL'}  "
+                       f"(strict mode: reused {d_re}, read {d_read} of {len(diverged)})")
         # ---- stage 4: a cancelled request must not claim KV it never built -----------------------
         stage = "4. cancelled"
         eng.resetter(reset_token)
@@ -276,6 +292,30 @@ def main():
         record(ok, f"4. cancelled    {'PASS' if ok else 'FAIL'}  "
                    f"(cancelled {cancelled}, both STOPs produced {cw['gen']}; after it, reused {re4} of at most "
                    f"{len(ext4)}; cold {cold4['gen']} vs warm {warm4['gen']})")
+        # ---- stage 5 (opt-in mode): a prompt that matches for a while then diverges ------------
+        # STRATA_KOLIBRI_REUSE_PREFIX=1 reuses the longest common prefix instead of demanding a full match, which
+        # is what a real client needs: re-rendering the conversation as text lets a BPE merge across the turn
+        # boundary rewrite the prompt's last token or two.  Covered here because it is a separate code path;
+        # skipped unless the caller opts in, since it needs its own engine process with the knob set.
+        if os.environ.get("STRATA_KOLIBRI_REUSE_PREFIX", "0") != "0":
+            stage = "5. prefix"
+            eng5 = Engine(a.bin, a.model, a.ctx, a.cpu_threads, {"STRATA_KOLIBRI_REUSE_PREFIX": "1"})
+            try:
+                prev = short_pre[:600]
+                nxt = short_pre[:598] + [1234, 5678] + short_pre[600:640]   # agrees on 598, then diverges
+                eng5.resetter(reset_token)
+                cold5 = eng5.send(nxt, 4)
+                eng5.resetter(reset_token)
+                eng5.send(prev, 1)
+                warm5 = eng5.send(nxt, 4)
+                re5 = field(warm5["done"], 8, int)
+                ok = cold5["gen"] == warm5["gen"] and len(cold5["gen"]) == 4 and re5 is not None and re5 > 0
+                record(ok, f"5. prefix       {'PASS' if ok else 'FAIL'}  "
+                           f"(reused {re5} of a 598-id common prefix; cold {cold5['gen']} vs warm {warm5['gen']})")
+            finally:
+                eng5.close()
+        else:
+            record(True, "5. prefix       SKIP  (set STRATA_KOLIBRI_REUSE_PREFIX=1 to exercise the opt-in mode)")
     except EngineHung as e:
         record(False, f"{stage:14s} FAIL  ({e}) - the engine stopped answering; failing instead of hanging")
     finally:

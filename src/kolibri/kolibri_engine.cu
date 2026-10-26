@@ -3676,8 +3676,27 @@ int serve(Engine& e, Scratch& s) {
             const char* v = std::getenv("STRATA_KOLIBRI_REUSE");
             return v == nullptr || std::atoi(v) != 0;
         }();
-        if (reuse_on && held > 0 && held < ids.size() && std::equal(live.begin(), live.begin() + held, ids.begin())) {
-            reuse = held;
+        // STRATA_KOLIBRI_REUSE_PREFIX=1 reuses the LONGEST COMMON PREFIX instead of demanding that the whole held
+        // prefix match.  Measured reason: real clients re-render the conversation as TEXT, and a BPE merge across
+        // the turn boundary rewrites the prompt's last token or two - through /v1/chat/completions, turn 2 agreed
+        // with turn 1 on 57 of 59 ids, so the strict check reset and the turn read all 72 tokens (cache_n 0).
+        // Rows 0..reuse-1 belong to the tokens that DO match, so reusing them is exactly as safe as the strict
+        // case, and the rewind below re-derives the chunk the same way.  OPT-IN and off by default, because the
+        // strict rule is the documented contract and the default path must stay byte-identical.
+        const bool prefix_reuse = [] {
+            const char* v = std::getenv("STRATA_KOLIBRI_REUSE_PREFIX");
+            return v != nullptr && v[0] != 0 && std::atoi(v) != 0;
+        }();
+        size_t match = 0;
+        if (reuse_on && held > 0 && held < ids.size()) {
+            if (prefix_reuse) {
+                while (match < held && live[match] == ids[match]) ++match;
+            } else if (std::equal(live.begin(), live.begin() + held, ids.begin())) {
+                match = held;
+            }
+        }
+        if (match > 0) {
+            reuse = match;
             // K27b rebuilds each layer's K/V transpose mirror ONCE per REQUEST, on the first decode token,
             // on the documented assumption that this "also covers everything a prefill wrote".  reset_state()
             // zeroes kt_ready for exactly that reason (see its K27b comment).  This path skips reset_state -
