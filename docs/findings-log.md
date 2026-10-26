@@ -470,3 +470,24 @@ nothing in that store should touch row 127 when processing positions 256..511. T
 concurrent write that overlaps the tile edges - the KV write and the ring gather were previously caught in a
 stream race in this file (see the STREAM RACE note at the grouped-expert leg), and the dump syncs `g_st`
 only, so a write issued on another stream could land between the snapshot and the store.
+
+### A one-row second chunk changes 192 earlier K/V rows
+
+The sharpest form of it. Prompt of 258 ids, so the prefill runs chunks `p0c=0/Tc=256` then `p0c=256/Tc=1`,
+with K/V snapshotted after each (layer 0, a sliding layer, stride 513):
+
+    the second chunk writes position 256 and nothing else
+    rows 0..255 that changed afterwards: 64, 65, 66, ... , 255        count = 192
+
+Rows 64..255 move; rows 0..63 do not. Deterministic, and reproduced on every run (two identical cold reads
+give 0 differing rows in every snapshot, so this is not a race and not the instrument).
+
+So a chunk that writes a single position perturbs 192 rows behind it. That is not a store of the wrong slot -
+`k_attn_prep_multi` writes `slot = pos % swa` for its own chunk's positions only - so something else is
+writing K/V over a range derived from the chunk, and the range starts 64 rows into the buffer.
+
+Consequence, and why this is the blocker for the reuse work: a resumed read cuts its final chunk differently
+from a cold read (8 rows against 9), so this perturbation lands differently and the two arms cannot agree
+bitwise, at any amount of fixing in the reuse path. It reproduces in a single cold request with no reuse
+involved. What the reuse path itself got wrong (a stale K/V transpose mirror, fixed in aa9f0e0e) is separate
+and is done.
