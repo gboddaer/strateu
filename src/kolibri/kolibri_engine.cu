@@ -2318,6 +2318,24 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
         if (sliding)
             k_kv_ring<<<grid1((int64_t) HKV * P * D), kThreads>>>(s.kc[l], s.vc[l], A.k16, A.v16, g.n_swa, P,
                                                                   first, D, HKV);
+        if (reuse_gate_kv_path() && (int) l == attn_dump_layer()) {
+            // Per-chunk snapshot, so the chunk that perturbs a row is named rather than inferred.  Header magic
+            // 0x4b564348 ("KVCH") distinguishes these from the decode-time records (0x4b4d414d).
+            KC(cudaStreamSynchronize(g_st));
+            const int64_t rows = sliding ? (int64_t) g.n_swa
+                                         : std::min<int64_t>(p0c + Tc, (int64_t) s.ctx);
+            const size_t nfl = (size_t) rows * (size_t) HKV * (size_t) D;
+            std::vector<__half> kh(nfl), vh(nfl);
+            KC(cudaMemcpy(kh.data(), s.kc[l], nfl * sizeof(__half), cudaMemcpyDeviceToHost));
+            KC(cudaMemcpy(vh.data(), s.vc[l], nfl * sizeof(__half), cudaMemcpyDeviceToHost));
+            if (std::FILE* f = std::fopen(reuse_gate_kv_path(), "ab")) {
+                const int32_t hdr[4] = {(int32_t) p0c, (int32_t) Tc, (int32_t) rows, 0x4b564348};
+                std::fwrite(hdr, 4, 4, f);
+                std::fwrite(kh.data(), sizeof(__half), nfl, f);
+                std::fwrite(vh.data(), sizeof(__half), nfl, f);
+                std::fclose(f);
+            }
+        }
         k_to_f16<<<grid1((int64_t) Tc * H * D), kThreads>>>(A.q_m, A.q16, (int64_t) Tc * H * D);
 #if STRATA_KOLIBRI_MMA_AVAILABLE
         if (attn_mma_on() && H == 48 && HKV == 4 && D == 128) {

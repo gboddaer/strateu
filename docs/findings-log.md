@@ -444,3 +444,29 @@ transpose mirror), which moved the divergence from 6.8e-01 to 2.1e-02 relative a
 
 Not yet explained, and the next thing to look at: why a 128-row boundary is special in the K/V write, and
 whether the same perturbation happens for every chunk or only for the final one.
+
+### Which chunk does it: the K/V dump per prefill chunk
+
+The same cold read of a 522-token prompt, with K/V snapshotted after every prefill chunk (magic `KVCH`):
+
+  records: p0c=0/Tc=256, p0c=256/Tc=256, p0c=512/Tc=9   (all 513 ring rows each)
+
+| comparison | rows that moved |
+|---|---|
+| after chunk 2 against after chunk 1 | 127, 255, 256, 383, 384, 512 |
+| after chunk 3 against after chunk 1 | 127, 128, 129, 255, 256, 257, 383, 384, 512 |
+
+Chunk 2 writes positions 256..511, i.e. slots 256..511. Every row it is *supposed* to write did change, as it
+must. The problem is the rows it is not supposed to write: **127 and 255** (both written by chunk 1) changed
+anyway, and so did 512, which no chunk has reached yet at that point. After chunk 3 the moved set grows to
+127..129 and 255..257 — the last row of one 128-row tile and the first rows of the next.
+
+So the chunk that perturbs is not the last one: chunk 2 already moves rows behind itself. 127, 255 and 383 are
+exactly the last row of each 128-row tile, and 128/256/384 the first row of the next, which is what the
+cold-against-reused comparison at the decode step was already showing.
+
+Still not explained: `k_attn_prep_multi` writes `slot = pos % swa` for its own chunk's positions only, so
+nothing in that store should touch row 127 when processing positions 256..511. The next thing to check is a
+concurrent write that overlaps the tile edges - the KV write and the ring gather were previously caught in a
+stream race in this file (see the STREAM RACE note at the grouped-expert leg), and the dump syncs `g_st`
+only, so a write issued on another stream could land between the snapshot and the store.
