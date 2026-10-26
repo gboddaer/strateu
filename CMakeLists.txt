@@ -1028,6 +1028,18 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(kolibri_router_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(kolibri_router_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME kolibri_router_parity COMMAND kolibri_router_parity)
+  # G1 follow-up (plan 2026-10-26): PF_PARTIAL rides the fp16-cache scratch; without it the engine must refuse
+  # at startup (it used to fault with a CUDA invalid argument at prefill's first publish, kolibri_engine.cu:2584).
+  add_test(NAME kolibri_pf_partial_guard_test
+    COMMAND ${CMAKE_COMMAND} -DENGINE=$<TARGET_FILE:strata-kolibri>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/kolibri/pf_partial_guard_test.cmake)
+  set_tests_properties(kolibri_pf_partial_guard_test PROPERTIES
+      ENVIRONMENT "STRATA_KOLIBRI_PF_PARTIAL=1" TIMEOUT 120)
+  add_test(NAME kolibri_pf_partial_guard_explicit_zero_test
+    COMMAND ${CMAKE_COMMAND} -DENGINE=$<TARGET_FILE:strata-kolibri>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/kolibri/pf_partial_guard_test.cmake)
+  set_tests_properties(kolibri_pf_partial_guard_explicit_zero_test PROPERTIES
+      ENVIRONMENT "STRATA_KOLIBRI_PF_PARTIAL=1;STRATA_KOLIBRI_EXPERT_F16=0" TIMEOUT 120)
   # #783 PR-c: the multi-token router and the k = 10 float4 combine, bitwise against the single-token contracts
   add_executable(native_multi_parity src/kernels/native_multi_parity.cpp)
   target_include_directories(native_multi_parity PRIVATE ${_strata_gpu_include_directories})

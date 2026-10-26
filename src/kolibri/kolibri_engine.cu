@@ -4395,6 +4395,16 @@ int strata::kolibri::run(int argc, char** argv) {
         else if (a == "--attn-2pass-max" && i + 1 < argc) g_two_pass_max = std::atoi(argv[++i]);
         else if (a == "--counters") counters = 1;
     }
+    if (pf_partial_on() && expert_f16_n() <= 0) {
+        // G1 follow-up (plan 2026-10-26-kolibri-pf-partial-f16-guard.md): the pf_partial scratch (act1.wts_h,
+        // p_h, p_m, rr_sel_m, p_done - kolibri_engine.cu:3252-3263) is allocated only under the fp16 expert
+        // cache, and the partial legs read the cache's resident rows.  Setting the knob alone reaches the first
+        // prefill publish and dies with CUDA "invalid argument" (copy into the null wts_h, :2584).  Refuse here,
+        // before any model read or CUDA init, and name the missing knob.
+        std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_PF_PARTIAL rides the fp16 expert cache's scratch; "
+                             "set STRATA_KOLIBRI_EXPERT_F16 (experts per layer, e.g. 28) first\n");
+        return 2;
+    }
     if (model.empty()) {
         std::fprintf(stderr, "strata-kolibri: the Kolibri 1 engine path (plan T7); --model GGUF [--load-only] for now\n");
         return 2;

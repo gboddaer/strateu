@@ -120,7 +120,9 @@ pp 512 **179.8 / 181.0 tok/s** (serve path 181.7 cold, 201.8 warm), pp 32,768 **
 **30.0 / 30.3 tok/s**, tg 128 after 32K **13.3 / 13.4 tok/s**, KL 0.00133 against the knob-off 0.00123 with
 llama.cpp's own CPU-vs-GPU floor at 0.00178.  The +16% at 512 tokens is real and the 32K figure never went down in
 any pair; what it does not do is reach the 200 tok/s target, because the expert GEMM underneath is 4.18 ms/layer and
-the compressed alternative measured 9.99.
+the compressed alternative measured 9.99.  It needs the fp16 expert cache's scratch: set STRATA_KOLIBRI_EXPERT_F16
+too - without it the engine refuses at startup (before the 2026-10-26 fix it died with a CUDA invalid argument at
+the first publish).
 
 **Card classes - what carries over, and what does not.**  The placement sign (the findings register's
 "Slots refutation: box-scoped") is the whole story, and it is decided by ONE ratio: the host's streaming
