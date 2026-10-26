@@ -467,10 +467,12 @@ OWN_PATH_FAMILIES = {
                 "hf": hf("Hob-forge/Kolibri-1-GGUF"), "file": "Kolibri-1-{q}.gguf", "tag": "kolibri-",
                 "name": "kolibri-1", "license": "Apache 2.0: https://huggingface.co/AlephAlpha/Kolibri-1",
                 "binary": "strata-kolibri",   # source-build family: its own engine binary (src/kolibri), compiled in build/
-                "models": {"Q4_K_M": {"about": "4-bit (Q4_K experts, Q6_K down-projections every 5th layer)", "ram_gb": 56},
-                           "Q8_0": {"about": "8-bit, the closest to the full model", "ram_gb": 96}},
-                # the Q4_K_M hash is the HF API LFS oid at the pinned commit, from the local files' .fetch/ script;
-                # the Q8_0 hashes are sha256sum over the two local shards (83.1 GB read, 2026-10-17)
+                "models": {"Q4_K_M": {"about": "4-bit (Q4_K experts, Q6_K down-projections every 5th layer)", "ram_gb": 56}},
+                # the Q4_K_M hash is the HF API LFS oid at the pinned commit, from the local files' .fetch/ script
+                # (HEAD at 40eaa5cf: 200, 47454113472 bytes).  Q4_K_M is the only size setup offers: Q5_K_M, Q6_K
+                # and Q8_0 live in repo SUBFOLDERS (Q8_0/Kolibri-1-Q8_0-0000i-of-00002.gguf - a flat URL is a 404)
+                # and need a shard download loop, Q2_K and Q3_K_M are not wired in.  Their hashes stay below as
+                # verified data for whoever adds that loop.
                 "sha256": {"Kolibri-1-Q4_K_M.gguf": (47454113472, "c2ac1301424441ef210b6de50ce25e8ccf69f86494df53d6ba52ed558456062e"),
                            "Kolibri-1-Q8_0-00001-of-00002.gguf": (44679459296, "2cc41e6d39f48533dd354f76883d9a05100bc39d34b84d4c314590f8d6dfeb82"),
                            "Kolibri-1-Q8_0-00002-of-00002.gguf": (38455934400, "ff900a95fa17625d7e9a36992195b189916e01d224ac3126e0c54c0cb4a58810")},

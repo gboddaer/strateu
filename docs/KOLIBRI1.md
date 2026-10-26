@@ -42,6 +42,8 @@ Routed experts are 42.4 GB (Q4_K_M) / 75 GB (Q8_0); one decoded token reads 6 ex
 
 (`--gguf-dir` names the folder that holds the file; setup checks its SHA-256. Setup compiles the family's own
 binary `strata-kolibri` in `build/` - no ready-made engine carries this family yet.)
+Setup offers Q4_K_M only. The repository's other sizes (Q2_K, Q3_K_M, Q5_K_M, Q6_K, Q8_0 - the last three in
+subfolders) are not wired into setup yet.
 
 or directly:
 
