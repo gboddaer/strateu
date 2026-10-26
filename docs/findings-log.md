@@ -491,3 +491,24 @@ from a cold read (8 rows against 9), so this perturbation lands differently and 
 bitwise, at any amount of fixing in the reuse path. It reproduces in a single cold request with no reuse
 involved. What the reuse path itself got wrong (a stale K/V transpose mirror, fixed in aa9f0e0e) is separate
 and is done.
+
+### RETRACTION: the "128-aligned K/V rows differ" and "one-row chunk changes 192 rows" findings were wrong
+
+Both came from my comparator, not from the engine. A K/V row is `D` = 128 halves; the comparator indexed
+rows as `HKV * D` = 512 halves, so "row r" was really **position 4r**, and past position 128 it ran off the
+end of head 0 into heads 1..3. Every claim built on that indexing is withdrawn: the 128-alignment pattern,
+the 192 rows moving, and the "second writer over a range derived from the chunk".
+
+Redone with correct per-head indexing (`offset = (h * rows + p) * D`), the cold-against-reused comparison on a
+522-id prompt at a 513-id prefix gives:
+
+    positions whose K/V differ (any head): [512]      count = 1 of 513
+
+One position. Every other K/V position is byte-identical between a cold read and a resumed read. Position 512
+is the boundary row, and its provenance legitimately differs: the prefix request writes it through the
+single-token DECODE path, while a cold read of the longer prompt writes it inside a prefill chunk.
+
+So the remaining gap is a single row with two different computation paths, not a broad perturbation. The
+alignment experiment (quantising the reusable prefix down to a chunk boundary) is not the fix: at a 513 prefix
+it changed the request's chunk geometry (prefill starting at 513 with 9 rows, decode at 522) and the logits
+divergence got worse, 1.4e-01 against 4.1e-02. Withdrawn with the rest.

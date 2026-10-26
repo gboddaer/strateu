@@ -3684,6 +3684,7 @@ int serve(Engine& e, Scratch& s) {
             // full window copy once per layer per request, which is what a cold request already pays.
             std::fill(s.kt_ready.begin(), s.kt_ready.end(), (char) 0);
         }
+        }
         else {
             reset_state(e, s);
             live.clear();
