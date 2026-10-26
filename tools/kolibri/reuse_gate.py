@@ -23,9 +23,10 @@ Stages (one engine process; each stage starts from a cold state via a resetter r
                    the 4 generated ids must be identical.  `pre` is 3,000 ids, well past the 513-row
                    sliding ring, so the ring has wrapped before the extension - extension-only reuse is
                    ring-safe by construction and this proves it rather than assuming it.
-  1b. bitwise-1    same, with a ONE-token tail: nothing is left to prefill, and that must look correct
-                   (this is what today's bug looks like) rather than be mistaken for it.  640-id prefix,
-                   still past the ring, since the property is the ring, not the size.
+  1b. bitwise-1    same, with a ONE-token tail: the extending request has almost nothing left to prefill, and
+                   that must still look correct rather than be mistaken for today's bug.  The read count is NOT
+                   0 - the rewind gives back up to a chunk, so this stage reports ~130 - and the one geometry
+                   that would read nothing at all (reuse == ids.size()-1) is not exercised here.
   2. accounting    stage 1's reused arm must report reused == |pre| + 1, read == |tail|, prompt_ms > 0.
                    A prompt_ms of 0.0 with tokens read is the bug, so it fails the gate.
   3. negative      a prefix that diverges in its last id is not an extension: reused 0, everything read.
@@ -131,6 +132,9 @@ class Engine:
                 return r
 
     def resetter(self, token):
+        # Load-bearing detail: the reset token must NOT equal the first id of the next prompt, or the engine
+        # would see an extension instead of a fresh request.  main() picks 1 or 2 for that reason, which is why
+        # a fixture whose first id is neither still works only by luck - keep the choice explicit.
         """A one-token request nothing can extend, so the next request starts from a clean state.
         (GEN 0 would be cheaper but never answers - see the module docstring.)"""
         self.send([token], 1)
