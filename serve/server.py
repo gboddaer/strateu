@@ -3795,9 +3795,20 @@ class Service:
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         if not changed:
-            return self.tok.encode(prompt, parse_special=True)
-        prompt, plain = unmark_think_literals(prompt, self.literals)
-        return self.tok.encode(prompt, parse_special=True, plain=plain)
+            ids = self.tok.encode(prompt, parse_special=True)
+        else:
+            prompt, plain = unmark_think_literals(prompt, self.literals)
+            ids = self.tok.encode(prompt, parse_special=True, plain=plain)
+        # STRATEU_DUMP_PROMPT=<path> appends one JSON line per request with the rendered text and its ids.  It
+        # exists because the engine's prefix reuse depends on the CLIENT resending an exact token prefix, so
+        # "why did cache_n stay 0" is only answerable by comparing what was actually sent.  Off unless set.
+        if _dump := os.environ.get("STRATEU_DUMP_PROMPT"):
+            try:
+                with open(_dump, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"ids": ids, "text": prompt}) + "\n")
+            except OSError:
+                pass
+        return ids
 
     @contextlib.contextmanager
     def _turn(self, cancel=None):
