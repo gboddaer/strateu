@@ -166,9 +166,31 @@ chose 75 slots/layer from 9,501 MiB free, and prints the exchange rate it implie
 of context at 20.0 KB/token, which is why `--ctx` and `--expert-slots` are one decision and not two.  Not measured:
 sessions long enough for the hot set to drift, and any card other than this T4.
 
+### Speed on an integrated Radeon (measured 2026-10-26, Radeon 8060S in a Ryzen AI Max+ 395, gfx1151, HIP on ROCm 7.14.1, 123 GiB RAM, Q4_K_M)
+
+The engine was built from this tree with `-DSTRATA_ENABLE_HIP=ON -DCMAKE_HIP_ARCHITECTURES=gfx1151` against the ROCm
+7.14.1 toolchain (setup's own source build is CUDA-only - see "Not verified" below). Same harness
+(`tools/kolibri/bench.py --prefill --cpu-threads 24`), the same Q4_K_M file, 42.90 GiB of expert blobs pinned in the
+shared LPDDR5X pool:
+
+| Prompt | Writes answers | Reads your prompt |
+| --- | ---: | ---: |
+| **short (512 tokens)** | 23.8 tokens/s | 168.5 tokens/s |
+| **32K tokens** | 9.8 tokens/s | 114.0 tokens/s |
+
+Reading (prefill) a short prompt is faster than on the T4 above (168.5 against 156-160 tokens/s): there is no PCIe
+hop, the pool and the GPU read one unified pool.  Writing (generation) is slower (23.8 against 30 tokens/s), and at
+32K both directions fall behind the T4 (114.0 and 9.8 against 119-120 and 13-14): the CPU pool and the 40-CU iGPU
+share one memory system.
+Loading took 9 s.  No 100K prompt was measured here.  The 16-token greedy generation from
+`tools/kolibri/oracle_ids512.txt` is **bitwise identical** to the RTX 3090's CUDA run, which is what makes these
+numbers comparable at all.
+
 ## Not verified (v1)
 
-- AMD (HIP) — the code builds for HIP by the q36 pattern, validated on NVIDIA only.
+- AMD (HIP) beyond the two boxes measured: a Radeon AI PRO R9700 (gfx1201, docs/AMD_R9700_PORT.md) and an integrated
+  Radeon 8060S (gfx1151, the speed subsection above). Setup's own HIP build for this family is still open, so a
+  one-click install on AMD is not verified.
 - Q8_0 beyond a smoke run (parity is at Q4_K_M).
 - Speculative decoding: the model has no MTP layer; prompt-lookup drafting is future work.
 - Multi-GPU, images, the Intel Arc (SYCL) build (refused, like Qwen3.6's).
