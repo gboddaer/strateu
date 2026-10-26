@@ -217,6 +217,22 @@ static inline const char* reuse_gate_dump_path() {
     return p;
 }
 
+// Same instrument for the FINAL HIDDEN STATE at the generating position: the logits are one gemv away from
+// it, so if the hidden states of two arms agree while their logits differ the divergence is the output
+// projection, and if the hidden states already differ it is inside the stack.  Measurement-only.
+static inline const char* reuse_gate_hidden_path() {
+    static const char* p = std::getenv("STRATA_KOLIBRI_HIDDEN_DUMP");
+    return p;
+}
+
+// And for the K/V themselves, at the layer named by STRATA_KOLIBRI_ATTN_DUMP_LAYER.  Comparing the two arms'
+// bytes says whether the state handed over by the prefix request differs at all, and if it does, the first
+// differing row is the position the reuse path got wrong.  Measurement-only.
+static inline const char* reuse_gate_kv_path() {
+    static const char* p = std::getenv("STRATA_KOLIBRI_KV_DUMP");
+    return p;
+}
+
 
 
 struct LayerBlobs {
@@ -1971,6 +1987,21 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
             k_attn<<<H, n_vis <= g_two_pass_max ? kThreads : 512, n_vis <= g_two_pass_max ? (size_t) n_vis * sizeof(float) : (size_t) 4096 * sizeof(float), st>>>(
                 s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding, 0, g_two_pass_max, ktc, vtc);
         }
+        if (reuse_gate_kv_path() && (int) l == attn_dump_layer()) {
+            const int64_t rows = std::min<int64_t>((int64_t) s.pos + 1,
+                                                   sliding ? (int64_t) g.n_swa : (int64_t) s.ctx);
+            const size_t nfl = (size_t) rows * (size_t) HKV * (size_t) D;
+            std::vector<__half> kh(nfl), vh(nfl);
+            KC(cudaMemcpy(kh.data(), s.kc[l], nfl * sizeof(__half), cudaMemcpyDeviceToHost));
+            KC(cudaMemcpy(vh.data(), s.vc[l], nfl * sizeof(__half), cudaMemcpyDeviceToHost));
+            if (std::FILE* f = std::fopen(reuse_gate_kv_path(), "ab")) {
+                const int32_t hdr[3] = {(int32_t) s.pos, (int32_t) l, (int32_t) rows};
+                std::fwrite(hdr, 4, 3, f);
+                std::fwrite(kh.data(), sizeof(__half), nfl, f);
+                std::fwrite(vh.data(), sizeof(__half), nfl, f);
+                std::fclose(f);
+            }
+        }
         if (s.dec_att16) k_to_f16<<<dim3((H * D + 127) / 128), 128, 0, st>>>(s.att, s.dec_att16, H * D);   // S6
         gemv_dec(e.dense.at(L(l, "attn_output.weight")), s.att, s.dec_att16, s.y, st);
         k_rms_add<<<1, kThreads, 0, st>>>(s.y, e.f32.at(L(l, "post_attention_norm.weight")), s.x, N, e.eps);
@@ -3679,6 +3710,16 @@ int serve(Engine& e, Scratch& s) {
                     std::fwrite(hdr, 4, 3, lf);
                     std::fwrite(lg.data(), 4, lg.size(), lf);
                     std::fclose(lf);
+                }
+            }
+            if (produced == 0 && reuse_gate_hidden_path()) {
+                if (std::FILE* hf = std::fopen(reuse_gate_hidden_path(), "ab")) {
+                    std::vector<float> hh((size_t) e.g.n_embd);
+                    KC(cudaMemcpy(hh.data(), s.h, (size_t) e.g.n_embd * 4, cudaMemcpyDeviceToHost));
+                    const int32_t hdr[3] = {(int32_t) reuse, (int32_t) fresh, (int32_t) hh.size()};
+                    std::fwrite(hdr, 4, 3, hf);
+                    std::fwrite(hh.data(), 4, hh.size(), hf);
+                    std::fclose(hf);
                 }
             }
             if (e.counters) { e.cnt.d2h_n += 1; e.cnt.d2h_bytes += (long long) lg.size() * 4; }
