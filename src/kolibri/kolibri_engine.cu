@@ -3687,11 +3687,20 @@ int serve(Engine& e, Scratch& s) {
             const char* v = std::getenv("STRATA_KOLIBRI_REUSE_PREFIX");
             return v != nullptr && v[0] != 0 && std::atoi(v) != 0;
         }();
+        // The prefill never feeds the last prompt token - the decode step does - so that is the most a request can
+        // reuse however long the held prefix is.
+        const size_t reuse_cap = ids.size() > 1 ? ids.size() - 1 : 0;
         size_t match = 0;
-        if (reuse_on && held > 0 && held < ids.size()) {
+        if (reuse_on && held > 0 && ids.size() > 1) {
             if (prefix_reuse) {
-                while (match < held && live[match] == ids[match]) ++match;
-            } else if (std::equal(live.begin(), live.begin() + held, ids.begin())) {
+                // Cap at reuse_cap rather than requiring `held < ids.size()`.  A real turn often re-renders to
+                // FEWER tokens than the engine holds (the reply is truncated by max_tokens, and re-tokenizing it
+                // gives a different count), and the strict guard then rejected a prefix that genuinely matched:
+                // measured through /v1/chat/completions, the engine held 104 tokens while turn 2 was 78, so every
+                // turn read its whole prompt.  The rows for the matched ids are valid either way.
+                const size_t lim = std::min(held, reuse_cap);
+                while (match < lim && live[match] == ids[match]) ++match;
+            } else if (held < ids.size() && std::equal(live.begin(), live.begin() + held, ids.begin())) {
                 match = held;
             }
         }
