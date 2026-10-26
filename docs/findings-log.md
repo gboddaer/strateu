@@ -685,3 +685,24 @@ reachable, and both halves fail for a reason worth recording:
 So the two requirements are mutually exclusive: with the rewind the prefill always reads at least one chunk, and
 without it the answer stops being bitwise. The delivered gate asserts the reachable properties and prints the
 cold/warm ids with that note rather than pretending the plan's number was met.
+
+### Prefix mode also had to accept a SHORTER prompt than the engine holds
+
+The opt-in mode still required `held < ids.size()`, which a real client routinely violates in the other
+direction: the engine holds the prompt plus everything it generated, and the re-rendered next turn is often
+shorter, because the reply was truncated by `max_tokens` and re-tokenizes to a different count. Measured on the
+running server: the engine held 104 tokens while turn 2 was 78, so the guard rejected a prefix that genuinely
+matched and every turn read its whole prompt.
+
+Prefix mode now caps the match at `ids.size()-1` (the prefill never feeds the last prompt token - the decode step
+does) and the rewind still takes the reuse down to a chunk boundary, so the bitwise property is unchanged. Strict
+mode keeps `held < ids.size()`, so the default path is untouched.
+
+Three turns of a growing conversation through `http://192.168.123.122:8085/v1` after the change (T4, driver
+580.196.07, kernel 6.1.0-52, `--prefill --cpu-threads 24`, ctx 16384, `STRATA_KOLIBRI_REUSE_PREFIX=1`):
+
+| turn | cache_n | prompt_n | prompt_ms |
+|---|---|---|---|
+| 1 | 0 | 65 | 1348 |
+| 2 | 63 | 15 | 392 |
+| 3 | 76 | 14 | 374 |
