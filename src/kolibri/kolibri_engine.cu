@@ -3725,6 +3725,13 @@ int serve(Engine& e, Scratch& s) {
         // token, which the decode step feeds.  (Named pf_end, not stop: `stop` is this request's
         // cancellation flag, and shadowing it here is a compile error the first time it is tried.)
         const int64_t pf_end = (int64_t) ids.size() - 1;
+        // The contract serve/server.py already parses (:1934) and src/program/generate.cpp already keeps
+        // (:11225): <n> prompt tokens are not read again.  Printed before the first PP line and only when
+        // there are some, so a client that ignores it sees exactly today's stream.
+        if (reuse > 0) {
+            std::printf("RESUME %lld\n", (long long) reuse);
+            std::fflush(stdout);
+        }
         if (e.prefill > 0) {   // chunked prefill: 512 rows per pass, progress per chunk
             int64_t i = reuse;
             const int64_t n = pf_end - reuse;   // the tokens still to read (== ids.size()-1 when reuse is 0)
@@ -3736,13 +3743,13 @@ int serve(Engine& e, Scratch& s) {
                 forward_multi(e, s, T, s.pos);
                 s.pos += T;
                 i += T;
-                std::printf("PP %lld %lld %.0f %.1f\n", (long long) (i - reuse), (long long) fresh, ms_since(t0),
+                std::printf("PP %lld %lld %.0f %.1f\n", (long long) i, (long long) ids.size(), ms_since(t0),
                             (double) (i - reuse) / std::max(1e-9, ms_since(t0) / 1000.0));
                 std::fflush(stdout);
             }
         } else
         for (int64_t t = (int64_t) reuse + 1; t < (int64_t) ids.size(); ++t) {   // the prompt minus its last token            forward(e, s, ids[t - 1], nullptr);
-            std::printf("PP %lld %lld %.0f %.1f\n", (long long) (t - reuse), (long long) fresh, ms_since(t0),
+            std::printf("PP %lld %lld %.0f %.1f\n", (long long) t, (long long) ids.size(), ms_since(t0),
                         (double) (t - reuse) / std::max(1e-9, ms_since(t0) / 1000.0));
             std::fflush(stdout);
         }

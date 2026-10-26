@@ -27,7 +27,10 @@ def run_case(ids: str, n: int, ctx: int, label: str):
             if not l:
                 return None
             l = l.strip()
-            if l.startswith("PP ") or l.startswith("T "):
+            # RESUME <n> is the reused-token line and comes BEFORE the first PP; treating it as the end of the
+            # request would end the run early.  bench.py drives cold requests (reuse 0) so it never sees one
+            # today, but a harness that also drives warm ones must not trip on it.
+            if l.startswith("PP ") or l.startswith("T ") or l.startswith("RESUME "):
                 continue
             return l
     # The engine prints banner lines BEFORE the handshake: with --grouped the first line is
@@ -46,7 +49,11 @@ def run_case(ids: str, n: int, ctx: int, label: str):
     assert done and done.startswith("DONE"), f"expected DONE, got {done!r}"
     f = done.split()
     produced, n_ids, prompt_ms, decode_ms = int(f[1]), int(f[2]), float(f[3]), float(f[4])
-    print(f"{label}: pp {n_ids} tok in {prompt_ms:.0f} ms = {n_ids/max(1e-9,prompt_ms)*1000:.1f} tok/s; "
+    # the prompt rate is over the tokens actually READ: with a reused prefix n_ids counts the whole prompt but
+    # only n_ids - reused were prefilled, and rating the whole prompt against the tail's time would overstate it.
+    reused = int(f[8]) if len(f) > 8 else 0
+    read = max(1, n_ids - reused)
+    print(f"{label}: pp {read} tok read (of {n_ids}) in {prompt_ms:.0f} ms = {read/max(1e-9,prompt_ms)*1000:.1f} tok/s; "
           f"tg {produced} tok in {decode_ms:.0f} ms = {produced/max(1e-9,decode_ms)*1000:.1f} tok/s")
     p.stdin.close()
     p.wait(timeout=60)
