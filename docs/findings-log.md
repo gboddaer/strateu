@@ -1038,15 +1038,22 @@ much for free, and why 1A needed no mid-request machinery at all.
 the gap that 0.5 predicted would be captured is captured.  For scale: the shipped global set on the same prompt was
 25.7% when seeded from an unrelated profile and 21.0% from the id seed (0.1).
 
+**Across prompts, which is the case the cache is for.**  The v2 profile learned on prompt A, then used cold on the
+unrelated 12,000-token prompt B (39 experts per layer survived the trim, so this is a genuine transfer, not a replay):
+**46.6%** on B's first request and **63.8%** after B's own re-selection — against 19.9-20.2% for the id seed and 25.7-26.4%
+for the global set measured on these prompts in 0.1.  So a map learned on one prompt is worth roughly twice the shipped
+set on a *different* one, and B's own histogram then adds another 17 points.
+
 **Persistence.**  A second process loading the v2 profile written by the first run started at **84.7%** and reached
 **91.5%** on its second request — so the layer dimension survives a restart and a warm start does not have to relearn.
 
-**Decode does not regress, and does not improve either.**  Across both runs the per-layer arm reads 20.4-22.6 tok/s and
-the global arm 17.2-22.6; the two arms swapped places between runs and the values followed the box load, not the knob
-(run 2's global arm was measured at load 1.83 and the per-layer arm at load 0.97 twenty minutes later).  The honest
-statement is the one the box supports: **no regression attributable to the per-layer map** (the same binary, the same
-session shape, 22.1/22.2 in the 0.4 baseline), and no gain — on this box the CPU pool is the fast leg, so a hit that
-moves a pick from the pool to a VRAM slot buys PCIe traffic, not time.
+**Decode does not regress, and does not improve either.**  Across every session the per-layer arm reads 17.1-22.6 tok/s
+and the global arm 17.2-22.6; the arms swap places between runs and the values follow the box, not the knob (run 2's
+per-layer session was 21.04-20.38 at load 0.97, the cross-prompt session 17.41-17.13 at load 0.42).  The honest
+statement is the one the box supports: **no regression attributable to the per-layer map** (the 0.4 baseline on the same
+session shape is 22.1/22.2), and no gain — on this box the CPU pool is the fast leg (the release notes' own placement
+rule: slots lose to the pool by 1.7x and beat PCIe by 9x), so a hit that moves a pick from the pool to a VRAM slot buys
+PCIe traffic, not time.  The hit rate is the number 1A is for; it should not be sold as a decode speedup.
 
 **What 1A does not claim.**  It does not make generated ids equal to the by-id run, and cannot: 0.3 measured that any
 residency change across the pool/GPU boundary flips ids, and the by-id vs profile pair already disagrees.  What holds is
