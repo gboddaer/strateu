@@ -9,7 +9,10 @@
 #   1. ids smoke   64-token prompt, 4 generated ids, ~1 s        <- catches duplicated / misordered work
 #   2. PF_HASH     512-token prompt, 50 chunk-layer checksums     <- catches expert-leg value drift (needs determinism)
 #   3. oracle      the plain path, bitwise vs the recorded ids    <- catches anything that moves the plain path
-#   4. reuse       an extending request against a cold read        <- catches a resumed read that reads no tail,
+#   4. reuse       an extending request against a cold read       <- catches a resumed read that reads no tail,
+#                                                                     lies about what it read, or answers differently
+#   (0b. plain and 0c. no-prefill run BEFORE those: the plain --serve path and the zero-prefill geometry, which
+#    every --prefill stage is blind to.  0. build runs first and aborts, so a broken tree cannot pass.)
 #
 # Usage:  bash tools/kolibri/pf_gate.sh            # gate the CURRENT tree against the recorded expectations
 #         bash tools/kolibri/pf_gate.sh --record   # record this tree's outputs as the new expectation
@@ -17,7 +20,10 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 2
 M=${KOLIBRI_MODEL:-/data4/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf}
-BIN=${KOLIBRI_BIN:-/tmp/kolibri_bench_node1.sh}
+# Default to the tree's OWN binary.  This used to default to /tmp/kolibri_bench_node1.sh, a Campaign-I wrapper that
+# execs an older build - the trap that once had three gates passing against a binary with no PF_PARTIAL in it.
+# Pass KOLIBRI_BIN=<numa wrapper> when the run needs node pinning.
+BIN=${KOLIBRI_BIN:-$PWD/build/strata-kolibri}
 SMOKE=/tmp/pf_gate_smoke.txt
 HASH=/tmp/pf_gate_hash.txt
 EXP_SMOKE=${KOLIBRI_GATE_SMOKE:-/tmp/pf_gate_expect_smoke.txt}

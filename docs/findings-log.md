@@ -658,8 +658,9 @@ Two other audit points, recorded rather than argued away:
 
 * "one-token tail with `prompt_read == 0`" was my own wording and it is unreachable: `prompt_read` counts every
   prompt token the request did not skip, and the guard requires `held < ids.size()`, so the last token is always
-  fed by the decode step. What can be zero is the PREFILL, and `reuse_gate` stage 1c now asserts exactly that
-  (reused 640, 0 PP lines, prompt_read 1, answer equal to a cold read).
+  fed by the decode step. What can be zero is the PREFILL, and `pf_gate` stage 0c now asserts exactly that
+  (reused 640, 0 PP lines, prompt_read 1). It does NOT assert that the answer equals a cold read, because in that
+  geometry it does not - see the next section, which measures it differing.
 * the HIP debt was in a commit message only, which is not where it belongs: it is recorded here too. This box has
   no ROCm toolchain, so `kolibri_engine.cu`'s HIP path was never compiled. `docs/AMD_HIP.md` owes a build plus
   `reuse_gate.sh check` and `pf_gate.sh check` (with REUSE_GATE left on) on the AMD box.
