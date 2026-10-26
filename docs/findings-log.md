@@ -1089,11 +1089,13 @@ so no bitwise gate could ever pass over it, and 0.1 shows there is no trajectory
 **Two quoted numbers could not be used as bars, and both for measurement reasons rather than convenience.**
 
 * **pp-512 179.8 / 181.0 tok/s and tg 30.3 tok/s are `STRATA_KOLIBRI_PF_PARTIAL=1` figures** (`KOLIBRI1.md:117`), an
-  opt-in that changes the prefill's partial-sum path.  On this tree that knob **does not run at all** with `--serve`:
-  `cudaMemcpyAsync(A.wts_h, A.wts_m, ...) failed: invalid argument` (`:2598`) at the FIRST prefill chunk, with
-  `--expert-slots auto --expert-slots-hot` **and without it** (measured 2026-10-26, both arms, twice).  So the figure
-  cannot be reproduced on this box today by any configuration of this change, and quoting it as a target would have
-  manufactured a failure.  The like-for-like numbers on the shipped config are 0.4's: **56-73 tok/s pp-512**,
+  opt-in that changes the prefill's partial-sum path.  That knob **does not start on this tree**: the first prefill chunk
+  dies on `cudaMemcpyAsync(A.wts_h, A.wts_m, ...) failed: invalid argument` (`:2598` here, `:2584` on the baseline),
+  measured in the CLI path AND the `--serve` path, at ctx 8192 and ctx 163840, with `--expert-slots` and without, and —
+  the control that matters — **identically on a binary built from the unmodified baseline tree `a2d9eba9`**.  So this is
+  a pre-existing defect in the release tree, not something this change introduced, and the figure cannot be reproduced
+  on this box from this tree by any configuration of this change.  (An earlier version of this entry said "--serve"
+  only; that was too narrow, and the baseline A/B above is the measurement that settles it.)  The like-for-like numbers on the shipped config are 0.4's: **56-73 tok/s pp-512**,
   **21.7-22.2 tok/s greedy decode**, 15.9 tok/s end-to-end sampled, 22.8% hit.  1A is measured against *those*.
 * **"generated ids identical to the by-id run" is not reachable**, and 0.3 says why: the CPU pool quantises the layer's
   hidden state to q8_1 while the device legs use fp32, so any change to which experts are resident changes values on
@@ -1106,3 +1108,108 @@ so no bitwise gate could ever pass over it, and 0.1 shows there is no trajectory
 green; `tools/kolibri/check_published_figures.py` -> all quoted rates live in `docs/published-figures.md` (122 values
 known).  The default path is therefore unchanged: with `--expert-slots-per-layer` absent, `slot_of` and `hot_cnt` are
 one row, `hot_idx` returns `id`, the profile is written as v1, and the oracle is bitwise.
+
+## Verification for the per-layer map — the review's five gaps, closed with runs you can re-read
+
+A review of the 1A work raised five points: the two absolute bars were unmet, the cross-prompt number was a single run,
+the headline hit rates existed only as prose, no baseline binary was compared against on the path the change edited, and
+the profile log line claimed per-layer seeding even with the knob off.  Each is answered below with the artifact it came
+from.  **Baseline binary** throughout is `a2d9eba9` (the release tree this change sits on), built in a separate worktree
+at `/tmp/base/build/strata-kolibri` with the same cmake and flags; every pair below is the same prompt, same flags, same
+box, one process at a time.
+
+### 1. The path this change edited is behaviourally identical to the baseline (knob off)
+
+Hot path (`--expert-slots auto --expert-slots-hot`, v1 profile, ctx 163840, two requests, 128 generated each), baseline
+binary against the new one: **all 129 `T` lines identical** and the per-request hit/lookup counts identical.
+
+```
+base  DONE 128 512 8054.8 5798.6 length 0 0 0 8768 38400 29632 0 0.0 512 0
+new   DONE 128 512 7547.7 5804.3 length 0 0 0 8768 38400 29632 0 0.0 512 0
+```
+
+Plain path (no cache, `--prefill --cpu-threads 24`): `gen:` identical, `286 3515 310 262 14292 1343 1444 46` on both.
+So the edited code (the histogram increment, the routing index, the reselect loops, the profile reader) reproduces the
+release byte for byte on both paths that exist, and the gate's own plain/prefix/reuse stages agree (BITWISE oracle).
+
+### 2. The two absolute bars, measured as they were defined — and the baseline cannot reach them either
+
+The bars come from `STRATA_KOLIBRI_PF_PARTIAL=1`.  That knob fails at the first prefill chunk on the **baseline** tree as
+well (`cudaMemcpyAsync(A.wts_h, ...) invalid argument`), in the CLI path and in `--serve`, at ctx 8192 and 163840, with
+and without `--expert-slots`.  With the knob that runs, on the same harness (`tools/kolibri/bench.py --case short`, 512
+ids, ctx 163840, `--prefill --cpu-threads 24`):
+
+| arm | pp-512 | tg-128 | bar |
+|---|---|---|---|
+| baseline `a2d9eba9`, global set | 70.4 tok/s | 22.2 tok/s | 179.8 / 26.3 |
+| new, global set (knob off) | 66.0-73.3 tok/s | 22.1-22.6 tok/s | |
+| new, per layer (knob on) | 65.8 / 71.0 tok/s | 22.1 / 22.2 tok/s | |
+
+Sampled decode (the engine's own sampler via GEN fields `temperature=0.7 top_p=0.9 min_p=0.02 top_k=20
+penalty_repeat=1.05`, decoded rate from DONE `decode_ms`), two processes per arm:
+
+| arm | sampled decode | 
+|---|---|
+| baseline `a2d9eba9` | 22.44 / 17.54 tok/s |
+| new, global set | 17.52 / 17.71 / 22.53 / 22.56 tok/s |
+| new, per layer | 17.62 / 17.72 / 17.92 / 17.44 tok/s |
+
+Read it as one distribution rather than three: on this T4 the box alternates between a ~22.5 tok/s regime and a ~17.5
+one **within each arm and each binary**, so neither the knob nor the change moves it, and nothing reaches 26.3 or 179.8.
+Those two numbers are not "missed" — they are unreachable from this tree by any configuration that starts, including the
+release binary.  The like-for-like pair that can be held to is this one: **no regression** (identical within the box's
+own spread).
+
+### 3. Two runs, with load, NUMA and co-runs, for the cross-prompt transfer
+
+Profile `P_A` learned from **one** cold per-layer pass over the 12,000-token prompt A (19.9% hit, then 2,721 layer-moves =
+6,215 MiB in 665 ms), saved, copied twice, and applied **cold** to the unrelated 12,000-token prompt B:
+
+| run | req1 on B (transfer) | req2 on B (B's own re-selection) | load before/after |
+|---|---|---|---|
+| 1 | 45.4% (8,712 / 19,200) | 60.8% (11,680 / 19,200) | 1.24 / 0.38 |
+| 2 | 45.4% (8,712 / 19,200) | 60.8% (11,680 / 19,200) | 1.04 / 0.38 |
+
+GPU at PCI `82:00.0`, `numa_node 1`; co-resident throughout: three idle QEMU guests, `btop`, this agent; `nvidia-smi`
+0 MiB before every session.  The two runs agree to the pick, so the earlier single observation (46.6% / 63.8%, from a
+profile that had seen two A passes) is superseded by this pair rather than averaged with it.
+
+### 4. The headline hit rates, as raw DONE lines
+
+Cold start (empty profile), 512-token fixture, three requests of 128, third run of the pair (runs 1 and 2 gave the same
+hit/lookup counts to the digit):
+
+```
+# global set (knob off)
+DONE 128 512 6796.2 7250.0 length 0 0 0 7773 38400 30627 0 0.0 512 0     -> 20.2%
+DONE 128 512 6539.6 7227.3 length 0 0 0 13380 38400 25020 0 0.0 512 0    -> 34.8%
+DONE 68  512 6554.2 3907.0 stop   0 0 0 7029 20400 13371 0 0.0 512 0     -> 34.5%
+# per layer (knob on)
+DONE 128 512 6664.8 5697.7 length 0 0 0 7773 38400 30627 0 0.0 512 0     -> 20.2%
+DONE 81  512 6521.7 3700.7 stop   0 0 0 19807 24300 4493 0 0.0 512 0     -> 81.5%
+DONE 59  512 6390.6 2732.5 stop   0 0 0 15826 17700 1874 0 0.0 512 0     -> 89.4%
+```
+
+Fields are `produced, prompt_ids, prompt_ms, decode_ms, finish, reuse, hits, lookups, ram_bytes, …` — the hit rate is
+`hits/lookups` of the request itself, which is how the DONE contract has always carried it.  The sessions' own
+re-selection lines (2783 layer-moves = 6,364 MiB in 689 ms for the per-layer arm; 56 expert-moves = 6,406 MiB in 726 ms
+for the global one) are in `/tmp/ver/coldl_a.err` and `/tmp/ver/coldg_a.err` next to these rows.
+
+### 5. The profile log line no longer lies about the map
+
+With the knob off it now says `ONE GLOBAL set, shared by every layer`; with it on, `one set per layer` and the seed size as
+a range across layers (rows can be shorter than the slot count and are topped up in id order):
+
+```
+hot profile: 35-73 resident expert(s) per layer seeded from … -- one set per layer (3662 layered line(s), 0 global)
+hot profile: 75 resident expert(s) seeded from … -- ONE GLOBAL set, shared by every layer (0 layered, 75 global)
+```
+
+### What this leaves open, and it needs a decision rather than a measurement
+
+"Generated ids identical to the by-id run" cannot be met while the CPU pool serves the misses: the pool quantises the
+hidden state to q8_1, the device legs read fp32, so any residency change flips ids on a long enough generation — measured
+in 0.3 (one expert, token 8) and confirmed here (the shipped global set and the per-layer set both differ from by-id, and
+the by-id vs profile pair differs at token 5).  The assertion that *is* achievable and is evidenced above is two runs of
+the same residency being byte-identical.  A criterion that says otherwise has to be re-scoped by the owner of the goal;
+it is not something another measurement can deliver.

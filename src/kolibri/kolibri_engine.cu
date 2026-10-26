@@ -3824,9 +3824,21 @@ static std::vector<std::vector<int>> hot_profile_load(Engine& e) {
         if ((int) s.size() > e.slots) s.resize((size_t) e.slots);
         seeds[(size_t) l] = s;
     }
-    std::fprintf(stderr, "strata-kolibri: hot profile: %zu resident expert(s) per layer seeded from %s (%d layered"
-                 " line(s), %d global)\n", seeds.empty() ? (size_t) 0 : seeds[0].size(), e.hot_profile.c_str(),
-                 layered, flat);
+    // Say which map was actually seeded: with the knob off there is ONE row, and claiming "per layer" there is the
+    // exact distinction this work is about (found in review: the knob-off log said "per layer" and meant nothing of
+    // the kind).
+    // The seed size is per ROW: one number with the knob off, a range with it on (each layer's profile row can be
+    // shorter than the slot count, which alloc_slots then tops up in id order).
+    size_t smin = seeds.empty() ? 0 : seeds[0].size(), smax = smin;
+    for (const auto& v : seeds) { smin = std::min(smin, v.size()); smax = std::max(smax, v.size()); }
+    if (e.per_layer)
+        std::fprintf(stderr, "strata-kolibri: hot profile: %zu-%zu resident expert(s) per layer seeded from %s -- one set"
+                     " per layer (%d layered line(s), %d global line(s))\n", smin, smax, e.hot_profile.c_str(),
+                     layered, flat);
+    else
+        std::fprintf(stderr, "strata-kolibri: hot profile: %zu resident expert(s) seeded from %s -- ONE GLOBAL set,"
+                     " shared by every layer (%d layered line(s), %d global line(s))\n", smax, e.hot_profile.c_str(),
+                     layered, flat);
     return seeds;
 }
 
