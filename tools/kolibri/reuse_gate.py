@@ -29,6 +29,8 @@ Stages (one engine process; each stage starts from a cold state via a resetter r
   2. accounting    stage 1's reused arm must report reused == |pre| + 1, read == |tail|, prompt_ms > 0.
                    A prompt_ms of 0.0 with tokens read is the bug, so it fails the gate.
   3. negative      a prefix that diverges in its last id is not an extension: reused 0, everything read.
+  4. cancelled     after a STOP, whatever is claimed must be KV the engine built: extended with the tokens the
+                   cancelled request actually produced, the answer must still equal a cold read.
 
 Exit: 0 all stages pass, 1 any stage fails, 2 the harness could not run.
 """
@@ -202,10 +204,10 @@ def main():
         reused_n = field(reuse["done"], 8, int)
         read_n = field(reuse["done"], 14, int)
         prompt_ms = field(reuse["done"], 3, float)
-        # The counts must add up, and the read must cover the tail plus the token the previous request
+        # The `read` window is what discriminates: it must cover the tail plus the token the previous request
         # produced (sampled, never fed, so it has no KV row) plus at most one CHUNK given back by the rewind
-        # that makes a resumed read bitwise-equal to a cold one.  Asserting that relationship rather than a
-        # fixed number is what keeps this stage honest as the rewind's granularity changes.
+        # that makes a resumed read bitwise-equal to a cold one.  `reused + read == ext_len` is kept only as a
+        # consistency echo - both numbers come from the same expression in the engine, so it cannot fail.
         ext_len = len(pre) + 1 + len(tail)
         tail_min = len(tail) + 1
         ok = (reused_n is not None and read_n is not None
@@ -236,7 +238,11 @@ def main():
         stage = "3. negative"
         eng.resetter(reset_token)
         eng.send(short_pre + short_tail, 1)
-        diverged = (short_pre + short_tail)[:-1] + [(short_tail[-1] ^ 7)]
+        # ONE TOKEN LONGER as well as different: with equal lengths the engine's `held < ids.size()` guard
+        # sends the request down the cold path and std::equal is never evaluated, so the stage used to pass
+        # for an engine whose prefix comparison was broken outright.
+        base3 = short_pre + short_tail
+        diverged = base3[:-1] + [(base3[-1] ^ 7)] + [short_pre[0]]
         div = eng.send(diverged, 1)
         d_re, d_read = field(div["done"], 8, int), field(div["done"], 14, int)
         ok = d_re == 0 and d_read == len(diverged)
@@ -245,23 +251,27 @@ def main():
         # ---- stage 4: a cancelled request must not claim KV it never built -----------------------
         stage = "4. cancelled"
         eng.resetter(reset_token)
-        eng.send(short_pre, 1)                      # the turn to be cancelled from
-        eng.send_cancel(short_pre + short_tail, 64)  # cancelled after its first token
-        # Now extend the cancelled prefix's prompt further: whatever the engine claims to reuse must be KV it
-        # actually has, so the result must equal a cold read of this same prompt.
-        ext4 = short_pre + short_tail + short_tail[:8]
+        eng.send(short_pre, 1)                       # the turn to be cancelled from
+        cw = eng.send_cancel(short_pre + short_tail, 64)   # cancelled after its first token
+        # Extend with the tokens that request ACTUALLY produced.  Using fixture ids here made the stage vacuous:
+        # position |pre|+|tail| could never equal live's own sampled token, so an over-claim and a correct reset
+        # both produced reused 0 and both passed.
+        ext4 = short_pre + short_tail + cw["gen"]
         eng.resetter(reset_token)
         cold4 = eng.send(ext4, 4)
         eng.resetter(reset_token)
         eng.send(short_pre, 1)
-        eng.send_cancel(short_pre + short_tail, 64)
+        cw2 = eng.send_cancel(short_pre + short_tail, 64)
         warm4 = eng.send(ext4, 4)
         re4 = field(warm4["done"], 8, int)
-        ok = cold4["gen"] == warm4["gen"] and len(cold4["gen"]) == 4 and re4 is not None \
-            and re4 <= len(short_pre + short_tail)
+        finished = [f for f in (cw["done"], cw2["done"]) if f]
+        cancelled = bool(finished) and all(len(f) > 5 and f[5] == "cancel" for f in finished)
+        ok = (cw["gen"] == cw2["gen"] and cancelled
+              and cold4["gen"] == warm4["gen"] and len(cold4["gen"]) == 4
+              and re4 is not None and re4 <= len(ext4))
         record(ok, f"4. cancelled    {'PASS' if ok else 'FAIL'}  "
-                   f"(after a STOP, reused {re4} of at most {len(short_pre + short_tail)}; "
-                   f"cold {cold4['gen']} vs warm {warm4['gen']})")
+                   f"(cancelled {cancelled}, both STOPs produced {cw['gen']}; after it, reused {re4} of at most "
+                   f"{len(ext4)}; cold {cold4['gen']} vs warm {warm4['gen']})")
     except EngineHung as e:
         record(False, f"{stage:14s} FAIL  ({e}) - the engine stopped answering; failing instead of hanging")
     finally:
