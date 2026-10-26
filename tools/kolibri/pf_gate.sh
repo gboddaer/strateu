@@ -9,6 +9,7 @@
 #   1. ids smoke   64-token prompt, 4 generated ids, ~1 s        <- catches duplicated / misordered work
 #   2. PF_HASH     512-token prompt, 50 chunk-layer checksums     <- catches expert-leg value drift (needs determinism)
 #   3. oracle      the plain path, bitwise vs the recorded ids    <- catches anything that moves the plain path
+#   4. reuse       an extending request against a cold read        <- catches a resumed read that reads no tail,
 #
 # Usage:  bash tools/kolibri/pf_gate.sh            # gate the CURRENT tree against the recorded expectations
 #         bash tools/kolibri/pf_gate.sh --record   # record this tree's outputs as the new expectation
@@ -68,6 +69,17 @@ if bash tools/kolibri/oracle.sh check >/tmp/pf_gate_oracle.txt 2>&1; then
     echo "  3. oracle      PASS  ($(tail -1 /tmp/pf_gate_oracle.txt | cut -c1-60)...)"
 else
     echo "  3. oracle      FAIL"; tail -3 /tmp/pf_gate_oracle.txt | sed 's/^/     /'; rc=1
+fi
+
+# The reuse stage costs about four minutes (a 3,072-id cold read plus the arms around it), which is why it
+# is the last one: everything cheaper fails first.  It is skipped when REUSE_GATE=0, for the runs where only
+# the cold path matters (an A/B on a prefill knob, say).
+if [ "${REUSE_GATE:-1}" = 0 ]; then
+    echo "  4. reuse       SKIP  (REUSE_GATE=0)"
+elif KOLIBRI_BIN="$BIN" KOLIBRI_MODEL="$M" bash tools/kolibri/reuse_gate.sh check >/tmp/pf_gate_reuse.txt 2>&1; then
+    echo "  4. reuse       PASS  ($(grep -c 'PASS' /tmp/pf_gate_reuse.txt) stage(s) green)"
+else
+    echo "  4. reuse       FAIL"; grep -E "FAIL|GATE" /tmp/pf_gate_reuse.txt | sed 's/^/     /'; rc=1
 fi
 
 [ "$MODE" = record ] && { echo "RECORDED ($EXP_SMOKE, $EXP_HASH)"; exit 0; }
