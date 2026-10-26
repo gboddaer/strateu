@@ -3670,7 +3670,13 @@ int serve(Engine& e, Scratch& s) {
         // token it had written after the bare prefix).
         const size_t held = std::min<size_t>(live.size(), (size_t) s.pos);
         size_t reuse = 0;
-        if (held > 0 && held < ids.size() && std::equal(live.begin(), live.begin() + held, ids.begin())) {
+        // STRATA_KOLIBRI_REUSE=0 forces the cold path (every request re-reads its whole prompt).  It exists so the
+        // feature can be priced against itself on one binary instead of against an older one that crashed here.
+        const bool reuse_on = [] {
+            const char* v = std::getenv("STRATA_KOLIBRI_REUSE");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        if (reuse_on && held > 0 && held < ids.size() && std::equal(live.begin(), live.begin() + held, ids.begin())) {
             reuse = held;
             // K27b rebuilds each layer's K/V transpose mirror ONCE per REQUEST, on the first decode token,
             // on the documented assumption that this "also covers everything a prefill wrote".  reset_state()
@@ -3755,6 +3761,13 @@ int serve(Engine& e, Scratch& s) {
         }
         seed_hot(e, s);   // K29: the prompt's hot experts into the fp16 slots before decoding
     if (e.graphs > 0) KC(cudaMemcpy(s.pos_d, &s.pos, 4, cudaMemcpyHostToDevice));
+        // The held list must describe exactly the tokens this request consumed.  A reusing request already has
+        // the prefix in `live`, so appending from `reuse` duplicated positions reuse..held-1 and left the list
+        // describing a prompt that never existed: the NEXT request then failed its prefix check and reset, which
+        // made reuse work every other turn (measured in an agent-shaped run: turns 2, 4, 6 reused while 3 and 5
+        // read everything).  Truncating to `reuse` first makes the insert correct for every value of reuse,
+        // including the rewind that the bitwise fix introduced, and 0 (where the else branch already cleared it).
+        live.resize(reuse);
         live.insert(live.end(), ids.begin() + (long) reuse, ids.end());
         const double prompt_ms = ms_since(t0);
         std::mt19937_64 rng(smp.seed);
