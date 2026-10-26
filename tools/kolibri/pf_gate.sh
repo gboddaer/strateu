@@ -66,6 +66,16 @@ else
     echo "  0b. plain      FAIL"; sed 's/^/     /' /tmp/pf_gate_plain.txt | head -4; rc=1
 fi
 
+# 0c: the geometry where the prefill reads nothing (reuse == ids.size()-1).  Own process, because it needs the
+# rewind disabled and a second engine cannot live alongside the one this gate later holds resident.
+if [ "$MODE" = record ]; then
+    echo "  0c. no-prefill SKIP  (record mode)"
+elif KOLIBRI_BIN="$BIN" KOLIBRI_MODEL="$M" python3 tools/kolibri/no_prefill_check.py >/tmp/pf_gate_noprefill.txt 2>&1; then
+    echo "  0c. no-prefill PASS  ($(grep 'no-prefill:' /tmp/pf_gate_noprefill.txt | sed 's/^ *//'))"
+else
+    echo "  0c. no-prefill FAIL"; sed 's/^/     /' /tmp/pf_gate_noprefill.txt | head -4; rc=1
+fi
+
 run_smoke || exit 2
 if [ "$MODE" = record ]; then cp "$SMOKE" "$EXP_SMOKE"; else
     if cmp -s "$SMOKE" "$EXP_SMOKE"; then echo "  1. ids smoke   PASS  ($(cat "$SMOKE"))"
