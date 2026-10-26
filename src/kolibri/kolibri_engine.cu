@@ -3690,8 +3690,13 @@ int serve(Engine& e, Scratch& s) {
             // full window copy once per layer per request, which is what a cold request already pays.
             std::fill(s.kt_ready.begin(), s.kt_ready.end(), (char) 0);
             // (1) Rewind to the start of the PREVIOUS request's last prefill chunk, so this request's first chunk
-            // starts exactly where a cold read's chunk starts and every row is computed by a GEMM of the same
-            // length.  Two boundaries matter: the row at the reuse boundary (a cold read computes it inside a
+            // starts exactly where a cold read's chunk starts and every row is recomputed by a GEMM of the same
+            // length.  Two caveats, stated because the gate does not cover them: the rule below keys the chunk
+            // size on the prefix LENGTH, so above 8,192 tokens the resumed arm and a cold read can still pick
+            // different chunk sizes (256 against 512) and this alignment does not make them match - unmeasured;
+            // and the "same length" argument is about VALUES (the K/V bytes and the logits), not about ids, which
+            // is what the K28 note above measured when it found the generated ids identical however the prompt is
+            // cut.  Both statements are true at once; the id-level measurement simply cannot see the last bits.  Two boundaries matter: the row at the reuse boundary (a cold read computes it inside a
             // large prefill GEMM, a resumed read inherits the previous request's single-token DECODE result) and
             // the previous request's final chunk, which is SHORT because a prefill stops one token early - a
             // 3,071-row prefill cuts as 11x256 + 255, so a cold read would then compute positions 2816..3071 in
@@ -3721,9 +3726,11 @@ int serve(Engine& e, Scratch& s) {
         const auto t0 = Clock::now();
         const int64_t fresh = (int64_t) (ids.size() - reuse);   // a COUNT of new tokens - display only
         // `fresh` is a count and `reuse` is a position; the two must not meet in a loop bound.  They used
-        // to: the plain loop ran `t < fresh` (so with reuse > 0 it never ran at all - a 580-token request
-        // that extended the held prefix read 0 of its 64 new tokens and answered from KV that had never
-        // seen the new turn), and the chunked loop's `n = fresh - 1 - reuse` went negative, which made
+        // to: the plain loop ran `t < fresh`, so with a reuse of more than half the prompt it never ran at
+        // all, and below that it ran a PARTIAL prefill that left holes in the KV - the worse failure of the
+        // two, because it answers confidently instead of crashing (the 580-token case in the log read 0 of
+        // its 64 new tokens and answered from KV that had never seen the new turn), and the chunked loop's
+        // `n = fresh - 1 - reuse` went negative, which made
         // T = min(chunk, n) negative and (size_t)T * 4 wrap into a cudaMemcpy size the driver rejects
         // (:3604) - so an agent's second turn killed the engine outright.  With reuse == 0 every one of
         // these expressions already reduced to the cold-path value, which is why every benchmark ever run

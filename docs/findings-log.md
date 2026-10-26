@@ -508,10 +508,15 @@ One position. Every other K/V position is byte-identical between a cold read and
 is the boundary row, and its provenance legitimately differs: the prefix request writes it through the
 single-token DECODE path, while a cold read of the longer prompt writes it inside a prefill chunk.
 
-So the remaining gap is a single row with two different computation paths, not a broad perturbation. The
-alignment experiment (quantising the reusable prefix down to a chunk boundary) is not the fix: at a 513 prefix
-it changed the request's chunk geometry (prefill starting at 513 with 9 rows, decode at 522) and the logits
-divergence got worse, 1.4e-01 against 4.1e-02. Withdrawn with the rest.
+So the remaining gap is a single row with two different computation paths, not a broad perturbation.
+
+CORRECTION, added later and more important than the paragraph above: the alignment experiment was NOT wrong, its
+measurement was. It reported the divergence getting worse, 1.4e-01 against 4.1e-02, at "prefill starting at 513
+with 9 rows, decode at 522" - and that geometry is the signature of the `s.pos` bug (fixed later in ee12e9b7):
+the resumed prefill was writing its chunk one position too far along, so the test compared a correct arm against
+a broken one. Once `s.pos = reuse` was set, the same rewind measured K/V differing positions 1 -> 0 and logits
+4.1e-02 -> 0.000e+00, and it is what the engine now does by default. So: the withdrawal of those numbers stands,
+but the conclusion drawn from them - "the alignment is not the fix" - was itself wrong and is retracted here.
 
 ## Agent turns reuse the prefix: 153.8 s -> 52.6 s over six turns
 
