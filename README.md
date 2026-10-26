@@ -73,8 +73,25 @@ This fork also measured Aleph Alpha's **[Kolibri 1](docs/KOLIBRI1.md)** (Q4_K_M)
 | **32K tokens** | 13-14 tokens/s (NUMA binding) | 119-120 tokens/s |
 | **100K tokens** | — | 97 tokens/s |
 
-Two runs each on the bitwise-deterministic binary, box load stated; the 100K row is a single cold run. Box spec, full tables and context:
-[the campaign report](docs/strateu-campaign-report.md).
+Two runs each on the bitwise-deterministic binary, box load stated; the 100K row is a single cold run. Those rows were
+taken at a 256K context with a **hand-sized** expert cache. The current build sizes the cache itself and can place
+experts by how often the router picks them:
+
+- `--expert-slots auto` measured the room left after the dense weights, the KV and the scratch, then took
+  **75 slots/layer (8.49 GiB)** at a **160K** context, keeping 700 MiB clear for the CUDA runtime. It prints the
+  exchange rate it implies: 1 slot = 114 MiB = 5,857 tokens of context, because context and cache draw on the same
+  VRAM.
+- `--expert-slots-hot` fills those slots by routed-pick frequency instead of by expert id, and
+  `--expert-slots-profile` carries the learned set across restarts. On this T4 the hit rate went from **21.4%**
+  (by id) to **33.4-34.2%** on three different prompts, **37.9%** when the same prompt repeats, and **31.4%** on the
+  first request of a cold start seeded from a saved profile - for **24.4-26.3 tokens/s** decode with sampling on.
+  Greedy decoding is ~30% faster but loops on this model (`Chudnov Chudnov Chudnov ...`), which is why the server
+  samples by default.
+- The engine takes **160K** tokens of context; the client config declares 128K, below it.
+
+The swap itself is free in the token stream but not in time: promoting 57 experts cost 6.5 GiB over PCIe in ~690 ms,
+paid between requests. Residency moves bytes, it never changes them - the generated ids were identical in the
+by-id, hot and auto runs. Box spec, full tables and context: [the campaign report](docs/strateu-campaign-report.md).
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
 <sub>Strata is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>
