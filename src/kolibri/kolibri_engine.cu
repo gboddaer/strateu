@@ -208,6 +208,15 @@ static inline int attn_dump_layer() {
     return l;
 }
 
+// Reuse-gate instrument: dump the logits of the LAST prompt position.  Measurement-only and off unless
+// STRATA_KOLIBRI_LOGITS_DUMP is set: the copy is the one the sampler already takes, so the numerics are
+// untouched.  This exists because a bitwise comparison of generated ids cannot say WHY two arms differ -
+// greedy sampling turns a 1e-6 logit difference into a different token and hides the scale of the cause.
+static inline const char* reuse_gate_dump_path() {
+    static const char* p = std::getenv("STRATA_KOLIBRI_LOGITS_DUMP");
+    return p;
+}
+
 
 
 struct LayerBlobs {
@@ -3648,6 +3657,18 @@ int serve(Engine& e, Scratch& s) {
         for (;;) {
             forward(e, s, tok, nullptr);
             KC(cudaMemcpy(lg.data(), s.logits, lg.size() * 4, cudaMemcpyDeviceToHost));
+            if (produced == 0 && reuse_gate_dump_path()) {
+                // Measurement-only. The first decode step's logits ARE the logits for the last prompt position,
+                // so a cold read of a prompt and a reused read that extends a prefix write the same position
+                // here and the two records are directly comparable. Written as [reuse][fresh][nv] + floats,
+                // appended, so a comparator can tell the arms apart by their own fields.
+                if (std::FILE* lf = std::fopen(reuse_gate_dump_path(), "ab")) {
+                    const int32_t hdr[3] = {(int32_t) reuse, (int32_t) fresh, (int32_t) lg.size()};
+                    std::fwrite(hdr, 4, 3, lf);
+                    std::fwrite(lg.data(), 4, lg.size(), lf);
+                    std::fclose(lf);
+                }
+            }
             if (e.counters) { e.cnt.d2h_n += 1; e.cnt.d2h_bytes += (long long) lg.size() * 4; }
             const int32_t nx = smp.needs_logits() ? sample(lg, smp, hist, rng)
                                                   : (int32_t) (std::max_element(lg.begin(), lg.end()) - lg.begin());
