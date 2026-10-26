@@ -636,3 +636,33 @@ by default, so the default path stays byte-identical.
 That is the server reporting a non-zero `cache_n` for a real extending turn. It is worth being precise about what
 it is not: the default (strict) configuration still reads a whole text-rendered turn, because a text round trip
 cannot promise an exact token prefix. The opt-in is for serving, where the client re-renders conversation text.
+
+## The plain (non---prefill) path was regressed and no gate could see it
+
+*Found by the independent completion audit, 2026-10-26, and fixed in c58c1cbb.*
+
+Making `PP` positions absolute joined a loop's trailing comment and its `forward(e, s, ids[t - 1], nullptr)` call
+onto one line, so the call became part of the comment. The plain `--serve` path then fed the model nothing while
+still printing `PP` lines and reporting `prompt_read == ids.size()` - the failure mode this whole goal exists to
+eliminate. Measured on 64 ids without `--prefill`: `PP 61 64 0 489488.0`, `DONE ... 0.1 ... prompt_read 64`,
+generated `286 286 286 286`, and `tools/kolibri/bench.py` on its documented default invocation printed
+`pp 512 tok read (of 512) in 1 ms = 640000.0 tok/s` - a fabricated rate for work never done.
+
+No stage could catch it because every stage of every gate passes `--prefill` or `--tokens-file`. That is the
+lesson worth keeping: a gate suite that shares one flag configuration cannot see the other path at all.
+`tools/kolibri/plain_path_check.py` now asserts, in `pf_gate` stage 0b, that the plain path generates the same ids
+as the chunked path for the same prompt, prints exactly `ids-1` PP lines, and reports positive `prompt_ms`.
+After the repair: 63 PP lines for 64 ids, 1826 ms, `gen [3515 310 262 14292]` - the chunked path's answer.
+
+Two other audit points, recorded rather than argued away:
+
+* "one-token tail with `prompt_read == 0`" was my own wording and it is unreachable: `prompt_read` counts every
+  prompt token the request did not skip, and the guard requires `held < ids.size()`, so the last token is always
+  fed by the decode step. What can be zero is the PREFILL, and `reuse_gate` stage 1c now asserts exactly that
+  (reused 640, 0 PP lines, prompt_read 1, answer equal to a cold read).
+* the HIP debt was in a commit message only, which is not where it belongs: it is recorded here too. This box has
+  no ROCm toolchain, so `kolibri_engine.cu`'s HIP path was never compiled. `docs/AMD_HIP.md` owes a build plus
+  `reuse_gate.sh check` and `pf_gate.sh check` (with REUSE_GATE left on) on the AMD box.
+* the "before" column of the agent-turn table is `STRATA_KOLIBRI_REUSE=0` on the fixed binary, not a rebuild of
+  the pre-fix tree. That is a substitution, disclosed where the table is published: the pre-fix engine died on
+  extending requests, so a pre-fix multi-turn run has no rate to report, only a crash.
