@@ -105,6 +105,29 @@ class Engine:
                 r["done"] = line.split()
                 return r
 
+    def send_cancel(self, ids, n):
+        """Send a request, cancel it with STOP after its first token, and return the DONE fields.
+
+        The point is the token the engine sampled last: it is pushed onto the held list but never fed, so a
+        later request must not claim it as KV it built."""
+        self.p.stdin.write(f"GEN {n} {','.join(str(i) for i in ids)}\n")
+        self.p.stdin.flush()
+        r = {"gen": [], "done": None}
+        stopped = False
+        while True:
+            line = self._read()
+            if line.startswith("T "):
+                r["gen"].append(int(line.split()[1]))
+                if not stopped:
+                    self.p.stdin.write("STOP\n")
+                    self.p.stdin.flush()
+                    stopped = True
+            elif line.startswith("RESUME "):
+                pass
+            elif line.startswith("DONE"):
+                r["done"] = line.split()
+                return r
+
     def resetter(self, token):
         """A one-token request nothing can extend, so the next request starts from a clean state.
         (GEN 0 would be cheaper but never answers - see the module docstring.)"""
@@ -219,6 +242,26 @@ def main():
         ok = d_re == 0 and d_read == len(diverged)
         record(ok, f"3. negative     {'PASS' if ok else 'FAIL'}  "
                    f"(reused {d_re}, read {d_read} of {len(diverged)})")
+        # ---- stage 4: a cancelled request must not claim KV it never built -----------------------
+        stage = "4. cancelled"
+        eng.resetter(reset_token)
+        eng.send(short_pre, 1)                      # the turn to be cancelled from
+        eng.send_cancel(short_pre + short_tail, 64)  # cancelled after its first token
+        # Now extend the cancelled prefix's prompt further: whatever the engine claims to reuse must be KV it
+        # actually has, so the result must equal a cold read of this same prompt.
+        ext4 = short_pre + short_tail + short_tail[:8]
+        eng.resetter(reset_token)
+        cold4 = eng.send(ext4, 4)
+        eng.resetter(reset_token)
+        eng.send(short_pre, 1)
+        eng.send_cancel(short_pre + short_tail, 64)
+        warm4 = eng.send(ext4, 4)
+        re4 = field(warm4["done"], 8, int)
+        ok = cold4["gen"] == warm4["gen"] and len(cold4["gen"]) == 4 and re4 is not None \
+            and re4 <= len(short_pre + short_tail)
+        record(ok, f"4. cancelled    {'PASS' if ok else 'FAIL'}  "
+                   f"(after a STOP, reused {re4} of at most {len(short_pre + short_tail)}; "
+                   f"cold {cold4['gen']} vs warm {warm4['gen']})")
     except EngineHung as e:
         record(False, f"{stage:14s} FAIL  ({e}) - the engine stopped answering; failing instead of hanging")
     finally:
