@@ -3586,21 +3586,41 @@ int serve(Engine& e, Scratch& s) {
         if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); std::fflush(stdout); continue; }
         stop.store(false);
         // the held state continues when the request extends it (the KV rings cannot step back)
+        // The reusable prefix is what the KV actually HOLDS, not what the transcript claims.  The last
+        // token the previous request produced was sampled and never fed, so it has no KV row: `live`
+        // counts it (the decode loop pushes every produced token) and `s.pos` does not.  Reusing
+        // live.size() wrote every reused token one row early, which read as the model answering as if
+        // the new turn had never arrived (measured 2026-10-25, same 3,065-id prompt both ways:
+        // cold [4037 622 3515 622] against reused [310 310 310 310] - the reused arm just re-emitted the
+        // token it had written after the bare prefix).
+        const size_t held = std::min<size_t>(live.size(), (size_t) s.pos);
         size_t reuse = 0;
-        if (live.size() < ids.size() && std::equal(live.begin(), live.end(), ids.begin())) reuse = live.size();
+        if (held > 0 && held < ids.size() && std::equal(live.begin(), live.begin() + held, ids.begin()))
+            reuse = held;
         else {
             reset_state(e, s);
             live.clear();
         }
         const auto t0 = Clock::now();
-        const int64_t fresh = (int64_t) (ids.size() - reuse);
+        const int64_t fresh = (int64_t) (ids.size() - reuse);   // a COUNT of new tokens - display only
+        // `fresh` is a count and `reuse` is a position; the two must not meet in a loop bound.  They used
+        // to: the plain loop ran `t < fresh` (so with reuse > 0 it never ran at all - a 580-token request
+        // that extended the held prefix read 0 of its 64 new tokens and answered from KV that had never
+        // seen the new turn), and the chunked loop's `n = fresh - 1 - reuse` went negative, which made
+        // T = min(chunk, n) negative and (size_t)T * 4 wrap into a cudaMemcpy size the driver rejects
+        // (:3604) - so an agent's second turn killed the engine outright.  With reuse == 0 every one of
+        // these expressions already reduced to the cold-path value, which is why every benchmark ever run
+        // through this path looked normal.  `stop` is the position to stop at: the prompt minus its last
+        // token, which the decode step feeds.  (Named pf_end, not stop: `stop` is this request's
+        // cancellation flag, and shadowing it here is a compile error the first time it is tried.)
+        const int64_t pf_end = (int64_t) ids.size() - 1;
         if (e.prefill > 0) {   // chunked prefill: 512 rows per pass, progress per chunk
             int64_t i = reuse;
-            const int64_t n = fresh - 1 - reuse;   // the prompt minus its last token
+            const int64_t n = pf_end - reuse;   // the tokens still to read (== ids.size()-1 when reuse is 0)
             e.pf_total = n;   // the POOL_ALL rule: one decision for the whole prompt
         g_pf_total = n;   // K28: and the chunk rule keys on it (see pf_chunk_at)
-            while (i - reuse < n) {
-                const int T = (int) std::min<int64_t>(pf_chunk_at(s.pos), n - (i - reuse));
+            while (i < pf_end) {
+                const int T = (int) std::min<int64_t>(pf_chunk_at(s.pos), pf_end - i);
                 KC(cudaMemcpy(s.toks_d, ids.data() + i, (size_t) T * 4, cudaMemcpyHostToDevice));
                 forward_multi(e, s, T, s.pos);
                 s.pos += T;
@@ -3610,8 +3630,7 @@ int serve(Engine& e, Scratch& s) {
                 std::fflush(stdout);
             }
         } else
-        for (int64_t t = (int64_t) reuse + 1; t < fresh; ++t) {   // the prompt minus its last token
-            forward(e, s, ids[t - 1], nullptr);
+        for (int64_t t = (int64_t) reuse + 1; t < (int64_t) ids.size(); ++t) {   // the prompt minus its last token            forward(e, s, ids[t - 1], nullptr);
             std::printf("PP %lld %lld %.0f %.1f\n", (long long) (t - reuse), (long long) fresh, ms_since(t0),
                         (double) (t - reuse) / std::max(1e-9, ms_since(t0) / 1000.0));
             std::fflush(stdout);
