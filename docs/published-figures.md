@@ -150,3 +150,16 @@ labelled as such and are not measurements.
 | Option C expected gain | 165 tok/s to 180 tok/s | **projection** | §8.2 Option C |
 | pp-512 gap left after campaign II | 19 tok/s | **derived**, not measured: the difference between #19's 181.0 and the 200 target | "G5 (campaign II)" |
 | fused-kernel traffic estimate | 1.2-1.3 ms/layer against a 2.6 ms/layer gate | **projection** from byte math (82 MB read per projection at the rate the pool already sustains), never measured | "G3 (campaign II)" |
+
+## Agent-turn figures (branch `main`, Tesla T4, driver 580.196.07, kernel 6.1.0-52-amd64, 2026-10-26)
+
+`tools/kolibri/agent_bench.py --turns 6 --chunk 384`, numactl node 1, `--prefill --cpu-threads 24`,
+ATTN_FLASH=1, two runs per setting, load 4.6 rising to 8.1 across the four runs. 8,184 prompt tokens total.
+
+| # | figure | value | measured on |
+|---|---|---|---|
+| 26 | six agent turns, reuse off | 153.9 / 153.7 s wall | 8,184 tokens read, no reuse |
+| 27 | six agent turns, reuse on | 59.4 / 45.8 s wall | 2,808 read, 5,376 reused |
+| 28 | tokens read per six-turn session | 8,184 -> 2,808 | 5,376 reused, every turn after the first |
+| 29 | prefill rate over the tokens read | ~55 tok/s | both settings (`agent_bench.py`) |
+| 30 | per-turn reuse, six turns | 0, 256, 768, 1024, 1536, 1792 | identical across runs |

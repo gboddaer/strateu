@@ -512,3 +512,29 @@ So the remaining gap is a single row with two different computation paths, not a
 alignment experiment (quantising the reusable prefix down to a chunk boundary) is not the fix: at a 513 prefix
 it changed the request's chunk geometry (prefill starting at 513 with 9 rows, decode at 522) and the logits
 divergence got worse, 1.4e-01 against 4.1e-02. Withdrawn with the rest.
+
+## Agent turns reuse the prefix: 153.8 s -> 52.6 s over six turns
+
+*Measured 2026-10-26 on the T4 box (driver 580.196.07, kernel 6.1.0-52-amd64, numactl node 1, `--prefill
+--cpu-threads 24`, ATTN_FLASH=1). `tools/kolibri/agent_bench.py`, six turns of 384 new fixture ids plus the 8
+tokens each turn writes, 8,184 prompt tokens in total. Two runs per setting, wall-clock, load 4.6 rising to 8.1
+across the four runs.*
+
+| setting | wall | tokens read | reused |
+|---|---|---|---|
+| reuse off (`STRATA_KOLIBRI_REUSE=0`) | 153.9 s / 153.7 s | 8,184 | 0 |
+| reuse on (default) | 59.4 s / 45.8 s | 2,808 | 5,376 |
+
+Every turn after the first reuses (256, 768, 1024, 1536, 1792 tokens), and the reused count is identical across
+runs on both settings. Prefill runs at ~55 tok/s over the tokens actually read, which is the same rate the cold
+figures show - the saving is entirely in not reading them again.
+
+Not the whole prefix: the bitwise fix rewinds up to one chunk, so a turn re-reads up to 255 tokens it already
+had. At 384 new ids a turn that is a large fraction of the read, which is why 8,184 - 5,376 = 2,808 rather than
+the ~2,304 the new content alone would cost. The rewind buys bitwise equality with a cold read and it is the
+honest trade to state.
+
+Two defects had to be fixed before this number existed, and neither was visible in a two-request test: the
+reuse path never set `s.pos`, so the prefill wrote its chunk one position too far (`ee12e9b7`), and a reusing
+request appended its prefix to `live` twice, so the next turn's prefix check failed and reuse worked every
+other turn (`a2996634`).
