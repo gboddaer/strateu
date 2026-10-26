@@ -597,3 +597,42 @@ With that, the gate passes on both paths with the oracle unchanged:
 
     default path:  build PASS, ids smoke PASS, PF_HASH PASS (100 chunk-layers), oracle BITWISE PASS, reuse PASS
     PF_PARTIAL:    build PASS, ids smoke PASS, PF_HASH SKIP, oracle BITWISE PASS, reuse PASS
+
+## Why the HTTP turn reused nothing, and the opt-in that fixes it
+
+*Measured 2026-10-26 on the T4 box through the real server (`serve/server.py` on `build/strata-kolibri`, ctx
+8192, `--prefill --cpu-threads 24`) and offline with the model's own tokenizer.*
+
+The server was started against the real model and driven for two turns. `timings` reported
+`cache_n 0, prompt_n 72` for the second one, and the engine never printed `RESUME`. Adding
+`STRATEU_DUMP_PROMPT` showed why - the two prompts do not share a full prefix:
+
+    turn 1 ids  59 tokens, ending ... <|im_end|> \n <|im_start|> assistant \n
+    turn 2 ids  72 tokens
+    agreement                       57 of 59
+    turn 1 at 57..                   64090, 10
+    turn 2 at 57..                   1646, 10, 3683, 5032, ...
+
+So the divergence is at the very END of turn 1's prompt: appending the assistant's reply makes a BPE merge span
+the boundary, and the prompt's last tokens change. The engine's rule is "the whole held prefix must match", so it
+correctly reset and read everything.
+
+Ruled out, so it is not blamed elsewhere: the tokenizer round-trips (detok -> re-encode is the identity at 4, 8,
+12 and 16 generated tokens, including a max_tokens truncation), and the rendered turn-2 TEXT does begin with the
+turn-1 text - it is the tokens that move, not the text.
+
+The fix is opt-in, `STRATA_KOLIBRI_REUSE_PREFIX=1`, which reuses the longest common prefix: rows 0..reuse-1 belong
+to tokens that really do match, and the same rewind re-derives the chunk, so it is as safe as the strict rule. Off
+by default, so the default path stays byte-identical.
+
+    prompt agreeing on 598 ids then diverging:
+        strict (default)   reused 0,   read 652,   cold == warm
+        PREFIX=1           reused 512, read 140,   cold == warm      (512 = the aligned 598)
+
+    through /v1/chat/completions with PREFIX=1:
+        turn 1  cache_n 0,  prompt_n 59
+        turn 2  cache_n 57, prompt_n 15        <- the 57 ids that genuinely matched
+
+That is the server reporting a non-zero `cache_n` for a real extending turn. It is worth being precise about what
+it is not: the default (strict) configuration still reads a whole text-rendered turn, because a text round trip
+cannot promise an exact token prefix. The opt-in is for serving, where the client re-renders conversation text.
