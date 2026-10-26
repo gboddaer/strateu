@@ -53,6 +53,19 @@ fi
 echo "  0. build       PASS"
 
 rc=0
+
+# 0b: the plain (non---prefill) path must actually READ the prompt.  Every other stage here passes --prefill or
+# --tokens-file, so nothing in the suite could see this one, and it once fed nothing while still printing PP lines
+# and claiming prompt_read == ids.size().  The assertion lives in its own driver: the shell version of it grew into
+# the only syntax error this script has ever had.
+if [ "$MODE" = record ]; then
+    echo "  0b. plain      SKIP  (record mode)"
+elif KOLIBRI_BIN="$BIN" KOLIBRI_MODEL="$M" python3 tools/kolibri/plain_path_check.py >/tmp/pf_gate_plain.txt 2>&1; then
+    echo "  0b. plain      PASS  ($(grep 'plain path:' /tmp/pf_gate_plain.txt | sed 's/^ *//'))"
+else
+    echo "  0b. plain      FAIL"; sed 's/^/     /' /tmp/pf_gate_plain.txt | head -4; rc=1
+fi
+
 run_smoke || exit 2
 if [ "$MODE" = record ]; then cp "$SMOKE" "$EXP_SMOKE"; else
     if cmp -s "$SMOKE" "$EXP_SMOKE"; then echo "  1. ids smoke   PASS  ($(cat "$SMOKE"))"

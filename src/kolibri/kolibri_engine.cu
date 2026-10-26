@@ -3780,7 +3780,8 @@ int serve(Engine& e, Scratch& s) {
                 std::fflush(stdout);
             }
         } else
-        for (int64_t t = (int64_t) reuse + 1; t < (int64_t) ids.size(); ++t) {   // the prompt minus its last token            forward(e, s, ids[t - 1], nullptr);
+        for (int64_t t = (int64_t) reuse + 1; t < (int64_t) ids.size(); ++t) {   // the prompt minus its last token
+            forward(e, s, ids[t - 1], nullptr);   // ONE token through the plain path: this line is the read
             std::printf("PP %lld %lld %.0f %.1f\n", (long long) t, (long long) ids.size(), ms_since(t0),
                         (double) (t - reuse) / std::max(1e-9, ms_since(t0) / 1000.0));
             std::fflush(stdout);
