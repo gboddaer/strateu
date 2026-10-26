@@ -233,6 +233,23 @@ static inline const char* reuse_gate_kv_path() {
     return p;
 }
 
+// The K/V buffers are laid out [kvh][stride][D], where `stride` is swa for a sliding layer and ctx for a
+// full-attention one.  A plain copy of rows*HKV*D halves is only correct when stride == rows; for a
+// full-attention layer it runs past the first head's rows into unrelated positions and every row index after
+// that is meaningless.  Copy head by head, and record the stride so the parser can be sure.
+static inline bool reuse_gate_copy_kv(const __half* src, int64_t stride, int64_t n_rows, int HKV, int D,
+                                      std::vector<__half>& out) {
+    out.resize((size_t) n_rows * (size_t) HKV * (size_t) D);
+    for (int h = 0; h < HKV; ++h) {
+        if (cudaMemcpy(out.data() + (size_t) h * (size_t) n_rows * (size_t) D,
+                       src + (size_t) h * (size_t) stride * (size_t) D,
+                       (size_t) n_rows * (size_t) D * sizeof(__half),
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+            return false;
+    }
+    return true;
+}
+
 
 
 struct LayerBlobs {
@@ -1988,18 +2005,18 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                 s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding, 0, g_two_pass_max, ktc, vtc);
         }
         if (reuse_gate_kv_path() && (int) l == attn_dump_layer()) {
-            const int64_t rows = std::min<int64_t>((int64_t) s.pos + 1,
-                                                   sliding ? (int64_t) g.n_swa : (int64_t) s.ctx);
-            const size_t nfl = (size_t) rows * (size_t) HKV * (size_t) D;
-            std::vector<__half> kh(nfl), vh(nfl);
-            KC(cudaMemcpy(kh.data(), s.kc[l], nfl * sizeof(__half), cudaMemcpyDeviceToHost));
-            KC(cudaMemcpy(vh.data(), s.vc[l], nfl * sizeof(__half), cudaMemcpyDeviceToHost));
-            if (std::FILE* f = std::fopen(reuse_gate_kv_path(), "ab")) {
-                const int32_t hdr[3] = {(int32_t) s.pos, (int32_t) l, (int32_t) rows};
-                std::fwrite(hdr, 4, 3, f);
-                std::fwrite(kh.data(), sizeof(__half), nfl, f);
-                std::fwrite(vh.data(), sizeof(__half), nfl, f);
-                std::fclose(f);
+            const int64_t stride = sliding ? (int64_t) g.n_swa : (int64_t) s.ctx;
+            const int64_t rows = std::min<int64_t>((int64_t) s.pos + 1, stride);
+            std::vector<__half> kh, vh;
+            if (reuse_gate_copy_kv(s.kc[l], stride, rows, HKV, D, kh) &&
+                reuse_gate_copy_kv(s.vc[l], stride, rows, HKV, D, vh)) {
+                if (std::FILE* f = std::fopen(reuse_gate_kv_path(), "ab")) {
+                    const int32_t hdr[4] = {(int32_t) s.pos, (int32_t) rows, (int32_t) stride, 0x4b564344};
+                    std::fwrite(hdr, 4, 4, f);
+                    std::fwrite(kh.data(), sizeof(__half), kh.size(), f);
+                    std::fwrite(vh.data(), sizeof(__half), vh.size(), f);
+                    std::fclose(f);
+                }
             }
         }
         if (s.dec_att16) k_to_f16<<<dim3((H * D + 127) / 128), 128, 0, st>>>(s.att, s.dec_att16, H * D);   // S6
@@ -2320,20 +2337,20 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                                                                   first, D, HKV);
         if (reuse_gate_kv_path() && (int) l == attn_dump_layer()) {
             // Per-chunk snapshot, so the chunk that perturbs a row is named rather than inferred.  Header magic
-            // 0x4b564348 ("KVCH") distinguishes these from the decode-time records (0x4b4d414d).
+            // 0x4b564348 ("KVCH") distinguishes these from the decode-time records (0x4b564344, "KVCD").
             KC(cudaStreamSynchronize(g_st));
-            const int64_t rows = sliding ? (int64_t) g.n_swa
-                                         : std::min<int64_t>(p0c + Tc, (int64_t) s.ctx);
-            const size_t nfl = (size_t) rows * (size_t) HKV * (size_t) D;
-            std::vector<__half> kh(nfl), vh(nfl);
-            KC(cudaMemcpy(kh.data(), s.kc[l], nfl * sizeof(__half), cudaMemcpyDeviceToHost));
-            KC(cudaMemcpy(vh.data(), s.vc[l], nfl * sizeof(__half), cudaMemcpyDeviceToHost));
-            if (std::FILE* f = std::fopen(reuse_gate_kv_path(), "ab")) {
-                const int32_t hdr[4] = {(int32_t) p0c, (int32_t) Tc, (int32_t) rows, 0x4b564348};
-                std::fwrite(hdr, 4, 4, f);
-                std::fwrite(kh.data(), sizeof(__half), nfl, f);
-                std::fwrite(vh.data(), sizeof(__half), nfl, f);
-                std::fclose(f);
+            const int64_t stride = sliding ? (int64_t) g.n_swa : (int64_t) s.ctx;
+            const int64_t rows = std::min<int64_t>(p0c + Tc, stride);
+            std::vector<__half> kh, vh;
+            if (reuse_gate_copy_kv(s.kc[l], stride, rows, HKV, D, kh) &&
+                reuse_gate_copy_kv(s.vc[l], stride, rows, HKV, D, vh)) {
+                if (std::FILE* f = std::fopen(reuse_gate_kv_path(), "ab")) {
+                    const int32_t hdr[4] = {(int32_t) p0c, (int32_t) Tc, (int32_t) stride, 0x4b564348};
+                    std::fwrite(hdr, 4, 4, f);
+                    std::fwrite(kh.data(), sizeof(__half), kh.size(), f);
+                    std::fwrite(vh.data(), sizeof(__half), vh.size(), f);
+                    std::fclose(f);
+                }
             }
         }
         k_to_f16<<<grid1((int64_t) Tc * H * D), kThreads>>>(A.q_m, A.q16, (int64_t) Tc * H * D);
