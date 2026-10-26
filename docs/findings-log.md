@@ -706,3 +706,28 @@ Three turns of a growing conversation through `http://192.168.123.122:8085/v1` a
 | 1 | 0 | 65 | 1348 |
 | 2 | 63 | 15 | 392 |
 | 3 | 76 | 14 | 374 |
+
+## Expert-cache residency: by hotness instead of by id, and a cache that sizes itself
+
+T4 16 GB, driver 580.196.07, kernel 6.1.0-52-amd64, numactl node 1, Kolibri-1-Q4_K_M, 160K context, 70
+slots/layer (8.38 GiB), `--prefill --cpu-threads 24`.  Every row is a wall-clock token run; the hit rates are
+counter ratios over the same requests, not rates.
+
+The cache used to place experts by id (`id < slots`), which caps the hit rate at slots/384 for uniform routing and
+made more VRAM buy little.  `--expert-slots-hot` now chooses the residents by routed-pick frequency, and
+`--expert-slots-profile PATH` carries that set across restarts.
+
+| run | residency | hits / picks | hit rate |
+|---|---|---|---|
+| same 31-token prompt, request 1 | id-ordered 0-69 | 314 / 1800 | 17.4% |
+| same prompt, request 2 | hot set learned from request 1 | 682 / 1800 | 37.9% |
+| same prompt, request 1 of a cold start | hot set seeded from the saved profile | 727 / 1800 | 40.4% |
+
+Re-selection cost 669 ms between requests (57 experts newly resident, 6.5 GiB over PCIe), paid between requests,
+never during one.  The generated ids were identical in the id-ordered, the hot and a 75-slot `auto` run
+(`gen: 4688 4688 4688 4688`), so the change moves bytes without changing them.
+
+`--expert-slots auto` fits the cache to the free VRAM after the dense weights, the KV and the scratch are
+allocated, keeping `--vram-reserve-mib` (default 700) clear for the CUDA runtime.  At 160K it chose 75 slots/layer
+from 9,501 MiB free and printed the exchange rate: 1 slot = 114.4 MiB = 5,857 context tokens at 20.0 KB/token.
+Not measured: a session long enough for the hot set to drift, and any GPU other than this T4.

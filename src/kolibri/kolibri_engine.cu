@@ -357,6 +357,20 @@ struct Engine {
     std::vector<int> pf_cores;      // the pinnable physical cores, derived ONCE at startup before any pinning
     int64_t pf_total = 0;           // the prefill's total prompt length (the POOL_ALL rule keys on it)
     int slots = 0;                  // --expert-slots: experts per layer resident in VRAM (the GPU expert cache)
+    // EXPERT-CACHE FITTING AND HOTNESS RESIDENCY (opt-in; with the knobs off every field below is unused and the
+    // cache is allocated by expert id exactly as before).  --expert-slots auto fits the slot count to the VRAM
+    // that is still free once the dense weights, the KV and the scratch are allocated (the Qwen engine's method);
+    // --expert-slots-hot picks WHICH experts occupy those slots by how often the router picks them instead of by
+    // id, which is what caps the hit rate at slots/n_expert today; --expert-slots-profile saves and seeds that set.
+    int vram_reserve_mib = 700;     // --vram-reserve-mib: room kept free for the CUDA runtime (the Qwen default)
+    int hot_on = 0;                 // --expert-slots-hot or STRATA_KOLIBRI_SLOTS_HOT=1
+    int hot_min_picks = 8192;       // re-select only after this many routed picks (no per-token churn)
+    long long hot_picks_at_last = 0;
+    long long hot_promotions = 0;   // blobs re-copied into the slots (each one is n_layers x stride of PCIe traffic)
+    std::string hot_profile;        // --expert-slots-profile PATH: the learned hot set, read at load and saved after
+    std::vector<int> slot_of;       // expert id -> slot index, -1 = not resident (hot mode; empty in the id path)
+    mutable std::vector<long long> hot_cnt;  // per-expert routed-pick histogram: counted from layer_step, whose
+                                             // Engine is const (it reads the layer, it does not own the cache)
     int grouped = 0;                // --grouped: native_expert_grouped for the routed experts (one launch per layer)
     int graphs = 0;                 // --grouped + graphs (default on with --grouped): per-layer CUDA graphs
     int prefill = 0;                // --prefill: chunked prompt processing (GEMM projections, FP16 attention)
@@ -2066,12 +2080,20 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
             s.slot_ids.resize((size_t) K); s.ovf_ids.resize((size_t) K);
             for (int k = 0; k < K; ++k) {
                 const int id = g_ids_host[(size_t) k];
-                s.slot_ids[k] = id < S ? id : S;                                        // dev zero slot
-                s.ovf_ids[k] = id < S ? (e.cpu_threads > 0 ? id : (int) g.n_expert) : id;  // pinned zero slot
-                if (e.counters) {
-                    if (id < S) ++e.cnt.slot_hits;
-                    else { ++e.cnt.slot_miss; e.cnt.slot_bytes += (long long) b.stride; }  // mmvq reads the blob over PCIe
-                }
+                // Where this pick is served from.  The id path (default) is slot == id for the first `slots` ids,
+                // which is the historical cache byte for byte.  The hot path asks the residency map instead, so a
+                // slot can hold any expert; -1 means "not resident" and the pick falls through to the pool/UVA leg.
+                int sidx;
+                if (e.hot_on && (int) e.slot_of.size() == (int) g.n_expert) sidx = e.slot_of[(size_t) id];
+                else sidx = id < S ? id : -1;
+                s.slot_ids[k] = sidx >= 0 ? sidx : S;                                          // dev zero slot
+                s.ovf_ids[k] = sidx >= 0 ? (e.cpu_threads > 0 ? sidx : (int) g.n_expert) : id;  // pinned zero slot
+                // Counted ALWAYS, not only under --counters: the DONE line carries these as the request's hits and
+                // lookups, which is what the monitor's hit rate is computed from.  Two integer adds per routed pick.
+                // slot_bytes stays behind --counters because only the CNT report reads it.
+                if (sidx >= 0) ++e.cnt.slot_hits;
+                else { ++e.cnt.slot_miss; if (e.counters) e.cnt.slot_bytes += (long long) b.stride; }
+                if (e.hot_on) ++e.hot_cnt[(size_t) id];   // the histogram the reselection sorts on
             }
             g_ids_host = s.slot_ids;
             gemv(gu, s.h, s.eg2, s.ids, K, 0, b.dev, b.stride);   // K21: this gate gemv ran twice per layer
@@ -3159,7 +3181,8 @@ void init_scratch(const Engine& e, Scratch& s) {
         KC(cudaMalloc((void**) &s.scratch, strata::kernels::native_expert_scratch_bytes(cap_e, g.n_ff)));
         KC(cudaMalloc((void**) &s.gout, (size_t) K * N * 4));
     }
-    if (e.slots > 0) {   // the GPU expert cache's rows: the in-slot side and the overflow side
+    if (e.slots != 0) {   // the GPU expert cache's rows: the in-slot side and the overflow side.  kSlotsAuto (-1)
+                          // counts as "has a cache": the fit runs after this, but the buffers it will need are these.
         KC(cudaMalloc((void**) &s.eg2, (size_t) K * FF * 4));
         KC(cudaMalloc((void**) &s.eu2, (size_t) K * FF * 4));
         KC(cudaMalloc((void**) &s.eh2, (size_t) K * FF * 4));
@@ -3581,10 +3604,256 @@ std::vector<int32_t> parse_ids(const char* s) {
 
 bool is_eos(int t) { return t == 127906; }   // kolibri1: im_end
 
+// ===================== the expert cache: fitting it, and what lives in it (opt-in) ==============================
+// Three things this engine used to leave to the operator, who had to know two constants by heart -- the per-slot
+// stride (114.4 MiB here) and the KV cost per token (20 KB) -- and who got an OOM at load if the two over-committed
+// the card.  The Qwen engine (src/program/generate.cpp) already fits its cache from the free VRAM; this is the same
+// idea, on this engine's own allocation order:
+//
+//   --expert-slots auto       fit the slot count to the VRAM that is free once everything else is resident
+//   --expert-slots-hot        choose WHICH experts fill the slots by routed-pick frequency instead of by id
+//   --expert-slots-profile P  keep that learned set across restarts
+//
+// The reserve (--vram-reserve-mib, default 700 as in the Qwen engine) is deliberately NOT the last byte: the CUDA
+// runtime, the driver's allocations and the prefill's transients need headroom, and a cache that fills the card
+// exactly dies on the first long prompt.  With every knob off, none of this runs and the cache is allocated by id
+// exactly as before.
+static constexpr int kSlotsAuto = -1;
+static inline bool poison_zero_slot();   // defined with the loader below; alloc_slots needs it first
+
+// The KV of ONE context token in bytes: K and V for every full-attention layer.  The sliding layers keep a fixed
+// ring (g.n_swa rows), so they cost nothing per token of context.  This is why --ctx and --expert-slots are one
+// decision rather than two: at 20 KB/token, one 114 MiB slot is ~5,700 tokens of context.
+static long long kv_bytes_per_token(const Engine& e) {
+    long long n_full = 0;
+    for (int64_t l = 0; l < e.g.n_layers; ++l)
+        if (!strata::core::is_swa_layer(e.g, l)) ++n_full;
+    return n_full * 2LL * (long long) e.g.n_head_kv * (long long) e.g.head_dim * 2LL;
+}
+
+static long long slots_sum_stride(const Engine& e) {
+    long long t = 0;
+    for (const auto& b : e.blobs) t += (long long) b.stride;
+    return t;
+}
+
+// One expert's blob into one device slot, for every layer: n_layers memcpys of stride bytes.
+static void slot_promote(Engine& e, int id, int slot) {
+    for (auto& b : e.blobs)
+        KC(cudaMemcpy(b.dev + b.stride * (size_t) slot, b.table + b.stride * (size_t) id, b.stride,
+                      cudaMemcpyHostToDevice));
+}
+
+// Write the learned hot set: "id count" lines under a commented header, via a temp file and a rename so a kill or a
+// full disk leaves the previous profile intact.
+static void hot_profile_save(Engine& e) {
+    if (!e.hot_on || e.hot_profile.empty() || e.slots <= 0) return;
+    const int n_exp = (int) e.g.n_expert;
+    std::vector<int> order((size_t) n_exp);
+    for (int i = 0; i < n_exp; ++i) order[(size_t) i] = i;
+    const size_t keep = (size_t) std::min<int>(e.slots, n_exp);
+    std::partial_sort(order.begin(), order.begin() + keep, order.end(), [&](int a, int b) {
+        if (e.hot_cnt[(size_t) a] != e.hot_cnt[(size_t) b]) return e.hot_cnt[(size_t) a] > e.hot_cnt[(size_t) b];
+        return a < b;
+    });
+    const std::string tmp = e.hot_profile + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "w");
+    if (f == nullptr) { std::fprintf(stderr, "strata-kolibri: cannot write profile %s\n", tmp.c_str()); return; }
+    std::fprintf(f, "# strata-kolibri expert-cache profile v1 slots=%d layers=%d stride_sum=%lld\n", e.slots,
+                 (int) e.g.n_layers, slots_sum_stride(e));
+    size_t kept = 0;
+    for (size_t i = 0; i < keep; ++i) {
+        const int id = order[i];
+        if (e.hot_cnt[(size_t) id] == 0) break;   // never picked: writing zeros teaches the next run nothing
+        std::fprintf(f, "%d %lld\n", id, e.hot_cnt[(size_t) id]);
+        ++kept;
+    }
+    std::fclose(f);
+    if (std::rename(tmp.c_str(), e.hot_profile.c_str()) != 0)
+        std::fprintf(stderr, "strata-kolibri: cannot replace profile %s\n", e.hot_profile.c_str());
+    std::fprintf(stderr, "strata-kolibri: hot profile: %zu of %d slots written to %s\n", kept, e.slots,
+                 e.hot_profile.c_str());
+}
+
+// Seed order from the profile: ids by descending saved count.  A profile saved with a bigger cache is trimmed to
+// this run's slot count; a shorter one is topped up in id order by alloc_slots.
+static std::vector<int> hot_profile_load(Engine& e) {
+    std::vector<int> seed;
+    if (!e.hot_on || e.hot_profile.empty()) return seed;
+    std::FILE* f = std::fopen(e.hot_profile.c_str(), "r");
+    if (f == nullptr) return seed;
+    char buf[512];
+    while (std::fgets(buf, sizeof buf, f) != nullptr) {
+        if (buf[0] == '#' || buf[0] == '\n') continue;
+        int id = -1;
+        long long c = 0;
+        if (std::sscanf(buf, "%d %lld", &id, &c) != 2) continue;
+        if (id < 0 || id >= (int) e.g.n_expert) continue;
+        e.hot_cnt[(size_t) id] = c;
+        seed.push_back(id);
+    }
+    std::fclose(f);
+    std::stable_sort(seed.begin(), seed.end(), [&](int a, int b) {
+        if (e.hot_cnt[(size_t) a] != e.hot_cnt[(size_t) b]) return e.hot_cnt[(size_t) a] > e.hot_cnt[(size_t) b];
+        return a < b;
+    });
+    if ((int) seed.size() > e.slots) seed.resize((size_t) e.slots);
+    std::fprintf(stderr, "strata-kolibri: hot profile: %zu resident expert(s) seeded from %s\n", seed.size(),
+                 e.hot_profile.c_str());
+    return seed;
+}
+
+// Allocate the slot table and decide what starts in it.  Called AFTER init_scratch on purpose: the fit must see the
+// KV and the activations already allocated, or it counts their room as free and OOMs on the first long prompt.
+static void alloc_slots(Engine& e, int ctx) {
+    if (e.slots == 0) return;                       // no cache: the pool / UVA path, untouched
+    const int n_exp = (int) e.g.n_expert;
+    const long long stride_sum = slots_sum_stride(e);
+    if (e.slots == kSlotsAuto) {
+        size_t fb = 0, tb = 0;
+        KC(cudaMemGetInfo(&fb, &tb));
+        const long long reserve = (long long) e.vram_reserve_mib << 20;
+        const long long room = (long long) fb - reserve;
+        int n = (stride_sum > 0 && room > stride_sum) ? (int) (room / stride_sum) - 1 : 0;  // + zero slot per layer
+        if (n > n_exp) n = n_exp;
+        if (n < 1) {
+            const long long per_tok = std::max<long long>(1, kv_bytes_per_token(e));
+            std::fprintf(stderr,
+                         "strata-kolibri: --expert-slots auto: %.0f MiB free, %lld MiB per slot, %d MiB reserve:"
+                         " not one slot fits.  At %.1f KB/token, cutting --ctx by %lld tokens buys one slot.\n",
+                         (double) fb / (1 << 20), stride_sum >> 20, e.vram_reserve_mib, (double) per_tok / 1024.0,
+                         (long long) ((stride_sum + per_tok - 1) / per_tok));
+            std::exit(2);
+        }
+        e.slots = n;
+        std::fprintf(stderr,
+                     "strata-kolibri: expert cache fit: %.0f MiB free after dense+KV+scratch -> %d slots/layer"
+                     " (%.2f GiB), %d MiB kept for the runtime, %.0f MiB left\n",
+                     (double) fb / (1 << 20), e.slots, (double) (stride_sum * (e.slots + 1)) / (1 << 30),
+                     e.vram_reserve_mib,
+                     (double) ((long long) fb - reserve - stride_sum * (e.slots + 1)) / (1 << 20));
+    }
+    e.slots = std::min(e.slots, n_exp);
+    // What starts resident: the profile's hot set if there is one, else experts 0..S-1 (the id-ordered cache).
+    std::vector<int> seed;
+    if (e.hot_on) {
+        e.hot_cnt.assign((size_t) n_exp, 0);
+        seed = hot_profile_load(e);
+    }
+    if (!e.hot_on || seed.empty()) {   // the historical seed, and also the top-up when a profile is short
+        std::vector<char> taken((size_t) n_exp, 0);
+        for (int id : seed) taken[(size_t) id] = 1;
+        for (int id = 0; id < n_exp && (int) seed.size() < e.slots; ++id)
+            if (!taken[(size_t) id]) seed.push_back(id);
+    }
+    seed.resize((size_t) e.slots);
+    e.slot_of.assign((size_t) n_exp, -1);
+    for (int s = 0; s < e.slots; ++s) e.slot_of[(size_t) seed[(size_t) s]] = s;
+    const bool id_seed = !e.hot_on;
+    for (auto& b : e.blobs) {
+        KC(cudaMalloc((void**) &b.dev, b.stride * (size_t) (e.slots + 1)));
+        if (id_seed) {
+            KC(cudaMemcpy(b.dev, b.table, b.stride * (size_t) e.slots, cudaMemcpyHostToDevice));   // as before
+        } else {
+            for (int s = 0; s < e.slots; ++s)
+                KC(cudaMemcpy(b.dev + b.stride * (size_t) s, b.table + b.stride * (size_t) seed[(size_t) s],
+                              b.stride, cudaMemcpyHostToDevice));
+        }
+        if (poison_zero_slot()) KC(cudaMemset(b.dev + b.stride * (size_t) e.slots, 0xA5, b.stride));
+        else KC(cudaMemset(b.dev + b.stride * (size_t) e.slots, 0, b.stride));
+    }
+    // The (ctx, slots) exchange, printed together: they draw on the same VRAM and the operator should see the rate
+    // rather than discover it as an OOM.
+    size_t fb = 0, tb = 0;
+    const bool have = cudaMemGetInfo(&fb, &tb) == cudaSuccess;
+    const long long per_tok = kv_bytes_per_token(e);
+    std::fprintf(stderr, "strata-kolibri: expert cache: %d slots/layer = %.2f GiB VRAM\n", e.slots,
+                 (double) e.slots * stride_sum / (1 << 30));
+    if (per_tok > 0)
+        std::fprintf(stderr,
+                     "strata-kolibri: (ctx, slots) draw on the same VRAM: 1 slot = %lld MiB = %lld context tokens"
+                     " at %.1f KB/token; ctx %d x %lld = %.2f GiB, %s%.0f MiB free (reserve %d MiB)\n",
+                     stride_sum >> 20, (long long) (stride_sum / per_tok), (double) per_tok / 1024.0, ctx, per_tok,
+                     (double) per_tok * ctx / (1 << 30), have ? "" : "", have ? (double) fb / (1 << 20) : -1.0,
+                     e.vram_reserve_mib);
+    if (have && (long long) fb < ((long long) e.vram_reserve_mib << 20))
+        std::fprintf(stderr,
+                     "strata-kolibri: WARNING: %.0f MiB free is below the %d MiB reserve: a long prompt can run"
+                     " the card out.  %s\n", (double) fb / (1 << 20), e.vram_reserve_mib,
+                     e.slots == kSlotsAuto ? "" : "Use --expert-slots auto to fit it, or cut --ctx.");
+}
+
+// Re-pick which experts are resident and move the blobs that changed.  Called BETWEEN requests, never during one:
+// the copies are synchronous and the slot contents must not change under a running kernel.  Slots that stay
+// resident keep their number, so a steady workload settles and the PCIe traffic goes to zero.
+static void slots_reselect(Engine& e) {
+    if (!e.hot_on || e.slots <= 0) return;
+    long long picks = 0;
+    for (long long c : e.hot_cnt) picks += c;
+    if (picks - e.hot_picks_at_last < e.hot_min_picks) return;   // no churn on every token
+    e.hot_picks_at_last = picks;
+    const int n_exp = (int) e.g.n_expert, S = e.slots;
+    std::vector<int> order((size_t) n_exp);
+    for (int i = 0; i < n_exp; ++i) order[(size_t) i] = i;
+    const size_t keep = (size_t) std::min(S, n_exp);
+    std::partial_sort(order.begin(), order.begin() + keep, order.end(), [&](int a, int b) {
+        if (e.hot_cnt[(size_t) a] != e.hot_cnt[(size_t) b]) return e.hot_cnt[(size_t) a] > e.hot_cnt[(size_t) b];
+        return a < b;
+    });
+    std::vector<int> hot_ids;
+    for (size_t i = 0; i < keep; ++i) {
+        const int id = order[i];
+        if (e.hot_cnt[(size_t) id] == 0) break;   // nothing else has been picked yet
+        hot_ids.push_back(id);
+    }
+    std::vector<int> want((size_t) n_exp, -1);
+    std::vector<char> taken((size_t) S, 0);
+    int next_free = 0;
+    for (int id : hot_ids) {   // keep the slot every still-hot expert already had: that is what stops the churn
+        const int s = e.slot_of[(size_t) id];
+        if (s >= 0 && s < S) { want[(size_t) id] = s; taken[(size_t) s] = 1; }
+    }
+    for (int id : hot_ids) {
+        if (want[(size_t) id] >= 0) continue;
+        while (next_free < S && taken[(size_t) next_free]) ++next_free;
+        if (next_free >= S) break;
+        want[(size_t) id] = next_free;
+        taken[(size_t) next_free] = 1;
+    }
+    std::vector<int> moved;
+    for (int id : hot_ids)
+        if (want[(size_t) id] >= 0 && want[(size_t) id] != e.slot_of[(size_t) id]) moved.push_back(id);
+    if (moved.empty()) { e.slot_of = want; return; }
+    KC(cudaDeviceSynchronize());
+    const auto t0 = Clock::now();
+    for (int id : moved) slot_promote(e, id, want[(size_t) id]);
+    e.slot_of = want;
+    e.hot_promotions += (long long) moved.size();
+    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    std::fprintf(stderr, "strata-kolibri: hot slots: %zu expert(s) newly resident after %lld picks, %.0f MiB over"
+                 " PCIe in %.1f ms\n",
+                 moved.size(), picks, (double) moved.size() * slots_sum_stride(e) / (1 << 20), ms);
+}
+
 /// The serve protocol (serve/server.py's engine lines, q36's shape): READY, then per request GEN <max_new>
 /// [key=value ...] <ids>; PP lines as the prompt is consumed; T <id> per token; DONE at the end.  STOP cancels
 /// the running request.  A request whose ids extend the held prefix continues it (the serve `live` logic).
 int serve(Engine& e, Scratch& s) {
+    // INFO key=value before READY is what fills serve/server.py's engine.info (parser at :839), and /metrics
+    // publishes that dict as its "engine" block - which is where the Monitor tab reads the expert figures.  The
+    // Kolibri engine never printed one, so the tab had no slots and no hit-rate context to show.  Keys match the
+    // names the server already understands (expert_slots / expert_cache_mib / vram_free_mib).
+    {
+        long long cache_bytes = 0;
+        for (size_t li = 0; li < e.blobs.size(); ++li)
+            cache_bytes += (long long) e.blobs[li].stride * (long long) (e.slots + 1);
+        size_t fb = 0, tb = 0;
+        const bool have = cudaMemGetInfo(&fb, &tb) == cudaSuccess;
+        std::printf("INFO engine=kolibri-1 expert_slots=%lld expert_slots_per_layer=%d expert_cache_mib=%lld"
+                    " expert_cache_full_mib=%lld vram_free_mib=%lld kv=device cpu_threads=%d prefill=%d slots=%d\n",
+                    (long long) e.slots * (long long) e.g.n_layers, e.slots, cache_bytes >> 20, cache_bytes >> 20,
+                    have ? (long long) (fb >> 20) : -1LL, e.cpu_threads, e.prefill, e.slots);
+    }
     std::printf("READY %d stop\n", s.ctx);
     std::fflush(stdout);
     std::mutex mu;
@@ -3618,6 +3887,23 @@ int serve(Engine& e, Scratch& s) {
             lines.pop_front();
         }
         if (line.empty()) continue;
+        if (line == "VRAM" || line.rfind("VRAM ", 0) == 0) {
+            // The monitor's expert figures: serve/server.py's StrataEngine.vram() writes "VRAM[ <mib>]" and reads
+            // expert_slots / vram_free_mib out of a "VRAM key=value ..." reply, which is what the web page shows as
+            // the expert count.  This engine sizes its cache at load and has no elastic tier, so a requested
+            // reserve is reported back rather than applied - saying so beats pretending to resize.
+            long long cache_bytes = 0;
+            for (size_t li = 0; li < e.blobs.size(); ++li)
+                cache_bytes += (long long) e.blobs[li].stride * (long long) (e.slots + 1);
+            size_t fb = 0, tb = 0;
+            const bool have = cudaMemGetInfo(&fb, &tb) == cudaSuccess;
+            std::printf("VRAM expert_slots=%lld expert_cache_mib=%lld expert_cache_full_mib=%lld vram_free_mib=%lld"
+                        " elastic=0\n",
+                        (long long) e.slots * (long long) e.g.n_layers, cache_bytes >> 20, cache_bytes >> 20,
+                        have ? (long long) (fb >> 20) : -1LL);
+            std::fflush(stdout);
+            continue;
+        }
         if (line.rfind("GEN ", 0) != 0) {
             std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...>\n");
             std::fflush(stdout);
@@ -3806,6 +4092,10 @@ int serve(Engine& e, Scratch& s) {
         live.resize(reuse);
         live.insert(live.end(), ids.begin() + (long) reuse, ids.end());
         const double prompt_ms = ms_since(t0);
+        // Per-request expert-cache figures for the DONE line: the counters are cumulative, so the request's own
+        // numbers are the deltas.  slot hits are the routed picks served from VRAM slots, misses are the ones the
+        // CPU pool computed from the pinned table - which is why offloaded stays 0: nothing went over PCIe.
+        const long long hits0 = e.cnt.slot_hits, miss0 = e.cnt.slot_miss;
         std::mt19937_64 rng(smp.seed);
         std::vector<int32_t> hist = ids;
         const auto d0 = Clock::now();
@@ -3851,9 +4141,17 @@ int serve(Engine& e, Scratch& s) {
             tok = nx;
         }
         const double decode_ms = ms_since(d0);
-        std::printf("DONE %lld %zu %.1f %.1f %s 0 0 %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
-                    decode_ms, finish, reuse, (long long) fresh);
+        const long long dh = e.cnt.slot_hits - hits0, dm = e.cnt.slot_miss - miss0;
+        // Field contract unchanged (16 fields, f[8]=reuse, f[14]=prompt_read): what changed is that f[9]=hits,
+        // f[10]=lookups and f[11]=RAM blobs now carry the request's real numbers instead of literal zeros, so the
+        // monitor can show a hit rate and the expert tiers instead of nulls.
+        std::printf("DONE %lld %zu %.1f %.1f %s 0 0 %zu %lld %lld %lld 0 0.0 %lld 0\n", produced, ids.size(),
+                    prompt_ms, decode_ms, finish, reuse, dh, dh + dm, dm, (long long) fresh);
         std::fflush(stdout);
+        // Between requests is the only safe place to change what is resident: the promotions are synchronous and
+        // the slot contents must not move under a running kernel.
+        slots_reselect(e);
+        hot_profile_save(e);
         print_counters(e, "serve");
     }
 }
@@ -4056,6 +4354,10 @@ int strata::kolibri::run(int argc, char** argv) {
     std::string model, tokens, dump_layers, dump_logits, dump_full, force, tokens_file;
     bool load_only = false, serve_mode = false;
     int n_gen = 8, ctx = 8192, cpu_threads = 0, slots = 0, grouped = 0, no_graph = 0, prefill = 0, counters = 0;
+    // the expert cache's opt-in knobs (see alloc_slots / slots_reselect): off means the historical by-id cache
+    int hot = env_on("STRATA_KOLIBRI_SLOTS_HOT") ? 1 : 0;
+    int reserve_mib = 700;                     // --vram-reserve-mib: the Qwen engine's own default
+    std::string profile;                       // --expert-slots-profile: the learned hot set, read and written here
     int attn_bench = 0;             // K25 instrument: --attn-bench N launches the real attention kernel N times
     int attn_mode = 0;              // 0 = full, 1 = score pass only (V neutralised), 2 = V pass only (scores const)
     double expert_vram = 0;
@@ -4075,7 +4377,15 @@ int strata::kolibri::run(int argc, char** argv) {
         else if (a == "--load-only") load_only = true;
         else if (a == "--serve") serve_mode = true;
         else if (a == "--cpu-threads" && i + 1 < argc) cpu_threads = std::atoi(argv[++i]);
-        else if (a == "--expert-slots" && i + 1 < argc) slots = std::atoi(argv[++i]);
+        else if (a == "--expert-slots" && i + 1 < argc) {
+        // "auto" = fit the count to the VRAM that is still free once dense+KV+scratch are allocated.
+        const std::string v = argv[i + 1];
+        slots = (v == "auto") ? kSlotsAuto : std::atoi(v.c_str());
+        ++i;
+    }
+    else if (a == "--expert-slots-hot") hot = 1;
+    else if (a == "--expert-slots-profile" && i + 1 < argc) { hot = 1; profile = argv[++i]; }
+    else if (a == "--vram-reserve-mib" && i + 1 < argc) reserve_mib = std::atoi(argv[++i]);
         else if (a == "--expert-vram" && i + 1 < argc) expert_vram = std::atoi(argv[++i]);
         else if (a == "--grouped") grouped = 1;
         else if (a == "--no-graph") no_graph = 1;
@@ -4159,18 +4469,17 @@ int strata::kolibri::run(int argc, char** argv) {
         for (auto& b : e.blobs) stride_max = std::max(stride_max, b.stride);
         slots = (int) (expert_vram * (1 << 30) / ((double) stride_max * (double) e.g.n_layers));
     }
-    e.slots = std::min(slots, (int) e.g.n_expert);
-    if (e.slots > 0) {   // the GPU expert cache: slots blobs + 1 zero slot per layer, copied up front
-        for (auto& b : e.blobs) {
-            KC(cudaMalloc((void**) &b.dev, b.stride * (size_t) (e.slots + 1)));
-            KC(cudaMemcpy(b.dev, b.table, b.stride * (size_t) e.slots, cudaMemcpyHostToDevice));
-            if (poison_zero_slot())
-                KC(cudaMemset(b.dev + b.stride * (size_t) e.slots, 0xA5, b.stride));   // the poison control
-            else
-                KC(cudaMemset(b.dev + b.stride * (size_t) e.slots, 0, b.stride));
-        }
-        std::fprintf(stderr, "strata-kolibri: expert cache: %d slots/layer = %.2f GiB VRAM\n",
-                     e.slots, (double) e.slots * e.blobs[0].stride * e.g.n_layers / (1 << 30));
+    // The slot TABLE is allocated in alloc_slots(), after init_scratch: that is the only point where a fit can see
+    // the KV and the activations already paid for.  -1 (auto) and 0 (no cache) both pass through here.
+    e.slots = slots;
+    e.hot_on = hot;
+    e.hot_profile = profile;
+    e.vram_reserve_mib = reserve_mib > 0 ? reserve_mib : 700;
+    {
+        const char* rv = std::getenv("STRATA_KOLIBRI_VRAM_RESERVE_MIB");
+        if (rv != nullptr && std::atoi(rv) > 0) e.vram_reserve_mib = std::atoi(rv);
+        const char* hmin = std::getenv("STRATA_KOLIBRI_SLOTS_HOT_MIN");
+        if (hmin != nullptr && std::atoi(hmin) > 0) e.hot_min_picks = std::atoi(hmin);
     }
     if (e.cpu_threads > 1) {
         // The prefill fan-out's pool: lanes = the host lane + one lane per pinnable PHYSICAL core of this
@@ -4241,6 +4550,7 @@ int strata::kolibri::run(int argc, char** argv) {
         Scratch s;
         s.ctx = ctx;
         init_scratch(e, s);
+        alloc_slots(e, ctx);   // after init_scratch: the fit measures the KV and the scratch as already spent
         if (e.graphs > 0 && e.gexec.empty()) capture_graphs(e, s);
         return serve(e, s);
     }
@@ -4262,6 +4572,7 @@ int strata::kolibri::run(int argc, char** argv) {
     Scratch s;
     s.ctx = ctx;
     init_scratch(e, s);
+    alloc_slots(e, ctx);   // after init_scratch: the fit measures the KV and the scratch as already spent
     if (e.graphs > 0 && e.gexec.empty()) capture_graphs(e, s);
     std::vector<float> lg((size_t) e.g.n_vocab);
     std::vector<float> layers((size_t) e.g.n_layers * (size_t) e.g.n_embd);

@@ -148,6 +148,20 @@ same box does ~157 tok/s, and the decode after a 32K prompt is 13.4 / 13.5 again
 and `STRATA_KOLIBRI_DEC_RES=1` costs 10% of prefill for -3% of decode.  The levers are less expert traffic and a
 fused compressed-weight GEMM, or a card class where the placement sign flips - not another knob.
 
+The by-id limitation now has an opt-in path.  `--expert-slots-hot` picks the resident experts by routed-pick
+frequency instead of by id, `--expert-slots-profile PATH` saves that set and seeds the next start from it, and
+`--expert-slots auto` sizes the cache from the VRAM that is free once the dense weights, the KV and the scratch are
+allocated (`--vram-reserve-mib`, default 700, is kept clear for the runtime - deliberately not the last byte).
+Measured on this T4, 160K context, 70 slots (8.38 GiB), `--prefill --cpu-threads 24`, the same 31-token prompt
+twice: the id-ordered cache served **314 of 1,800** routed picks (**17.4%**), the set learned from the first request
+served **682 of 1,800** (**37.9%**) - same 70 slots, same bytes, placed where the traffic is.  Re-selecting cost
+669 ms between the two requests (57 experts, 6.5 GiB over PCIe).  Seeded from a saved profile, the *first* request
+of a cold start already served **727 of 1,800** (**40.4%**).  `gen:` was 4688 4688 4688 4688 in the id-ordered, the
+hot and a 75-slot `auto` run alike: residency moves bytes, it does not change them.  With `auto` at 160K the fit
+chose 75 slots/layer from 9,501 MiB free, and prints the exchange rate it implies - 1 slot = 114 MiB = 5,857 tokens
+of context at 20.0 KB/token, which is why `--ctx` and `--expert-slots` are one decision and not two.  Not measured:
+sessions long enough for the hot set to drift, and any card other than this T4.
+
 ## Not verified (v1)
 
 - AMD (HIP) — the code builds for HIP by the q36 pattern, validated on NVIDIA only.
