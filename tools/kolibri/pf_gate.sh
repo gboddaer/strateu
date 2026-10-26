@@ -61,7 +61,12 @@ fi
 
 run_hash || exit 2
 if [ "$MODE" = record ]; then cp "$HASH" "$EXP_HASH"; else
-    if cmp -s "$HASH" "$EXP_HASH"; then echo "  2. PF_HASH     PASS  ($(wc -l < "$HASH") chunk-layers)"
+    # PFHASH does not exist on the partial-sums path: the engine emits those lines only under
+    # `if (b.f16 && s.pf_nblk > 0 && !pf_partial_on())` (kolibri_engine.cu:2793), so with the knob on there is
+    # nothing to compare and a FAIL here would be measuring the absence of an instrument, not the tree.
+    if [ "${STRATA_KOLIBRI_PF_PARTIAL:-0}" != "0" ]; then
+        echo "  2. PF_HASH     SKIP  (STRATA_KOLIBRI_PF_PARTIAL is on: the engine emits no PFHASH lines on that path)"
+    elif cmp -s "$HASH" "$EXP_HASH"; then echo "  2. PF_HASH     PASS  ($(wc -l < "$HASH") chunk-layers)"
     else echo "  2. PF_HASH     FAIL  (differs from $(wc -l < "$EXP_HASH" 2>/dev/null) recorded lines)"; rc=1; fi
 fi
 

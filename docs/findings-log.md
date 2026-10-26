@@ -559,3 +559,36 @@ reuse/read fields (measured directly over the protocol: a 522-id request extendi
 exactly those two fields is covered by `serve/test_request_accounting.py`, which asserts
 `(timings["cache_n"], timings["prompt_n"]) == (5, original - 5)`. The launcher path on a box whose card it
 recognises still owes a two-turn `/v1/chat/completions` run asserting `cache_n > 0`.
+
+### Through /v1/chat/completions the reuse did not fire (cache_n 0) - and why that is not the engine
+
+Started the server on this box against the real model and drove two turns (a turn-1 chat, then the same
+conversation plus the assistant reply plus a new user line), reading the server's own `timings`:
+
+    turn 1: prompt 59 tokens, cached_tokens 0
+    turn 2: prompt 72 tokens, cache_n 0, prompt_n 72, prompt_ms 953.9
+
+So through HTTP the second turn read all 72 tokens. The engine never printed `RESUME` for those requests, i.e.
+it correctly declined to reuse because the prompt it was handed did not extend what it held - the same code that
+does reuse, bitwise, when the ids are resent (the gate and `agent_bench.py` both prove that).
+
+The likely cause, not yet proven: the reply goes back to the client as TEXT and is re-tokenized on the way in,
+and detokenize->retokenize is not the identity at a turn boundary - a BPE merge can span the boundary, and the
+chat template appends its own marker after the assistant content. The Qwen path in this repo solves that with a
+token-level conversation cache on the server side rather than relying on the client to reproduce tokens; the
+Kolibri path has no such cache.
+
+What would settle it, and what it needs: a token-id round trip that can be compared (a `/tokenize` endpoint, or
+a server-side cache of the ids it last sent). Neither is engine work, and neither is in this goal's scope - it is
+the server layer that owes it, together with the two-turn `cache_n > 0` assertion.
+
+### pf_gate on the partial-sums path: PF_HASH is not emitted there at all
+
+`STRATA_KOLIBRI_PF_HASH` lines are produced only under
+`if (b.f16 && s.pf_nblk > 0 && !pf_partial_on())` (kolibri_engine.cu:2793), so with `STRATA_KOLIBRI_PF_PARTIAL=1`
+there is nothing to compare and the stage reported FAIL for the absence of an instrument. It now prints
+`SKIP (STRATA_KOLIBRI_PF_PARTIAL is on: the engine emits no PFHASH lines on that path)`.
+With that, the gate passes on both paths with the oracle unchanged:
+
+    default path:  build PASS, ids smoke PASS, PF_HASH PASS (100 chunk-layers), oracle BITWISE PASS, reuse PASS
+    PF_PARTIAL:    build PASS, ids smoke PASS, PF_HASH SKIP, oracle BITWISE PASS, reuse PASS
