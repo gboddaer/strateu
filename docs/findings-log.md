@@ -1341,3 +1341,49 @@ repeat of any residency is byte-identical (A==A2, B==B2, C==C2, D==D2). That is 
 `GATE PASS` at `05321851`, 2026-10-27T07:14Z, with `BITWISE PASS: gen: 286 3515 310 262 14292 1343 1444 46 17156…` and all
 seven stages green (build, plain, no-prefill, prefix, ids smoke, PF_HASH 100 chunk-layers, reuse); `check_published_figures.py`
 clean against 122 known values. Artifact: `/tmp/ver/gate_final.txt`.
+
+
+## 0.6 The residency round: positions, budget, decay, margin, one stream sync (2026-10-27)
+
+**Why this exists.**  The round built earlier the same day ran on a 3-second wall clock, installed the whole wanted set
+(2,699 moves, 6,174 MiB, 629 ms inside one token boundary), never decayed its counts, had no admission margin, and
+copied with blocking `cudaMemcpy` after a `cudaDeviceSynchronize`.  The Qwen3.8-Flash-Next engine's adaptive tier
+(`src/program/generate.cpp:8842-8890`: `--adapt-every 4` windows, `--adapt-swaps 96`, `--adapt-min-gain 1.5`,
+`--adapt-decay 0.7`, one 2,048-swap pass after the prompt) does none of that, and its shape is what this round now has.
+Policy and tests live in `include/strata/kernels/kolibri_hot_policy.hpp` and `tests/kolibri/hot_policy_test.cpp`
+(`hot_due` / `hot_plan` / `hot_decay` / `hot_round`, 10 rule groups, no GPU, no model).
+
+**Measured** (T4 at PCI `82:00.0`, `numa_node 1`, pinned `numactl --cpunodebind=1 --membind=1`; 512-token prompt, 300
+greedy tokens per request, `--ctx 163840 --prefill --cpu-threads 24 --expert-slots auto --expert-slots-hot`, per-layer
+map default; two runs per arm; box load 0.9-4.0 before, 1.4-2.5 after; nothing else on the card):
+
+| arm | req1 hit | req2 hit | decode | rounds |
+| --- | --- | --- | --- | --- |
+| defaults (every 32, 96/2048, 1.5, 0.7) | **83.2 %** (61,641/74,100) | **88.7 %** (79,844/90,000) | 25.12 / 24.83 tok/s | after prompt 2,048 moves / 4,691 MiB / 469 ms; then 96 / 218-222 MiB / 21.8-22.5 ms each |
+| `--expert-slots-decay 1.0` | 84.7 % (18,552/21,900) | 86.3 % (22,791/26,400) | 25.27 / 25.00 | same |
+| `--expert-slots-reselect-every 0` (after-prompt pass only) | 85.7 % (20,051/23,400) | 85.5 % (32,332/37,800) | 25.47 / 24.79 | after-prompt 2,048 / 4,691 MiB / 470 ms; after-request 774 / 1,760 MiB / 176 ms |
+| `--expert-slots-swaps 0 --expert-slots-swaps-final 0` (static) | 20.2 % (18,210/90,000) | 20.2 % | 25.69 / 25.61 | none |
+| 8-token prompt (below the 8,192-pick floor) | 20.3 % (487/2,400) | - | 31.00 | none |
+
+Every arm's two runs printed the **same ids** (identical `T`-stream md5 and identical hit counts, e.g. 61,641/74,100
+twice, md5 `d657c0ba…`).  The 3-second clock could not do that; the position count can, because 32 positions is 32
+positions on every run.  The static arm prints the same ids on both requests as well (md5 `9db38d03…` four times).
+
+**What the prompt contributes.**  The prefill's routing had never fed the cache: `touch_hist` (the prefill's per-layer
+counts, previously allocated only for `--hist`/`STRATA_KOLIBRI_DEC_RES`) is now always allocated, filled when the cache
+is on, absorbed into `hot_cnt`/`hot_score` once per prompt and cleared.  Without it the post-prompt round found an empty
+histogram and the first request stayed at the id map's 20.2 %; with it, the first request is 83.2 %.  The first request's
+83.2 % against the previous unbudgeted round's 20.2 % -> 76.8 % (request 2) is the whole point of the change: the same
+map, installed before the decode instead of between requests, for 469 ms once per prompt instead of 629 ms at the first
+token.
+
+**Correctness.**  `pf_gate.sh check` at this tree: `GATE PASS`, all seven stages, oracle
+`BITWISE PASS: gen: 286 3515 310 262 14292 1343 1444 46 17156…` (the oracle runs the plain path with no slots, so it
+cannot see this work; PF_HASH's 100 chunk-layer checksums are what would catch a copy racing a kernel, and they are
+green).  `check_published_figures.py` clean against 122 values.  A `kill -9` during decode left the profile intact
+(19,654 bytes) and the next start seeded 26-60 experts per layer from it.
+
+**Not measured.**  The margin at 1.5 against anything but 0 and 1.5; decay 0.7 against 1.0 on a workload that changes
+subject inside one prompt (both were measured on this one fixture only, where 1.0 is not worse); any card other than
+this T4.  The mid-request rounds here are ~22 ms of a 32-position window (1.28 s at 25 tok/s), i.e. ~1.7 % of decode -
+which is inside this box's own run-to-run spread and is therefore not claimed as a speed change in either direction.

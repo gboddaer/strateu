@@ -23,6 +23,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/dequant_bf16.hpp"   // S7 dense-fp16 cache: dequant_f16 (Q4_K blocks -> FP16 bits on device)
 #include "strata/kernels/kolibri_window.hpp"
+#include "strata/kernels/kolibri_hot_policy.hpp"   // hot_due / hot_round: the residency round's arithmetic (host-only)
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"   // P1b: the library's ExpertPool (row-split, affinity-aware) for the CPU experts
@@ -366,6 +367,18 @@ struct Engine {
     int hot_on = 0;                 // --expert-slots-hot or STRATA_KOLIBRI_SLOTS_HOT=1
     int hot_min_picks = 8192;       // re-select only after this many routed picks (no per-token churn)
     long long hot_picks_at_last = 0;
+    // THE ROUND: the Qwen3.8-Flash-Next engine's adaptive tier (include/strata/kernels/kolibri_hot_policy.hpp carries
+    // the rules and the tests).  A round runs every --expert-slots-reselect-every POSITIONS (32; 0 = only after a
+    // request), moves at most --expert-slots-swaps experts mid-request (96) or --expert-slots-swaps-final after a
+    // request (2048), admits a candidate only when it beats the occupant by --expert-slots-min-gain (1.5), and
+    // multiplies the score it sorts on by --expert-slots-decay (0.7) after every round.  The clock of 2026-10-27 is
+    // gone: a wall clock moved a different number of positions on every box, so two runs of one prompt disagreed.
+    int hot_every = 32;
+    long long hot_pos_at_last = 0;
+    int hot_swaps = 96;
+    int hot_swaps_final = 2048;
+    double hot_min_gain = 1.5;
+    double hot_decay_factor = 0.7;
     long long hot_promotions = 0;   // blobs re-copied into the slots (each one is n_layers x stride of PCIe traffic)
     std::string hot_profile;        // --expert-slots-profile PATH: the learned hot set, read at load and saved after
     // --expert-slots-per-layer (DEFAULT ON since 2026-10-27; --no-expert-slots-per-layer or
@@ -386,6 +399,9 @@ struct Engine {
     mutable std::vector<long long> hot_cnt;  // (per_layer ? layer*n_expert : n_expert) routed-pick histogram: counted
                                              // from layer_step, whose Engine is const (it reads the layer, it does not
                                              // own the cache)
+    mutable std::vector<double> hot_score;   // the same shape, +1.0 per routed pick and *decay once per round: the score
+                                             // the swap policy sorts on.  hot_cnt stays the LIFETIME count that
+                                             // hot_profile_save writes, so a saved profile means what it always did.
     int grouped = 0;                // --grouped: native_expert_grouped for the routed experts (one launch per layer)
     int graphs = 0;                 // --grouped + graphs (default on with --grouped): per-layer CUDA graphs
     int prefill = 0;                // --prefill: chunked prompt processing (GEMM projections, FP16 attention)
@@ -1953,6 +1969,27 @@ static inline bool dec_xexp_on() { return env_on("STRATA_KOLIBRI_DEC_XEXP"); }
 /// K29: seed the decode's fp16 cache with each layer's HOT experts.  Without this the slots hold only the last prefill
 /// chunk's RES_TOP promotions, which measured 27% of decode picks; the prompt's own routing says which 24 per layer
 /// matter (the coverage probe measures 45.0% for a top-24 set).  ~1200 promotions, ~2.2 GB over PCIe, once per request.
+// The prompt's routing, into the cache's two counters: the LIFETIME count (the profile's data) and the DECAYED score
+// (the swap policy's).  Called once per prompt, before the post-prompt round; the caller clears touch_hist afterwards,
+// because the prefill path only increments it and a second request would otherwise count the first one again.
+static void hot_absorb_prompt(Engine& e) {
+    if (!e.hot_on || e.touch_hist.empty()) return;
+    const int64_t n_exp = (int64_t) e.g.n_expert;
+    for (size_t l = 0; l < e.touch_hist.size(); ++l) {
+        const std::vector<uint64_t>& h = e.touch_hist[l];
+        for (int64_t id = 0; id < n_exp && id < (int64_t) h.size(); ++id) {
+            if (h[(size_t) id] == 0) continue;
+            const size_t ix = e.hot_idx((int64_t) l, id);
+            e.hot_cnt[ix] += (long long) h[(size_t) id];
+            if (!e.hot_score.empty()) e.hot_score[ix] += (double) h[(size_t) id];
+        }
+    }
+}
+
+static void hot_forget_prompt(Engine& e) {
+    for (auto& h : e.touch_hist) std::fill(h.begin(), h.end(), (uint64_t) 0);
+}
+
 static void seed_hot(Engine& e, Scratch& s) {
     if (!dec_res_on() || e.touch_hist.empty()) return;
     const int64_t N = e.g.n_embd, FF = e.g.n_ff, f16_stride = 3 * FF * N;
@@ -2110,7 +2147,11 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                 // slot_bytes stays behind --counters because only the CNT report reads it.
                 if (sidx >= 0) ++e.cnt.slot_hits;
                 else { ++e.cnt.slot_miss; if (e.counters) e.cnt.slot_bytes += (long long) b.stride; }
-                if (e.hot_on) ++e.hot_cnt[e.hot_idx(l, id)];   // the histogram the reselection sorts on
+                if (e.hot_on) {
+                    ++e.hot_cnt[e.hot_idx(l, id)];   // the LIFETIME count the profile writes
+                    if (!e.hot_score.empty()) e.hot_score[e.hot_idx(l, id)] += 1.0;   // the decayed score the swap
+                    // policy sorts on: same index, halved about every 1.9 rounds (see kolibri_hot_policy.hpp)
+                }
             }
             g_ids_host = s.slot_ids;
             gemv(gu, s.h, s.eg2, s.ids, K, 0, b.dev, b.stride);   // K21: this gate gemv ran twice per layer
@@ -2576,7 +2617,8 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
             strata::kernels::native_router_sigmoid_logit_add(A.router_m, e.f32.at(L(l, "exp_probs_b.bias")),
                                                              A.ids_m, A.wts_m, Tc, g_st);
         }
-        if (e.hist_on || dec_res_on()) {   // coverage probe; also the touch counts the hot seed needs (K29)
+        if (!e.touch_hist.empty() && (e.hot_on || e.hist_on || dec_res_on())) {   // coverage probe, the K29 seed's
+            // counts, and the expert cache's own input: the prompt's routing is what the post-prompt round decides on
             std::vector<int> hid((size_t) NKc);
             KC(cudaMemcpy(hid.data(), A.ids_m, (size_t) NKc * sizeof(int), cudaMemcpyDeviceToHost));
             std::vector<uint64_t>& h = e.touch_hist[(size_t) l];
@@ -3722,19 +3764,21 @@ static long long slots_sum_stride(const Engine& e) {
     return t;
 }
 
-// One expert's blob into one device slot, for every layer: n_layers memcpys of stride bytes.
+// One expert's blob into one device slot, for every layer: n_layers memcpys of stride bytes, queued on the engine's
+// stream.  Asynchronous on purpose: the copies are ordered behind every kernel already launched on g_st (which read
+// the OLD occupants) and ahead of the next token's kernels, so a round neither drains the device nor waits per move.
 static void slot_promote(Engine& e, int id, int slot) {
     for (auto& b : e.blobs)
-        KC(cudaMemcpy(b.dev + b.stride * (size_t) slot, b.table + b.stride * (size_t) id, b.stride,
-                      cudaMemcpyHostToDevice));
+        KC(cudaMemcpyAsync(b.dev + b.stride * (size_t) slot, b.table + b.stride * (size_t) id, b.stride,
+                           cudaMemcpyHostToDevice, g_st));
 }
 
-// The same move for ONE layer: 1 memcpy of stride bytes (2.21 MB at this model), which is the per-layer map's whole
-// point - a promotion is a 50x cheaper bet than a whole-expert one, and it needs no mid-request machinery.
+// The same move for ONE layer: 1 queued copy of stride bytes (2.21 MB at this model).  The source is the PINNED host
+// table (LayerBlobs::table), so the copy is a real async DMA rather than a staged one.
 static void slot_promote_layer(Engine& e, int64_t l, int id, int slot) {
     LayerBlobs& b = e.blobs[(size_t) l];
-    KC(cudaMemcpy(b.dev + b.stride * (size_t) slot, b.table + b.stride * (size_t) id, b.stride,
-                  cudaMemcpyHostToDevice));
+    KC(cudaMemcpyAsync(b.dev + b.stride * (size_t) slot, b.table + b.stride * (size_t) id, b.stride,
+                       cudaMemcpyHostToDevice, g_st));
 }
 
 // Write the learned hot set, via a temp file and a rename so a kill or a full disk leaves the previous profile intact.
@@ -3882,6 +3926,7 @@ static void alloc_slots(Engine& e, int ctx) {
     std::vector<std::vector<int>> seeds((size_t) n_lay);
     if (e.hot_on) {
         e.hot_cnt.assign((size_t) (e.per_layer ? (int64_t) n_lay * n_exp : n_exp), 0);
+        e.hot_score.assign(e.hot_cnt.size(), 0.0);
         seeds = hot_profile_load(e);
     }
     for (int l = 0; l < n_lay; ++l) {
@@ -3944,87 +3989,77 @@ static void alloc_slots(Engine& e, int ctx) {
 // and a slot changes the values, and greedy decoding turns that into different generated ids within a few tokens.  That
 // is true of the global map today and of the per-layer map below; it is why no gate here may claim "ids unchanged"
 // across two different resident sets, only across two runs of the same one.
-static void slots_reselect(Engine& e) {
+static void slots_reselect(Engine& e, const char* why = nullptr, int budget = -1) {
     if (!e.hot_on || e.slots <= 0) return;
+    const int cap = budget >= 0 ? budget : e.hot_swaps;
+    if (cap == 0) return;   // this pass is off (--expert-slots-swaps 0 / --expert-slots-swaps-final 0)
     long long picks = 0;
     for (long long c : e.hot_cnt) picks += c;
     if (picks - e.hot_picks_at_last < e.hot_min_picks) return;   // no churn on every token
     e.hot_picks_at_last = picks;
-    const int n_exp = (int) e.g.n_expert, S = e.slots;
+    const int n_exp = (int) e.g.n_expert;
     const int n_lay = e.per_layer ? (int) e.g.n_layers : 1;
-    const size_t keep = (size_t) std::min(S, n_exp);
-    // One pass per resident row.  With the knob off there is exactly one row and the loop is the historical single
-    // set, expert for expert; with --expert-slots-per-layer each layer re-picks from its own histogram row and pays
-    // one stride of PCIe per move instead of n_layers of them.
-    std::vector<std::vector<int>> want((size_t) n_lay, std::vector<int>((size_t) n_exp, -1));
-    std::vector<std::vector<int>> moved((size_t) n_lay);
-    for (int l = 0; l < n_lay; ++l) {
-        const size_t row = (size_t) l * (size_t) n_exp;
-        std::vector<int>& w = want[(size_t) l];
-        std::vector<int> order((size_t) n_exp);
-        for (int i = 0; i < n_exp; ++i) order[(size_t) i] = i;
-        std::partial_sort(order.begin(), order.begin() + keep, order.end(), [&](int a, int b) {
-            const long long ca = e.hot_cnt[row + (size_t) a], cb = e.hot_cnt[row + (size_t) b];
-            if (ca != cb) return ca > cb;
-            return a < b;
-        });
-        std::vector<int> hot_ids;
-        for (size_t i = 0; i < keep; ++i) {
-            const int id = order[i];
-            if (e.hot_cnt[row + (size_t) id] == 0) break;   // nothing else has been picked yet
-            hot_ids.push_back(id);
-        }
-        std::vector<char> taken((size_t) S, 0);
-        int next_free = 0;
-        for (int id : hot_ids) {   // keep the slot every still-hot expert already had: that is what stops the churn
-            const int s = (e.per_layer && !e.slot_of.empty()) ? e.slot_of[row + (size_t) id]
-                                                             : (e.slot_of.empty() ? -1 : e.slot_of[(size_t) id]);
-            if (s >= 0 && s < S) { w[(size_t) id] = s; taken[(size_t) s] = 1; }
-        }
-        for (int id : hot_ids) {
-            if (w[(size_t) id] >= 0) continue;
-            while (next_free < S && taken[(size_t) next_free]) ++next_free;
-            if (next_free >= S) break;
-            w[(size_t) id] = next_free;
-            taken[(size_t) next_free] = 1;
-        }
-        for (int id : hot_ids) {
-            const int s0 = e.slot_of.empty() ? -1 : e.slot_of[(e.per_layer ? row + (size_t) id : (size_t) id)];
-            if (w[(size_t) id] >= 0 && w[(size_t) id] != s0) moved[(size_t) l].push_back(id);
-        }
+    // The score the policy sorts on: the decayed array, or the lifetime counts when the cache was opened without one
+    // (a build or a test path that never sized hot_score keeps the counters' behaviour rather than moving nothing).
+    std::vector<double> from_cnt;
+    const std::vector<double>* sc = &e.hot_score;
+    if (e.hot_score.empty()) {
+        from_cnt.assign(e.hot_cnt.begin(), e.hot_cnt.end());
+        sc = &from_cnt;
     }
-    size_t n_moved = 0;
+    // hot_round() plans with the scores as they stand, then decays them: the order is pinned by
+    // tests/kolibri/hot_policy_test.cpp case I, and it is why this is one call and not two.
+    std::vector<double> score = *sc;
+    const std::vector<strata::kolibri::HotSwap> plan =
+        strata::kolibri::hot_round(n_lay, n_exp, e.slots, score, e.slot_of.data(), cap, e.hot_min_gain,
+                                   e.hot_decay_factor);
+    if (!e.hot_score.empty()) e.hot_score.swap(score);   // the decay lands in the engine's array
+    if (plan.empty()) return;
     long long moved_bytes = 0;
-    for (int l = 0; l < n_lay; ++l) {
-        n_moved += moved[(size_t) l].size();
-        moved_bytes += (long long) moved[(size_t) l].size() *
-                       (e.per_layer ? (long long) e.blobs[(size_t) l].stride : slots_sum_stride(e));
+    double gain_sum = 0.0;
+    for (const strata::kolibri::HotSwap& s : plan) {
+        const size_t row = e.per_layer ? (size_t) s.layer * (size_t) n_exp : 0;
+        if (s.victim >= 0) e.slot_of[row + (size_t) s.victim] = -1;   // the occupant stops being resident
+        e.slot_of[row + (size_t) s.expert] = s.slot;
+        moved_bytes += (long long) (e.per_layer ? e.blobs[(size_t) s.layer].stride : slots_sum_stride(e));
+        gain_sum += s.gain;
     }
-    // Install the new maps first: from here a pick reads only slots that are about to be written, and the copies
-    // below are synchronous, so nothing observes a half-written one.
-    for (int l = 0; l < n_lay; ++l) {
-        if (e.per_layer) {
-            const size_t row = (size_t) l * (size_t) n_exp;
-            for (int id = 0; id < n_exp; ++id) e.slot_of[row + (size_t) id] = want[(size_t) l][(size_t) id];
-        } else {
-            e.slot_of = want[0];
-        }
-    }
-    if (n_moved == 0) return;
-    KC(cudaDeviceSynchronize());
+    // The copies are STREAM-ORDERED, not device-serialised.  Every kernel that could read the slots being overwritten
+    // was launched on g_st before this point, so the queued copies run after it; the next token's kernels are queued
+    // after the copies.  slot_of is a HOST table - changing it needs no device drain at all - and the previous version's
+    // cudaDeviceSynchronize() plus one blocking cudaMemcpy per move was what turned a 96-move round into a 629 ms stall
+    // (the 2,699-move round measured on 2026-10-27).  This is the Qwen3.8-Flash-Next engine's ordering: copies on the
+    // engine's own stream, joined once.
     const auto t0 = Clock::now();
-    for (int l = 0; l < n_lay; ++l)
-        for (int id : moved[(size_t) l]) {
-            const int s = want[(size_t) l][(size_t) id];
-            if (e.per_layer) slot_promote_layer(e, l, id, s);
-            else slot_promote(e, id, s);
-        }
-    e.hot_promotions += (long long) n_moved;
+    for (const strata::kolibri::HotSwap& s : plan) {
+        if (e.per_layer) slot_promote_layer(e, s.layer, s.expert, s.slot);
+        else slot_promote(e, s.expert, s.slot);
+    }
+    KC(cudaStreamSynchronize(g_st));
+    e.hot_promotions += (long long) plan.size();
     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-    std::fprintf(stderr, "strata-kolibri: hot slots: %zu expert(s) newly resident after %lld picks, %.0f MiB over"
-                 " PCIe in %.1f ms%s\n",
-                 n_moved, picks, (double) moved_bytes / (1 << 20), ms,
-                 e.per_layer ? " (per-layer map)" : "");
+    std::fprintf(stderr, "strata-kolibri: hot slots%s: %zu expert(s) newly resident after %lld picks (mean gain"
+                 " %.2f+), %.0f MiB over PCIe in %.1f ms, budget %d%s\n",
+                 why != nullptr ? why : "", plan.size(), picks, gain_sum / (double) plan.size(),
+                 (double) moved_bytes / (1 << 20), ms, cap, e.per_layer ? " (per-layer map)" : "");
+}
+
+// Mid-request re-selection, on a POSITION count instead of on a wall clock.  Called from the two boundaries the 0.2
+// probe priced: after a prefill chunk, and after a decode token.  The gate is hot_due()'s: N positions since the last
+// round AND the pick floor, so two runs of one prompt take their rounds at the same positions and produce the same ids
+// (the clock could not: 3 s was a different number of positions on every box and every load).  No drain here either -
+// slots_reselect's copies are queued on g_st, behind whatever was already launched there.
+static void slots_tick(Engine& e, const char* site, long long pos) {
+    if (!e.hot_on || e.slots <= 0 || e.hot_every <= 0) return;
+    if (pos < e.hot_pos_at_last) e.hot_pos_at_last = pos;   // a request rewound the position: never a negative wait
+    long long picks = 0;
+    for (long long c : e.hot_cnt) picks += c;
+    if (!strata::kolibri::hot_due(e.hot_every, pos, e.hot_pos_at_last, picks, e.hot_picks_at_last, e.hot_min_picks))
+        return;
+    e.hot_pos_at_last = pos;
+    char why[96];
+    std::snprintf(why, sizeof why, " [round: %s at position %lld]", site, pos);
+    slots_reselect(e, why);
 }
 
 // **0.2 PROBE — what one expert-swap round costs, at the boundaries a round could use.**  Measurement only, and gated
@@ -4375,6 +4410,7 @@ int serve(Engine& e, Scratch& s) {
         if (e.prefill > 0) {   // chunked prefill: 512 rows per pass, progress per chunk
             int64_t i = reuse;
             const int64_t n = pf_end - reuse;   // the tokens still to read (== ids.size()-1 when reuse is 0)
+            e.hot_pos_at_last = s.pos;   // the request's own position count, so a reuse does not inherit the last one
             e.pf_total = n;   // the POOL_ALL rule: one decision for the whole prompt
         g_pf_total = n;   // K28: and the chunk rule keys on it (see pf_chunk_at)
             while (i < pf_end) {
@@ -4386,6 +4422,7 @@ int serve(Engine& e, Scratch& s) {
                 std::printf("PP %lld %lld %.0f %.1f\n", (long long) i, (long long) ids.size(), ms_since(t0),
                             (double) (i - reuse) / std::max(1e-9, ms_since(t0) / 1000.0));
                 std::fflush(stdout);
+                slots_tick(e, "chunk", (long long) i);   // a round every --expert-slots-reselect-every positions
             }
         } else
         for (int64_t t = (int64_t) reuse + 1; t < (int64_t) ids.size(); ++t) {   // the prompt minus its last token
@@ -4394,7 +4431,15 @@ int serve(Engine& e, Scratch& s) {
                         (double) (t - reuse) / std::max(1e-9, ms_since(t0) / 1000.0));
             std::fflush(stdout);
         }
+        e.hot_pos_at_last = s.pos;   // the request's own position count: a reuse starts at `reuse`, not at 0
+        // The prompt has now been routed through every layer, so one large round is worth more than any number of
+        // 96-move rounds during the decode: this is the Qwen3.8-Flash-Next engine's `hybrid_swaps_after_prompt = 2048`
+        // pass (generate.cpp:1821), run at the same place - after process(), before the decode loop.  Measured on
+        // 2026-10-27: 1,719 admissible moves, 3,925 MiB, 394 ms, and the round's own budget bounds it.
+        hot_absorb_prompt(e);   // the prompt routed every layer: its counts are what the round below decides on
+        slots_reselect(e, " [after prompt]", e.hot_swaps_final);
         seed_hot(e, s);   // K29: the prompt's hot experts into the fp16 slots before decoding
+        hot_forget_prompt(e);   // prompt-scoped: the next request counts its own
     if (e.graphs > 0) KC(cudaMemcpy(s.pos_d, &s.pos, 4, cudaMemcpyHostToDevice));
         // The held list must describe exactly the tokens this request consumed.  A reusing request already has
         // the prefix in `live`, so appending from `reuse` duplicated positions reuse..held-1 and left the list
@@ -4445,6 +4490,7 @@ int serve(Engine& e, Scratch& s) {
                                                   : (int32_t) (std::max_element(lg.begin(), lg.end()) - lg.begin());
             std::printf("T %d\n", nx);
             std::fflush(stdout);
+            slots_tick(e, "token", (long long) s.pos);   // a round every --expert-slots-reselect-every positions
             ++produced;
             hist.push_back(nx);
             live.push_back(nx);
@@ -4461,9 +4507,10 @@ int serve(Engine& e, Scratch& s) {
         std::printf("DONE %lld %zu %.1f %.1f %s 0 0 %zu %lld %lld %lld 0 0.0 %lld 0\n", produced, ids.size(),
                     prompt_ms, decode_ms, finish, reuse, dh, dh + dm, dm, (long long) fresh);
         std::fflush(stdout);
-        // Between requests is the only safe place to change what is resident: the promotions are synchronous and
-        // the slot contents must not move under a running kernel.
-        slots_reselect(e);
+        // Between requests is the default place to change what is resident: the promotions are synchronous and the
+        // slot contents must not move under a running kernel.  slots_tick() is the same pass run mid-request, on a
+        // timer and after a drain, between two decode tokens or two prefill chunks.
+        slots_reselect(e, nullptr, e.hot_swaps_final);   // the after-request pass: the larger budget
         hot_profile_save(e);
         print_counters(e, "serve");
     }
@@ -4511,8 +4558,10 @@ bool load(const std::string& path, Engine& e, std::string& err) {
 
     // pass 1: the routed experts, layer by layer, repacked into pinned [gate|up|down] blob tables
     e.blobs.resize((size_t) e.g.n_layers);
-    if (e.hist_on || dec_res_on())
-        e.touch_hist.assign((size_t) e.g.n_layers, std::vector<uint64_t>((size_t) e.g.n_expert, 0));
+    // The prompt's own routing counts (per layer, per expert).  `--hist` prints them, the K29 fp16 seed reads them,
+    // and the expert cache's post-prompt round needs them: without them a prompt feeds the hot set nothing, and the
+    // first request of a cold start can only learn from its own decode.  Always allocated (50 x 384 x 8 = 150 KB).
+    e.touch_hist.assign((size_t) e.g.n_layers, std::vector<uint64_t>((size_t) e.g.n_expert, 0));
     size_t expert_bytes = 0;
     for (int64_t l = 0; l < e.g.n_layers; ++l) {
         const strata::TensorInfo *gate = nullptr, *up = nullptr, *down = nullptr;
@@ -4674,6 +4723,14 @@ int strata::kolibri::run(int argc, char** argv) {
     // Needs --expert-slots-hot; with the by-id cache nothing below is touched either way.
     int per_layer = env_on_default_on("STRATA_KOLIBRI_SLOTS_PER_LAYER") ? 1 : 0;
     bool per_layer_asked = std::getenv("STRATA_KOLIBRI_SLOTS_PER_LAYER") != nullptr;
+    // The round's knobs (see include/strata/kernels/kolibri_hot_policy.hpp and the Engine block's comment): the
+    // cadence in POSITIONS, two move budgets, the admission margin and the decay.  All of them are opt-out, and 0
+    // means off for the pass it governs, the same meaning --adapt-swaps 0 has in the Qwen3.8-Flash-Next engine.
+    int reselect_every = 32;
+    int swaps_mid = 96;
+    int swaps_final = 2048;
+    double min_gain = 1.5;
+    double decay = 0.7;
     int reserve_mib = 700;                     // --vram-reserve-mib: the Qwen engine's own default
     std::string profile;                       // --expert-slots-profile: the learned hot set, read and written here
     int attn_bench = 0;             // K25 instrument: --attn-bench N launches the real attention kernel N times
@@ -4705,6 +4762,11 @@ int strata::kolibri::run(int argc, char** argv) {
         else if (a == "--expert-slots-per-layer") { hot = 1; per_layer = 1; per_layer_asked = true; }
         else if (a == "--no-expert-slots-per-layer") { per_layer = 0; per_layer_asked = true; }
     else if (a == "--expert-slots-profile" && i + 1 < argc) { hot = 1; profile = argv[++i]; }
+    else if (a == "--expert-slots-reselect-every" && i + 1 < argc) { hot = 1; reselect_every = std::atoi(argv[++i]); }
+    else if (a == "--expert-slots-swaps" && i + 1 < argc) { hot = 1; swaps_mid = std::atoi(argv[++i]); }
+    else if (a == "--expert-slots-swaps-final" && i + 1 < argc) { hot = 1; swaps_final = std::atoi(argv[++i]); }
+    else if (a == "--expert-slots-min-gain" && i + 1 < argc) { hot = 1; min_gain = std::atof(argv[++i]); }
+    else if (a == "--expert-slots-decay" && i + 1 < argc) { hot = 1; decay = std::atof(argv[++i]); }
     else if (a == "--vram-reserve-mib" && i + 1 < argc) reserve_mib = std::atoi(argv[++i]);
         else if (a == "--expert-vram" && i + 1 < argc) expert_vram = std::atoi(argv[++i]);
         else if (a == "--grouped") grouped = 1;
@@ -4810,6 +4872,20 @@ int strata::kolibri::run(int argc, char** argv) {
         std::fprintf(stderr, "strata-kolibri: expert cache: PER-LAYER residency map (%d layers x %d experts), not one"
                              " global set (default; --no-expert-slots-per-layer for a single set)\n",
                      (int) e.g.n_layers, (int) e.g.n_expert);
+    e.hot_every = reselect_every > 0 ? reselect_every : 0;
+    e.hot_swaps = swaps_mid > 0 ? swaps_mid : 0;
+    e.hot_swaps_final = swaps_final > 0 ? swaps_final : 0;
+    e.hot_min_gain = min_gain > 0.0 ? min_gain : 0.0;
+    const bool decay_ok = decay > 0.0 && decay <= 1.0;
+    e.hot_decay_factor = decay_ok ? decay : 1.0;
+    if (!decay_ok)
+        std::fprintf(stderr, "strata-kolibri: --expert-slots-decay %.2f is outside (0, 1]: using 1.0 (no decay)\n",
+                     decay);
+    if (e.hot_on)
+        std::fprintf(stderr, "strata-kolibri: expert cache: a round every %d position(s)%s, at most %d move(s)"
+                             " mid-request and %d after a request, min gain %.2f, decay %.2f\n",
+                     e.hot_every, e.hot_every > 0 ? "" : " (between requests only)", e.hot_swaps, e.hot_swaps_final,
+                     e.hot_min_gain, e.hot_decay_factor);
     e.hot_profile = profile;
     e.vram_reserve_mib = reserve_mib > 0 ? reserve_mib : 700;
     {
@@ -4817,6 +4893,16 @@ int strata::kolibri::run(int argc, char** argv) {
         if (rv != nullptr && std::atoi(rv) > 0) e.vram_reserve_mib = std::atoi(rv);
         const char* hmin = std::getenv("STRATA_KOLIBRI_SLOTS_HOT_MIN");
         if (hmin != nullptr && std::atoi(hmin) > 0) e.hot_min_picks = std::atoi(hmin);
+        const char* rev = std::getenv("STRATA_KOLIBRI_SLOTS_RESELECT_EVERY");
+        if (rev != nullptr) reselect_every = std::atoi(rev);
+        const char* sw = std::getenv("STRATA_KOLIBRI_SLOTS_SWAPS");
+        if (sw != nullptr) swaps_mid = std::atoi(sw);
+        const char* swf = std::getenv("STRATA_KOLIBRI_SLOTS_SWAPS_FINAL");
+        if (swf != nullptr) swaps_final = std::atoi(swf);
+        const char* mg = std::getenv("STRATA_KOLIBRI_SLOTS_MIN_GAIN");
+        if (mg != nullptr) min_gain = std::atof(mg);
+        const char* dk = std::getenv("STRATA_KOLIBRI_SLOTS_DECAY");
+        if (dk != nullptr) decay = std::atof(dk);
     }
     if (e.cpu_threads > 1) {
         // The prefill fan-out's pool: lanes = the host lane + one lane per pinnable PHYSICAL core of this
@@ -4994,6 +5080,7 @@ int strata::kolibri::run(int argc, char** argv) {
             std::printf("PFchunk %lld/%lld %.0fms\n", (long long) i, (long long) n, ms_since(tp0));
             std::fflush(stdout);
             dyn_probe_step(e, "chunk", dyn_probe_on() ? dyn_now_ms() - dyn_t0 : 0.0);
+            slots_tick(e, "chunk", (long long) i);   // a round every --expert-slots-reselect-every positions
         }
         if (pf_host_prev.valid) strata::kernels::cpu::restore_thread_affinity(pf_host_prev);
         tok = ids.back();
@@ -5006,6 +5093,9 @@ int strata::kolibri::run(int argc, char** argv) {
         }
         tok = ids[t];
     }
+    hot_absorb_prompt(e);   // the prompt routed every layer: its counts are what the round below decides on
+    slots_reselect(e, " [after prompt]", e.hot_swaps_final);   // the prompt is read: the one large round (above)
+    hot_forget_prompt(e);
     if (e.graphs > 0) KC(cudaMemcpy(s.pos_d, &s.pos, 4, cudaMemcpyHostToDevice));
     // the last prompt token and every step after it: run, argmax, feed back (a --force sequence replaces the
     // greedy picks - kl.py's teacher-forced KL path, kolibriref's semantics)
@@ -5029,6 +5119,7 @@ int strata::kolibri::run(int argc, char** argv) {
         gen.push_back(a);
         tok = i + 1 == n_steps ? a : (i < (int) forced.size() ? forced[i] : a);
         if (dyn_probe_on()) dyn_probe_step(e, "token", dyn_now_ms() - dyn_t0);
+        slots_tick(e, "token", (long long) s.pos);   // a round every --expert-slots-reselect-every positions
     }
     dyn_probe_finish(e);
     std::printf("\n");

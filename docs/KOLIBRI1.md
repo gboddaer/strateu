@@ -161,10 +161,32 @@ twice: the id-ordered cache served **314 of 1,800** routed picks (**17.4%**), th
 served **682 of 1,800** (**37.9%**) - same 70 slots, same bytes, placed where the traffic is.  Re-selecting cost
 669 ms between the two requests (57 experts, 6.5 GiB over PCIe).  Seeded from a saved profile, the *first* request
 of a cold start already served **727 of 1,800** (**40.4%**).  `gen:` was 4688 4688 4688 4688 in the id-ordered, the
-hot and a 75-slot `auto` run alike: residency moves bytes, it does not change them.  With `auto` at 160K the fit
+hot and a 75-slot `auto` run alike: residency moves bytes, it does not change them - true with the CPU pool off, where
+the two device legs are bitwise (findings-log 0.3, P == Q); with `--cpu-threads` on, moving one expert between a slot and
+the pool changes the ids (0.3: mean |dlogit| 0.855 per step, id flipped at token 8), which is why the round below is
+measured by hit rate and by repeated runs, not by an unchanged `gen:`.  With `auto` at 160K the fit
 chose 75 slots/layer from 9,501 MiB free, and prints the exchange rate it implies - 1 slot = 114 MiB = 5,857 tokens
-of context at 20.0 KB/token, which is why `--ctx` and `--expert-slots` are one decision and not two.  Not measured:
-sessions long enough for the hot set to drift, and any card other than this T4.
+of context at 20.0 KB/token, which is why `--ctx` and `--expert-slots` are one decision and not two.
+
+**The residency round now has the shape the Qwen3.8-Flash-Next engine's adaptive tier uses** (`src/program/generate.cpp`
+there: `--adapt-every`, `--adapt-swaps`, `--adapt-min-gain`, `--adapt-decay`).  A round runs every 32 **positions** (not
+every N seconds), moves at most 96 experts mid-request and 2,048 once after each prompt, admits a candidate only when its
+score beats the resident's by 1.5, and multiplies the scores by 0.7 after every round so the map follows the
+conversation instead of freezing on the prompt.  The copies are `cudaMemcpyAsync` on the engine's stream behind one
+stream sync, so a round no longer drains the device (`--expert-slots-reselect-every`, `--expert-slots-swaps`,
+`--expert-slots-swaps-final`, `--expert-slots-min-gain`, `--expert-slots-decay`; 0 turns a pass off).  Measured on the
+same T4, 512-token prompt, 300 greedy tokens, 160K context, `--prefill --cpu-threads 24`, two runs per arm, pinned to
+NUMA node 1, box load 0.9-4.0: the after-prompt round moves 2,048 experts (4,691 MiB in 469 ms) and the first request
+then serves **83.2 %** of its routed picks from VRAM (61,641/74,100), the second **88.7 %** (79,844/90,000); each
+mid-decode round moves 96 experts, 218-222 MiB, in 21.8-22.5 ms.  `--expert-slots-decay 1.0` gave 84.7 % / 86.3 % and
+`--expert-slots-reselect-every 0` 85.7 % / 85.5 % on shorter requests; `--expert-slots-swaps 0
+--expert-slots-swaps-final 0` leaves the map as it was placed (**20.2 %** on both requests) and is the arm for
+byte-identical repeats.  Two runs of an arm print the same ids - the positional trigger is why, and the 3-second clock it
+replaced could not (its own paragraph above is the measurement of that clock).
+
+Not measured: sessions long enough for the hot set to drift, and any card other than this T4; and whether 1.5 is the
+right margin (only 0 and 1.5 were compared) or 0.7 the right decay (0.7 against 1.0 on this fixture only, no workload
+that changes subject inside one prompt).
 
 ### Speed on an integrated Radeon (measured 2026-10-26, Radeon 8060S in a Ryzen AI Max+ 395, gfx1151, HIP on ROCm 7.14.1, 123 GiB RAM, Q4_K_M)
 
