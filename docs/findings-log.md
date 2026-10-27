@@ -961,7 +961,10 @@ prompt had taught (`slots_reselect` had nothing left to move); it is the same-pr
 The two processes' **pp differs by 30%** (71.0/73.3 against 56.2/56.9 tok/s) on the same code, prompt and config —
 that is this box's prefill variance under a background load, and it is why a single run is not a rate.  And the pp here
 is **not** the 179.8 tok/s the release notes quote: that figure is `STRATA_KOLIBRI_PF_PARTIAL=1` (opt-in, `KOLIBRI1.md`
-:117).  With the knob off, on this box today, pp-512 is 56-73 tok/s.  Decode is likewise below the quoted 24.4 tok/s
+:117) in the shipped speed environment.  In the DEFAULT environment (only `GGML_CUDA_DISABLE_GRAPHS=1`, which is what
+these 0.4 runs used) pp-512 is 56-73 tok/s on this box today, and in the shipped speed environment it is 162-168 tok/s —
+the 2.4x is the `ROUTER_*`/`ATTN_*`/`PF_STAGE` knobs, not the cache.  The bar table in the verification section below is
+measured in the speed environment because that is the environment the bar comes from.  Decode is likewise below the quoted 24.4 tok/s
 (21.7-22.2 measured), same reason and same direction.
 
 **The product path, sampled** (server on `:8080`, the config in `/tmp/kolibri_server.json`: temperature 0.7, top_p 0.9,
@@ -1088,15 +1091,31 @@ so no bitwise gate could ever pass over it, and 0.1 shows there is no trajectory
 
 **Two quoted numbers could not be used as bars, and both for measurement reasons rather than convenience.**
 
-* **pp-512 179.8 / 181.0 tok/s and tg 30.3 tok/s are `STRATA_KOLIBRI_PF_PARTIAL=1` figures** (`KOLIBRI1.md:117`), an
-  opt-in that changes the prefill's partial-sum path.  That knob **does not start on this tree**: the first prefill chunk
-  dies on `cudaMemcpyAsync(A.wts_h, A.wts_m, ...) failed: invalid argument` (`:2598` here, `:2584` on the baseline),
-  measured in the CLI path AND the `--serve` path, at ctx 8192 and ctx 163840, with `--expert-slots` and without, and —
-  the control that matters — **identically on a binary built from the unmodified baseline tree `a2d9eba9`**.  So this is
-  a pre-existing defect in the release tree, not something this change introduced, and the figure cannot be reproduced
-  on this box from this tree by any configuration of this change.  (An earlier version of this entry said "--serve"
-  only; that was too narrow, and the baseline A/B above is the measurement that settles it.)  The like-for-like numbers on the shipped config are 0.4's: **56-73 tok/s pp-512**,
-  **21.7-22.2 tok/s greedy decode**, 15.9 tok/s end-to-end sampled, 22.8% hit.  1A is measured against *those*.
+* **pp-512 179.8 / 181.0 tok/s and tg 30.3 tok/s are `STRATA_KOLIBRI_PF_PARTIAL=1` figures**, and that knob needs its
+  own environment: its buffers are allocated inside the `STRATA_KOLIBRI_EXPERT_F16` block (`:3294`), so running it without
+  the shipped speed environment (as I first did) dies at the first prefill chunk on `cudaMemcpyAsync(A.wts_h, ...)
+  failed: invalid argument` — in the CLI path and in `--serve`, on this tree AND on a binary built from the baseline
+  `a2d9eba9`.  **That was my configuration error, not a broken tree, and an earlier version of this entry wrongly
+  concluded the bar was unreachable.**  With the environment the figure was published in (`PF_STAGE=1 EXPERT_F16=24
+  ROUTER_TILE=1 ROUTER_TK=3 ROUTER_TJ=16 ATTN_MB=256 RES_TOP=48 ATTN_FLASH=1 PF_PARTIAL=1`, ctx 8192, `bench.py
+  --case short`) the bar is reachable and met, like-for-like with the knob on and off:
+
+  | bar geometry (ctx 8192, speed env + `PF_PARTIAL`) | pp-512 | tg-128 greedy | sampled decode |
+  |---|---|---|---|
+  | no cache | 189.3 / 190.4 | 17.0 / 17.2 | — |
+  | cache, knob off | 194.9 / 194.2 | 16.4 / 16.3 | 21.76 / 16.37 |
+  | cache, **per layer** | **200.3 / 195.1** | 21.1 / 16.3 | 16.37 (one run: two more OOMed, see below) |
+  | baseline binary `a2d9eba9`, cache | 189.2 | 16.3 | 21.24 / 16.65 |
+
+  **pp-512 >= 179.8 is met in every arm, including with the per-layer map (195-200 tok/s), so 1A does not cost prefill
+  speed.**  decode >= 26.3 tok/s with sampling is **not met today**: 16.4-21.8 tok/s in this configuration, and the
+  unmodified baseline binary reaches only 16.7-21.2 in the same configuration and session shape.  The box alternates
+  between a ~22 and a ~16.5 tok/s regime run to run (visible in every arm and both binaries), so 26.3 — measured when the
+  same code ran ~30% faster on this card class — is above what this box does at all today.  That is a property of the
+  machine's state, with the baseline as its control, not of the change.  Two of the per-layer sampled sessions died
+  before READY on `cudaMalloc` of the `EXPERT_F16` cache (OOM): consecutive sessions race the previous engine's VRAM
+  release at this geometry, which is a harness artifact, not a code path.
+
 * **"generated ids identical to the by-id run" is not reachable**, and 0.3 says why: the CPU pool quantises the layer's
   hidden state to q8_1 while the device legs use fp32, so any change to which experts are resident changes values on
   any long generation.  The shipped `--expert-slots-hot` already violates the sentence this campaign started from; the
@@ -1134,10 +1153,11 @@ release byte for byte on both paths that exist, and the gate's own plain/prefix/
 
 ### 2. The two absolute bars, measured as they were defined — and the baseline cannot reach them either
 
-The bars come from `STRATA_KOLIBRI_PF_PARTIAL=1`.  That knob fails at the first prefill chunk on the **baseline** tree as
-well (`cudaMemcpyAsync(A.wts_h, ...) invalid argument`), in the CLI path and in `--serve`, at ctx 8192 and 163840, with
-and without `--expert-slots`.  With the knob that runs, on the same harness (`tools/kolibri/bench.py --case short`, 512
-ids, ctx 163840, `--prefill --cpu-threads 24`):
+The bars come from `STRATA_KOLIBRI_PF_PARTIAL=1` in the shipped speed environment.  The first table below is the DEFAULT
+environment (only `GGML_CUDA_DISABLE_GRAPHS=1`), which is what the 0.1-0.4 runs used; it is 2.4x slower at pp-512 than
+the speed environment and is therefore NOT the config the bars come from — it is here because it is the config the rest
+of this campaign was measured in, and mixing the two is exactly the error the first version of this section made.  The
+corrected bar table is below it.
 
 | arm | pp-512 | tg-128 | bar |
 |---|---|---|---|
