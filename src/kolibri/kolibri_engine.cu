@@ -368,12 +368,15 @@ struct Engine {
     long long hot_picks_at_last = 0;
     long long hot_promotions = 0;   // blobs re-copied into the slots (each one is n_layers x stride of PCIe traffic)
     std::string hot_profile;        // --expert-slots-profile PATH: the learned hot set, read at load and saved after
-    // --expert-slots-per-layer (opt-in, default OFF): ONE residency map per layer instead of one set shared by all 50.
-    // The storage was already per layer (`e.blobs`, one cudaMalloc each); only `slot_of` and the histogram forced one
-    // set everywhere.  Measured on this box (findings-log, "0.5"): the same 75 slots/layer cover 29.9% as one global
-    // set and 69.3% as 75 per-layer sets.  With the knob off, slot_of and hot_cnt are n_expert long and every index
-    // below is `id`, so the default path is byte-identical to the release before this.
-    int per_layer = 0;
+    // --expert-slots-per-layer (DEFAULT ON since 2026-10-27; --no-expert-slots-per-layer or
+    // STRATA_KOLIBRI_SLOTS_PER_LAYER=0 restores one global set): ONE residency map per layer instead of one set shared by
+    // all 50.  The storage was already per layer (`e.blobs`, one cudaMalloc each); only `slot_of` and the histogram
+    // forced one set everywhere.  Measured on this box (findings-log, "0.5"): the same 75 slots/layer cover 29.9% as one
+    // global set and 69.3% as 75 per-layer sets; on the repeat prompt one set went 34.8% -> 34.5% where per layer went
+    // 34.8% -> 81.5% -> 89.4%.  With the knob off, slot_of and hot_cnt are n_expert long and every index below is `id`,
+    // so the off path is byte-identical to the release before this.  It only acts when the hot path is on
+    // (`--expert-slots-hot`, which the server config passes); with the by-id cache nothing below is touched.
+    int per_layer = 1;
     // expert index into slot_of / hot_cnt: the layer's own row when per_layer, the single global row otherwise.
     size_t hot_idx(int64_t l, int id) const {
         return per_layer ? (size_t) (l * (int64_t) g.n_expert + id) : (size_t) id;
@@ -4666,9 +4669,11 @@ int strata::kolibri::run(int argc, char** argv) {
     int n_gen = 8, ctx = 8192, cpu_threads = 0, slots = 0, grouped = 0, no_graph = 0, prefill = 0, counters = 0;
     // the expert cache's opt-in knobs (see alloc_slots / slots_reselect): off means the historical by-id cache
     int hot = env_on("STRATA_KOLIBRI_SLOTS_HOT") ? 1 : 0;
-    // --expert-slots-per-layer / STRATA_KOLIBRI_SLOTS_PER_LAYER=1: the opt-in per-layer residency map (Phase 1A of the
-    // dynamic-expert-cache plan).  Needs --expert-slots-hot; off by default, and off means nothing below is touched.
-    int per_layer = env_on("STRATA_KOLIBRI_SLOTS_PER_LAYER") ? 1 : 0;
+    // --expert-slots-per-layer: the per-layer residency map (Phase 1A of the dynamic-expert-cache plan), ON BY
+    // DEFAULT; --no-expert-slots-per-layer or STRATA_KOLIBRI_SLOTS_PER_LAYER=0 restores one set for all 50 layers.
+    // Needs --expert-slots-hot; with the by-id cache nothing below is touched either way.
+    int per_layer = env_on_default_on("STRATA_KOLIBRI_SLOTS_PER_LAYER") ? 1 : 0;
+    bool per_layer_asked = std::getenv("STRATA_KOLIBRI_SLOTS_PER_LAYER") != nullptr;
     int reserve_mib = 700;                     // --vram-reserve-mib: the Qwen engine's own default
     std::string profile;                       // --expert-slots-profile: the learned hot set, read and written here
     int attn_bench = 0;             // K25 instrument: --attn-bench N launches the real attention kernel N times
@@ -4697,7 +4702,8 @@ int strata::kolibri::run(int argc, char** argv) {
         ++i;
     }
     else if (a == "--expert-slots-hot") hot = 1;
-        else if (a == "--expert-slots-per-layer") { hot = 1; per_layer = 1; }
+        else if (a == "--expert-slots-per-layer") { hot = 1; per_layer = 1; per_layer_asked = true; }
+        else if (a == "--no-expert-slots-per-layer") { per_layer = 0; per_layer_asked = true; }
     else if (a == "--expert-slots-profile" && i + 1 < argc) { hot = 1; profile = argv[++i]; }
     else if (a == "--vram-reserve-mib" && i + 1 < argc) reserve_mib = std::atoi(argv[++i]);
         else if (a == "--expert-vram" && i + 1 < argc) expert_vram = std::atoi(argv[++i]);
@@ -4798,11 +4804,12 @@ int strata::kolibri::run(int argc, char** argv) {
     e.slots = slots;
     e.hot_on = hot;
     e.per_layer = (hot && per_layer) ? 1 : 0;
-    if (per_layer && !hot)
+    if (per_layer && per_layer_asked && !hot)
         std::fprintf(stderr, "strata-kolibri: --expert-slots-per-layer needs --expert-slots-hot: ignored\n");
     if (e.per_layer)
         std::fprintf(stderr, "strata-kolibri: expert cache: PER-LAYER residency map (%d layers x %d experts), not one"
-                             " global set\n", (int) e.g.n_layers, (int) e.g.n_expert);
+                             " global set (default; --no-expert-slots-per-layer for a single set)\n",
+                     (int) e.g.n_layers, (int) e.g.n_expert);
     e.hot_profile = profile;
     e.vram_reserve_mib = reserve_mib > 0 ? reserve_mib : 700;
     {
