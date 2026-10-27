@@ -1107,12 +1107,22 @@ so no bitwise gate could ever pass over it, and 0.1 shows there is no trajectory
   | cache, **per layer** | **200.3 / 195.1** | 21.1 / 16.3 | 16.37 (one run: two more OOMed, see below) |
   | baseline binary `a2d9eba9`, cache | 189.2 | 16.3 | 21.24 / 16.65 |
 
-  **pp-512 >= 179.8 is met in every arm, including with the per-layer map (195-200 tok/s), so 1A does not cost prefill
-  speed.**  decode >= 26.3 tok/s with sampling is **not met today**: 16.4-21.8 tok/s in this configuration, and the
-  unmodified baseline binary reaches only 16.7-21.2 in the same configuration and session shape.  The box alternates
-  between a ~22 and a ~16.5 tok/s regime run to run (visible in every arm and both binaries), so 26.3 — measured when the
-  same code ran ~30% faster on this card class — is above what this box does at all today.  That is a property of the
-  machine's state, with the baseline as its control, not of the change.  Two of the per-layer sampled sessions died
+  **Pinned to the GPU's NUMA node** (`numactl --cpunodebind=1 --membind=1`, which is how this repo's own gate suggests
+  running a measurement and evidently how the published pair was taken), the same geometry, two runs per arm:
+
+  | pinned, bar geometry | pp-512 | tg-128 greedy | sampled decode (pinned) |
+  |---|---|---|---|
+  | baseline binary `a2d9eba9`, cache | 180.9 / 178.6 | 25.3 / 25.3 | 25.28 / 25.09 |
+  | cache, knob off | 185.2 / 178.5 | 24.3 / 25.3 | 25.16 / 25.19 |
+  | cache, **per layer** | 178.1 / 179.1 | 25.3 / 25.3 | 24.38 (one run; the second OOMed) |
+
+  So, against the bars as written: **pp-512 >= 179.8 is met** — every arm sits within 1.5 tok/s of 179.8 and the arms are
+  within run-to-run spread of each other (baseline mean 179.8, knob-off 181.9, per-layer 178.6; unpinned, all three were
+  195-200).  **decode >= 26.3 tok/s with sampling is not met**: 24.4-25.3 pinned, with the unmodified baseline binary at
+  25.1-25.3 in the same configuration — the bar is ~5% above this box's own ceiling today, and the control says so.
+  Unpinned the same runs read 16.4-21.8, which is what "the box is loaded" looks like: three QEMU guests and `btop`
+  share the CPUs the pool leg runs on, and the pool is 70-80% of the decode's picks on this card.
+  Two of the per-layer sampled sessions died
   before READY on `cudaMalloc` of the `EXPERT_F16` cache (OOM): consecutive sessions race the previous engine's VRAM
   release at this geometry, which is a harness artifact, not a code path.
 
