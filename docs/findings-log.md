@@ -1299,3 +1299,45 @@ unmodified baseline, i.e. ~4% above this box's own ceiling today.
 3. **The 0.1 stop line** — "flat in both phases = stop the whole plan" — was read as killing in-request rounds (1B) while
    0.5's own branch chose 1A, which does not depend on a trajectory. The plan contains both sentences; the reading should
    be confirmed by the owner rather than settled by the executor.
+
+## Re-scope of the two absolute bars, and the final verdict against it
+
+The goal's owner re-scoped two criteria that no measurement could satisfy as written. As re-scoped: decode and pp-512
+must show **no regression against a same-day baseline binary measured in the same environment**, with the published
+absolute figures (26.3 tok/s sampled, 179.8 tok/s pp-512) reported as the opt-in `PF_PARTIAL` configuration's numbers rather
+than as targets for a cache change; bitwise claims are scoped to what residency can preserve (same residency ⇒
+byte-identical; the two device legs bitwise equal); and the 0.1 stop rule applies to in-request rounds (1B), while 1A is
+decided by 0.5. Everything measured above is unchanged; only the reading of two numbers is.
+
+### No regression, same day, same environment, same two runs per arm
+
+| same-day pair, pinned, bar env | baseline `a2d9eba9` | knob off | per layer |
+|---|---|---|---|
+| sampled decode (driver DONE) | 25.28 / 25.09 | 25.16 / 25.19 | **25.34 / 25.19** |
+| greedy tg-128 (`bench.py`) | 25.3 / 25.3 | 24.3 / 25.3 | 25.3 / 25.3 |
+| pp-512, driver DONE | 173.6 / 174.2 | 180.6 / 172.6 | **181.3 / 181.5** |
+| pp-512, `bench.py` pinned | 180.9 / 178.6 | 185.2 / 178.5 | 178.1 / 179.1 |
+
+Per layer is at or above the baseline in both artifact-backed pp pairs and in both sampled-decode pairs, and inside
+run-to-run spread in the two `bench.py` pairs; no arm is behind the baseline by more than the spread between two runs of
+the same binary. That is the no-regression criterion, met. The absolute 26.3 and 179.8 are quoted above as what they are:
+this box reaches 179.8 in the pp arm and does not reach 26.3 with sampling in any arm, the unmodified baseline included.
+
+### The baseline is a build of the release commit, not a fork of it
+
+`git log 2637bdf9..a2d9eba9 -- src/kolibri` is empty: the engine source of the baseline worktree is the release commit's
+engine source, so "identical to a same-day build of the baseline commit for the paths the change touches" is exactly what
+was measured — the knob-off id line `gen: 286 3515 310 262 14292 1343 1444 46` and 129/129 identical `T` lines.
+
+### The cross-leg difference, as the re-scoped criterion asks it to be documented
+
+0.3 stays in the log as the measured statement of what residency cannot preserve: the pool leg quantises the hidden state
+to q8_1, both device legs read fp32, so one expert's slot-vs-pool move gives a mean |Δlogit| of 0.855 per step and moves the
+generated id at token 8, with 53/64 argmax flips. The two device legs themselves are bitwise (P == Q, pool off), and a
+repeat of any residency is byte-identical (A==A2, B==B2, C==C2, D==D2). That is the whole of the bitwise surface, measured.
+
+### Final gate, on the tree that ships
+
+`GATE PASS` at `05321851`, 2026-10-27T07:14Z, with `BITWISE PASS: gen: 286 3515 310 262 14292 1343 1444 46 17156…` and all
+seven stages green (build, plain, no-prefill, prefix, ids smoke, PF_HASH 100 chunk-layers, reuse); `check_published_figures.py`
+clean against 122 known values. Artifact: `/tmp/ver/gate_final.txt`.
