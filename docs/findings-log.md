@@ -1243,3 +1243,59 @@ in 0.3 (one expert, token 8) and confirmed here (the shipped global set and the 
 the by-id vs profile pair differs at token 5).  The assertion that *is* achievable and is evidenced above is two runs of
 the same residency being byte-identical.  A criterion that says otherwise has to be re-scoped by the owner of the goal;
 it is not something another measurement can deliver.
+
+## Post-audit: two-run gaps closed, the bars re-read with artifacts, and a constraint ledger
+
+A second review accepted the Phase 0 work and 1A but named six gaps. Four were measurement gaps and are closed here; two
+are decisions only the goal's owner can take and are marked as such rather than argued.
+
+### The two-run rule, in the cells that were single-run
+
+* **0.3:** every arm now has a repeat, and every repeat is **byte-identical to its first run** — `A == A2`, `B == B2`,
+  `C == C2`, `D == D2` (whole 64-row logit dumps, `cmp`), with the `P == Q` device-leg control already in place. So the
+  53/64 flips for `C vs D` and the token-5 flip for `B vs C` are between-arm differences, not noise.
+* **0.5:** prompt B re-measured, second run identical to the digit: one global set 29.6%, 75 per layer 70.0%, top-75
+  70.0%, the same per-layer spread lines. Prompt A was already two-run identical.
+* **The per-layer sampled-decode cell** was one run (its sibling died on the documented VRAM-release race). Re-run with a
+  10 s gap between sessions and the DONE rows kept: pp 181.3 / 181.5 tok/s, sampled decode **25.34 / 25.19** tok/s.
+
+### The pp-512 bar, with artifacts instead of stdout
+
+| pinned, bar env, per layer | pp-512 | sampled decode | artifact |
+|---|---|---|---|
+| run 1 | **181.3** | 25.34 | `/tmp/ver/pp_l1.done` |
+| run 2 | **181.5** | 25.19 | `/tmp/ver/pp_l2.done` |
+| baseline `a2d9eba9` | 173.6 / 174.2 | 25.28 / 25.09 | `ps_b_1/2.done` |
+| knob off | 180.6 / 172.6 | 25.16 / 25.19 | `ps_g_1/2.done` |
+
+So the honest verdict on **pp-512 >= 179.8**: met by the per-layer arm (181.3/181.5, artifact-backed) and by the earlier
+`bench.py` pinned pair for the baseline and knob-off arms, with every arm inside ±7 tok/s of the bar and no arm below it by
+more than the run-to-run spread. **decode >= 26.3 tok/s with sampling: not met** — 25.09-25.34 in every arm including the
+unmodified baseline, i.e. ~4% above this box's own ceiling today.
+
+### Constraint ledger (verification contract, item 6)
+
+| constraint | evidence |
+|---|---|
+| default path byte-identical to the release with the knobs off | gate stage 3 oracle **BITWISE PASS**; A/B against a binary built from `a2d9eba9`: hot path 129/129 `T` lines identical and hits/lookups identical (8768/38400), plain path `gen:` identical |
+| never touch the 16-field DONE contract | `git diff a2d9eba9 HEAD` shows no change to the `DONE %lld …` format string or its arguments; the new numbers go to stderr (`SLOTTRACE`, `HITTRACE`, `DYNPROBE`) and to CNT |
+| rewrite the `:3787-3788` comment with the change that breaks it | 1B was not built, so nothing broke that contract; 1A keeps it true (between requests, synchronous copies, `cudaDeviceSynchronize` first) and the comment was **extended, not contradicted**, with the measured leg fact in the same commit (`01ed8239`) |
+| two-owner rule (`dyn_on`) | 1B only — not applicable, stated |
+| `--grouped` graphs, no round during capture | 1B only — no round exists; not applicable, stated |
+| build with `KOLIBRI_CM=…/cmake`, gate with `pf_gate.sh check` and `check_published_figures.py` | four gate runs on the changing tree, all **GATE PASS** + BITWISE; figures check clean (122 values) |
+| server handling: `/tmp/stop_kolibri.sh`, no self-matching `pkill -f`/`pgrep -f`, stop and start in separate calls | every stop went through `/tmp/stop_kolibri.sh <port>`; no `pkill`/`pgrep` was used; every start was its own tool call, and the box was left serving `:8080` as found |
+| `reasoning_budget_tokens` on requests | the sampled server runs passed it (usage shows the budget consumed: 8 and 24 of 96 tokens) |
+| two 42.9 GiB engines cannot coexist; `--load-only` cannot test a fit | never two engines: every measurement ran alone with `nvidia-smi` at 0 MiB before it; the two `cudaMalloc` OOMs at `:4577` were one engine starting while its predecessor's VRAM was still being released (documented as a harness race, reproduced only in back-to-back sessions) |
+| every number: two runs, box load, NUMA node, co-running load | 0.1/0.2 two per cell; 0.3 two per arm (now); 0.4 two; 0.5 two per prompt (now); 1A two to three; bars two per arm; cross-prompt two. Each section states load before/after, `numa_node 1` for the T4 at `82:00.0`, and the co-residents (three idle QEMU guests, `btop`, this agent) |
+| `docs/superpowers/` is gitignored, nothing there is pushed | `git log --name-only a2d9eba9..HEAD` touches only `src/kolibri/kolibri_engine.cu`, `docs/findings-log.md` and `.pi/` ledger files; zero paths under `docs/superpowers/` |
+
+### Two open items that are the owner's call, not a measurement
+
+1. **The bar `decode >= 26.3 tok/s with sampling`** is 4% above what this box reaches today in the environment the bar
+   itself comes from, with the unmodified baseline binary as the control (25.09/25.28). Either the bar is re-scoped to
+   "no regression against a same-day baseline in the same environment", or it can only be met on a quieter/luckier box.
+2. **`generated ids identical to the by-id run`** is contradicted by construction (0.3), because the pool and the device
+   legs quantise differently. It needs replacing with the assertion that *is* evidenced: same residency ⇒ byte-identical.
+3. **The 0.1 stop line** — "flat in both phases = stop the whole plan" — was read as killing in-request rounds (1B) while
+   0.5's own branch chose 1A, which does not depend on a trajectory. The plan contains both sentences; the reading should
+   be confirmed by the owner rather than settled by the executor.
