@@ -1773,3 +1773,32 @@ Q4_K, (d) the `ids` mapping's base (dst row = `ids[row]` counts rows of `ld_dst`
 default or not. The probe (`tools/kolibri/mmq_pipeline_probe.cu`) is where this gets settled - it needs a parity arm
 that compares one group's MMQ product against a CPU reference, which is the only way to tell (a) from (d) without
 guessing.
+
+### P4 verdict (2026-10-28): the kernel passes its criterion by 38x; the integration does not converge in this session
+
+What is settled, measured:
+
+- **The kill criterion is met with room**: `mmq_q4k_bench` puts the grouped Q4_K product at **11 551 GFLOP/s** with 10
+  rows per expert (44 423 at 160, 56 055 at 626) against the pool's **316-323 GFLOP/s**. The expert leg of an 8K prompt
+  (19 325 GFLOP) is 1.7 s on the matrix units against 61.1 s on the pool.
+- **Two real wiring bugs found and fixed**: `GatherGroup::first` is the index within a fresh group (0), not an expert
+  index; and the staging buffers must be sized from the blob's own offsets, because a Kolibri layer's down matrix is
+  **Q6_K** while gate/up are Q4_K (`gate/up 1474560 B, down 1095840 B` from the blob, against 737 280 from
+  `matrix_bytes(Q4_K, ...)`). With those fixed the arm runs to completion instead of hanging or faulting.
+
+What is not settled, and is why nothing ships:
+
+- **The numbers are wrong.** With the arm on, a 64-token prompt returns `gen: 0 0 0 0`. The delta-activation parity arm
+  (`mmq_pipeline_probe --parity`, x[k] = δ_{k0} so the product's output must equal one dequantized weight element)
+  shows MMQ returning 24.629 where the reference element is 2.4435 at column 0, 53.982 against 27.006 at column 1,
+  35.355 against 10.279 at column 7 - and 24.6 is outside the range the reference weights can even produce, so MMQ is
+  not applying a delta activation to the matrix I gathered: something in the activation array's addressing (its row
+  indexing, or the `xq` base the product expects) does not line up with what `quantize()` wrote.
+- The engine branch is **reverted** and the tree re-verified (`oracle.sh check` BITWISE PASS). A knob that computes
+  garbage is not shipped, off by default or not.
+
+**Task verdict**: P4's *measurement* half is complete and its criterion is met by a wide margin; its *integration* half
+needs a session that starts from the parity arm. The tooling for that is in the tree: the shape bench
+(`mmq_q4k_bench`), the orchestration probe with switches (`mmq_pipeline_probe`), and now the delta-activation parity
+comparison. Nothing about the projection changes - a working integration is worth **~795 tok/s at 8K (10.3 s TTFT)**
+against 117.6 today - but the projection is not a result.

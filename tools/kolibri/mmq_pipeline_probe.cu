@@ -50,11 +50,140 @@ static std::vector<uint8_t> weights_q4k(int64_t rows, int64_t cols, int experts,
     return w;
 }
 
+
+// ---- a scalar Q4_K reference (the engine's deq32, host side): one row of a matrix, `cols` values -------------------
+static float h2f_(uint16_t h) {
+    const uint32_t s = (uint32_t) (h >> 15) << 31, e = (h >> 10) & 0x1f, m = h & 0x3ff;
+    if (e == 0) { const float v = std::ldexp((float) m, -24); return s ? -v : v; }
+    const uint32_t f = e == 31 ? (s | 0x7f800000u | (m << 13)) : (s | ((e + 112) << 23) | (m << 13));
+    float out; std::memcpy(&out, &f, 4); return out;
+}
+static uint16_t ld16_(const uint8_t* p) { return (uint16_t) (p[0] | (p[1] << 8)); }
+static void scale_min_k4_(int j, const uint8_t* q, int& d, int& m) {
+    if (j < 4) { d = q[j] & 63; m = q[j + 4] & 63; }
+    else { d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
+}
+static void deq_row_q4k(const uint8_t* matrix, int64_t row, int64_t cols, float* out) {
+    const size_t row_bytes = (size_t) (cols / 256) * 144;
+    const uint8_t* r = matrix + (size_t) row * row_bytes;
+    for (int64_t c = 0; c < cols / 32; ++c) {
+        const uint8_t* b = r + 144 * (c >> 3);
+        const int j = (int) (c & 7);
+        const float d = h2f_(ld16_(b)), dmin = h2f_(ld16_(b + 2));
+        int sc, mn;
+        scale_min_k4_(j, b + 4, sc, mn);
+        const float d1 = d * (float) sc, m1 = dmin * (float) mn;
+        const uint8_t* qs = b + 16 + 32 * (j >> 1);
+        for (int l = 0; l < 32; ++l)
+            out[c * 32 + l] = d1 * (float) ((j & 1) ? (qs[l] >> 4) : (qs[l] & 0xF)) - m1;
+    }
+}
+
+// ---- parity: one group's product against the reference, and the three layout hypotheses --------------------------
+static int parity_mode(int R, int kN) {
+    const int64_t N = 2560, FF = 512;
+    const int64_t rows = (int64_t) kN * R;
+    std::mt19937 rng(11);
+    auto wgu = weights_q4k(FF, N, kN, rng);   // gate only, one matrix per expert
+    auto wd = weights_q4k(N, FF, kN, rng);
+    const size_t gu_half = (size_t) (FF / 256) * 144 * 1;   // one matrix's bytes per expert: rows * (cols/256) * 144
+    const size_t gu_bytes = (size_t) FF * (N / 256) * 144;
+    const size_t d_bytes = (size_t) N * (FF / 256) * 144;
+    (void) gu_half;
+
+    // blobs: gate at +0, up at +gu_bytes, down at +2*gu_bytes
+    std::vector<uint8_t> blobs((size_t) kN * (2 * gu_bytes + d_bytes) + 4096);
+    for (int z = 0; z < kN; ++z) {
+        const size_t base = (size_t) z * (2 * gu_bytes + d_bytes);
+        std::memcpy(&blobs[base], &wgu[(size_t) z * gu_bytes], gu_bytes);                 // gate
+        std::memcpy(&blobs[base + gu_bytes], &wgu[(size_t) z * gu_bytes], gu_bytes);      // up (same matrix: a test)
+        std::memcpy(&blobs[base + 2 * gu_bytes], &wd[(size_t) z * d_bytes], d_bytes);
+    }
+    void* d_blobs = nullptr;
+    ck(hipMalloc(&d_blobs, blobs.size()), "malloc blobs");
+    ck(hipMemcpy(d_blobs, blobs.data(), blobs.size(), hipMemcpyHostToDevice), "copy blobs");
+
+    void *gu_stage = nullptr, *d_stage = nullptr, *d_xq = nullptr;
+    float *d_gu = nullptr, *d_dst = nullptr, *d_x = nullptr;
+    int32_t *d_tok = nullptr, *d_sel = nullptr, *d_bounds = nullptr;
+    ck(hipMalloc(&gu_stage, 2 * gu_bytes * kN + 4096), "malloc gu_stage");
+    ck(hipMalloc(&d_stage, d_bytes * kN + 4096), "malloc d_stage");
+    ck(hipMalloc(&d_xq, mmq::q8_bytes(rows, N) + 4096), "malloc xq");
+    ck(hipMalloc(&d_gu, (size_t) rows * 2 * FF * 4), "malloc gu");
+    ck(hipMalloc(&d_dst, (size_t) rows * N * 4), "malloc dst");
+    ck(hipMalloc(&d_x, (size_t) rows * N * 4), "malloc x");
+    ck(hipMalloc(&d_tok, (size_t) rows * 4), "malloc tok");
+    ck(hipMalloc(&d_sel, (size_t) rows * 4), "malloc sel");
+    ck(hipMalloc(&d_bounds, (size_t) (kN + 1) * 4), "malloc bounds");
+    std::vector<float> x((size_t) rows * N, 0.f);
+    for (int64_t r = 0; r < rows; ++r) x[(size_t) r * N] = 1.f;   // delta: out[row][c] must be W[c][0] of that row's expert
+    ck(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice), "copy x");
+    std::vector<int32_t> tok((size_t) rows), sel((size_t) rows), bnd((size_t) kN + 1);
+    for (size_t i = 0; i < tok.size(); ++i) { tok[i] = (int32_t) (i / 2); sel[i] = (int32_t) (rows - 1 - i); }  // a swap: tests the ids base
+    for (int g = 0; g <= kN; ++g) bnd[(size_t) g] = (int32_t) ((int64_t) g * R);
+    ck(hipMemcpy(d_tok, tok.data(), tok.size() * 4, hipMemcpyHostToDevice), "copy tok");
+    ck(hipMemcpy(d_sel, sel.data(), sel.size() * 4, hipMemcpyHostToDevice), "copy sel");
+    ck(hipMemcpy(d_bounds, bnd.data(), bnd.size() * 4, hipMemcpyHostToDevice), "copy bounds");
+
+    mmq::quantize(d_x, d_tok, d_xq, GGML_TYPE_Q4_K, N, N, rows, nullptr);
+    mmq::GatherGroup grp;
+    grp.first = 0;
+    grp.n = kN;
+    for (int q = 0; q < kN; ++q) grp.blob[q] = (const uint8_t*) d_blobs + (size_t) q * (2 * gu_bytes + d_bytes);
+    if (!mmq::gather_native_group(grp, gu_bytes, gu_bytes, 2 * gu_bytes, d_bytes, gu_stage, 2 * gu_bytes, d_stage,
+                                  d_bytes, nullptr)) {
+        std::printf("gather refused\n");
+        return 3;
+    }
+    mmq::Context ctx;
+    mmq::Product p{};
+    p.type = GGML_TYPE_Q4_K;
+    p.n = kN;
+    p.xq = d_xq;
+    p.bounds = d_bounds;
+    p.ids = d_sel;
+    p.total_rows = rows;
+    p.max_rows = R;
+    p.w = gu_stage;
+    p.w_rows = 2 * FF;
+    p.w_cols = N;
+    p.expert_bytes = 2 * gu_bytes;
+    p.dst = d_gu;
+    p.ld_dst = 2 * FF;
+    ctx.run(p, nullptr);
+    ck(hipDeviceSynchronize(), "sync");
+
+    std::vector<float> gu((size_t) rows * 2 * FF);
+    ck(hipMemcpy(gu.data(), d_gu, gu.size() * 4, hipMemcpyDeviceToHost), "copy gu");
+    // reference for row 0, columns 0, 1 and FF (gate vs up), and column FF+1
+    std::vector<float> wr((size_t) std::max(N, FF)), gater((size_t) N), upr((size_t) N);
+    const int64_t cols_gate[4] = {0, 1, 7, (int64_t) FF - 1};
+    std::printf("row 0 reference (fp32 dequant x fp32 x) against MMQ's gathered gate/up block:\n");
+    std::printf("%-8s %-14s %-14s %-14s\n", "col", "MMQ out", "ref gate", "ref up");
+    for (int64_t ci = 0; ci < 4; ++ci) {
+        const int64_t c = cols_gate[ci];
+        // gate row c of expert 0
+        auto dot = [&](const uint8_t* mat, int64_t row, int64_t col) {
+            deq_row_q4k(mat, row, N, wr.data());
+            (void) col;
+            return wr[0];   // the delta activation picks out column 0 of row `row`
+        };
+        const float rg = dot(&blobs[0], c, 0);
+        const float ru = dot(&blobs[gu_bytes], c, 0);
+        std::printf("%-8lld %-14.5g %-14.5g %-14.5g\n", (long long) c, gu[(size_t) 0 * 2 * FF + c], rg, ru);
+    }
+    // ids base: sel[0] = rows-1, so dst row rows-1 should hold row 0's product
+    std::printf("ids check: ids[0]=%d, MMQ row0 == dst row %d ? (compare col 0: %.6g vs %.6g)\n", sel[0], rows - 1,
+                gu[0], gu[(size_t) (rows - 1) * 2 * FF]);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     int R = 10, groups = 1;
-    bool no_gather = false, no_down = false, identity_ids = false, dst_host = false, no_quant_ids = false;
+    bool parity = false, no_gather = false, no_down = false, identity_ids = false, dst_host = false, no_quant_ids = false;
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
+        if (!std::strcmp(a, "--parity")) parity = true;
         if (!std::strcmp(a, "--rows") && i + 1 < argc) R = std::atoi(argv[++i]);
         else if (!std::strcmp(a, "--groups") && i + 1 < argc) groups = std::atoi(argv[++i]);
         else if (!std::strcmp(a, "--no-gather")) no_gather = true;
@@ -63,6 +192,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--dst-host")) dst_host = true;
         else if (!std::strcmp(a, "--no-quant-ids")) no_quant_ids = true;
     }
+    if (parity) return parity_mode(2, 2);
     if (!mmq::built() || !mmq::supported(GGML_TYPE_Q4_K)) {
         std::printf("mmq: not built / Q4_K unsupported (needs STRATA_MMQ_KQ=1)\n");
         return 2;
