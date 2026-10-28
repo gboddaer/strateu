@@ -1387,3 +1387,70 @@ green).  `check_published_figures.py` clean against 122 values.  A `kill -9` dur
 subject inside one prompt (both were measured on this one fixture only, where 1.0 is not worse); any card other than
 this T4.  The mid-request rounds here are ~22 ms of a 32-position window (1.28 s at 25 tok/s), i.e. ~1.7 % of decode -
 which is inside this box's own run-to-run spread and is therefore not claimed as a speed change in either direction.
+
+
+## 0.7 Where the published prompt and decode rates went - a diagnosis, no fix (2026-10-27)
+
+The question: the engine today reads a 512-token prompt at 55 tok/s and decodes at 24-25 tok/s where the release notes
+quote 180 tok/s and ~30 tok/s.  Attribution below is one knob at a time, serve path, the same 512-token prompt, 128
+greedy tokens, `--cpu-threads 24`, pinned `numactl --cpunodebind=1 --membind=1`, T4 at PCI `82:00.0` (`numa_node 1`),
+box load 0.4-3.4, driver 580.196.  Two runs where two are shown; single runs are marked.
+
+| # | environment | expert cache | pp-512 | decode | hit |
+| --- | --- | --- | --- | --- | --- |
+| A | `GGML_CUDA_DISABLE_GRAPHS=1`, ctx 163840 | slots auto + hot (75/layer) | 55.4 / 57.3 | 25.31 / 24.49 | 83.8 % |
+| B | A, ctx 8192 | slots auto + hot (105/layer) | 55.6 / 56.7 | 26.36 / 25.76 | 86.2 % |
+| C | speed env, no `PF_PARTIAL`, ctx 8192 | slots auto + hot (20/layer) | 150.9 / 167.7 | 23.89 / 23.79 | 56.5 % |
+| D | C + `PF_PARTIAL=1` | slots auto + hot (20/layer) | 172.7 / 199.9 | 23.71 / 23.86 | 56.0 % |
+| E | D + `PF_STAGE=1` (the published env, complete) | slots auto + hot | 171.8 / 191.4 and 167.1 | 24.49 / 24.53 and 24.61 | 56-58 % |
+| F | E | **no cache at all** | 177.4 | **30.36** | - |
+| G | E | cache, rounds off (`--expert-slots-swaps 0 --expert-slots-swaps-final 0`) | 181.5 | 25.33 | 5.7 % |
+| I | E, warm profile from E | cache, rounds on | 178.7 | 24.60 | 53.5 % |
+| H | A + `STRATA_KOLIBRI_REUSE_PREFIX=1` | slots auto + hot | 45.8 / 46.4 | 25.2 | 83.8 % |
+| J | E + `STRATA_KOLIBRI_REUSE_PREFIX=1` | slots auto + hot | 154.6 | 24.29 | 56.0 % |
+
+"speed env" = `STRATA_KOLIBRI_PF_STAGE=1 EXPERT_F16=24 ROUTER_TILE=1 ROUTER_TK=3 ROUTER_TJ=16 ATTN_MB=256 RES_TOP=48
+ATTN_FLASH=1`, the environment the release figures were taken in (`docs/published-figures.md:42`).
+
+**The prompt rate is configuration, not code.**  A -> B: ctx 163840 -> 8192 changes nothing (55.4 -> 55.6).  B -> C: the
+speed env without `PF_PARTIAL` is **+95 tok/s** (55.6 -> 150.9/167.7).  C -> D: `PF_PARTIAL=1` adds **+14.5 % / +19.2 %**
+(-> 172.7/199.9), which is the published +16.0 % and the same mechanism (2.87 GB of host round-trip removed).  With the
+complete published env (E) a run lands at 167-191, i.e. the published 179.8/181.0 is reproduced on this box today.  The
+55 tok/s figure is what the *server's* environment does: `/tmp/kolibri_server.json` passes none of those knobs, only
+`GGML_CUDA_DISABLE_GRAPHS=1` and `STRATA_KOLIBRI_REUSE_PREFIX=1`.
+
+**The decode rate is the expert cache, and it is already published as such.**  `KOLIBRI1.md:147`: "`--expert-slots`
+caches experts by id rather than by hotness and costs 17 % of decode (25.0 / 25.1 against 30.3)".  Measured again
+here: no cache 30.36 (F, one run), cache with a 5.7 % hit rate 25.33 (G, one run), cache with 53-58 % hits 23.7-24.6
+(C, D, E, I), cache with 84-86 % hits and more slots 25.2-25.4 (A, B).  Two independent components: the split
+slot/miss path costs ~17 % as soon as it exists (F vs G), and each additional hit is worth a little decode on this card
+(G vs E), because the slot leg is a per-pick launch where the pool is 13 parallel lanes.
+
+**The speed env costs the cache its VRAM, and that is the second-order effect worth knowing.**  `EXPERT_F16=24` holds
+about 6 GiB of the 16 GiB card, so `--expert-slots auto` fits **20 slots/layer (2.23 GiB)** instead of 75-105, and the
+hit rate halves: 83.8-86.2 % (A, B) against 56.0-56.5 % (C, D, E).  The published 181 tok/s prompt rate and the
+published 25.3 tok/s decode therefore come from two *different* VRAM layouts; no single configuration on this card has
+both.
+
+**Reuse is not the cause; it is a win.**  With `STRATA_KOLIBRI_REUSE_PREFIX=1` an identical second request answers
+`RESUME 511` and `DONE 128 512 0.0 5103.4 ... 0 0.0 1 0` - a **0.0 ms prompt read** (`f[14] = 1`, prompt_read) and the
+same decode rate (25.1 in H, 24.29 in J).  What reuse does cost is the *first* read: A 55.4/57.3 against H 45.8/46.4
+(-17 %), and E 171.8/167.1 against J 154.6 (-8 %) - the resume bookkeeping plus the rewind.  For an agent-shaped session
+(repeated prompts) that is a large net win; for a single cold prompt it is a small loss.  There is nothing here for the
+Qwen3.8-Flash-Next engine's `--prompt-cache`/checkpoint design to fix: Kolibri's reuse already resumes a 511-token prefix
+at zero prompt cost and already implements the "rewind the turn boundary's last token or two" that engine documents.
+
+**`STRATA_KOLIBRI_PF_PARTIAL=1` can be used, with two conditions.**  Its scratch lives inside the `EXPERT_F16` block, and
+this tree now refuses at startup instead of faulting (`kolibri: STRATA_KOLIBRI_PF_PARTIAL rides the fp16 expert cache's
+scratch; set STRATA_KOLIBRI_EXPERT_F16 (experts per layer, e.g. 28) first`, commit 25fd3aca of the upstream main).  With
+`PF_PARTIAL=1 EXPERT_F16=24` the gate on this tree reads **GATE PASS** with the oracle **BITWISE PASS** (`gen: 286 3515
+310 262 14292 1343 1444 46 17156...`), plain/no-prefill/prefix/ids-smoke/reuse green and PF_HASH **SKIP** - the engine
+emits no PFHASH lines on that path, so the chunk-layer checksums cannot be compared.  It is therefore not bitwise
+against the default prefill (it re-associates the expert sum: all 100 Campaign-I PFHASH lines differ), but it is
+deterministic run to run (re-anchored PFHASH identical twice, G1) and its accuracy is measured: answers-only mean KL
+0.00133 against 0.00123 knob off and the llama.cpp CPU floor 0.00178, top-1 0.9725 against 0.9633.  Speed here today:
++14.5 % / +19.2 %.
+
+**Not measured.**  Any card other than this T4; F and G are one run each (their gap to E is 5.8 and 0.7 tok/s, far outside
+run-to-run spread but not a two-run pair); and the 20-slot vs 75-slot hit-rate difference was not separated from the
+`ATTN_FLASH`/`ROUTER_*` part of the speed env (one env bundle, not its members, was toggled).
