@@ -1944,3 +1944,33 @@ different cause, and the probe's parity arm needs expert 1's reference computed 
 **Next**: print, in the *engine*, the gu product's output rows for expert 1 (`mmq_gu` rows [bounds[1], bounds[2])) next
 to `swiglu`'s output for the same rows, which splits "the product emitted NaN" from "the NaN appears in swiglu/down".
 That is one build and one arm, and it is the last link in the chain that has not been looked at directly.
+
+## Chunk invariance in the prefill path is broken (2026-10-28): the answer depends on the chunk size, and which size is right flips with length
+
+Found while trying to retire the auditor's objection about the chunk-128 arm. Same binary, same prompt ids, same config
+(`EXPERT_F16=0`, `ATTN_MB=512`, `RES_TOP=56`, `--cpu-threads 8`, `--prefill`, `--n 4`, ctx 8192), only
+`STRATA_KOLIBRI_PF_CHUNK` varied:
+
+| prompt tokens | chunk 128 | chunk 256 |
+|---|---|---|
+| 511 | `286 3515 310 262` | `286 3515 310 262` |
+| 1 024 | `286 3515 310 262` | `286 3515 310 262` |
+| 2 048 | `286 3515 310 262` | `286 3515 310 262` |
+| **4 096** | `286 3515 310 262` | **`10 127908 263 50`** |
+| **8 191** | **`10 127908 263 50`** | `286 3515 310 262` |
+
+Both arms reproduce (the 8191/128 arm was run twice: `k128c` and `k128d`, both `10 127908 263 50`, with 29.36 GiB
+VRAM free at each load, so this is not contention). The two candidate answers **swap between 4 096 and 8 191 tokens**,
+and at each length one chunk size agrees with the 511-token pooled answer while the other does not.
+
+The engine's own comment (`kolibri_engine.cu`, the K28 note) claims the opposite - "a chunked causal prefill computes
+each token's row and per-token softmax identically regardless of how the prompt is cut", verified at a 12K prefix.
+That claim does not hold on this build at 4K or 8K.
+
+Settling *which* answer is correct needs an independent reference, and the obvious one does not run: the unchunked
+path at 4 096 tokens exits `rc=1` with `scores GEMM failed` (it was built for <= 512-token prompts), so llama.cpp on
+this box or the plain path at a length it supports is the reference to use next.
+
+Not a chunk-128 curiosity, then, and not the auditor's mistake: **the prefill path's answer depends on how the prompt is
+cut, in the shipped configuration (chunk 256 is the default below 8 192 tokens)**. That is a correctness defect and it
+outranks every performance number in this ledger until it is explained.
