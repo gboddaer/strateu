@@ -55,9 +55,11 @@ Sampling defaults (the model card's): temperature 1.0, top-p 0.97, top-k 128. Re
 `"chat_template_kwargs": {"reasoning_effort": "low"}` - `none`, `low`, `medium`, `high`; measured on the T4:
 `none` answers directly ("27 x 43 = 1161.", no thinking), the default thinks first. The tokenizer is gpt2 BPE,
 128,000 tokens, `pre = kolibri1` (the Qwen2 pre-tokenizer split). The model writes tool calls as
-`<tool_call>{JSON}</tool_call>` next to the template's XML form: set `"tool_call_recovery": true` in the
-config and the server parses them into structured `tool_calls` (measured: `get_weather {"city": "Berlin"}`,
-`finish_reason: tool_calls`).
+`<tool_call>{JSON}</tool_call>` next to the template's XML form. Its own chat template asks for exactly that form, so the
+server reads it as structured `tool_calls` with no setting to add (measured: `get_weather {"city": "Berlin"}`,
+`finish_reason: tool_calls`). The server decides this from the template it serves: a template that asks for the JSON
+form has that form read as calls (`tool_call_recovery` unset), and `"tool_call_recovery": false` in the config turns
+it off again.
 
 ## How the engine path works
 
@@ -257,7 +259,8 @@ numbers comparable at all.
 - Reasoning effort: `none` answers directly; `low` thinks briefly then "1161."; the default (high) thinks at
   length (`reasoning_content` carries the `<think>` block).
 - Tool call: `get_weather` with `{"city": "Berlin"}` comes back as a structured `tool_calls` entry with
-  `finish_reason: tool_calls` (config `"tool_call_recovery": true`, which parses the model's JSON call form).
+  `finish_reason: tool_calls` (config `"tool_call_recovery": true` at the time; unset gives the same today, because the
+  pack's own template asks for the JSON call form and the server follows the template - see the top of this page).
 - Long-context needle: a 6,201-token prompt (240 numbered sentences, the needle "Das Schluesselwort ist
   Kastanienmarmelade" at sentence 120) answered exactly "Kastanienmarmelade". The 100K needle (102,551
   tokens, ctx 131072, server :8124) ran to completion 2026-10-18 00:29 with `--prefill --cpu-threads 48`

@@ -62,7 +62,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
-                            tool_choice_of, unmark_think_literals)
+                            template_json_calls, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
@@ -3146,6 +3146,20 @@ def drafting_card_class() -> str:
     return _CARD_CLASS[0]
 
 
+def tool_call_recovery_of(cfg: dict, template: ChatTemplate) -> bool:
+    """The config's "tool_call_recovery": whether the output parser also reads a call in a form next to the XML
+    `<function=NAME>` block it reads first (`OutputParser`'s recover).  Unset follows the template: a template that
+    asks for the JSON call form - Kolibri-1's own, `<tool_call>{\"name\": ..., \"arguments\": {...}}</tool_call>` -
+    has its calls read as calls, since otherwise the model's every call goes back as the answer's text; every other
+    template keeps the default, off."""
+    asked = cfg.get("tool_call_recovery")
+    if asked is None:
+        return template_json_calls(template)
+    if not isinstance(asked, bool):
+        raise ValueError(f'config "tool_call_recovery" must be true or false, not {asked!r}')
+    return asked
+
+
 def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
@@ -4041,7 +4055,8 @@ class Service:
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
-        self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
+        self.tool_call_recovery = False                   # call forms next to the template's: the config's
+        #                                                  "tool_call_recovery", else the template's own form
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
@@ -9109,10 +9124,15 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
-    recovery = cfg.get("tool_call_recovery", False)     # opt-in: see OutputParser's recover
-    if not isinstance(recovery, bool):
-        raise SystemExit(f"[strata] config \"tool_call_recovery\" must be true or false, not {recovery!r}")
+    try:
+        recovery = tool_call_recovery_of(cfg, svc.template)   # unset: the template's own call form (see there)
+    except ValueError as e:
+        raise SystemExit(f"[strata] {e}")
     svc.tool_call_recovery = recovery
+    if recovery and cfg.get("tool_call_recovery") is None:
+        print("[strata] this model's chat template asks for tool calls as JSON inside <tool_call>: the parser reads "
+              "that form, so the model's calls come back as real calls (turn it off with \"tool_call_recovery\": "
+              "false in the config)", flush=True)
     etu = cfg.get("env_to_user", False)                # opt-in: see frontend._env_to_user
     if not isinstance(etu, bool):
         raise SystemExit(f"[strata] config \"env_to_user\" must be true or false, not {etu!r}")

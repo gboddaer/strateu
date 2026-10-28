@@ -746,6 +746,23 @@ FUNC_END = "</function>"
 # `<=NAME>` (the word `function` dropped), `<function:NAME>`, `<function =NAME>`, or the bare `<NAME>`
 _LOOSE_OPEN = re.compile(r"<\s*(?:function\s*[=:]\s*|=\s*)?([A-Za-z0-9_.\-]+)\s*>")
 _LOOSE_PART = re.compile(r"<\s*(?:function[ \t]*[=:]?\s*|=\s*)?[A-Za-z0-9_.\-]*\s*$")
+# the JSON call form a template can ask for: `<tool_call>` and then a JSON object with the name and its arguments
+_JSON_CALL_FORM = re.compile(r"<tool_call>\s*\{\s*\"(?:name|tool)\"\s*:")
+_JSON_CALL_NAME = re.compile(r"\{\s*\"name\"\s*:\s*\"([^\"\n]{1,80})\"")
+
+
+def template_json_calls(template: "ChatTemplate") -> bool:
+    """Whether this template tells the model to write its call as a JSON object inside `<tool_call>` - the form
+    Kolibri-1's own template asks for (`<tool_call>{\"name\": ..., \"arguments\": {...}}</tool_call>`) - rather than
+    as the XML `<function=NAME><parameter=P>...` block `OutputParser` reads first.  Read from the rendered prompt, so
+    a template that builds its instruction in pieces or escapes it is read as the model reads it."""
+    probe = [{"name": "strata_caps_call_0", "description": "strata_caps_description",
+              "parameters": {"type": "object", "properties": {"arg": {"type": "string"}}}}]
+    try:
+        prompt = template.render([{"role": "user", "content": "strata_caps_user"}], tools=probe)
+    except Exception:                                # noqa: BLE001 - a template that cannot render here is not this form
+        return False
+    return _JSON_CALL_FORM.search(prompt) is not None
 
 
 def param_end(text: str, final: bool = False) -> int:
@@ -1036,8 +1053,10 @@ class OutputParser:
         return None
 
     def _follower(self, after: str) -> str:
-        """recover: what a `<tool_call>` followed (after whitespace) by `after` opens: "call" (`<function=`), "param"
-        (a declared tool's name written as `<parameter=NAME>`), "json" (`{`), "wait" (not decided yet) or "text"."""
+        """What a `<tool_call>` followed (after whitespace) by `after` opens: "call" (`<function=`), "param"
+        (a declared tool's name written as `<parameter=NAME>`), "json" (`{`), "wait" (not decided yet) or "text".
+        The JSON form is a drift form to `recover` and the model's own form where its template asks for it; the
+        caller reads it with recovery on and counts it as unread with recovery off."""
         if after.startswith(FUNC_START):
             return "call"
         if after.startswith(PARAM_START):
@@ -1333,6 +1352,8 @@ class OutputParser:
                             call.name = name
                     except ValueError:
                         pass
+                    if call is None and self.recover:      # the JSON form, as the template may ask for it
+                        call = json_tool_call(body[:end].strip(), self.schemas)
                     raw = self.buf[:len(CALL_START) + end + len(CALL_END)]
                     if call is not None or self.pending:
                         self.pending.append([raw, call])    # settled by what follows it (see __init__)
@@ -1470,7 +1491,12 @@ class OutputParser:
                         at = len(self.buf) - len(after)
                         self.buf = self.buf[:at] + FUNC_START + loose[0] + ">" + after[loose[1]:]
                         continue
-                kind = self._follower(after) if self.recover else None
+                form = self._follower(after)
+                kind = form if self.recover else None
+                if not self.recover and form == "json":
+                    # The model wrote its call as JSON in the wrapper and recovery is off: the block goes back as text.
+                    # Count it, so the server's log and /metrics say so instead of a client seeing only raw text.
+                    self.unread += 1
                 if (after.startswith("<") and kind is None and not FUNC_START.startswith(after)
                         and not after.startswith(FUNC_START)):
                     self.unread += 1
@@ -1537,6 +1563,11 @@ class OutputParser:
                     return out
                 call = json_tool_call(self.buf[:i].strip(), self.schemas)
                 if call is None:
+                    # a name the request did not declare, or JSON that does not parse: text, and counted (#3441)
+                    named = _JSON_CALL_NAME.search(self.buf[:i])
+                    self.unread += 1
+                    if named and len(self.unread_names) < 5:
+                        self.unread_names.append(named.group(1)[:80])
                     out.append(Event("content", self._track(CALL_START + self.buf[:i + len(CALL_END)])))
                 else:
                     out.append(Event("tool_call", call=call))
