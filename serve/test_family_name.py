@@ -19,11 +19,13 @@ class FamilyName(unittest.TestCase):
     def test_per_family(self):
         self.assertEqual(default_model_name({"arch": "qwen35moe"}), "qwen3.6-35b-a3b")
         self.assertEqual(default_model_name({"arch": "qwen4exp"}), "qwen3.8-flash-next")
+        self.assertEqual(default_model_name({"arch": "kolibri1"}), "kolibri-1")
 
     def test_old_configs(self):
         self.assertEqual(default_model_name({}), "qwen3.8-flash-next")
         self.assertEqual(default_model_name({"arch": "something-else"}), "qwen3.8-flash-next")
-        self.assertEqual(set(FAMILY_MODEL_NAMES), {"qwen4exp", "qwen35moe"})
+        # the fork adds Kolibri 1 (its own engine path): the name map carries it too
+        self.assertEqual(set(FAMILY_MODEL_NAMES), {"qwen4exp", "qwen35moe", "kolibri1"})
 
 
 if __name__ == "__main__":
