@@ -50,6 +50,7 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
@@ -65,6 +66,7 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/program/adapt_decay.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
@@ -502,6 +504,8 @@ struct Options {
     strata::kernels::cpu::PoolAffinity pool_affinity = strata::kernels::cpu::PoolAffinity::All;
     /// --host-core first|last (STRATA_HOST_CORE): the host thread's core (see HostCore in pool.hpp)
     std::string host_core;
+    /// --pool-cores LIST (STRATA_POOL_CORES; experimental, off by default): the logical processors the pool workers are pinned to
+    std::string pool_cores;
     /// R2.2's first half, as an A/B arm.  **ON by default**, because the measurement that justifies it is the
     /// pool's own drain: 33.7 GB/s against 5/6 x 44.14 = 36.8 for five workers, on a machine whose sixth core
     /// is reserved for a host thread that has nothing to do while the drain runs.
@@ -640,6 +644,8 @@ struct Options {
     /// Plan v0.3 P6: the share (0..1) of each layer's distinct missed experts the GPU reads over PCIe from the
     /// pinned arena while the CPU computes the rest (verify windows).
     double pcie_frac = -1.0;   ///< < 0: the model's default (0.2 direct for the Q2_0 pack, 0.55 DMA for native packs)
+    bool pcie_frac_auto = false;     ///< STRATA_PCIE_FRAC_DEFAULT=auto, single card, no --pcie-frac: the share is refined in the first decode windows (PcieAuto)
+    double pcie_probe_gbps = 0.0;    ///< the start-up probe's reading (for PcieAuto)
     std::string pcie_mode = "auto";   ///< auto | dma | kernel | direct
     /// Plan v0.3 P6: every `adapt_every` rounds, swap up to `adapt_swaps` of the most-routed missing experts into
     /// the VRAM tier in place of the least-routed resident ones (decayed counts).  0 = static residency.
@@ -928,6 +934,9 @@ void usage() {
                  "                       interrupts to one logical processor, usually the first, and every copy that lands\n"
                  "                       raises one: a spinning host there waits for them.  Moves threads only, never a\n"
                  "                       result.  Not on hybrid CPUs (STRATA_HOST_CORE sets it too).\n"
+                 "  --pool-cores LIST    Experimental, off by default: pin the CPU workers to exactly these logical\n"
+                 "                       processors (0,2,4,6 or 2-14:2).  Two entries on one core, or the host's own, are\n"
+                 "                       kept with a warning.  STRATA_POOL_CORES sets it too.\n"
                  "  --pool-affinity MODE Worker CPU affinity: all (default: one worker per physical core, as\n"
                  "                       always), auto (hybrid CPUs: P-cores first, then their SMT siblings,\n"
                  "                       then E-cores) or p-cores (P-cores and their siblings only).\n"
@@ -1425,6 +1434,20 @@ bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, co
     return false;
 }
 
+/// #3350: a conversation checkpoint is an optimization, like parking.  After a failed save: true when the failure was
+/// only the copy's memory (a host or driver allocation, which does not stick), so the caller goes on without that
+/// checkpoint; false when the GPU itself is unwell (a sticky error comes back from the synchronize), which still ends
+/// the request as before.
+bool checkpoint_failure_is_survivable() {
+    // SYCL has no sticky error state to clear: the queues either drain or throw (a lost device)
+    try {
+        dpct::get_current_device().queues_wait_and_throw();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 /// Puts a checkpoint's running state back; the positional cells below it are the caller's to guarantee.
 bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
     std::string error;
@@ -1624,9 +1647,49 @@ catch (sycl::exception const &exc) {
 // what the x16 share costs.  Continuous (#485): before, 19.9 GB/s gave 0.42 and 20.0 the full 0.55 (and 4.0 GB/s
 // gave 0.08, 3.9 none), so a reading near either edge moved the share by a quarter of its range.  From 20 GB/s up
 // (an x16 PCIe 4/5 link: ~26-28 GB/s) the share is unchanged.
-double pcie_frac_for_gbps(double gbps, double base) {
-    return gbps <= 0.0 ? base : base * std::min(1.0, gbps / 20.0);
+double pcie_frac_for_gbps(double gbps, double base, double ref_gbps = 20.0) {
+    return gbps <= 0.0 ? base : base * std::min(1.0, gbps / ref_gbps);
 }
+
+// 0.1.42 (CUDA) / 0.1.48 (SYCL, opt-in STRATA_PCIE_FRAC_DEFAULT=auto): the share refined from what the CPU pool measures in
+// the first decode windows.  The balance share of the missed experts is link / (link + 1.85 x CPU rate); the link is the
+// start-up probe, the CPU rate the expert bytes over the pool's wall time per missed expert (ms_run / multi_misses).
+// Three updates at most (after 48, then 96 and 96 more windows), each rounded to 0.05.
+struct PcieAuto {
+    static constexpr double kPoolFactor = 1.85;
+    bool on = false;
+    double link_gbps = 0.0, blob_bytes = 0.0;
+    double mark_ms = 0.0;
+    int64_t mark_jobs = 0;
+    double acc_ms = 0.0;
+    int64_t acc_jobs = 0;
+    int acc_win = 0, updates = 0;
+    void mark(double ms_run, int64_t jobs) { mark_ms = ms_run; mark_jobs = jobs; }
+    /// After a decode window: the new share, or -1 while there is nothing to change.  `tc_us`/`rate` get the reading.
+    double window(double ms_run, int64_t jobs, double cur, double* tc_us, double* rate) {
+        if (!on) return -1.0;
+        acc_ms += ms_run - mark_ms;
+        acc_jobs += jobs - mark_jobs;
+        mark(ms_run, jobs);
+        ++acc_win;
+        if (acc_win < (updates == 0 ? 48 : 96)) return -1.0;
+        if (acc_jobs < 300) {          // too few missed experts to read the pool's speed (everything hits): look again
+            if (acc_win >= 2000) on = false;
+            return -1.0;
+        }
+        const double tc = acc_ms * 1000.0 / (double) acc_jobs;
+        acc_ms = 0.0;
+        acc_jobs = 0;
+        acc_win = 0;
+        if (++updates >= 3) on = false;
+        if (!(tc > 1.0) || !(blob_bytes > 0.0) || !(link_gbps > 0.0)) return -1.0;
+        const double r = blob_bytes / (tc * 1e-6) / 1e9;
+        const double f = std::min(0.60, std::max(0.10, std::round(link_gbps / (link_gbps + kPoolFactor * r) * 20.0) / 20.0));
+        *tc_us = tc;
+        *rate = r;
+        return std::fabs(f - cur) < 0.025 ? -1.0 : f;
+    }
+};
 
 }  // namespace
 
@@ -1675,6 +1738,15 @@ int main(int argc, char **argv) try {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    // `strata --version` / `-V` (also `strata generate --version`): the version and nothing else, before any GPU is touched, as the CUDA
+    // and HIP engines have answered it. `strata update` runs it as the engine's smoke test, and the Intel package build runs it with
+    // an empty environment.
+    for (int i = 1; i < argc && i < 3; ++i) {
+        if (std::strcmp(argv[i], "--version") == 0 || std::strcmp(argv[i], "-V") == 0) {
+            std::printf("strata %s\n", STRATA_VERSION);
+            return 0;
+        }
+    }
 #if (defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(_WIN32)
     // AMD, a file-backed arena (STRATA_ARENA_MMAP): ROCclr copies a pageable source of 1 MiB or more by locking its
     // pages in place (a GPU userptr), and keeps them - so every expert the VRAM fill copied from the mapped
@@ -1792,6 +1864,7 @@ int main(int argc, char **argv) try {
         else if (a == "--graph-only") o.graph_only = true;
         else if (a == "--gpu-only-full") o.gpu_only_full = true;
         else if (a == "--pool-workers") o.pool_workers = std::atoi(next("--pool-workers"));
+        else if (a == "--pool-cores") o.pool_cores = next("--pool-cores");
         else if (a == "--host-core") {
             o.host_core = next("--host-core");
             if (o.host_core != "first" && o.host_core != "last") {
@@ -1864,7 +1937,7 @@ int main(int argc, char **argv) try {
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
-        else if (a == "--adapt-decay") o.adapt_decay = (float) std::atof(next("--adapt-decay"));
+        else if (a == "--adapt-decay") o.adapt_decay = strata::program::adapt_decay_checked(std::atof(next("--adapt-decay")));   // #1284: outside 0..1 -> 0.7, said
         else if (a == "--adapt-async") o.adapt_async = std::atoi(next("--adapt-async")) != 0 ? 1 : 0;
         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
         else if (a == "--stop-eos") o.stop_eos = true;
@@ -2027,6 +2100,18 @@ int main(int argc, char **argv) try {
         if (hc.empty())
             if (const char* e = std::getenv("STRATA_HOST_CORE")) hc = e;
         if (hc == "last") strata::kernels::cpu::set_host_core(strata::kernels::cpu::HostCore::Last);
+    }
+    {   // --pool-cores / STRATA_POOL_CORES (experimental, off by default), before the pool is built; a list that cannot be read is
+        // said and left out (recommend, never force)
+        std::string pc = o.pool_cores;
+        if (pc.empty())
+            if (const char* e = std::getenv("STRATA_POOL_CORES")) pc = e;
+        if (!pc.empty()) {
+            std::vector<int> cpus;
+            std::string perr;
+            if (strata::kernels::cpu::parse_pool_cores(pc, cpus, perr)) strata::kernels::cpu::set_pool_cores(cpus);
+            else std::fprintf(stderr, "strata generate: --pool-cores: %s; the pool uses its default placement\n", perr.c_str());
+        }
     }
     strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
@@ -2568,6 +2653,11 @@ int main(int argc, char **argv) try {
                 return 1;
             }
         }
+        // APR (prism.hadamard) packs (Gyro): every expert path rotates its activations (CPU pool: native_quant_act / _h;
+        // GPU verify and the prompt's FP16 chain: hadamard_rows).  Validated on the Arc A750 (SYCL, JIT build).
+        if (strata::kernels::cpu::hadamard_spec().any())
+            std::fprintf(stderr, "strata generate: APR pack: Hadamard-folded experts (block %d)\n",
+                         strata::kernels::cpu::hadamard_spec().block);
     }
     const bool native_pack = strata::kernels::cpu::expert_layout().native;
     // STRATA_EARLY_REMOTE_CONTEXTS=1: create EVERY secondary context here, like CUDA1's.  Under WSL2 the driver's
@@ -2599,9 +2689,23 @@ int main(int argc, char **argv) try {
         if (!native_pack) {
             o.pcie_frac = base;
         } else if (bw > 0.0) {
-            o.pcie_frac = pcie_frac_for_gbps(bw, base);
+            // Gyro's trellis experts: the CPU pool decodes them at ~8 GB/s (48 cycles a block on AVX2, compute bound, a third of the
+            // i-quants' rate), so the link carries a bigger share of the misses than the 20 GB/s reference says.  Measured on the
+            // Arc A750 (10.5 GB/s link): 0.29 -> 12.8 tok/s, 0.45 -> 15.5, 0.60 -> 15.2 (5 interleaved pairs each).  The reference
+            // for these packs is 12 GB/s: 10.5 GB/s gives 0.48; from 12 GB/s up the measured 0.55 stays.
+            bool trellis = false;
+            {
+                const auto& lay = strata::kernels::cpu::expert_layout();
+                for (size_t l = 0; lay.native && l < lay.fmt.size(); ++l) trellis = trellis || lay.fmt[l].gu_type >= 144;
+            }
+            o.pcie_frac = pcie_frac_for_gbps(bw, base, trellis ? 12.0 : 20.0);
             std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device (best of %s) -> pcie_frac %.2f "
                                  "(default %.2f)\n", bw, bursts.c_str(), o.pcie_frac, base);
+            {   // PcieAuto on SYCL: opt-in (STRATA_PCIE_FRAC_DEFAULT=auto), one card, not the xe NO_HOST path
+                const char* pfd = std::getenv("STRATA_PCIE_FRAC_DEFAULT");
+                o.pcie_frac_auto = pfd != nullptr && std::strcmp(pfd, "auto") == 0 && o.layer_split.empty();
+                o.pcie_probe_gbps = bw;
+            }
         } else {
             o.pcie_frac = base;
             std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
@@ -3093,7 +3197,7 @@ int main(int argc, char **argv) try {
                                          "MB/s of random 4 KiB reads): a prompt can spend minutes reading layer 1 and trip the "
                                          "stall watchdog (#1425, #1629). --ple-io mmap was 40-100x faster on some DRAM-less NVMe drives but 7x slower on a SATA SSD (#2040), so it is not chosen for you; "
                                          "--ple-io ram needs the RAM for the table%s\n", rps, rps * 4096.0 / 1e6,
-                                 o.ple_io_explicit ? "" : " (kept direct: pass --ple-io mmap or --ple-io ram to change it)");
+                                 o.ple_io_explicit ? "" : " (kept direct: pass --ple-io mmap or --ple-io ram to change it; in a config file's \"args\" they are two entries: \"--ple-io\", \"mmap\")");
                 }
             }
         }
@@ -4381,6 +4485,8 @@ int main(int argc, char **argv) try {
                              "(--host-core %s)\n", pool.workers(), on.c_str(), ht.host_core,
                      pool.host_works() ? " (draining too)" : "",
                      strata::kernels::cpu::host_core_setting() == strata::kernels::cpu::HostCore::Last ? "last" : "first");
+        // the same facts in plain words, and whether each worker has a physical core of its own
+        std::fprintf(stderr, "strata generate: %s\n", pool.placement_line().c_str());
     }
     if (o.no_ple_prefetch) strata::kernels::ple_prefetch_enable(false);
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`
@@ -7579,13 +7685,26 @@ int main(int argc, char **argv) try {
             id.config = *config_fp;
             return true;
         };
+        // What a park captures: the main session's conversation (park_current) or an idle batch slot's (park_slot:
+        // the reply it decoded, before an admission overwrites it).  One budget / admission / snapshot path for both.
+        struct ParkSource {
+            const std::vector<int32_t>& ids;
+            const std::vector<ImgKey>& imgs;
+            std::vector<ConvCheckpoint>& checks;          ///< moved apart into stage parts for the capture, put back after
+            bool cvec;
+            strata::core::SessionState& session;          ///< stage 0's
+            std::vector<strata::core::SessionState*> stage_sessions;   ///< the later stages', in stage order (stages[k]->dev)
+            const strata::core::QsaState* draft0;         ///< the draft layer's K/V saved with stage 0's image (or none)
+            const strata::core::QsaState* draft_last;     ///< ... with the last stage's image (a split: the drafter's GPU)
+            bool with_reuse;                              ///< the retained K/V describes this source (the main session's)
+            std::string what;                             ///< the log's words after the token count ("", " from slot 1")
+        };
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
-        auto park_current_body = [&](size_t held) -> bool {
-            if (!conversations.enabled() || !live_ok || live.empty()) return true;
+        auto park_source = [&](const ParkSource& src, size_t held) -> bool {
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
-            if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
+            if (const size_t dropped = conversations.drop_superseded(src.ids, src.imgs, src.checks, src.cvec))
                 std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
                              "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
             // A layer split parks one image per stage: the first stage's (with the draft layer's K/V) and one per
@@ -7594,16 +7713,25 @@ int main(int argc, char **argv) try {
             const size_t n_st = stages.size();
             // the draft layer's K/V lives on the last stage's GPU (the drafter is loaded there): with a split it is
             // saved with that stage's image, under its device; stage 0's image holds none
-            const strata::core::QsaState* draft0 = n_st > 0 || !use_mtp ? nullptr : &mtp.kv_state();   // no --mtp: no draft K/V (snapshots accept null)
-            auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return use_mtp && k + 1 == n_st ? &mtp.kv_state() : nullptr; };
+            const strata::core::QsaState* draft0 = src.draft0;   // no --mtp: no draft K/V (snapshots accept null)
+            auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return k + 1 == n_st ? src.draft_last : nullptr; };
+            std::vector<ConvCheckpoint>& checks = src.checks;
             strata::core::ConversationCheckpointSplit cs;
             if (n_st > 0) cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st);   // #752: two-phase; a bad_alloc leaves `checks` whole
             struct MergeBack {
                 strata::core::ConversationCheckpointSplit& cs; std::vector<ConvCheckpoint>& checks; bool on;
                 ~MergeBack() { if (on && !strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear(); }
             } merge_back{cs, checks, n_st > 0};
-            const strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached};
-            auto reuse = conversations.take_reuse();
+            const strata::core::ConversationView view{src.ids, src.imgs, n_st > 0 ? cs.stage0 : checks, src.cvec};
+            const int64_t retained_n = src.with_reuse ? conversations.retained_tokens() : 0;
+            // a batch slot's image carries no retained K/V (it describes the main session's conversation), and the
+            // main session's stays retained for its own park
+            auto reuse = src.with_reuse ? conversations.take_reuse_for(src.ids)   // never another conversation's K/V
+                                        : strata::core::ConversationKvReuse{};
+            if (retained_n > 0 && reuse.unchanged_tokens < retained_n)
+                std::fprintf(stderr, "strata serve: conversation cache: retained K/V reused for %lld of its %lld tokens "
+                                     "(the rest is not this conversation's)\n", (long long) reuse.unchanged_tokens,
+                             (long long) retained_n);
             std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
             stage_reuse.resize(n_st);
             reuse.stages.clear();
@@ -7612,9 +7740,9 @@ int main(int argc, char **argv) try {
             for (size_t k = 0; k < n_st; ++k) {
                 auto& st = stages[k];
                 const strata::core::OnDevice on(st->dev);
-                const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
+                const strata::core::ConversationView view_k{src.ids, src.imgs, cs.parts[k], src.cvec};
                 size_t b = 0;
-                if (!strata::core::conversation_snapshot_bytes(view_k, st->ss, g, draft_of(k), b, err)) {
+                if (!strata::core::conversation_snapshot_bytes(view_k, *src.stage_sessions[k], g, draft_of(k), b, err)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (stage CUDA%d: %s)\n",
                                  st->dev, err.c_str());
                     err.clear();
@@ -7622,8 +7750,8 @@ int main(int argc, char **argv) try {
                 }
                 if (!stage_reuse[k].kv.empty()) {
                     size_t r = 0;
-                    if (strata::core::conversation_snapshot_capture_bytes(stage_reuse[k], view_k, st->ss, g, draft_of(k),
-                                                                          r, err)) {
+                    if (strata::core::conversation_snapshot_capture_bytes(stage_reuse[k], view_k, *src.stage_sessions[k], g,
+                                                                          draft_of(k), r, err)) {
                         b = r;
                         stage_retained += stage_reuse[k].bytes();
                     } else {
@@ -7634,14 +7762,14 @@ int main(int argc, char **argv) try {
                 stage_estimate += b;
             }
             size_t estimate = 0;
-            if (!strata::core::conversation_snapshot_bytes(view, ss, g, draft0, estimate, err)) {
+            if (!strata::core::conversation_snapshot_bytes(view, src.session, g, draft0, estimate, err)) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n", err.c_str());
                 err.clear(); // A recoverable miss must not poison the batched draft prefill's error channel.
                 return true;
             }
             const size_t fresh_estimate = estimate;
             if (!reuse.kv.empty() && !strata::core::conversation_snapshot_capture_bytes(
-                    reuse, view, ss, g, draft0, estimate, err)) {
+                    reuse, view, src.session, g, draft0, estimate, err)) {
                 reuse = {};
                 estimate = fresh_estimate;
                 err.clear();
@@ -7671,7 +7799,7 @@ int main(int argc, char **argv) try {
                 }
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
-                if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
+                if (!strata::core::conversation_snapshot_save(image, view, src.session, g, draft0, err,
                         std::move(reuse), &reused_bytes)) return false;
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
@@ -7680,9 +7808,9 @@ int main(int argc, char **argv) try {
                                              .queues_wait_and_throw()) != 0) {
                         err = "stage sync failed"; return false;
                     }
-                    const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
+                    const strata::core::ConversationView view_k{src.ids, src.imgs, cs.parts[k], src.cvec};
                     strata::core::SavedConversation part;
-                    if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
+                    if (!strata::core::conversation_snapshot_save(part, view_k, *src.stage_sessions[k], g, draft_of(k), err,
                             std::move(stage_reuse[k]), &reused_bytes))
                         return false;
                     image.stage_images.push_back(std::move(part));
@@ -7693,8 +7821,8 @@ int main(int argc, char **argv) try {
                 }
                 const size_t snapshot_bytes = image.bytes();
                 const bool stored = conversations.put(std::move(image), held);
-                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
-                             stored ? "parked" : "skipped", live.size(),
+                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens%s in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
+                             stored ? "parked" : "skipped", src.ids.size(), src.what.c_str(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes);
             } catch (const std::bad_alloc&) {
@@ -7703,6 +7831,15 @@ int main(int argc, char **argv) try {
                 std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
             }
             return true;
+        };
+        auto park_current_body = [&](size_t held) -> bool {
+            if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            const size_t n_st = stages.size();
+            ParkSource src{live, live_imgs, checks, cvec_cached, ss, {},
+                           n_st > 0 || !use_mtp ? nullptr : &mtp.kv_state(),
+                           use_mtp && n_st > 0 ? &mtp.kv_state() : nullptr, true, ""};
+            for (auto& st : stages) src.stage_sessions.push_back(&st->ss);
+            return park_source(src, held);
         };
         // #752: the whole park (the checkpoint split included) is under one try, so a host OOM skips parking instead of
         // ending the server
@@ -7855,7 +7992,15 @@ int main(int argc, char **argv) try {
                 } else {
                     saved = checkpoint_at(done, nullptr, tail_checkpoint && !periodic_checkpoint);
                 }
-                if (!saved) { e = "saving a conversation checkpoint failed" + ckpt_why; return false; }
+                if (!saved) {
+                    // #3350: only a GPU that is unwell ends the request; a copy that ran out of memory skips this checkpoint
+                    if (!ckpt_why.empty() || !checkpoint_failure_is_survivable()) {
+                        e = "saving a conversation checkpoint failed" + ckpt_why;
+                        return false;
+                    }
+                    std::fprintf(stderr, "strata serve: checkpoint at %lld skipped: its state could not be copied out (see "
+                                         "above); the request goes on without it\n", (long long) done);
+                }
                 if (periodic_checkpoint) pp_next_check = done + o.prompt_cache_every;
                 if (tail_checkpoint) pp_tail_saved = true;
             }
@@ -7872,7 +8017,16 @@ int main(int argc, char **argv) try {
                     part_next[i] = done + o.prompt_cache_every;
                     ConvCheckpoint part;   // this stage's state at `done` (its stream is synchronized)
                     part.ids.assign(cur.begin(), cur.begin() + done);
-                    if (!checkpoint_save(part, stage_ss, g)) { e = "saving a checkpoint part failed"; return false; }
+                    if (!checkpoint_save(part, stage_ss, g)) {
+                        // #3350: the copy ran out of memory (not the GPU): leave this part out. The set at `done` is then
+                        // incomplete and the checkpoint is skipped below, as for a part that was never made
+                        if (!checkpoint_failure_is_survivable()) { e = "saving a checkpoint part failed"; return false; }
+                        std::fprintf(stderr, "strata serve: checkpoint at %lld skipped: stage %zu's state could not be copied "
+                                             "out (see above); the request goes on without it\n", (long long) done, i);
+                        std::lock_guard<std::mutex> lk(part_mu);
+                        part_at[done].resize(stages.size() + 1);   // (marks the set as seen; its empty parts make it incomplete)
+                        return true;
+                    }
                     std::lock_guard<std::mutex> lk(part_mu);
                     auto& v = part_at[done];
                     v.resize(stages.size() + 1);
@@ -7887,6 +8041,29 @@ int main(int argc, char **argv) try {
             std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        PcieAuto pcie_auto;
+        if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && n_stages == 1) {
+            const auto& pl = strata::kernels::cpu::expert_layout();
+            double sum = 0.0;
+            for (int64_t l = 0; l < g.n_layers; ++l) sum += (double) pl.blob_bytes(l);
+            pcie_auto.on = true;
+            pcie_auto.link_gbps = o.pcie_probe_gbps;
+            pcie_auto.blob_bytes = g.n_layers > 0 ? sum / (double) g.n_layers : 0.0;
+        }
+        auto pcie_auto_step = [&](double& req_pcie_frac) {
+            if (!pcie_auto.on) return;
+            double tc_us = 0.0, rate = 0.0;
+            const double nf = req_pcie_frac == o.pcie_frac
+                                  ? pcie_auto.window(drive.d.ms_run, drive.d.multi_misses, o.pcie_frac, &tc_us, &rate)
+                                  : (pcie_auto.mark(drive.d.ms_run, drive.d.multi_misses), -1.0);
+            if (nf < 0.0) return;
+            std::fprintf(stderr, "strata serve: PCIe share: the CPU pool takes %.0f us per missed expert (%.1f GB/s of expert bytes), "
+                                 "the link %.1f GB/s -> pcie_frac %.2f (was %.2f; --pcie-frac N fixes it)\n",
+                         tc_us, rate, pcie_auto.link_gbps, nf, o.pcie_frac);
+            o.pcie_frac = nf;
+            req_pcie_frac = nf;
+            drive.d.pcie_num = std::max(0, std::min(256, (int) (nf * 256.0 + 0.5)));
+        };
         // #477 --expert-profile-save: what the adaptive tier learned, kept across restarts (opt-in; off: `heat` stays
         // empty and nothing below runs).  It needs the adaptive tier's counts and the residency table.
         std::vector<double> heat;
@@ -8937,6 +9114,8 @@ int main(int argc, char **argv) try {
         // `at`: one of the slot's checkpoints - only the K/V up to it is copied and its state restored instead
         auto copy_from_slot = [&](int b, const ConvCheckpoint *at,
                                   std::string &e) -> bool {
+            // the main session's K/V is replaced by the slot's: K/V retained from a restore described the old one
+            conversations.take_reuse();
             try {
         const int64_t upto = at != nullptr ? (int64_t)at->ids.size()
                                            : (int64_t)bs[(size_t)b].ids.size();
@@ -9001,6 +9180,65 @@ int main(int argc, char **argv) try {
                     << ", line:" << __LINE__ << std::endl;
           std::exit(1);
         }
+        };
+        // What an idle slot holds (the conversation it decoded last: its sessions, its draft K/V and its checkpoints)
+        // goes to the parked conversations before an admission overwrites it.  The main session was parked with that
+        // conversation's prompt only (the admission's copy), so the reply the slot decoded lives nowhere else: without
+        // this, the conversation's next turn finds its prompt-read state and reads the whole reply again (measured on
+        // four 200K chats over two slots: 255 of a 256-token reply re-read, and a chat whose copies the cache had
+        // evicted meanwhile read from token 0).  Nothing to do when the live main session or a parked conversation
+        // already holds that state (or a continuation of it).
+        // Parking is an optimization like a checkpoint (#3350): a skip and a failed snapshot (a host or device
+        // allocation that ran out) are logged and the slot is overwritten as before.  Nothing here ends the request
+        // or the engine.
+        auto park_slot = [&](int b) {
+            BSlot& sl = bs[(size_t) b];
+            if (!conversations.enabled() || sl.active || !sl.cached || sl.img || sl.ids.empty()) return;
+            auto prefix_of = [&](const std::vector<int32_t>& whole) {
+                return whole.size() >= sl.ids.size() && std::equal(sl.ids.begin(), sl.ids.end(), whole.begin());
+            };
+            const bool in_main = live_ok && cvec_cached == sl.cvec && prefix_of(live) &&
+                                 imgs_below(live_imgs, (int64_t) sl.ids.size()).empty();
+            if (in_main || conversations.holds(sl.ids, {}, sl.cvec)) return;
+            if (use_mtp && !batch_mtp) {   // no draft K/V of its own: an image without it would not restore beside the drafter
+                std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (its %zu tokens "
+                                     "have no per-slot draft K/V without --batch-mtp)\n", b, sl.ids.size());
+                return;
+            }
+            try {
+                if (DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()) != 0) {
+                    std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (device "
+                                         "sync failed)\n", b);
+                    return;
+                }
+            } catch (sycl::exception const& exc) {
+                std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+                std::exit(1);
+            }
+            std::string why;
+            if (batch_mtp && !slot_mtp[(size_t) b]->idle(why)) {
+                std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (%s)\n",
+                             b, why.c_str());
+                return;
+            }
+            const size_t n_st = stages.size();
+            static const std::vector<ImgKey> no_imgs;
+            ParkSource src{sl.ids, no_imgs, sl.checks, sl.cvec, *bslot_ss[0][(size_t) b], {},
+                           n_st > 0 || !batch_mtp ? nullptr : &slot_mtp[(size_t) b]->kv_state(),
+                           batch_mtp && n_st > 0 ? &slot_mtp[(size_t) b]->kv_state() : nullptr, false,
+                           " from slot " + std::to_string(b)};
+            for (size_t k = 1; k < bslot_ss.size(); ++k) src.stage_sessions.push_back(bslot_ss[k][(size_t) b].get());
+            try {
+                if (park_source(src, 0)) return;
+                // the snapshot failed (the copy's own memory, as in #3350): the slot is not touched, so go on without
+                // the image
+                std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (%s)\n",
+                             b, err.empty() ? "the snapshot failed" : err.c_str());
+                err.clear();
+                (void) checkpoint_failure_is_survivable();
+            } catch (const std::bad_alloc&) {
+                std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking slot %d\n", b);
+            }
         };
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds
@@ -9553,6 +9791,9 @@ int main(int argc, char **argv) try {
             // log-probability and the K most likely tokens', from the verify window's head logits (before sampling,
             // penalties and temperature). -1 (absent): no LP lines; a server that does not ask never sees one.
             int req_logprobs = -1;
+            // allowed=a,b,c: with logprobs, print only these token ids (the server renormalises over them; the same key
+            // the CUDA engine reads).  Absent: the K most likely tokens, as before.
+            std::vector<int32_t> req_allowed;
             // ckpt=0: a one-shot call whose turn no later request extends.  No checkpoint at its last turn boundary
             // (so no split there) nor every --prompt-cache-every tokens, and its session is neither continued nor
             // parked after it.  It still resumes from a checkpoint it matches, and still saves the system-prompt root
@@ -9588,6 +9829,17 @@ int main(int argc, char **argv) try {
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "logprobs") req_logprobs = std::clamp(std::atoi(tok.c_str() + eq + 1), -1, 20);
+                    else if (key == "allowed") {
+                        const std::string csv = tok.substr(eq + 1);
+                        size_t p = 0;
+                        while (p < csv.size()) {
+                            const size_t c = csv.find(",", p);
+                            const std::string one = csv.substr(p, c == std::string::npos ? std::string::npos : c - p);
+                            if (!one.empty()) req_allowed.push_back((int32_t) std::atoi(one.c_str()));
+                            if (c == std::string::npos) break;
+                            p = c + 1;
+                        }
+                    }
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "img_keys") {
@@ -9871,13 +10123,26 @@ int main(int argc, char **argv) try {
                     // checkpoints as if it had not stopped
                     if (slot_ck == nullptr && bs[(size_t) slot_source].partial && admit_slot == slot_source) {
                         resumed_from0 = bs[(size_t) slot_source].partial_from0;
-                        for (const ConvCheckpoint& c : bs[(size_t) slot_source].checks) checks.push_back(c);
                         bs[(size_t) slot_source].partial = false;
+                    }
+                    // the slot's checkpoints come along (the one continued from, and any shorter one: prefixes of what
+                    // was copied back, their K/V cells with it), so the chain keeps its branch points and the parked
+                    // copies of this conversation a turn back - whose deepest checkpoint the chain holds again - go
+                    // as superseded (#342) instead of taking a parked entry each until the cache evicts another chat
+                    try {   // an optimization: a host allocation that fails skips the rest
+                        // (a shorter checkpoint only when it is a prefix of the tokens copied back, text only)
+                        const std::vector<int32_t>& copied_back = slot_ck != nullptr ? slot_ck->ids : bs[(size_t) slot_source].ids;
+                        for (const ConvCheckpoint& c : bs[(size_t) slot_source].checks)
+                            if ((int64_t) c.ids.size() <= slot_tokens && c.imgs.empty() && c.ids.size() <= copied_back.size() &&
+                                std::equal(c.ids.begin(), c.ids.end(), copied_back.begin()))
+                                checks.push_back(c);
+                    } catch (const std::bad_alloc&) {
+                        std::fprintf(stderr, "strata batch: slot %d: its checkpoints were not all copied (out of memory); the rest are skipped\n", slot_source);
                     }
                     if (slot_ck != nullptr) {
                         live = slot_ck->ids;
-                        checks.push_back(*slot_ck);   // the main session's chain has it now
-                        checks.back().used = ++check_clock;
+                        for (ConvCheckpoint& c : checks)   // the main session's chain has it now
+                            if (c.ids.size() == slot_ck->ids.size()) c.used = ++check_clock;
                     } else {
                         live = bs[(size_t) slot_source].ids;
                     }
@@ -9949,7 +10214,7 @@ int main(int argc, char **argv) try {
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
-                    conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv));
+                    conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv), live);
                 }
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
                 std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
@@ -10401,6 +10666,7 @@ int main(int argc, char **argv) try {
                         std::string ye;
                         const auto ty = Clock::now();
                         std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
+                        if (can) park_slot(ys);   // the conversation the slot holds, before this read overwrites it
                         if (can && copy_to_slot(ys, pre, ye)) {
                             BSlot& sl = bs[(size_t) ys];
                             sl = BSlot{};
@@ -10558,8 +10824,12 @@ int main(int argc, char **argv) try {
                 at = to;
                 if ((to == turn_at || to == root_at || to == message_at) &&
                     !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at)) {   // the tail kind leaves first
-                    std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
-                    return 1;
+                    if (!ckpt_why.empty() || !checkpoint_failure_is_survivable()) {   // #3350: only an unwell GPU ends the request
+                        std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
+                        return 1;
+                    }
+                    std::fprintf(stderr, "strata serve: checkpoint at %lld skipped: its state could not be copied out (see "
+                                         "above); the request goes on without it\n", (long long) to);
                 }
                 if (trace && to == message_at)
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
@@ -10621,7 +10891,25 @@ int main(int argc, char **argv) try {
             const DecSnap ds0 = dec_snap();
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
             int64_t dec_windows = 0, dec_T = 0;
+            // STRATA_FOLLOW=<file> (test path, off by default): this request decodes the token ids in <file> (whitespace
+            // separated, read and deleted at the request's start) instead of the argmax, through the real verify windows
+            // with the MTP drafts; STRATA_FOLLOW_LOGPOS=<path> appends, for every valid window row, the teacher-forced
+            // log-probability of the forced token and the top STRATA_LOGPOS_TOPK log-probabilities
+            std::vector<int32_t> fol;
+            if (const char* fp = std::getenv("STRATA_FOLLOW")) {
+                if (std::FILE* ff = std::fopen(fp, "r")) {
+                    long long v;
+                    while (std::fscanf(ff, "%lld", &v) == 1) fol.push_back((int32_t) v);
+                    std::fclose(ff);
+                    std::remove(fp);
+                }
+            }
+            static std::FILE* fol_lp = [] {
+                const char* p = std::getenv("STRATA_FOLLOW_LOGPOS");
+                return p != nullptr ? std::fopen(p, "ab") : nullptr;
+            }();
             const int64_t decode_hits0 = drive.d.cache_hits;
+            pcie_auto.mark(drive.d.ms_run, drive.d.multi_misses);   // the prompt's windows are not the decode's
             // CS-T: the RAM and file tiers of this request (the mmap source; 0 with the arena)
             const int64_t ram0 = src.ram_reads(), files0 = src.file_reads();
             const uint64_t file_bytes0 = src.file_read_bytes();
@@ -11398,8 +11686,20 @@ int main(int argc, char **argv) try {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
+                int32_t fol_tgt[16];
+                if (!fol.empty()) {   // STRATA_FOLLOW: the forced continuation stands in for the argmax
+                    for (int i = 0; i < T && i < 16; ++i) {
+                        const size_t k = (size_t) produced_n + (size_t) i;
+                        fol_tgt[i] = k < fol.size() ? fol[k] : -1;
+                        if (fol_tgt[i] >= 0) outv[(size_t) i] = fol_tgt[i];
+                    }
+                }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                if (!fol.empty() && fol_lp != nullptr && !ver.window_logprobs(fol_tgt, a + 1, produced_n, -1, fol_lp, err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
                 if (strata::core::MtpDrafter::top2_env() && !from_sfx && !first_window && a < T_mtp - 1 && a < 8) {
@@ -11438,7 +11738,14 @@ int main(int argc, char **argv) try {
                             for (const float v : lrow) se += std::exp((double) v - mx);
                             const double lse = (double) mx + std::log(se);
                             std::printf("LP %.6f", (double) lrow[(size_t) outv[(size_t) i]] - lse);
-                            if (req_logprobs > 0) {
+                            if (!req_allowed.empty()) {
+                                // only the ids the caller named (never the chosen one, which the head carries, and never an id
+                                // past the engine's own vocabulary); the server renormalises over them
+                                for (const int32_t id : req_allowed) {
+                                    if (id == outv[(size_t) i] || id < 0 || (size_t) id >= lrow.size()) continue;
+                                    std::printf(" %d:%.6f", (int) id, (double) lrow[(size_t) id] - lse);
+                                }
+                            } else if (req_logprobs > 0) {
                                 lord.resize(lrow.size());
                                 for (size_t v = 0; v < lrow.size(); ++v) lord[v] = (int32_t) v;
                                 std::partial_sort(lord.begin(), lord.begin() + req_logprobs, lord.end(),
@@ -11470,6 +11777,7 @@ int main(int argc, char **argv) try {
                     dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
                     ++dec_windows; dec_T += T;
                 }
+                pcie_auto_step(req_pcie_frac);   // PcieAuto (opt-in): the share refined from the CPU pool's speed
                 if (adapt_thr.joinable()) adapt_thr.join();
                 if (!adapt_ok) {
                     std::printf("ERR an adaptive refill failed\n");
@@ -11677,6 +11985,7 @@ int main(int argc, char **argv) try {
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
                 const auto tc0 = Clock::now();
+                if (cont) park_slot(admit_slot);   // the conversation the slot holds, before this one overwrites it
                 if (cont && !copy_to_slot(admit_slot, live, err)) {
                     std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
                     bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
