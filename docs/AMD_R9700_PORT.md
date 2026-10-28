@@ -1293,3 +1293,24 @@ tasks, using T2's 3.69 us per launch: batching the picks into one launch per lay
 ~3.1 ms, and leave 67.3 ms/token = 14.86 tok/s - **still 6.5 % below the shipped arm**. That is the ceiling for any
 launch-count fix, which is why T7 and T8 cannot flip the sign by rerouting or splitting: the work itself (15.6 ms of
 3-launch-per-pick GEMV) has to shrink, and that is T11's fused kernel.
+
+## T7 (2026-10-28): not attempted, on T6's numbers - the reroute cannot change the launch count
+
+Task 7 would reroute `DEC_RES`'s resident-pick hits from hipBLAS-at-T=1 to the in-tree slot GEMV. T6 has now measured
+what that GEMV costs on this card, and it decides the question without another arm:
+
+- the slot path already *is* that GEMV (`CNT branches per tok: … slots-path 50.0`), and it serves 96.6 % of picks
+  through 875 `q4_K mmvq` launches per token - three per pick, gate/up/down - for 15.6 ms of GPU time;
+- the reroute changes *which* kernel serves a hit, not how many launches there are. Its best case is therefore T6's
+  own arm (14.21 tok/s) or, with the picks batched (T2's 3.69 us/launch), 14.86 tok/s. Both are **below the shipped
+  15.90 tok/s**;
+- and it is strictly worse than T6's arm on one axis that T6 did not pay: `DEC_RES` needs the fp16 cache resident
+  (`EXPERT_F16>0`), which the launcher no longer ships, and the recorded `DEC_RES` arm was 11x slower before the
+  cache even helped.
+
+So the honest verdict is a non-attempt with its arithmetic shown, not an arm that lands between a losing baseline and
+a losing ceiling. What would change the answer is T11: the 15.6 ms is 875 three-launch picks, and a fused kernel that
+computes gate/up/down for a pick in one pass, or one launch per layer, is the only shape of change that moves it.
+
+No gate was run for this task because nothing was built: the shipped path is untouched (oracle BITWISE and `pf_gate`
+GATE PASS stand from §T4), and no pf_gate expectation was recorded or overwritten.
