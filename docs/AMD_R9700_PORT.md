@@ -1206,3 +1206,34 @@ and a shape set whose GEMMs go through `Gemm::f16`; this engine's do not.
 **Not run:** the pooled-KL 0.00162 re-measurement. It exists to catch numerics drift from an *algorithm swap*, and
 this task swapped nothing - the shipped table is byte-identical before and after, and `pf_gate.sh` on the same binary
 (§T4) already reports GATE PASS with its oracle stage BITWISE. Recorded as unnecessary rather than skipped.
+
+## T5 (2026-10-28): the LM-head fp16 cache is dropped before it is built - the measurements say it is a loss
+
+Task 5 proposed caching `output.weight` in fp16 (128000 x 2560, 656 MB) and computing the logits through the capped
+GEMV instead of the shipped path. Two measurements settle it without spending a run on an arm that is known to lose.
+
+**What the shipped path costs.** `rocprofv3 --kernel-trace` over a decode (§T1): the LM head is one
+`native_q6_k_mmvq` per token, the last dispatch of every token - **519.8-520.3 µs** in steady state (697.2 µs on the
+first token, the warm-up datum for T15). Against the standing arm's **62.9 ms/token**, that is **0.83 % of the decode
+wall**.
+
+**What the proposal would cost.** The micro-bench (§T2) ran exactly this data path at exactly this shape: a
+128000 x 2560 F16 GEMV is **2.120 ms** block-per-row and **1.902 ms** grid-stride. The reason is bytes: fp16 reads
+**655 MB** per token where Q6_K reads **269 MB**, and this card moves that shape at 309-345 GB/s (fp16) against ~517
+GB/s effective for the Q6_K mmvq. Substituting either form into the wall:
+
+| arm | LM head ms/token | decode wall | decode rate | vs shipped |
+|---|---|---|---|---|
+| shipped Q6_K mmvq | 0.520 | 62.9 ms | 15.90 tok/s | - |
+| fp16, block-per-row | 2.120 | 64.5 ms | 15.50 tok/s | **-2.5 %** |
+| fp16, grid-stride | 1.902 | 64.3 ms | 15.56 tok/s | **-2.2 %** |
+
+It also asks for 656 MB of the 20.56 GiB free (3.2 %) to make the thing it touches slower.
+
+**Verdict: dropped.** The knob would trade 2.2-2.5 % of decode for a 4x slower LM head in a leg that is under one
+percent of the wall, and the only thing it could win is a numerics argument - the shipped Q6_K path is already the
+arithmetic the oracle pins, and nothing measured here suggests an fp16 dequant of the same values would clear the
+0.78x KL floor by enough to justify a default. Task 14 has nothing to adopt from it.
+
+**Shipped path untouched:** no code changed, so the gate set is the one already recorded on this binary - oracle
+BITWISE PASS and `pf_gate.sh` GATE PASS (§T4).
