@@ -72,5 +72,59 @@ class KolibriFamily(unittest.TestCase):
         self.assertEqual([p.name for p in shards], ["Kolibri-1-Q4_K_M.gguf"])
 
 
+class KolibriSourceTuning(unittest.TestCase):
+    """The real config writer, with the existing offline install harness (no GPU/downloads)."""
+    def setUp(self):
+        from tools.test_setup_qwen36 import InstallOwnPath
+        InstallOwnPath.setUp(self)
+        self.families = {"kolibri1"}
+        from unittest import mock
+        for patch in (mock.patch.object(setup, "get_llama_cpp", return_value=self.root / "llama"),
+                      mock.patch.object(setup, "find_tool", side_effect=lambda name: "/tools/" + name),
+                      mock.patch.object(setup, "rocm_root", return_value=(self.root / "rocm", ["/rocm/lib"]))):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def install(self, hip=True):
+        from tools.test_setup_qwen36 import args, run
+        return run(setup.install_own_path, args(models_dir=str(self.root / "models"), model="Q4_K_M", vision="no"),
+                   "kolibri", {"index": 0, "count": 1, "vram_gb": 32, "arch": "gfx1201", "name": "R9700"},
+                   hip, [], 13, [], 8080, 96, None)
+
+    def test_source_install_selects_compatible_shared_expert_tuning(self):
+        from unittest import mock
+        table = self.root / "gfx1201-hipblaslt-100202.txt"
+        with mock.patch.object(setup, "hipblaslt_table", return_value=table):
+            rc, out = self.install()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.cfg["env"]["STRATA_HIPBLASLT_TUNING"], str(table))
+
+    def test_fresh_amd_source_build_enables_hip_mmq_not_cuda(self):
+        from unittest import mock
+        with mock.patch.object(setup, "hipblaslt_table", return_value=None):
+            rc, out = self.install()
+        self.assertEqual(rc, 0, out)
+        conf = next(c[1] for c in self.calls if c[0] == "run" and "-S" in c[1])
+        self.assertIn("-DSTRATA_ENABLE_HIP=ON", conf)
+        self.assertIn("-DSTRATA_ENABLE_CUDA=OFF", conf)
+        self.assertIn("-DSTRATA_PREFILL_MMQ=ON", conf)
+        self.assertIn("-DCMAKE_HIP_ARCHITECTURES=gfx1201", conf)
+
+    def test_missing_table_keeps_the_runtime_pool_fallback(self):
+        from unittest import mock
+        with mock.patch.object(setup, "hipblaslt_table", return_value=None):
+            rc, out = self.install()
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("env", self.cfg)
+
+    def test_cuda_config_does_not_change(self):
+        from unittest import mock
+        with mock.patch.object(setup, "hipblaslt_table") as find:
+            rc, out = self.install(hip=False)
+        self.assertEqual(rc, 0, out)
+        find.assert_not_called()
+        self.assertNotIn("env", self.cfg)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -316,18 +316,45 @@ int main(int argc, char ** argv) {
                     std::cout << "synthetic-" << name << " skipped: not built (STRATA_MMQ_KQUANTS off?)\n";
                     continue;
                 }
-                const int rows = 5;
-                const std::vector<int> counts{rows};
+                // THREE experts, not one: the engine's expert staging puts 16 experts in one buffer and steps them by
+                // expert_bytes, and the one-expert case cannot see that layout at all - which is why this gate passed
+                // while the engine's 16-expert groups returned NaN from expert 1 on (docs/AMD_R9700_PORT.md §P4).
+                const std::vector<int> counts{5, 5, 5};
+                const int rows = 15;
                 const auto src = permutation(rows, 3, false), dst = permutation(rows, 2, true);
-                run_product(ctx, stream, std::string("synthetic-") + name, type,
-                            1280, 2560, synthetic_of_type(type, 1, 1280, 2560, 5), counts,
+                run_product(ctx, stream, std::string("synthetic-") + name + "-x3", type,
+                            1280, 2560, synthetic_of_type(type, 3, 1280, 2560, 5), counts,
                             make_activations(rows, 2560, 77), src, dst);
+                // and the single-expert case the engine's per-expert fallback uses
+                run_product(ctx, stream, std::string("synthetic-") + name, type,
+                            1280, 2560, synthetic_of_type(type, 1, 1280, 2560, 5), std::vector<int>{5},
+                            make_activations(5, 2560, 77), permutation(5, 3, false), permutation(5, 2, true));
+            }
+            // Kolibri's exact staged shapes and uneven expert buckets. In particular, a Q6_K down stride
+            // is the block-aligned matrix size, not the blob's padded region size.
+            if (supported(GGML_TYPE_Q4_K) && supported(GGML_TYPE_Q6_K)) {
+                const std::vector<int> kolibri_counts{8, 11, 5};
+                run_product(ctx, stream, "kolibri-Q4_K-GU", GGML_TYPE_Q4_K, 1024, 2560,
+                            synthetic_of_type(GGML_TYPE_Q4_K, 3, 1024, 2560, 19), kolibri_counts,
+                            make_activations(24, 2560, 21), permutation(24, 2, false), permutation(24, 3, true));
+                run_product(ctx, stream, "kolibri-Q6_K-down", GGML_TYPE_Q6_K, 2560, 512,
+                            synthetic_of_type(GGML_TYPE_Q6_K, 3, 2560, 512, 23), kolibri_counts,
+                            make_activations(24, 512, 25), permutation(24, 2, false), permutation(24, 3, true));
             }
             // APR trellis experts (ggml types 144-146), when the build has their MMQ instances (agention fork): gate/up
             // 1280 x 2560 and down 2560 x 640 (5 blocks per row: the last 256-slice reads past the row, against zero
             // activations)
             for (const ggml_type t : {(ggml_type) 145, (ggml_type) 146, (ggml_type) 144}) {
                 if (!supported((int) t)) { std::cout << "type " << (int) t << ": no MMQ instance in this build\n"; continue; }
+                if ((int) t < 0 || (int) t >= GGML_TYPE_COUNT) {
+                    std::cout << "type " << (int) t << ": SKIP (outside this GGML host type table)\n";
+                    continue;
+                }
+                const auto* traits = ggml_get_type_traits(t);
+                if (!traits || !traits->from_float_ref || !traits->to_float) {
+                    std::cout << "type " << (int) t << ": SKIP (no independent host quantizer/dequantizer)\n";
+                    continue;
+                }
                 const std::vector<int> counts{2, 3};
                 const auto src = permutation(5, 1, false), dst = permutation(5, 2, true);
                 const char* known = ggml_type_name(t);   // null when this ggml has no name for the id (no trellis types in it): #3358

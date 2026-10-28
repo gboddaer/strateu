@@ -1174,6 +1174,16 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx");
 }
 
+bool Gemm::f16_tuned(int64_t T, int64_t N, int64_t K, int64_t ldy) {
+#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+    return hipblaslt_solution_for(hipblaslt_state_, strata::prefill::hipblaslt::InputType::f16,
+                                  T, N, K, ldy > 0 ? ldy : N, 0.0f) >= 0;
+#else
+    (void) T; (void) N; (void) K; (void) ldy;
+    return false;
+#endif
+}
+
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                float beta) {
     if (T <= 0 || N <= 0) return;

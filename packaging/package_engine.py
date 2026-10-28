@@ -45,6 +45,7 @@ from strata_control.components import BACKEND_MATRIX, host_platform  # noqa: E40
 
 
 DSV41_EXE = "strata-dsv41"
+KOLIBRI_EXE = "strata-kolibri"
 
 
 def sha256(path: Path) -> str:
@@ -59,7 +60,7 @@ def wanted(path: Path) -> bool:
     name = path.name.lower()
     return (name.endswith((".dll", ".so", ".dylib", ".metallib")) or ".so." in name or name == "build.json"
             or name.startswith("license") or name in ("strata-vision", "strata-vision.exe", "strata-vision-hip", "strata-vision-hip.exe",
-                                                       DSV41_EXE, DSV41_EXE + ".exe"))   # the picture readers (CPU, AMD GPU) and the DeepSeek-V4.1 engine beside the engine
+                                                       DSV41_EXE, DSV41_EXE + ".exe", KOLIBRI_EXE, KOLIBRI_EXE + ".exe"))   # the picture readers (CPU, AMD GPU) and the DeepSeek-V4.1 engine beside the engine
 
 
 READER_NAMES = ("strata-vision", "strata-vision.exe")
@@ -222,7 +223,7 @@ def build(src: Path, backend: str, version: str, target: str, out: Path, *, entr
             manifest["notes"] = notes
         (staging / ec.MANIFEST).write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8")
         if os.name != "nt":
-            for exe_name in (entrypoint, DSV41_EXE, "strata-vision", "strata-vision-hip"):      # the programs setup starts: executable in the tar
+            for exe_name in (entrypoint, DSV41_EXE, KOLIBRI_EXE, "strata-vision", "strata-vision-hip"):      # the programs setup starts: executable in the tar
                 if (staging / exe_name).is_file():
                     (staging / exe_name).chmod(0o755)
         ec.verify(ec.read_manifest(staging), full=True)

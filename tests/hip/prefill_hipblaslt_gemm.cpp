@@ -177,6 +177,11 @@ int main() {
             HIP_CHECK(hipStreamDestroy(stream));
             return 2;
         }
+        if (!gemm.f16_tuned(255, 512, 2560) || !gemm.f16_tuned(256, 512, 2560) ||
+            !gemm.f16_tuned(512, 512, 2560) || gemm.f16_tuned(256, 513, 2561)) {
+            std::fprintf(stderr, "direct f16 tuning availability reported the wrong route\n");
+            return 1;
+        }
         hipblasHandle_t blas = nullptr;
         HIPBLAS_CHECK(hipblasCreate(&blas));
         HIPBLAS_CHECK(hipblasSetStream(blas, stream));
@@ -187,10 +192,14 @@ int main() {
         ok &= run_case(gemm, blas, stream, true, 37, 48, 2560, 96, 48, 1.0f, 102);
         ok &= run_case(gemm, blas, stream, false, 4096, 512, 2560, 512, 0, 0.0f, 103);
         ok &= run_case(gemm, blas, stream, false, 37, 512, 2560, 512, 7, 1.0f, 104);
+        // Kolibri's shared gate/up: both chunk sizes and the 511-token prompt's last short chunk.
+        ok &= run_case(gemm, blas, stream, false, 255, 512, 2560, 512, 0, 0.0f, 105);
+        ok &= run_case(gemm, blas, stream, false, 256, 512, 2560, 512, 0, 0.0f, 106);
+        ok &= run_case(gemm, blas, stream, false, 512, 512, 2560, 512, 0, 0.0f, 107);
         HIPBLAS_CHECK(hipblasDestroy(blas));
     }
     HIP_CHECK(hipStreamDestroy(stream));
-    std::printf("smoke test: 4 cases on 2 of the table's %zu rows; %s\n", table.rows().size(),
+    std::printf("smoke test: 7 cases on 2 of the table's %zu rows; %s\n", table.rows().size(),
                 ok ? "outputs match hipBLASEx (solution ids are not verified; see STRATA_HIPBLASLT_VERBOSE)"
                    : "FAILED");
     return ok ? 0 : 1;

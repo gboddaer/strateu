@@ -51,6 +51,11 @@ public:
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);
 
+    /// Whether a validated direct hipBLASLt f16 table entry is available for this shape.
+    /// False without a compatible table or on other backends. Does not launch a product.
+    /// Callers must separately exclude experimental dense-kernel overrides.
+    bool f16_tuned(int64_t T, int64_t N, int64_t K, int64_t ldy = 0);
+
     /// S7 increment C: `batch` independent f16() products of the SAME shape, pointer arrays on the DEVICE
     /// (cublasGemmBatchedEx).  One launch replaces `batch` f16() launches - the resident-expert leg's 11.6k
     /// launches/chunk (0.9 s of launch overhead at pp512) collapse to 3 per layer.  Same layout as f16():

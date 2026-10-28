@@ -2004,11 +2004,22 @@ static int64_t g_pf_total = 0;   // K28: the request's prefix length, so pf_chun
 // divergence first seen here was the P1 residency bug, not the chunking: a chunked causal prefill computes each
 // token's row and per-token softmax identically regardless of how the prompt is cut.  STRATA_KOLIBRI_PF_CHUNK_KEY=0
 // restores the position-keyed rule for an A/B.
-/// P4: the prompt's routed experts through strata::prefill::mmq instead of the CPU pool.  Off by default, inert in a
-/// build without STRATA_PREFILL_MMQ.
+/// P4: prompt experts through MMQ. Default on Linux gfx1201; requires direct shared-expert tuning.
+/// An explicit 0 keeps the pool. Inert in a build without STRATA_PREFILL_MMQ.
 static inline bool pf_mmq_on() {
 #if defined(STRATA_KOLIBRI_MMQ)
-    static const bool v = env_on("STRATA_KOLIBRI_PF_MMQ");
+    static const bool v = [] {
+        if (std::getenv("STRATA_KOLIBRI_PF_MMQ")) return env_on("STRATA_KOLIBRI_PF_MMQ");
+#if defined(__HIPCC__) && !defined(_WIN32)
+        int dev = 0;
+        hipDeviceProp_t prop{};
+        if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&prop, dev) != hipSuccess) return false;
+        const std::string arch(prop.gcnArchName);
+        return arch == "gfx1201" || arch.starts_with("gfx1201:");
+#else
+        return false;
+#endif
+    }();
     return v;
 #else
     return false;
@@ -2438,6 +2449,20 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
     const int H = (int) g.n_head, HKV = (int) g.n_head_kv, D = (int) g.head_dim;
     const int B = 256;
     const int NK = T * K;
+    // The uncalibrated rocBLAS -> hipBLASLt route corrupted shared gate/up outputs in this launch mix.
+    // A compatible direct tuning entry is required; otherwise keep the CPU pool. No timing drains are needed.
+    [[maybe_unused]] const bool mmq_safe = pf_mmq_on() && !pf_pipe_on() &&
+        !env_on("STRATA_DENSE_MMQ") && !env_on("STRATA_PF_GEMM") && !env_on("STRATA_WMMA_GEMM") &&
+        e.gemm.f16_tuned(T, FS, N);
+    if (pf_mmq_on() && !mmq_safe) {
+        static bool warned = false;
+        if (!warned) {
+            std::fprintf(stderr, "strata-kolibri: MMQ falling back to the pool: requires compatible direct "
+                                 "hipBLASLt shared-expert tuning, PF_PIPE=0 and no experimental dense overrides. "
+                                 "See docs/AMD_R9700_PORT.md.\n");
+            warned = true;
+        }
+    }
     cublasHandle_t blas = e.blas;
     const float one = 1.0f, zero = 0.0f;
     const Dense& emb = e.dense.at("token_embd.weight");
@@ -3066,7 +3091,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                 // and a group-sized destination that this caller scatters.  Every guard falls back to the pool.
                 bool mmq_did = false;
 #if defined(STRATA_KOLIBRI_MMQ)
-                if (pf_mmq_on() && e.mmq_ctx != nullptr && !pool_list.empty() &&
+                if (mmq_safe && !b.f16 && e.mmq_ctx != nullptr && !pool_list.empty() &&
                     strata::prefill::mmq::supported(b.L.gu_type) && strata::prefill::mmq::supported(b.L.d_type)) {
                     std::vector<int> ml;
                     int64_t rows = 0;
@@ -3306,13 +3331,6 @@ static const int grp_max = [] {
                                              (double) xh, (double) xx, (int) b.L.gu_type, (int) b.L.d_type,
                                              (long long) b.L.up_off, (long long) b.L.down_off, b.stride);
                             }
-                            // The K-quant product is NOT deterministic in this call pattern (docs/AMD_R9700_PORT.md
-                            // §P4 determinism): identical host inputs, different generated ids, and 1 run in 3 collapsing
-                            // the router to a single expert.  STRATA_KOLIBRI_MMQ_SYNC=1 drains the device after every
-                            // group, which did not collapse in 6 consecutive runs - six is not proof, so this is off by
-                            // default and the arm is measurement-only until the cause is found.
-                            static const bool mmq_async = std::getenv("STRATA_KOLIBRI_MMQ_ASYNC") != nullptr;
-                            if (!mmq_async) KC(cudaDeviceSynchronize());
                             r0 += nr;
                         }
                         if (ok) {
@@ -3320,6 +3338,11 @@ static const int grp_max = [] {
                             KC(cudaStreamSynchronize(g_st));
                             mmq_did = true;
                             s.mmq_gout = true;   // gout_m is final for this layer-chunk: skip the pool's host H2D
+                            static bool announced = false;
+                            if (!announced) {
+                                std::fprintf(stderr, "strata-kolibri: MMQ active (direct shared-expert tuning verified)\n");
+                                announced = true;
+                            }
                             if (std::getenv("STRATA_KOLIBRI_MMQ_DEBUG") != nullptr) {
                                 std::vector<float> g((size_t) NKc * N);
                                 KC(cudaMemcpy(g.data(), A.gout_m, g.size() * 4, cudaMemcpyDeviceToHost));
@@ -3419,6 +3442,9 @@ static const int grp_max = [] {
                     // resident scatter into the same host buffer).  Two identical runs print two sequences; the first
                     // line that differs names the exact chunk where the prefill stops being reproducible.  The dump
                     // instruments cannot do this - --dump-layers disables chunking entirely, so it never runs this code.
+                    // The MMQ arm writes the device selection buffer, not the pool's host output. Hashing the
+                    // untouched host buffer used to record all zeros and could not detect a broken MMQ result.
+                    if (s.mmq_gout) KC(cudaMemcpy(A.ey_h, A.gout_m, (size_t) NKc * N * 4, cudaMemcpyDeviceToHost));
                     double hs = 0.0, hmax = 0.0;
                     for (int64_t q = 0; q < NKc * N; ++q) {
                         const double v = (double) A.ey_h[(size_t) q];
@@ -3779,20 +3805,16 @@ void init_scratch(const Engine& e, Scratch& s) {
                 // An arm that is switched on but cannot run must say so: the guard above falls through to the CPU pool
                 // for every layer, so without this line the operator sees "on" and measures pool speed.
                 std::fprintf(stderr, "strata-kolibri: STRATA_KOLIBRI_PF_MMQ is set, but no expert type in this model has an "
-                                     "MMQ path here - K-quants need STRATA_MMQ_KQ=1 with the strata_kq library beside the "
-                                     "engine. Falling back to the CPU pool.\n");
+                                     "MMQ path here - K-quants need STRATA_MMQ_KQ=1 (static on HIP; CUDA also needs "
+                                     "strata_kq beside the engine). Falling back to the CPU pool.\n");
             }
             if (e.mmq_ctx == nullptr) e.mmq_ctx = std::make_unique<strata::prefill::mmq::Context>();
             std::fprintf(stderr, "strata-kolibri: STRATA_KOLIBRI_PF_MMQ: prompt experts on the int8 tensor units "
                                  "(gate/up %zu B, down %zu B per expert, %lld selections a chunk)\n",
                          gu_max, d_max, (long long) ents);
-            if (gu_max != 0) {
-                // Honesty beats a fast wrong answer: this arm is 2.6x faster at 8K and is NOT deterministic yet.
-                std::fprintf(stderr, "strata-kolibri: STRATA_KOLIBRI_PF_MMQ is MEASUREMENT-ONLY: the K-quant product is "
-                                     "not reproducible here (measured: ids change between runs with identical inputs, "
-                                     "and about one run in three collapses). It is not a default. See "
-                                     "docs/AMD_R9700_PORT.md \xc2\xa7P4 determinism.\n");
-            }
+            if (gu_max != 0)
+                std::fprintf(stderr, "strata-kolibri: MMQ requires direct shared-expert tuning; "
+                                     "FP16-resident expert layers and unsupported configurations retain the pool.\n");
         }
 #endif
         if (pf_pipe_on()) {
@@ -5307,6 +5329,17 @@ int strata::kolibri::run(int argc, char** argv) {
     Engine e;
     std::string err;
     KC(cudaStreamCreate(&g_st));
+#if defined(STRATA_KOLIBRI_MMQ) && defined(__HIPCC__)
+    // Enable only this engine's measured prompt arm, before MMQ caches its K-quant availability.
+    // Honor an explicit STRATA_MMQ_KQ=0. HIP links these instances statically (no strata_kq DSO).
+    if ((prefill > 0 || serve_mode) && pf_mmq_on() && !std::getenv("STRATA_MMQ_KQ")) {
+#if defined(_WIN32)
+        if (_putenv_s("STRATA_MMQ_KQ", "1") != 0) return 2;
+#else
+        if (setenv("STRATA_MMQ_KQ", "1", 0) != 0) return 2;
+#endif
+    }
+#endif
     {   // S6: mirror the decode's coalesced-dot flag to the device (the kernel body is device code)
         const bool v = env_on("STRATA_KOLIBRI_ATTN_COALESCED");
         KC(cudaMemcpyToSymbol(g_attn_coalesced, &v, sizeof(bool)));

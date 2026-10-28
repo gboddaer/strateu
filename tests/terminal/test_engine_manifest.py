@@ -119,6 +119,18 @@ class Manifest(unittest.TestCase):
         bare = package_engine.build(self.src, "cuda", "0.1.47", HERE, plain, archs=("sm_86",), build_id="x")
         self.assertEqual(package_engine.main(["--verify", str(bare), "--require-dsv41"]), 1)
 
+    def test_kolibri_and_its_tuning_travel_beside_the_engine(self):
+        kolibri = "strata-kolibri.exe" if WINDOWS else "strata-kolibri"
+        (self.src / kolibri).write_bytes(b"kolibri-binary")
+        tuning = self.src / "tuning" / "gfx1201-hipblaslt-100202.txt"
+        tuning.parent.mkdir()
+        tuning.write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1201 100202\n")
+        folder = self.package(include=["tuning/**"])
+        names = {f[0] for f in ec.read_manifest(folder).files}
+        self.assertIn(kolibri, names)
+        self.assertIn("tuning/" + tuning.name, names)
+        ec.verify(ec.read_manifest(folder), full=True)
+
     def test_a_gpu_package_without_archs_is_refused_by_the_packager(self):
         with self.assertRaises(SystemExit):
             self.package(archs=())

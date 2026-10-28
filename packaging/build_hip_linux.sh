@@ -13,6 +13,7 @@
 #   VISION_ONLY=1                    build only the two readers (no engine, no package)
 #   DSV41=1|0                        also build strata-dsv41 (the DeepSeek-V4.1 engine, tools/dsv41/build_hip_linux.sh's flags) and ship it beside
 #                                    strata: default 1 for the rx9070 variant (gfx1200 gfx1201; built and run on an R9700), 0 for the others
+#   KOLIBRI=1                        also build/package strata-kolibri with the same MMQ build and tuning tables (opt-in)
 #   NO_PACKAGE=1                     stop after the stage folder
 #   VISION_HIP_DEFS="-DGGML_CUDA_FA=OFF"   extra cmake definitions for the GPU reader only
 #
@@ -29,6 +30,10 @@ OUT=${OUT:-$PWD/work-$V}
 PKGVER=${PKGVER:-0.1.52}
 COMMIT=${COMMIT:-unknown}
 JOBS=${JOBS:-16}
+KOLIBRI=${KOLIBRI:-0}
+case "$KOLIBRI" in 0|1) ;; *) echo 'KOLIBRI must be 0 or 1' >&2; exit 2 ;; esac
+ENGINE_TARGETS=(strata)
+[ "$KOLIBRI" = 1 ] && ENGINE_TARGETS+=(strata-kolibri)
 case "$V" in
   rx9070) ARCHS=${ARCHS:-gfx1200;gfx1201} ;;
   rx7900) ARCHS=${ARCHS:-gfx1100;gfx1101;gfx1102} ;;
@@ -54,6 +59,9 @@ export HIP_PLATFORM=amd HIP_COMPILER=clang HIP_RUNTIME=rocclr ROCM_PATH=$HP HIP_
 SYSDEPS=""; [ -d "$HP/lib/rocm_sysdeps" ] && SYSDEPS=";$HP/lib/rocm_sysdeps"
 HIPDEFS=(-DCMAKE_HIP_COMPILER=$HP/llvm/bin/clang++ -DCMAKE_HIP_COMPILER_ROCM_ROOT=$HP "-DCMAKE_PREFIX_PATH=$HP;$LIBW$SYSDEPS"
          "-DCMAKE_HIP_FLAGS=--rocm-path=$HP --rocm-device-lib-path=$HP/lib/llvm/amdgcn/bitcode")
+if [ "$KOLIBRI" = 1 ]; then
+  HIPDEFS+=(-DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_Q6K_EXPERTS=ON)
+fi
 st "start $V ($ARCHS) commit $COMMIT"
 cd "$SRC" || exit 1
 if [ -z "${VISION_ONLY:-}" ]; then
@@ -61,9 +69,10 @@ if [ -z "${VISION_ONLY:-}" ]; then
     -DSTRATA_PREFILL_MMQ=ON "-DCMAKE_HIP_ARCHITECTURES=$ARCHS" "${HIPDEFS[@]}" -DSTRATA_GGML_DIR="$LLAMA" -DSTRATA_PORTABLE=ON \
     "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath,'\$ORIGIN' -Wl,--enable-new-dtags" > "$OUT/cfg.log" 2>&1
   chk $? "engine configured"
-  nice -n 10 cmake --build "$OUT/b" --target strata -j "$JOBS" > "$OUT/build.log" 2>&1
+  nice -n 10 cmake --build "$OUT/b" --target "${ENGINE_TARGETS[@]}" -j "$JOBS" > "$OUT/build.log" 2>&1
   chk $? "engine built"
   [ -x "$OUT/b/strata" ] || { st "ABORT no strata"; exit 1; }
+  if [ "$KOLIBRI" = 1 ] && [ ! -x "$OUT/b/strata-kolibri" ]; then st "ABORT no strata-kolibri"; exit 1; fi
   if [ "$DSV41" = 1 ]; then      # own build tree: the engine's flags stay as they were; STRATA_NATIVE_EXPERTS=ON is what the DeepSeek path was built with
     rm -f "$OUT/bd/CMakeCache.txt" "$OUT/bd/strata-dsv41"      # (the build id is baked in at configure time: always configure again)
     cmake -G Ninja -S . -B "$OUT/bd" -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_BUILD_TESTS=OFF       -DSTRATA_BUILD_DSV41=ON -DSTRATA_NATIVE_EXPERTS=ON "-DCMAKE_HIP_ARCHITECTURES=$ARCHS" "${HIPDEFS[@]}" -DSTRATA_GGML_DIR="$LLAMA" -DSTRATA_PORTABLE=ON       "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath,'\$ORIGIN' -Wl,--enable-new-dtags" > "$OUT/cfg-dsv41.log" 2>&1
@@ -96,6 +105,7 @@ EOJ
 # the libraries the engine and the GPU reader load (the CPU reader needs only the system's), collected from the build outputs
 DATA=(--data "$LIBW/lib/rocblas/library=rocblas/library" --data "$LIBW/lib/hipblaslt/library=hipblaslt/library" --data-arch "$DATAARCH")
 BINS=("$OUT/b/strata" "$OUT/bh/bin/strata-vision-hip"); [ "$DSV41" = 1 ] && BINS+=("$OUT/bd/strata-dsv41")
+[ "$KOLIBRI" = 1 ] && BINS+=("$OUT/b/strata-kolibri")
 for b in "${BINS[@]}"; do
   python3 packaging/collect_libs.py --binary "$b" --search "$LIBW/lib" --search "$HP/lib" --search "$CORE/lib" --search "$CORE/lib/llvm/lib" ${SYSDEPS:+--search "$HP/lib/rocm_sysdeps/lib"} \
     --also 'libamd_comgr.so*' --also 'libhiprtc*.so*' --out "$STAGE" \
@@ -105,8 +115,9 @@ for b in "${BINS[@]}"; do
 done
 cp "$OUT/b/strata" "$OUT/bv/bin/strata-vision" "$OUT/bh/bin/strata-vision-hip" "$STAGE/"
 [ "$DSV41" = 1 ] && cp "$OUT/bd/strata-dsv41" "$STAGE/"
+[ "$KOLIBRI" = 1 ] && cp "$OUT/b/strata-kolibri" "$STAGE/"
 for f in "$STAGE"/*.so "$STAGE"/*.so.*; do [ -f "$f" ] && [ ! -L "$f" ] && patchelf --set-rpath '$ORIGIN' "$f"; done
-for f in "$STAGE/strata" "$STAGE/strata-vision" "$STAGE/strata-vision-hip" $([ "$DSV41" = 1 ] && echo "$STAGE/strata-dsv41"); do
+for f in "$STAGE/strata" "$STAGE/strata-vision" "$STAGE/strata-vision-hip" $([ "$DSV41" = 1 ] && echo "$STAGE/strata-dsv41") $([ "$KOLIBRI" = 1 ] && echo "$STAGE/strata-kolibri"); do
   st "RUNPATH $(basename "$f"): $(readelf -d "$f" | grep -E 'RPATH|RUNPATH' | cut -d'[' -f2 | tr -d ']' | paste -sd' ')"
 done
 # the hipBLASLt version of this ROCm into BUILD.json, and the tuning tables of tools/hip that match it (architecture and version) into tuning/

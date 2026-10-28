@@ -24,6 +24,8 @@ M=${KOLIBRI_MODEL:-/data4/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf}
 # execs an older build - the trap that once had three gates passing against a binary with no PF_PARTIAL in it.
 # Pass KOLIBRI_BIN=<numa wrapper> when the run needs node pinning.
 BIN=${KOLIBRI_BIN:-$PWD/build/strata-kolibri}
+BUILD=${KOLIBRI_BUILD:-build}
+THREADS=24
 SMOKE=/tmp/pf_gate_smoke.txt
 HASH=/tmp/pf_gate_hash.txt
 EXP_SMOKE=${KOLIBRI_GATE_SMOKE:-/tmp/pf_gate_expect_smoke.txt}
@@ -32,27 +34,53 @@ MODE=${1:-check}
 MODE=${MODE#--}      # accept `--record` and `record` alike
 
 # the shipped prefill config, with ATTN_FLASH=1 because PF_HASH needs a deterministic prefill
-export STRATA_KOLIBRI_PF_STAGE=1 STRATA_KOLIBRI_EXPERT_F16=24 STRATA_KOLIBRI_ROUTER_TILE=1 STRATA_KOLIBRI_ROUTER_TK=3
-export STRATA_KOLIBRI_ROUTER_TJ=16 STRATA_KOLIBRI_ATTN_MB=256 STRATA_KOLIBRI_RES_TOP=48 STRATA_KOLIBRI_ATTN_FLASH=1
+if [ "${KOLIBRI_GATE_PROFILE:-pool}" = mmq-gfx1201 ]; then
+    # A separate numerical arm, never recorded over the pool's expectations.
+    EXP_SMOKE=${KOLIBRI_GATE_SMOKE:-$PWD/tools/kolibri/pf_gate_expect_smoke_mmq_gfx1201.txt}
+    EXP_HASH=${KOLIBRI_GATE_HASH:-$PWD/tools/kolibri/pf_gate_expect_hash_mmq_gfx1201.txt}
+    THREADS=8
+    export STRATA_KOLIBRI_PF_STAGE=0 STRATA_KOLIBRI_EXPERT_F16=0 STRATA_KOLIBRI_ROUTER_TILE=0
+    export STRATA_KOLIBRI_ATTN_MB=512 STRATA_KOLIBRI_RES_TOP=56 STRATA_KOLIBRI_ATTN_FLASH=0
+    export STRATA_KOLIBRI_PF_MMQ=1 STRATA_MMQ_KQ=1
+else
+    export STRATA_KOLIBRI_PF_MMQ=${STRATA_KOLIBRI_PF_MMQ:-0}
+    export STRATA_KOLIBRI_PF_STAGE=1 STRATA_KOLIBRI_EXPERT_F16=24 STRATA_KOLIBRI_ROUTER_TILE=1 STRATA_KOLIBRI_ROUTER_TK=3
+    export STRATA_KOLIBRI_ROUTER_TJ=16 STRATA_KOLIBRI_ATTN_MB=256 STRATA_KOLIBRI_RES_TOP=48 STRATA_KOLIBRI_ATTN_FLASH=1
+fi
 export GGML_CUDA_DISABLE_GRAPHS=1
 
 run_smoke() {   # 64-token prompt, 4 ids: the cheapest test that sees the schedule
     [ -s /tmp/ids64.txt ] || { echo "FATAL: /tmp/ids64.txt missing (64 prompt ids)"; return 2; }
-    "$BIN" --model "$M" --tokens-file /tmp/ids64.txt --n 4 --ctx 8192 --prefill --cpu-threads 24 2>/dev/null \
-        | grep '^gen:' > "$SMOKE"
+    if ! "$BIN" --model "$M" --tokens-file /tmp/ids64.txt --n 4 --ctx 8192 --prefill --cpu-threads "$THREADS" 2>/tmp/pf_gate_smoke.err \
+        | grep '^gen:' > "$SMOKE"; then
+        echo 'FATAL: smoke engine failed'; return 2
+    fi
     [ -s "$SMOKE" ] || { echo "FATAL: no gen: line (the prefill did not run)"; return 2; }
+    if [ "${KOLIBRI_GATE_PROFILE:-pool}" = mmq-gfx1201 ]; then
+        grep -q 'MMQ active (direct shared-expert tuning verified)' /tmp/pf_gate_smoke.err || {
+            echo 'FATAL: MMQ profile silently fell back; no compatible shared-expert tuning?'; return 2;
+        }
+    fi
 }
 run_hash() {    # 512-token prompt: the per-chunk-layer expert-output checksums
     [ -s tools/kolibri/oracle_ids512.txt ] || { echo "FATAL: oracle_ids512.txt missing"; return 2; }
-    env STRATA_KOLIBRI_PF_HASH=1 "$BIN" --model "$M" --tokens-file tools/kolibri/oracle_ids512.txt --n 4 \
-        --ctx 8192 --prefill --cpu-threads 24 2>&1 | grep -a PFHASH > "$HASH"
+    if ! env STRATA_KOLIBRI_PF_HASH=1 "$BIN" --model "$M" --tokens-file tools/kolibri/oracle_ids512.txt --n 4 \
+        --ctx 8192 --prefill --cpu-threads "$THREADS" >/tmp/pf_gate_hash.run 2>&1; then
+        echo 'FATAL: hash engine failed'; return 2
+    fi
+    grep -a PFHASH /tmp/pf_gate_hash.run > "$HASH"
     [ -s "$HASH" ] || { echo "FATAL: no PFHASH lines (the prefill did not run)"; return 2; }
+    if [ "${KOLIBRI_GATE_PROFILE:-pool}" = mmq-gfx1201 ]; then
+        grep -q 'MMQ active (direct shared-expert tuning verified)' /tmp/pf_gate_hash.run || {
+            echo 'FATAL: hash profile fell back instead of using MMQ'; return 2;
+        }
+    fi
 }
 
 # **BUILD FIRST, AND ABORT IF IT FAILS.**  A gate that does not build silently tests the PREVIOUS binary: this script
 # reported GATE PASS while the tree did not compile, which is the same class of trap as the --cpu-threads one.
 : "${KOLIBRI_CM:?set KOLIBRI_CM to the cmake binary}"
-if ! "$KOLIBRI_CM" --build build -j 24 --target strata-kolibri >/tmp/pf_gate_build.txt 2>&1; then
+if ! "$KOLIBRI_CM" --build "$BUILD" -j 8 --target strata-kolibri >/tmp/pf_gate_build.txt 2>&1; then
     echo "  0. build       FAIL"; grep -E "error" /tmp/pf_gate_build.txt | head -5 | sed 's/^/     /'
     echo "GATE FAIL"; exit 2
 fi

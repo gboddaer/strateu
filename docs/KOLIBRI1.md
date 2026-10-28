@@ -128,28 +128,29 @@ short of work per launch.
   of picks from VRAM, which cuts the streamed leg from 714 to 291 MB/token - and still decodes at **14.21 tok/s**
   against 15.90. The reason is three launches per expert pick (gate, up, down): 875 launches and 15.6 ms of GPU time
   per token, plus 4.7 GB of PCIe traffic to fill the cache after the prompt (+14 % on the prompt).
-- **Two knobs that sound useful and are not, here.** The hipBLASLt tuning table ships for this card and is **inert**:
-  it loads, but the engine never asks it - the only GEMMs that consult it are the single-projection forms Kolibri
-  does not call. The grid-capped GEMV (`STRATA_KOLIBRI_GEMV_GS`) is +10 % at a 128 000-row shape and -29 % at the
+- **Two knobs that do not speed up decode here.** The hipBLASLt tuning table does not affect decode's GEMVs.
+  It is now required for P4's prompt shared-expert GEMMs, as described below. The grid-capped GEMV (`STRATA_KOLIBRI_GEMV_GS`) is +10 % at a 128 000-row shape and -29 % at the
   2 560-row shapes this model runs, and never fires at all.
-- **The prompt's experts now run on the int8 tensor units (measured 2026-10-28).** Behind
-  `STRATA_KOLIBRI_PF_MMQ=1` in a `-DSTRATA_PREFILL_MMQ=ON` build, the engine hands a chunk's experts to
-  `strata::prefill::mmq` in groups of 16, exactly as the Qwen path does. On this card, `--cpu-threads 8`, chunk 512:
+- **P4 is the prompt default on Linux R9700/gfx1201 in an MMQ build.** It uses groups of 16 experts and requires
+  compatible direct hipBLASLt shared-expert tuning. Without it, the engine says why and keeps the pool. Other cards
+  keep their previous default. `STRATA_KOLIBRI_PF_MMQ=0` switches it off. HIP links the K-quant kernels statically;
+  it does not need a separate `strata_kq` library.
 
-  | prompt | CPU pool (shipped) | int8 tensor units | ids |
-  |---|---|---|---|
-  | 511 tokens | 4 710 ms, 108.6 tok/s | **3 155 / 2 982 ms, 165 tok/s** | equal to the plain-path oracle |
-  | 8 191 tokens | 66 449 ms, 123.3 tok/s | **26 100 ms, 313.8 tok/s** | identical to the pool |
+  On the Ryzen 5700G / R9700, the staged package measured **168–169 tok/s** for a warm 511-token prompt and
+  **314–315 tok/s** for 8 191 tokens. The same packaged binary with P4 off read 8 191 tokens at **102.4 tok/s**:
+  79.97 s versus 26.02–26.08 s, about **3.07x**. Short-prompt pool times varied with box state; all runs, including
+  the slower first packaged start, are in [the P4 shipping ledger](AMD_R9700_PORT.md#p4-shipping-validation).
+  Settings: `--cpu-threads 8`, `EXPERT_F16=0`, ctx 8192/12288, chunks 256/512 respectively.
 
-  That is **2.55x** at 8K. The arm is **measurement-only, not a default**: the K-quant product is not reproducible
-  here - with identical inputs the ids change between runs and about one run in three used to collapse the router to a
-  single expert. Draining the device after every expert group removed the collapse in 12 consecutive runs (and costs
-  1.4 % at 8K), but the cause is still unknown, so it stays opt-in
-  ([AMD_R9700_PORT.md](AMD_R9700_PORT.md) §P4 determinism). The projection in the previous revision (795 tok/s) was too optimistic: it assumed the
-  expert leg would vanish, and the measured 25.7 s says the remaining wall is now something else - the new wall has
-  not been decomposed yet, so nothing is claimed about it. The arm is opt-in and off by default; `build/` does not
-  compile it. The one-line cause of the first attempt's wrong numbers is in
-  [AMD_R9700_PORT.md](AMD_R9700_PORT.md) §P4 (a per-expert stride that was not a whole number of weight blocks).
+  P4 does not change the generation code. The paired 128-token wall measurements were **15.2–15.6 tok/s** after
+  the short prompt and **11.6–11.7 tok/s** after 8K. Full-logit repeat checks passed at both lengths, without a
+  per-group device drain. Against the existing eight-prompt llama.cpp references, mean KL was **0.00236**, top-1
+  agreement **99%**, and KL was **0.89x** the CPU noise floor (200 teacher-forced steps).
+
+  The earlier nondeterminism claim blamed the K-quant product too soon. The first differing buffer was the shared
+  expert's dense gate output. Requiring its validated direct tuning route removes the failing configuration. The
+  vendor backend's internal fault is not established. FP16-resident expert layers and the two-chunk pipeline retain
+  the pool. The previous 795 tok/s projection remains retracted; there is no new extrapolation beyond 8K.
 - **One real defect fixed on the way**: an exactly-8 192-token request used to take the *short*-chunk branch and run
   32 chunks of 256 where 16 of 512 were intended; it now runs the long chunk (+2.7 %, ids bitwise).
 - **Attention is the second lever**, not the first: 4 % of the wall at short context, the wall itself at 100K.

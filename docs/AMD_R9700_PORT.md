@@ -2125,7 +2125,10 @@ numerics-changing arm needs one before it could ever become a default), valgrind
 and the new 25.7 s wall has not been decomposed - so what the next lever is (attention, the activation quantize, the
 staging copies) is unknown until that is measured.
 
-### P4 determinism (2026-10-28): the K-quant product is not reproducible here, and that is why it is not a default
+### P4 determinism (2026-10-28, historical diagnosis; superseded)
+
+**The attribution below was premature.** See [P4 shipping validation](#p4-shipping-validation) for the corrected
+localization, the validated dense tuning requirement and the qualified Linux gfx1201 default.
 
 The int8 path is fast - 2.55x at 8K - and it was **not stable**, which three of my earlier "two identical runs"
 statements hid. Measured, same binary, same prompt, only the environment different:
@@ -2153,4 +2156,19 @@ oracle at 511** - the pool itself is the path that differs from the oracle at 51
 
 Verdict: **not a default.** The workaround holds 12/12, and twelve is not proof; the failure mode is a silent total
 collapse, which is exactly the "unexplained failure" the plan says to stop on. The arm stays opt-in, prints a
-MEASUREMENT-ONLY warning when enabled, and `build/` does not compile it at all.
+MEASUREMENT-ONLY warning when enabled, and `build/` does not compile it at all. This was the verdict at that point,
+not the current default.
+
+### P4 shipping validation
+
+P4 is now the default on **Linux gfx1201** when the binary includes MMQ and the shared-expert GEMM has a compatible
+direct hipBLASLt tuning entry. It keeps the pool for unsupported configurations. The old per-group device drain is
+removed. `STRATA_KOLIBRI_PF_MMQ=0` is the off switch.
+
+The failing configuration was localized to the shared expert's dense gate output: the routed-expert output, normed
+input, router weights and residual still matched when that gate first differed. Requiring the validated direct tuning
+route removed the failing configuration. This is not proof of the vendor backend's internal defect. Neither the
+original claim that the K-quant product was at fault nor a device drain is used as the shipping argument.
+
+The full measurement ledger, test results, package recipe and limits are in
+[KOLIBRI_P4_SHIPPING.md](KOLIBRI_P4_SHIPPING.md).

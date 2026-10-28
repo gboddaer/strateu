@@ -7893,13 +7893,28 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
 
     step(4, "the Strata engine")
     if fam.get("binary"):
-        # a source-build family (Kolibri 1: its own engine binary, no ready-made engine carries it yet): compile
-        # the family's target in build/ with the cache this checkout already has (a fresh one configures with
-        # nvcc on PATH and this card's architecture)
+        # A source-build family (Kolibri 1): compile its own target. CUDA keeps build/; HIP uses a separate
+        # build-kolibri-hip/ so an existing CUDA cache cannot select the wrong backend.
         llama = get_llama_cpp()
         cmake, ninja = find_tool("cmake"), find_tool("ninja")
-        bdir = ROOT / "build"
-        if not (bdir / "CMakeCache.txt").exists():
+        bdir = ROOT / ("build-kolibri-hip" if hip else "build")
+        lib_dirs = []
+        if hip:
+            # Keep a cached CUDA build separate. Reconfigure the own-path HIP target so an older cache cannot
+            # silently omit MMQ, and use the same ROCm discovery/flags as the main HIP source build.
+            root, lib_dirs = rocm_root(gpu.get("archs") or [gpu["arch"]])
+            bitcode = next((p for p in (root / "lib" / "llvm" / "amdgcn" / "bitcode", root / "amdgcn" / "bitcode")
+                            if p.is_dir()), root / "amdgcn" / "bitcode")
+            conf = [cmake, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}", "-S", str(ROOT), "-B", str(bdir),
+                    "-DCMAKE_BUILD_TYPE=Release", "-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF",
+                    "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_PREFILL_MMQ=ON", "-DSTRATA_Q6K_EXPERTS=ON",
+                    "-DSTRATA_MMQ_KQUANTS=ON", "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(gpu.get("archs") or [gpu["arch"]]),
+                    f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
+                    "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *(str(Path(d).parent) for d in lib_dirs)]),
+                    f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}", f"-DSTRATA_GGML_DIR={llama}"]
+            run(conf, env=dict(os.environ, HIP_PLATFORM="amd", HIP_COMPILER="clang", HIP_RUNTIME="rocclr",
+                               ROCM_PATH=str(root), HIP_PATH=str(root)))
+        elif not (bdir / "CMakeCache.txt").exists():
             conf = [cmake, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}", "-S", str(ROOT), "-B", str(bdir),
                     "-DCMAKE_BUILD_TYPE=Release", "-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF",
                     f"-DCMAKE_CUDA_ARCHITECTURES={gpu.get('arch', 75)}", f"-DSTRATA_GGML_DIR={llama}"]
@@ -7909,7 +7924,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
             run(conf)
         say(f"  Compiling {fam['binary']} (once, a few minutes on a first install) ...")
         run([cmake, "--build", str(bdir), "--target", fam["binary"], "-j", str(max(2, (os.cpu_count() or 4) // 2))])
-        eng, lib_dirs, meta = bdir, [], {}
+        eng, meta = bdir, {}
         ok(f"engine: {bdir / fam['binary']}")
     else:
         llama, eng, meta, lib_dirs, gpu, vision = engine_step(a, gpu, hip, amd, cuda_tk, vision)
@@ -7979,6 +7994,10 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         cfg["cuda"] = 12
     if hip:
         cfg["backend"] = "hip"
+        if family == "kolibri":
+            table = hipblaslt_table(gpu["arch"], lib_dirs, extra_dirs=[eng / "tuning"])
+            if table:
+                cfg["env"] = {"STRATA_HIPBLASLT_TUNING": str(table)}
     if gpu.get("count", 1) > 1 or a.gpu is not None:
         cfg["gpu"] = gpu["index"]
         cfg["gpus_asked"] = True
