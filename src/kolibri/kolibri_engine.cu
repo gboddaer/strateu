@@ -554,10 +554,8 @@ __device__ bool g_attn_pv4 = false;   // S8b: the PV 4-chain variant (host mirro
 /// Q4_K dequant (the decode's pre-expert chain measured 0.9 ms/layer = 66%% of the decode's wall, at 36 GB/s
 /// effective = 6%% of the T4's bandwidth - the dequant, not the bandwidth).  The x vector is converted to fp16
 /// once per call site; the dot accumulates in fp32.
-__global__ void k_gemv_f16(const __half* __restrict__ W, const __half* __restrict__ x, int n_in, float* y, int n_out) {
-    __shared__ float sh[kThreads];
-    const int o = blockIdx.x;
-    const __half* row = W + (size_t) o * (size_t) n_in;
+/// The row body both F16 grids share (one function, two grids: the per-row arithmetic cannot drift between them).
+__device__ __forceinline__ float row_dot_f16(const __half* row, const __half* x, int n_in, float* sh) {
     float acc = 0.f;
     for (int c = threadIdx.x * 8; c < n_in; c += blockDim.x * 8) {
         const uint4 wv = *reinterpret_cast<const uint4*>(row + c);
@@ -567,8 +565,59 @@ __global__ void k_gemv_f16(const __half* __restrict__ W, const __half* __restric
 #pragma unroll
         for (int l = 0; l < 8; ++l) acc = fmaf(__half2float(wh[l]), __half2float(xh[l]), acc);
     }
-    acc = block_sum(acc, sh);
-    if (threadIdx.x == 0) y[o] = acc;
+    return block_sum(acc, sh);
+}
+__global__ void k_gemv_f16(const __half* __restrict__ W, const __half* __restrict__ x, int n_in, float* y, int n_out) {
+    __shared__ float sh[kThreads];
+    const int o = blockIdx.x;
+    y[o] = row_dot_f16(W + (size_t) o * (size_t) n_in, x, n_in, sh);
+}
+
+// T3 (plan 2026-10-28-kolibri-r9700-speed.md): the same row under a capped grid.  A GEMV with a large row count
+// pays for one block per row - 128 000 single-row blocks at the LM head's shape - and above kGemvGsMinOut rows a
+// grid-stride form over the SAME rows is faster: measured on the R9700 at n_out = 128 000, 1.902 ms against
+// 2.120 ms, +10.3 % (tools/kolibri/grid_shape_bench.cu, docs/AMD_R9700_PORT.md §T2).  Below that it is SLOWER -
+// n_out = 2 560 measured 33.6 us against 26.1 us, -29 %, because 256 blocks leave this card's 32 CUs under-fed on a
+// 3.7 MB weight.  So the cap is gated on the row count, never applied blanket: shipped shapes (2 560) take the
+// block-per-row form whatever the knob says, and the shipped output is byte-identical by construction.  The row
+// body is shared with the block-per-row kernel (one function, two grids), so the arithmetic order per row cannot
+// drift between them.
+constexpr int kGemvGsMinOut = 16384;   // the measured crossover band, not a guess: 2 560 loses, 128 000 wins
+constexpr int kGemvGsBlocks = 1024;
+static inline bool gemv_gs_on() {
+    static const bool v = env_on("STRATA_KOLIBRI_GEMV_GS");
+    return v;
+}
+static void gemv_gs_note(int n_out) {
+    static bool noted = false;
+    if (noted) return;
+    noted = true;
+    std::fprintf(stderr, "strata-kolibri: STRATA_KOLIBRI_GEMV_GS: grid-stride GEMV, %d row(s) over %d blocks\n", n_out,
+                 kGemvGsBlocks);
+}
+
+__global__ void k_gemv_f16_gs(const __half* __restrict__ W, const __half* __restrict__ x, int n_in, float* y,
+                              int n_out) {
+    __shared__ float sh[kThreads];
+    for (int o = blockIdx.x; o < n_out; o += gridDim.x) y[o] = row_dot_f16(W + (size_t) o * (size_t) n_in, x, n_in, sh);
+}
+
+/// The quantised-row body both `k_gemv` grids share, for the same reason.
+template <int T>
+__device__ __forceinline__ float row_dot_q(const uint8_t* row, const float* xs, int n_in) {
+    float acc = 0.f, v[32];
+    for (int c = threadIdx.x; c < n_in / 32; c += blockDim.x) {
+        deq32<T>(row, c, v);
+        const float* xc = xs + 32 * c;
+        for (int l = 0; l < 32; ++l) acc += v[l] * xc[l];
+    }
+    return acc;
+}
+template <int T>
+__global__ void k_gemv_gs(const uint8_t* W, size_t row_bytes, int n_in, const float* x, float* y, int n_out) {
+    __shared__ float sh[kThreads];
+    for (int o = blockIdx.x; o < n_out; o += gridDim.x)
+        y[o] = block_sum(row_dot_q<T>(W + (size_t) o * row_bytes, x, n_in), sh);
 }
 
 template <int T>
@@ -579,13 +628,7 @@ __global__ void k_gemv(const uint8_t* W, size_t row_bytes, size_t expert_bytes, 
     const int e = ids ? ids[sel] : 0;
     const uint8_t* row = W + (size_t) e * expert_bytes + (size_t) o * row_bytes;
     const float* xs = x + (size_t) sel * x_stride;
-    float acc = 0.f, v[32];
-    for (int c = threadIdx.x; c < n_in / 32; c += blockDim.x) {
-        deq32<T>(row, c, v);
-        const float* xc = xs + 32 * c;
-        for (int l = 0; l < 32; ++l) acc += v[l] * xc[l];
-    }
-    acc = block_sum(acc, sh);
+    const float acc = block_sum(row_dot_q<T>(row, xs, n_in), sh);
     if (threadIdx.x == 0) y[(size_t) sel * n_out + o] = acc;
 }
 // S8b/B1: the DECODE's F32 dense gemv - the router, 3.75 MiB/layer read on every token - runs at 57 GB/s (69 us a call,
@@ -1651,7 +1694,12 @@ constexpr size_t kActBuf = 1 << 16;
 /// (the decode) and the weight must have its f16 copy.
 void gemv_f16(const Dense& w, const __half* x, float* y, cudaStream_t st = 0) {
     const int n_in = (int) w.shape[0], n_out = (int) w.shape[1];
-    k_gemv_f16<<<dim3(n_out), kThreads, 0, st>>>((const __half*) w.f16, x, n_in, y, n_out);
+    if (gemv_gs_on() && n_out >= kGemvGsMinOut) {
+        gemv_gs_note(n_out);
+        k_gemv_f16_gs<<<kGemvGsBlocks, kThreads, 0, st>>>((const __half*) w.f16, x, n_in, y, n_out);
+    } else {
+        k_gemv_f16<<<dim3(n_out), kThreads, 0, st>>>((const __half*) w.f16, x, n_in, y, n_out);
+    }
     KC(cudaGetLastError());
 }
 
@@ -1687,6 +1735,20 @@ void gemv(const Dense& w, const float* x, float* y, const int* ids, int n_sel, s
         return;
     }
     const size_t row_bytes = w.row_bytes;
+    // T3: the capped grid, only where it was measured faster (kGemvGsMinOut) and only for the single-selection form
+    // this task covers - the expert-id and multi-selection forms keep the block-per-row path untouched.
+    if (gemv_gs_on() && n_sel == 1 && ids == nullptr && x_stride == 0 && n_out >= kGemvGsMinOut &&
+        (w.type == T_F32 || w.type == T_F16 || w.type == T_BF16)) {
+        gemv_gs_note(n_out);
+        switch (w.type) {
+        case T_F32: k_gemv_gs<T_F32><<<kGemvGsBlocks, kThreads, 0, st>>>(W, row_bytes, n_in, x, y, n_out); break;
+        case T_F16: k_gemv_gs<T_F16><<<kGemvGsBlocks, kThreads, 0, st>>>(W, row_bytes, n_in, x, y, n_out); break;
+        case T_BF16: k_gemv_gs<T_BF16><<<kGemvGsBlocks, kThreads, 0, st>>>(W, row_bytes, n_in, x, y, n_out); break;
+        default: break;
+        }
+        KC(cudaGetLastError());
+        return;
+    }
     if (dec_gemv_v4_on() && w.type == T_F32 && n_sel == 1 && ids == nullptr && x_stride == 0) {
         k_gemv_f32_v4<<<n_out, kThreads, 0, st>>>((const float*) W, x, n_in, y, n_out);
         KC(cudaGetLastError());

@@ -1094,3 +1094,33 @@ proposal's data path: 128000 x 2560 of F16 at 2.12 ms, against the shipped Q6_K 
 projection measured at **0.52 ms** (Task 1). The fp16 form doubles the bytes read and the card is bandwidth-bound at
 309-345 GB/s on that shape. Combined with Task 1's finding that the LM head is 0.8 % of decode, Task 5's speed premise
 is dead on this box; it can only be argued as a numerics experiment, and the shipped Q6_K path already wins on speed.
+
+## T3 (2026-10-28): the grid-capped GEMV lands, and finds nothing to cap on this model
+
+`STRATA_KOLIBRI_GEMV_GS=1` (default off) routes a GEMV through a 1024-block grid-stride form when its row count is at
+least `kGemvGsMinOut = 16384`, and leaves every other shape on the block-per-row path. The threshold is the measured
+crossover from §T2, not a guess: at `n_out = 128000` the capped grid is 10.3 % faster, at `n_out = 2560` it is 29 %
+slower. The two grids share their row body (`row_dot_f16`, `row_dot_q<T>`), so the per-row arithmetic cannot drift
+between them; that is what makes the pair bitwise rather than merely equivalent.
+
+Gates, R9700 (gfx1201), box idle, with `KOLIBRI_CM`/`KOLIBRI_GATE_HASH`/`KOLIBRI_GATE_SMOKE` pointing at the in-repo
+gfx1201 expectation files:
+
+| gate | knob off (shipped) | knob on |
+|---|---|---|
+| `oracle.sh check` | BITWISE PASS | BITWISE PASS |
+| `pf_gate.sh` | (not re-run; shipped path is the pre-change code) | **GATE PASS**, all 6 stages |
+| two-run ids | identical (same oracle) | identical |
+| `ctest` | 85/89 (same 4 box-scoped) | not run (no behaviour change to gate) |
+| decode, ctx 131072, standing arm | 15.90 / 15.87 tok/s (§T1) | **15.78 / 15.98 tok/s** |
+
+The decode delta is **zero within noise** (±0.6 % across two runs either way), and the reason is structural, not
+statistical: **the capped arm never fires on this model.** The startup note it prints when it launches
+(`STRATA_KOLIBRI_GEMV_GS: grid-stride GEMV, N row(s) over 1024 blocks`) does not appear in any run. Two facts explain
+that: a quantized weight never reaches `k_gemv` at all - `gemv` sends Q4_K/Q6_K/Q8_0 to `native_mmvq` first - and the
+F32/F16/BF16 dense shapes on Kolibri-1 are 2560 rows, far below the threshold. The one 128000-row GEMV in the model is
+the LM head, and its weight is Q6_K, so it takes the native path (measured at 0.52 ms/token in §T1).
+
+So Task 3 is landed as an engine capability and collects **nothing** on this box: the +10.3 % it was built for is
+behind a shape this GGUF does not route through this kernel. It stays opt-in, and Task 14 must not adopt it as a
+default - there is no measurement on this card that would justify one.
