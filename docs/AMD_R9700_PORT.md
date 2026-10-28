@@ -2101,3 +2101,26 @@ Measured, card0, `--cpu-threads 8`, `EXPERT_F16 0`, `ATTN_MB 512`, `RES_TOP 56`,
 than gn=16; gn=4 differs in its last two tokens (a near-tie, as the chunk-size finding above predicts - compare logits,
 not ids, when changing the group size). The arm stays opt-in behind `STRATA_KOLIBRI_PF_MMQ` and exists only in
 `build-mmq`; `build/` does not compile the block at all.
+
+### P4 verification (2026-10-28): two runs, both gates, and the same ctest count
+
+- **511 tokens, MMQ, group 16, two runs**: 3,072 ms and 2,966 ms; ids bitwise identical to each other, and equal to
+  the plain-path **oracle** (`gen: 286 3515 310 262 14292 1343 1444 46 17156 32 51 48 58 4037 262 1890`). The pool path
+  is the one that differs from the oracle here, in its last three tokens.
+- **8 191 tokens, MMQ, two runs**: 25,734 ms and 25,738 ms (0.02 % spread), ids **bitwise identical to each other and
+  to the pool's** `gen: 286 3515 310 262 14292 1343 1444 275 127907 263 127908 263 50 54 127906 10`. The pool takes
+  66,449 ms for the same prompt, so 2.58x.
+- **`tools/kolibri/oracle.sh check`**: BITWISE PASS.
+- **`tools/kolibri/pf_gate.sh`** with `KOLIBRI_GATE_SMOKE`/`KOLIBRI_GATE_HASH` exported at the in-repo
+  `tools/kolibri/pf_gate_expect_{smoke,hash}_gfx1201.txt`: **GATE PASS**, all seven stages (0, 0b, 0c, 0d, 1, 2, 3, 4).
+  (The first run of that gate in this session passed against stale `/tmp` expectation files; re-run against the
+  in-repo ones for the real result.)
+- **ctest**: 85/89, the same four box-scoped failures as the gate count (`vmm_test`, `ple_parity`,
+  `platform_memory_test`, `conversation_copy_streams_test`).
+- Nothing moved in the shipped path: the arm is behind `STRATA_KOLIBRI_PF_MMQ`, `build/` does not compile the block,
+  and every launcher default is unchanged.
+
+Still open, and not claimed as done: the arm has no recorded pf_gate expectation file **of its own** (a
+numerics-changing arm needs one before it could ever become a default), valgrind was not run on this host-side edit,
+and the new 25.7 s wall has not been decomposed - so what the next lever is (attention, the activation quantize, the
+staging copies) is unknown until that is measured.
