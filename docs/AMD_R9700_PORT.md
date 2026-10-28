@@ -1687,3 +1687,38 @@ from one buffer, while MMQ needs the group's experts gathered (Kolibri's blob la
 array in expert order (`quantize_scatter` exists for that). Both are existing entry points; neither has been called
 from this engine yet. Numerics change (int8 tensor cores, q8_1 activations), so the arm needs its own `pf_gate`
 expectation file and a KL figure before anything is wired into a default.
+
+### P4 wiring, first attempt (2026-10-28): compiles, runs, **hangs** - reverted
+
+Implemented behind `STRATA_KOLIBRI_PF_MMQ` (default off, compiled only when the build carries `STRATA_KOLIBRI_MMQ`,
+which the MMQ CMake branch now sets on `strata_kolibri`): the chunk's touched experts filtered and bounded, the chunk's
+activations quantized in expert order (`mmq::quantize` with a row->token table), groups of 16 experts gathered with
+`gather_native_group`, gate+up as one `[2*FF x N]` product, a packed SwiGLU kernel, the hidden quantized, and the down
+product writing each row straight into its selection slot through the product's `ids` table (`A.ey_h + sel*N`) - so no
+scatter kernel. The pool stays the fallback for every guard (unsupported type, gather refusal, more selections than
+the scratch holds), and its counters no longer fire for an MMQ arm.
+
+Result: **it builds in `build-mmq` and then hangs.** The pool arm in the same session did its 511-token prefill in
+4.785 s and printed `gen: 286 3515 310 262 14292 ...`; the MMQ arm produced no `PFchunk` line inside 300 s and was
+killed.
+
+**Reverted, and the tree re-verified**: `git checkout -- src/kolibri/kolibri_engine.cu`, rebuilt, `oracle.sh check`
+BITWISE PASS. The only thing kept from this attempt is the CMake plumbing (link `strata_mmq` + define
+`STRATA_KOLIBRI_MMQ` inside the MMQ branch) and the bench, both inert in a build without `STRATA_PREFILL_MMQ`. A knob
+that hangs is not something to leave in a tree, even off by default.
+
+The debug list for the next session, in the order that would find it fastest (all on a 64-token prompt with
+`HIP_LAUNCH_BLOCKING=1`, which turns an asynchronous hang into a named failure):
+
+1. `Product.total_rows` / `max_rows` semantics for a *group*: the header says `total_rows` is the rows of `xq` and
+   `max_rows` the most rows one expert has, but a group's `bounds` index into the whole array while the launch grid is
+   built from `max_rows` - if the tile scheduler iterates `bounds[0]..bounds[n]` against a group-relative assumption,
+   it can walk off the end.
+2. whether `mmq::Context` needs a workspace the caller sizes (the header says it keeps a scratch pool; nothing in it
+   says how big, and the engine gives it none).
+3. whether `gather_native_group`'s `zero_bytes` is mandatory for Q4_K (the MMQ tail after the last expert's slots).
+4. the *down* product's activation type: `quantize(..., b.L.d_type, ...)` matches the weight type, but the q8_1 layout
+   the product expects is the one built by the header's own swiglu+quantize helper, not necessarily `quantize` alone.
+
+None of that touches the measured kernel: **11.55 TFLOPS at 10 rows per expert, 36x the pool** (step 0b above), so the
+lever is real and only the orchestration is unfinished.

@@ -2441,6 +2441,12 @@ if(STRATA_NATIVE_EXPERTS)
     set_source_files_properties(src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu src/prefill/moe_f16_kq.cu
                                 PROPERTIES INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
     add_library(strata_mmq STATIC ${_strata_mmq_sources})
+    # P4 (plan 2026-10-28-kolibri-prefill-gap.md): the Kolibri engine may call this library.  The define is what
+    # compiles that call in at all - a build without STRATA_PREFILL_MMQ keeps the arm inert rather than unlinkable.
+    if(TARGET strata_kolibri)
+      target_link_libraries(strata_kolibri PRIVATE strata_mmq)
+      target_compile_definitions(strata_kolibri PRIVATE STRATA_KOLIBRI_MMQ=1)
+    endif()
     # Kolibri's prompt-expert product at Kolibri's own shapes (plan 2026-10-28-kolibri-prefill-gap.md, P4): the number
     # the kill criterion is measured against.  Built only in the STRATA_PREFILL_MMQ branch, like the library.
     set_source_files_properties(tools/kolibri/mmq_q4k_bench.cu PROPERTIES LANGUAGE HIP)
