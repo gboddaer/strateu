@@ -1802,3 +1802,52 @@ needs a session that starts from the parity arm. The tooling for that is in the 
 (`mmq_q4k_bench`), the orchestration probe with switches (`mmq_pipeline_probe`), and now the delta-activation parity
 comparison. Nothing about the projection changes - a working integration is worth **~795 tok/s at 8K (10.3 s TTFT)**
 against 117.6 today - but the projection is not a result.
+
+## P3 (2026-10-28): not attempted - it is the second half of P4, not a task of its own
+
+Residency without a fast GPU consumer is a measured loss on this box: §T6 ran exactly that shape (the Q4 slot path,
+96.6 % of picks served from VRAM, 875 launches a token) and it decoded at **14.21 tok/s against 15.90**. The fill itself
+is cheap and measured - a 4.7 GB promotion took 382.7 ms at 12.2 GB/s, and at 512-token chunks a chunk touches ~158 of
+384 experts, well inside the 214 slots that fit - so the fill was never the problem; the per-pick product was.
+
+That is what P4 replaces. P3 lands with P4 or not at all: once the MMQ leg computes the chunk's experts, the resident
+set stops being an alternative to the pool and becomes its **input** (the gathered group buffer can be filled from
+VRAM instead of from pinned host memory, which is the same code path with a different source pointer). Recorded as a
+non-attempt with that reason, and with the numbers above as the evidence, rather than spending two arms to re-measure
+14.21 tok/s.
+
+## P5 (2026-10-28): closed as not needed - P4's kernel met its bar by 38x
+
+P5's contract was "runs only if P4 missed its kill criterion". P4 did not miss it: the grouped Q4_K MMQ product
+measures **11 551 GFLOP/s** at 10 rows per expert against a 300 GFLOP/s criterion. A fused gfx12 WMMA kernel would be
+reimplementing, on one backend, what a library in this tree already does faster than the criterion asks - so it is not
+built, and the probe that justified it (§T11: 110.64 TFLOPS) stays in the record as the ceiling if the library ever
+disappoints.
+
+## P6 (2026-10-28): the T4 / 3090 hand-off
+
+Out of scope on this box (neither card is here), and the reason it must not be skipped is measured: on the T4 the CPU
+pool was a **3.9x prefill win** (`POOL_ALL=1` took a 512-token prompt from 38.9 to 150 tok/s), the opposite of this
+box's conclusion, because that box's GPU path was mmvq at M=1 per pick and it had 15.5 GB of VRAM. Whoever runs this
+next should re-derive, not inherit.
+
+The two commands, unchanged from this session except for the build directory:
+
+```sh
+cmake -S . -B build-mmq -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON \
+      -DCMAKE_HIP_ARCHITECTURES=gfx1201 -DSTRATA_PREFILL_MMQ=ON -DCMAKE_PREFIX_PATH=/opt/rocm   # + the CUDA equivalent
+STRATA_MMQ_KQ=1 build-mmq/mmq_q4k_bench 10 160 626        # the criterion's number, this card's shapes
+build/strata-kolibri --model <gguf> --tokens-file /tmp/ids8k.txt --n 4 --ctx 16384 \
+      --cpu-threads 8 --prefill --counters                # `prefill-standing`, the row everything is held against
+```
+
+The three card-specific terms to record on each machine, because they are what move the verdict:
+
+| term | T4 16 GB (sm_75) | 3090 24 GB (sm_86) | R9700 32 GB (gfx12) |
+|---|---|---|---|
+| residency share of the 42.90 GiB expert table | ~9-10 GB free at short ctx → ~25 %, ~90-100 slots/layer against 117 touched → **misses** | 24 GB → ~56 %, ~240 slots/layer → holds | 20.56 GiB free → **214 slots/layer**, holds |
+| fill of 12.9 GB (measured 13.4 GB/s here) | PCIe 3.0 ~12 GB/s → **1.1 s** | PCIe 4.0 ~25 GB/s → 0.5 s | 13.4 GB/s → 0.96 s |
+| the MMQ tile the arch picks (`mmq::fits` / `kq_ok`) | K-quant tiles exist (CUDA); the pool still won prefill there | int8 tensor cores, the best of the three | 11 551 GFLOP/s measured (this session) |
+
+And the T4 baseline the next person must beat, per its own campaign report: **150-160 tok/s prefill with the pool on**,
+22.7 tok/s decode, `ctest` 60/62.
