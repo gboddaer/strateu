@@ -36,9 +36,28 @@
 #
 # WHAT THE DEFAULTS ARE, AND WHERE THEY COME FROM.  ATTN_MB / RES_TOP / the router tiles are the
 # configuration measured on the CUDA campaign box (16 GB Tesla T4, 27 pinnable cores) -
-# docs/strateu-campaign-report.md.  On the AMD Radeon AI PRO R9700 (gfx1201, 32 GB) they are
+# docs/strateu-campaign-report.md.  On the AMD Radeon AI PRO R9700 (gfx1201, 32 GB) they were
 # starting points, not verdicts: that report's §9.3 names them as the verdicts to re-derive on a
-# 32 GB card rather than inherit.  EXPERT_F16 has been re-derived here and is 0: see the sweep below.
+# 32 GB card rather than inherit.  They have now been re-derived there, and every one of them stays
+# where it is - docs/AMD_R9700_PORT.md §T14 records the measurement behind each:
+#   EXPERT_F16 0        re-derived 2026-10-28 (sweep below).  Cache-on costs a third of the prompt.
+#   ATTN_MB    512      kept. 1024 was measured better at 99-128K only, and this launcher's ctx is
+#                       131072: a long-context win, but the same VRAM the expert slots draw on, and
+#                       no arm measured it faster at the 512-token shape most requests use.  It is a
+#                       per-user opt-in, not a default (set ATTN_MB=1024 for needle/long-prompt work).
+#   RES_TOP    56       kept, and inert at EXPERT_F16=0: it only caps the prefill promotion, which
+#                       needs the fp16 cache.  Kept on the T4 note until an arm says otherwise.
+#   ROUTER_TILE/TK/TJ   kept on the T4 note: not re-derived on this card, and unmeasured here.
+#   CTX        131072   kept.  A bigger ctx is VRAM the expert slots and attention scratch want, and
+#                       the prompt rate a user sees depends on it (57-72 tok/s at 131072 with the
+#                       cache, 87.8 at 8192 without it - different configs, so not a like-for-like).
+#   THREADS    physical cores   kept: 8 on this box; 24 lanes halve decode (15.8 -> 7.6 tok/s).
+#   --grouped / CUDA graphs     untouched: graphs are off by construction whenever --cpu-threads is
+#                       set (e == 0 lanes is the condition), which every launcher run is.
+# Two opt-in knobs were measured and deliberately NOT wired here: STRATA_HIPBLASLT_TUNING (the table
+# ships and is inert on this engine - the resolver is only reached from Gemm::f16/bf16, which Kolibri
+# never calls) and STRATA_KOLIBRI_GEMV_GS (the grid cap is +10.3 % at n_out 128000 but -29 % at the
+# 2560-row shapes this model runs, and it never fires here at all).  See §T9 and §T3.
 #
 # EXPERT_F16 (measured 2026-10-28 on this box: Radeon AI PRO R9700, gfx1201, Ryzen 7 5700G, 93 GiB,
 # Q4_K_M, ctx 131072, 8 lanes, a 512-token prompt and 128 greedy tokens per request, two requests

@@ -111,6 +111,32 @@ VRAM) and **costs a fifth of the generation speed** (16.2 -> 13.0 tok/s), so it 
 to try on other cards. CUDA graphs, the attention tile at 256 MiB, 7 instead of 8 CPU lanes and the partial-sum prefill
 path were all inside the noise on this box.
 
+### Where the speed goes, and what is left (measured 2026-10-28 on the same R9700)
+
+A decode token costs **62.9 ms** on this card (15.90 tok/s, ctx 131072, the launcher's own command line). Of that, the
+GPU is busy **16.1 ms** and the CPU expert pool **22.3 ms**; the rest is hand-off and waiting. The GPU side runs
+**1 347 kernel launches per token**, which is the shape of the problem: this model is not short of arithmetic, it is
+short of work per launch.
+
+- **The prompt is half CPU pool.** A 511-token prompt reads at 70 tok/s and **50.8 %** of that wall is the pool
+  streaming 280 MB per chunk at 7.7 GB/s. The pool already runs at its roof (32.1 GB/s, 326-329 GFLOP/s against a
+  226 GFLOP/s compute roof in its own accounting), so prompt gains have to come from *not* sending 117 experts per
+  layer through it.
+- **The slot cache loses for a named reason.** At this box's VRAM it fits 214 experts per layer and serves **96.6 %**
+  of picks from VRAM, which cuts the streamed leg from 714 to 291 MB/token - and still decodes at **14.21 tok/s**
+  against 15.90. The reason is three launches per expert pick (gate, up, down): 875 launches and 15.6 ms of GPU time
+  per token, plus 4.7 GB of PCIe traffic to fill the cache after the prompt (+14 % on the prompt).
+- **Two knobs that sound useful and are not, here.** The hipBLASLt tuning table ships for this card and is **inert**:
+  it loads, but the engine never asks it - the only GEMMs that consult it are the single-projection forms Kolibri
+  does not call. The grid-capped GEMV (`STRATA_KOLIBRI_GEMV_GS`) is +10 % at a 128 000-row shape and -29 % at the
+  2 560-row shapes this model runs, and never fires at all.
+- **What is worth doing next.** The gfx12 matrix cores work here - a bare WMMA 16x16x16 probe runs at **110.6
+  TFLOPS** - while the per-pick expert path runs at 151 GFLOP/s, and its floor is 663 MB/token (~1.1 ms) against
+  15.6 ms today. A fused expert kernel is the one change that can move this model, and attention is the second
+  (4 % of the wall at short context, the wall itself at 100K).
+
+All of it, with the commands and the per-arm tables, is in [AMD_R9700_PORT.md](AMD_R9700_PORT.md) §T1-T14.
+
 ## Validation
 
 Checked against the patched llama.cpp (`~/llama.cpp`, upstream + the conversion's 4-commit kolibri1 series) by
