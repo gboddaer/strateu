@@ -70,7 +70,7 @@ This fork also measured Aleph Alpha's **[Kolibri 1](docs/KOLIBRI1.md)** (Q4_K_M)
 
 | Prompt | Writes answers | Reads your prompt |
 | --- | ---: | ---: |
-| **short (512 tokens)** | 30 tokens/s (NUMA binding) | 156-160 tokens/s (opt-in `PF_PARTIAL`: 180-181, warm server 202) |
+| **short (512 tokens)** | 30 tokens/s (NUMA binding, expert cache off) | 156-160 tokens/s (opt-in `PF_PARTIAL`: 180-181, warm server 202) |
 | **32K tokens** | 13-14 tokens/s (NUMA binding) | 119-120 tokens/s |
 | **100K tokens** | — | 97 tokens/s |
 
@@ -91,18 +91,26 @@ experts by how often the router picks them:
 - `--expert-slots auto` measured the room left after the dense weights, the KV and the scratch, then took
   **75 slots/layer (8.49 GiB)** at a **160K** context, keeping 700 MiB clear for the CUDA runtime. It prints the
   exchange rate it implies: 1 slot = 114 MiB = 5,857 tokens of context, because context and cache draw on the same
-  VRAM.
-- `--expert-slots-hot` fills those slots by routed-pick frequency instead of by expert id, and
-  `--expert-slots-profile` carries the learned set across restarts. On this T4 the hit rate went from **21.4%**
-  (by id) to **33.4-34.2%** on three different prompts, **37.9%** when the same prompt repeats, and **31.4%** on the
-  first request of a cold start seeded from a saved profile - for **24.4-26.3 tokens/s** decode with sampling on.
-  Greedy decoding is ~30% faster but loops on this model (`Chudnov Chudnov Chudnov ...`), which is why the server
-  samples by default.
-- The engine takes **160K** tokens of context; the client config declares 128K, below it.
+  VRAM. In the shipped Tesla T4 configuration (`--ctx 131072`, `EXPERT_F16=20`, `--vram-reserve-mib 1024`) the same
+  fit takes **7 slots/layer (0.89 GiB)**: the fp16 expert cache and the residency cache draw on the same 16 GB.
+- `--expert-slots-hot` fills those slots by routed-pick frequency instead of by expert id, **one map per layer** (the
+  default since 2026-10-27), and `--expert-slots-profile` carries the learned set across restarts. The set is re-chosen
+  in **rounds**: every 32 positions at most 96 experts move while a request runs, and one larger round of up to 2,048
+  runs after each prompt; a candidate has to beat the expert it evicts by 1.5 decayed counts, and the counts decay by
+  0.7 a round. On this T4 at a 160K context the hit rate went from **21.4%** (by id) to **83.2%** on the first request
+  and **88.7%** on the second (two runs each); the same code at 128K with `EXPERT_F16=20` serves **31.4% / 33.1%**,
+  because the fp16 cache leaves 7 slots/layer instead of 75. Decode with sampling stays at 24.4-26.3 tokens/s; greedy
+  is ~30% faster but loops on this model (`Chudnov Chudnov Chudnov ...`), which is why the server samples by default.
+- The engine takes whatever `--ctx` gives it; for a 16 GB Tesla T4 `setup.py` now recommends **128K**, because the KV
+  of 128K costs 2.5 GiB of the 16. An explicit `--context`, or the config's `--max-context`, overrides it.
 
-The swap itself is free in the token stream but not in time: promoting 57 experts cost 6.5 GiB over PCIe in ~690 ms,
-paid between requests. Residency moves bytes, it never changes them - the generated ids were identical in the
-by-id, hot and auto runs. Box spec, full tables and context: [the campaign report](docs/strateu-campaign-report.md).
+The cost of a round is bounded: 96 experts is 218-222 MiB over PCIe in ~22 ms mid-request, and the after-prompt round
+of up to 2,048 is 4,691 MiB in ~470 ms (the campaign's unbudgeted round moved 57 experts, 6.5 GiB, ~690 ms). Residency
+moves bytes, and with a CPU pool in play that does change them - an expert in a slot is read in fp32, the same expert
+on the pool in q8_1 (findings-log 0.3: mean |dlogit| 0.855, the id flips at token 8); with the pool off the two device
+legs are bitwise. Shipped T4 speed, two runs pinned to NUMA node 1: **154.0 / 158.6 tokens/s** reading a 512-token
+prompt, **24.83 / 24.93 tokens/s** writing, and a repeated prompt reads in **0 ms**. Box spec, full tables and context:
+[the campaign report](docs/strateu-campaign-report.md).
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
 <sub>Strata is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>

@@ -19,7 +19,7 @@ Bilder und arbeitet mit deinen Apps und Coding-Agents zusammen. Nichts verlässt
 **Kolibri-1**-Engine (`src/kolibri`). Eine Messwoche hat den CUDA-Port **bitweise deterministisch** gemacht
 (Prefill besteht racecheck, Differenz zweier Läufe 0.0) und **per KL-Divergenz gegen llama.cpp abgeglichen**
 (0,00132 über 109 Antwortschritte, Top-1 0,982, Plain-Path-Oracle BITWISE). Auf einer 16-GB-Karte, mit Stoppuhr gemessen (je zwei Löufe): rund **119-120 Token/s** Prefill nach einem
-32K-Prompt, **30 Token/s** Generierung kurz und **13-14 Token/s** nach 32K
+32K-Prompt, **30 Token/s** Generierung kurz (ohne Expertencache) und **13-14 Token/s** nach 32K
 (neu gemessen, nachdem ein Audit einen zählerbasierten Berichtsfehler fand). Die 100K-Nadel wird in 4 von 5 Fällen gefunden (davon 3 exakt, einer um einen Buchstaben
 verkürzt), beide Abweichungen sind protokolliert (die llama.cpp-Referenz ist bei dieser Länge selbst nicht stabil). Gates und Speedkonfiguration
 liegen in `tools/kolibri/`; jede Zahl entstammt zwei Läufen mit angegebener Systemlast. Die komplette Beweiskette:
@@ -67,7 +67,7 @@ mit 755 GB RAM für den Experten-Pool gemessen:
 
 | Prompt | Schreibt Antworten | Liest deinen Prompt |
 | --- | ---: | ---: |
-| **kurz (512 Token)** | 30 Token/s (NUMA-Bindung) | 156-160 Token/s (opt-in `PF_PARTIAL`: 180-181, warm 202) |
+| **kurz (512 Token)** | 30 Token/s (NUMA-Bindung, ohne Expertencache) | 156-160 Token/s (opt-in `PF_PARTIAL`: 180-181, warm 202) |
 | **32K Token** | 13-14 Token/s (NUMA-Bindung) | 119-120 Token/s |
 | **100K Token** | — | 97 Token/s |
 
@@ -86,18 +86,30 @@ aktuelle Stand dimensioniert den Cache selbst und kann Experten danach platziere
 
 - `--expert-slots auto` misst den Platz, der nach den dichten Gewichten, dem KV und dem Scratch übrig ist, und nahm
   bei **160K** Kontext **75 Slots/Layer (8,49 GiB)** mit 700 MiB Reserve für die CUDA-Laufzeit. Es druckt den
-  Tauschkurs: 1 Slot = 114 MiB = 5.857 Token Kontext, weil Kontext und Cache aus demselben VRAM kommen.
-- `--expert-slots-hot` füllt diese Slots nach Routing-Häufigkeit statt nach Experten-ID, und
-  `--expert-slots-profile` trägt den gelernten Satz über Neustarts. Auf dieser T4 stieg die Trefferquote von **21,4 %**
-  (nach ID) auf **33,4-34,2 %** bei drei verschiedenen Prompts, **37,9 %** beim Wiederholen desselben Prompts und
-  **31,4 %** beim ersten Request eines Kaltstarts aus einem gespeicherten Profil - für **24,4-26,3 Token/s**
-  Dekodieren mit Sampling. Greedy ist ~30 % schneller und läuft auf diesem Modell in Schleifen
-  (`Chudnov Chudnov Chudnov ...`), deshalb sampelt der Server standardmäßig.
-- Die Engine nimmt **160K** Kontext-Token; die Client-Konfiguration deklariert 128K, darunter.
+  Tauschkurs: 1 Slot = 114 MiB = 5.857 Token Kontext, weil Kontext und Cache aus demselben VRAM kommen. In der
+  ausgelieferten Tesla-T4-Konfiguration (`--ctx 131072`, `EXPERT_F16=20`, `--vram-reserve-mib 1024`) nimmt dieselbe
+  Rechnung **7 Slots/Layer (0,89 GiB)**: der fp16-Expertencache und der Residenz-Cache teilen sich dieselben 16 GB.
+- `--expert-slots-hot` füllt diese Slots nach Routing-Häufigkeit statt nach Experten-ID, **eine Karte pro Layer**
+  (Standard seit 2026-10-27), und `--expert-slots-profile` trägt den gelernten Satz über Neustarts. Der Satz wird in
+  **Runden** neu gewählt: alle 32 Positionen ziehen während eines Requests höchstens 96 Experten um, und nach jedem
+  Prompt folgt eine größere Runde mit bis zu 2.048; ein Kandidat muss den Experten, den er verdrängt, um 1,5
+  abklingende Zählungen schlagen (die Zählungen klingen pro Runde um 0,7 ab). Auf dieser T4 bei 160K Kontext stieg die
+  Trefferquote von **21,4 %** (nach ID) auf **83,2 %** beim ersten und **88,7 %** beim zweiten Request (je zwei Läufe);
+  derselbe Code bei 128K mit `EXPERT_F16=20` liefert **31,4 % / 33,1 %**, weil der fp16-Cache nur 7 Slots/Layer statt
+  75 lässt. Dekodieren mit Sampling bleibt bei 24,4-26,3 Token/s; Greedy ist ~30 % schneller und läuft auf diesem
+  Modell in Schleifen (`Chudnov Chudnov Chudnov ...`), deshalb sampelt der Server standardmäßig.
+- Die Engine nimmt, was `--ctx` ihr gibt; für eine Tesla T4 mit 16 GB empfiehlt `setup.py` jetzt **128K**, weil der KV
+  von 128K 2,5 GiB der 16 kostet. Ein ausdrückliches `--context` oder das `--max-context` der Konfiguration hat
+  Vorrang.
 
-Der Tausch selbst ist im Token-Strom gratis, in der Zeit nicht: 57 Experten zu promoten kostete 6,5 GiB über PCIe in
-~690 ms, bezahlt zwischen Requests. Residency verschiebt Bytes, sie ändert sie nie - die generierten IDs waren im
-ID-, Hot- und Auto-Lauf identisch. Box-Spec und volle Tabellen: [der Kampagnenbericht](docs/strateu-campaign-report.md).
+Die Kosten einer Runde sind begrenzt: 96 Experten sind 218-222 MiB über PCIe in ~22 ms mitten im Request, und die
+Runde nach dem Prompt mit bis zu 2.048 sind 4.691 MiB in ~470 ms (die unbegrenzte Runde der Kampagne bewegte 57
+Experten, 6,5 GiB, ~690 ms). Residency verschiebt Bytes, und mit einem CPU-Pool im Spiel ändert das auch die Bytes: ein
+Experte im Slot wird in fp32 gelesen, derselbe Experte im Pool in q8_1 (findings-log 0.3: mittleres |dlogit| 0,855,
+die ID kippt bei Token 8); ohne den Pool sind beide GPU-Wege bitwise. Ausgelieferte T4-Geschwindigkeit, zwei Läufe auf
+NUMA-Knoten 1 gebunden: **154,0 / 158,6 Token/s** beim Lesen eines 512-Token-Prompts, **24,83 / 24,93 Token/s** beim
+Schreiben, und ein wiederholter Prompt wird in **0 ms** gelesen. Box-Spec und volle Tabellen:
+[der Kampagnenbericht](docs/strateu-campaign-report.md).
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
 <sub>Strata ist kostenlos. Wenn es auf deinem PC gut läuft, hält ein Kaffee die Arbeit daran am Laufen.</sub></p>

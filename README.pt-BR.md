@@ -19,7 +19,7 @@ funciona com seus apps e agentes de programação. Nada sai do seu PC. Ele tamb�
 **Kolibri 1** (`src/kolibri`). Uma semana de medições tornou o port CUDA **determinístico bit a bit** (o prefill
 passa no racecheck, diferença 0.0 entre duas execuções) e **verificado contra o llama.cpp por divergência KL**
 (0,00132 em 109 passos de resposta, top-1 0,982, oracle do caminho simples em BITWISE). Numa placa de 16 GB, medido a relógio (duas execuções cada): cerca de **119-120 tokens/s** de prefill após um
-prompt de 32K, **30 tokens/s** de geração curto e **13-14 tokens/s** após 32K
+prompt de 32K, **30 tokens/s** de geração curto (sem o cache de especialistas) e **13-14 tokens/s** após 32K
 (remedido após uma auditoria apontar cifras antes derivadas de contador). a agulha de 100K é recuperada em 4 de 5 casos, com as duas
 divergências registradas (a própria referência llama.cpp é instável nessa extensão). Os portões de qualidade e a
 configuração de velocidade ficam em `tools/kolibri/`; cada número vem de duas execuções com a carga da máquina
@@ -65,7 +65,7 @@ Este fork também mediu **[Kolibri 1](docs/KOLIBRI1.md)** da Aleph Alpha (Q4_K_M
 
 | Prompt | Escreve respostas | Lê seu prompt |
 | --- | ---: | ---: |
-| **curto (512 tokens)** | 30 tokens/s (depende da ligação NUMA) | 156-160 tokens/s (`PF_PARTIAL` opcional: 180-181, aquecido 202) |
+| **curto (512 tokens)** | 30 tokens/s (depende da ligação NUMA, sem o cache de especialistas) | 156-160 tokens/s (`PF_PARTIAL` opcional: 180-181, aquecido 202) |
 | **32K tokens** | 13-14 tokens/s (depende da ligação NUMA) | 119-120 tokens/s |
 | **100K tokens** | — | 97 tokens/s |
 
@@ -86,17 +86,28 @@ com que o roteador os escolhe:
 - `--expert-slots auto` mede o espaço livre depois dos pesos densos, do KV e do scratch, e ficou com **75
   slots/camada (8,49 GiB)** em **160K** de contexto, mantendo 700 MiB livres para o runtime do CUDA. Ele imprime a
   taxa de troca implícita: 1 slot = 114 MiB = 5.857 tokens de contexto, porque contexto e cache disputam a mesma VRAM.
-- `--expert-slots-hot` preenche esses slots pela frequência de roteamento em vez do id do especialista, e
-  `--expert-slots-profile` leva o conjunto aprendido entre reinícios. Neste T4 a taxa de acerto foi de **21,4%**
-  (por id) para **33,4-34,2%** em três prompts diferentes, **37,9%** quando o mesmo prompt se repete e **31,4%** na
-  primeira requisição de uma partida a frio semeada por um perfil salvo - com **24,4-26,3 tokens/s** de decodificação
-  com sampling. Greedy é ~30% mais rápido e entra em laço neste modelo (`Chudnov Chudnov Chudnov ...`), por isso o
-  servidor faz sampling por padrão.
-- O motor aceita **160K** tokens de contexto; a configuração do cliente declara 128K, abaixo disso.
+  Na configuração entregue para a Tesla T4 (`--ctx 131072`, `EXPERT_F16=20`, `--vram-reserve-mib 1024`) essa mesma
+  conta fica com **7 slots/camada (0,89 GiB)**: o cache fp16 de especialistas e o cache de residência dividem os
+  mesmos 16 GB.
+- `--expert-slots-hot` preenche esses slots pela frequência de roteamento em vez do id do especialista, **um mapa por
+  camada** (o padrão desde 2026-10-27), e `--expert-slots-profile` leva o conjunto aprendido entre reinícios. O
+  conjunto é reescolhido em **rodadas**: a cada 32 posições no máximo 96 especialistas se movem durante uma
+  requisição, e depois de cada prompt vem uma rodada maior, de até 2.048; um candidato precisa superar em 1,5 o
+  especialista que ele expulsa (as contagens decaem 0,7 por rodada). Neste T4 com 160K de contexto a taxa de acerto
+  foi de **21,4%** (por id) para **83,2%** na primeira requisição e **88,7%** na segunda (duas execuções cada); o
+  mesmo código a 128K com `EXPERT_F16=20` entrega **31,4% / 33,1%**, porque o cache fp16 deixa 7 slots/camada em vez
+  de 75. A decodificação com sampling fica em 24,4-26,3 tokens/s; greedy é ~30% mais rápido e entra em laço neste
+  modelo (`Chudnov Chudnov Chudnov ...`), por isso o servidor faz sampling por padrão.
+- O motor aceita o que o `--ctx` der; para uma Tesla T4 de 16 GB o `setup.py` agora recomenda **128K**, porque o KV de
+  128K custa 2,5 GiB dos 16. Um `--context` explícito, ou o `--max-context` da configuração, manda mais que isso.
 
-A troca não custa nada no fluxo de tokens, mas custa tempo: promover 57 especialistas custou 6,5 GiB por PCIe em
-~690 ms, pagos entre requisições. A residência move bytes, nunca os altera - os ids gerados foram idênticos nas
-execuções por id, hot e auto. Especificação da máquina e tabelas completas:
+O custo de uma rodada é limitado: 96 especialistas são 218-222 MiB por PCIe em ~22 ms no meio de uma requisição, e a
+rodada depois do prompt, de até 2.048, são 4.691 MiB em ~470 ms (a rodada sem limite da campanha movia 57
+especialistas, 6,5 GiB, ~690 ms). A residência move bytes, e com um pool de CPU em jogo isso também os altera: um
+especialista num slot é lido em fp32, o mesmo especialista no pool em q8_1 (findings-log 0.3: |dlogit| médio 0,855, o
+id muda no token 8); sem o pool, as duas vias de GPU são bitwise. Velocidade entregue neste T4, duas execuções presas
+ao nó NUMA 1: **154,0 / 158,6 tokens/s** lendo um prompt de 512 tokens, **24,83 / 24,93 tokens/s** escrevendo, e um
+prompt repetido é lido em **0 ms**. Especificação da máquina e tabelas completas:
 [o relatório da campanha](docs/strateu-campaign-report.md).
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>

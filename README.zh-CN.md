@@ -18,7 +18,7 @@ AI 模型，通常要用服务器才能跑。它能聊天、写代码、看图�
 **Kolibri 1** 引擎（`src/kolibri`）。一周的测量让这个 CUDA 移植版本变得**逐位可复现**（prefill 通过 racecheck、
 两次运行差异为 0.0），并**用 KL 散度对标 llama.cpp**（109 个回答步骤为 0.00132，top-1 一致率 0.982，plain-path
 oracle 为 BITWISE）。16 GB 显卡上的实测（每项两次、壁钟计时）：32K 提示后的 prefill 约为 **119-120 token/秒**；
-生成约为 **30 token/秒**（短）与 **13-14 token/秒**（32K 后）——审计发现此前误用计数器数值后重新测得；100K 长文本的“大海捞针”检索 5 例命中 4 例，
+生成约为 **30 token/秒**（短，未开专家缓存）与 **13-14 token/秒**（32K 后）——审计发现此前误用计数器数值后重新测得；100K 长文本的“大海捞针”检索 5 例命中 4 例，
 两处偏差都已记录（在那个长度上 llama.cpp 参考实现本身也不稳定）。闸门和速度配置在 `tools/kolibri/`；每个数字
 都做两次运行并注明机器负载，完整证据链见[战役报告](docs/strateu-campaign-report.md)和 `docs/superpowers/plans/` 下的账目文件。
 
@@ -61,7 +61,7 @@ NVIDIA：Q2_0 用的是引擎 0.1.36，其他各行用的是 0.1.26（4K 回答�
 
 | 提示长度 | 写回答 | 读提示 |
 | --- | ---: | ---: |
-| **短（512 token）** | 30 token/秒（随 NUMA 绑定变化） | 156-160 token/秒（启用 `PF_PARTIAL`：180-181，服务已运行 202） |
+| **短（512 token）** | 30 token/秒（随 NUMA 绑定变化，未开专家缓存） | 156-160 token/秒（启用 `PF_PARTIAL`：180-181，服务已运行 202） |
 | **32K token** | 13-14 token/秒（随 NUMA 绑定变化） | 119-120 token/秒 |
 | **100K token** | — | 97 token/秒 |
 
@@ -79,16 +79,25 @@ iGPU 上没有测过 100K 提示。
 
 - `--expert-slots auto` 测量密权重、KV 与临时缓冲之后剩余的显存，在 **160K** 上下文下取 **75 个 slot/层
   （8.49 GiB）**，为 CUDA 运行时留出 700 MiB。它还会打印隐含的换算率：1 个 slot = 114 MiB = 5,857 个上下文
-  token，因为上下文与缓存争用同一块显存。
-- `--expert-slots-hot` 按路由频次而不是专家 id 填充这些 slot，`--expert-slots-profile` 把学到的集合跨重启
-  保留。在这块 T4 上，命中率从 **21.4%**（按 id）提升到三个不同 prompt 的 **33.4-34.2%**、同一 prompt 重复时
-  的 **37.9%**，并用保存的 profile 预置冷启动后第一个请求为 **31.4%**——开启采样时解码 **24.4-26.3 token/秒**。
-  greedy 约快 30%，但在这个模型上会退化循环（`Chudnov Chudnov Chudnov ...`），所以服务器默认采样。
-- 引擎接受 **160K** 上下文 token；客户端配置声明 128K，低于该值。
+  token，因为上下文与缓存争用同一块显存。在交付的 Tesla T4 配置（`--ctx 131072`、`EXPERT_F16=20`、
+  `--vram-reserve-mib 1024`）下，同一算法只取到 **7 个 slot/层（0.89 GiB）**：fp16 专家缓存与驻留缓存共享
+  同样的 16 GB。
+- `--expert-slots-hot` 按路由频次而不是专家 id 填充这些 slot，**每层一张映射**（2026-10-27 起的默认），
+  `--expert-slots-profile` 把学到的集合跨重启保留。集合按**轮**重新选择：每 32 个位置，请求进行中最多移动 96 个
+  专家，每个 prompt 之后还有一轮更大的、最多 2,048 个；候选必须比被淘汰的专家高出 1.5（衰减计数），计数每轮
+  乘以 0.7。在这块 T4、160K 上下文下，命中率从 **21.4%**（按 id）提升到第一个请求 **83.2%**、第二个请求
+  **88.7%**（各两次运行）；同样的代码在 128K、`EXPERT_F16=20` 下为 **31.4% / 33.1%**，因为 fp16 缓存只留下
+  7 个 slot/层而不是 75 个。开启采样的解码仍在 24.4-26.3 token/秒；greedy 约快 30%，但在这个模型上会退化循环
+  （`Chudnov Chudnov Chudnov ...`），所以服务器默认采样。
+- 引擎接受 `--ctx` 给它的上下文长度；对 16 GB 的 Tesla T4，`setup.py` 现在推荐 **128K**，因为 128K 的 KV 要占
+  16 GB 中的 2.5 GiB。显式的 `--context` 或配置里的 `--max-context` 优先。
 
-换入换出在 token 流里不花钱，但在时间上要花：晋升 57 个专家在 PCIe 上搬 6.5 GiB、约 690 ms，在请求之间付出。
-驻留只搬字节、从不改变字节——按 id、hot 与 auto 三种运行的生成 id 完全一致。机器规格与完整表格见
-[战役报告](docs/strateu-campaign-report.md)。
+一轮的开销是有界的：96 个专家是 PCIe 上的 218-222 MiB，请求进行中约 22 ms；prompt 之后那一轮最多 2,048 个，
+4,691 MiB、约 470 ms（战役阶段不限量的一轮是 57 个专家、6.5 GiB、约 690 ms）。驻留搬的是字节，而一旦有 CPU 池
+参与，字节就会变：slot 上的专家按 fp32 读取，池上的同一个专家按 q8_1 读取（findings-log 0.3：平均 |dlogit|
+0.855，第 8 个 token 处 id 就不同了）；关掉池，两条 GPU 通路是 bitwise 的。交付配置在这块 T4 上的速度（两次运行，
+绑定 NUMA 节点 1）：读取 512 token 的 prompt 为 **154.0 / 158.6 token/秒**，生成为 **24.83 / 24.93 token/秒**，
+重复的 prompt 读取为 **0 ms**。机器规格与完整表格见[战役报告](docs/strateu-campaign-report.md)。
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="请我喝杯咖啡" height="50"></a><br>
 <sub>Strata 是免费的。如果它在你的电脑上跑得不错，请我喝杯咖啡，让这个项目继续下去。</sub></p>
