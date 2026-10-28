@@ -55,6 +55,8 @@ code now measures differently, the difference is box state and both numbers are 
 | 32 | decode short with `STRATA_KOLIBRI_DEC_RES=1` | **29.5 / 29.2 tok/s**, prefill 144.9 / 141.8 tok/s | wall clock, `bench.py short` | load 3.79 / 4.48 | "G4 (campaign II)" | report |
 | 33 | 100K needle, campaign II build | **recall 4/5, exact 3/5** (exact PASS on 32k90, 64k90, anchor; d90b recalled one letter short `quart-willow-8` vs `quartz-willow-884`; d90 answered a different instruction) | `needle_audit.py` on the venv interpreter, five fixtures | shipped path; unchanged from #12 | "G5 (campaign II)" | STRATEU, KOLIBRI1 |
 | 34 | prefill 512, knob off, quiet box | **184.9 / 183.6 tok/s** with `PF_PARTIAL=1` against **159.0 / 158.8** off (+16.0%) | wall clock, `bench.py short` | load < 1 | "G1 (campaign II)" | report |
+| 35 | prefill 512, T4 speed configuration (128K, `EXPERT_F16=20`, speed env, `PF_PARTIAL=1`, expert cache + reuse) | **154.0 / 158.6 tok/s** | engine serve `DONE` `prompt_ms`, two runs, 512-token prompt | load 0.4-1.6, `numactl --cpunodebind=1 --membind=1`, 7 slots/layer | "0.7 speed configuration (2026-10-28)" | KOLIBRI1 |
+| 36 | decode short, same configuration | **24.83 / 24.93 tok/s** | engine serve `DONE` `decode_ms`, two runs, 128 greedy tokens | same | "0.7 speed configuration (2026-10-28)" | KOLIBRI1 |
 
 
 The AMD R9700 table that follows numbers its own rows from 18; the two tables are per-box and number independently.

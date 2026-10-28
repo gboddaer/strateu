@@ -188,6 +188,22 @@ Not measured: sessions long enough for the hot set to drift, and any card other 
 right margin (only 0 and 1.5 were compared) or 0.7 the right decay (0.7 against 1.0 on this fixture only, no workload
 that changes subject inside one prompt).
 
+**The speed configuration on this T4: 128K of context, `STRATA_KOLIBRI_EXPERT_F16=20`, the speed environment, the
+expert cache and prefix reuse together.**  `STRATA_KOLIBRI_PF_STAGE=1 ROUTER_TILE=1 ROUTER_TK=3 ROUTER_TJ=16
+ATTN_MB=256 RES_TOP=48 ATTN_FLASH=1 EXPERT_F16=20 PF_PARTIAL=1`, `--ctx 131072 --expert-slots auto --expert-slots-hot
+--expert-slots-profile ... --vram-reserve-mib 1024 --prefill --cpu-threads 24`.  Measured, two runs of two requests,
+512-token prompt, 128 greedy tokens, pinned to NUMA node 1, load 0.4-1.6: **prompt read 154.0 / 158.6 and decode
+24.83 / 24.93 tok/s** (published-figures #35, #36), 7 slots/layer of residency cache (0.78 GiB; the fit keeps 1024 MiB
+free for the runtime), 31.4 % of picks served from VRAM on the first request and 33.1 % on the second, and the second
+request of an identical prompt reads **0.0 ms** (`RESUME 511`, `f[14]=1`).
+
+Why 20 experts/layer: the fp16 cache is what makes the prompt read fast, and it is VRAM the residency cache would
+otherwise have - at 8 experts 43 slots/layer fit, at 12 thirty, at 16 seventeen, at 20 seven, and at 22 and 24 the fit
+reports "not one slot" (1239 and 539 MiB free).  At 160K the same 20 experts leave 4 slots/layer instead of 7 (the
+KV of 128K costs 2.5 GiB of the 16), which is why 128K is the recommendation for this card: `setup.py` now gives a
+16 GB Tesla T4 128K (`recommended_context`), and an explicit `--context` / the config's `--max-context` still overrides
+it.
+
 ### Speed on an integrated Radeon (measured 2026-10-26, Radeon 8060S in a Ryzen AI Max+ 395, gfx1151, HIP on ROCm 7.14.1, 123 GiB RAM, Q4_K_M)
 
 The engine was built from this tree with `-DSTRATA_ENABLE_HIP=ON -DCMAKE_HIP_ARCHITECTURES=gfx1151` against the ROCm

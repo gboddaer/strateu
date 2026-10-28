@@ -4255,6 +4255,22 @@ def ctx_ram_need(model, ctx, low_ram=False):
     return MODELS[model]["arena_gb"] + ctx * 13 * 1056 / 1e9 + 24
 
 
+def recommended_context(vram_gb, gpu_names: str, budget) -> int:
+    """The context setup recommends for the smallest chosen card, before the RAM rule caps it (#406).
+
+    A 16 GB Tesla T4 gets 128K.  Its KV cache at 128K costs 2.6 GB of the 16, which still leaves ~11 GB for the fp16
+    expert cache and the expert slots; 64K buys nothing on it, and 160K leaves room for 4 slots/layer only (measured:
+    docs/findings-log.md 0.7).  Every other 14-19 GB card keeps 64K.  An explicit --context, a pick from the menu, or
+    the earlier install's --max-context always wins over this."""
+    if budget is not None:   # UD-Q4_K_XL: every GB of KV is a GB fewer of cached experts
+        return 8192 if vram_gb < 14 else 32768
+    if vram_gb < 14:
+        return 32768
+    if vram_gb < 20:
+        return 131072 if "tesla t4" in gpu_names.lower() else 65536
+    return 131072
+
+
 def ram_ctx(model, ram, low_ram=False) -> int:
     """#406: the longest context the RAM rule recommends: 128K, or longer where the estimate fits this PC's RAM.  It
     is part of the recommended default (the smaller of it and the GPU's rule); a longer choice is kept, with a note.
@@ -6303,9 +6319,8 @@ def main() -> int:
         say(f"  Its license: {MODELS[model]['license']}")
     tag = fam["tag"] + model                           # names of the pack, config and start script
     small = min(x["vram_gb"] for x in chosen)         # each card keeps its layers' KV of the whole context
-    rec_ctx = 32768 if small < 14 else 65536 if small < 20 else 131072
-    if budget is not None:                             # UD-Q4_K_XL: every GB of KV is a GB fewer of cached experts
-        rec_ctx = 8192 if small < 14 else 32768
+    # a 16 GB Tesla T4 is recommended 128K (see recommended_context); everything else keeps the VRAM rule
+    rec_ctx = recommended_context(small, " ".join(gpu_name(x) for x in chosen), budget)
     # #406: the RAM rule is part of the recommendation (the smaller of the two), no longer a cap over the user's choice
     rec_ctx = min(rec_ctx, ram_ctx(model, ram, low_ram))
     if a.context:
