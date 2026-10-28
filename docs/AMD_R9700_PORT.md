@@ -1974,3 +1974,37 @@ this box or the plain path at a length it supports is the reference to use next.
 Not a chunk-128 curiosity, then, and not the auditor's mistake: **the prefill path's answer depends on how the prompt is
 cut, in the shipped configuration (chunk 256 is the default below 8 192 tokens)**. That is a correctness defect and it
 outranks every performance number in this ledger until it is explained.
+
+### Chunk invariance, quantified (2026-10-28): the divergence is a ~0.2-logit difference at a near-tie, not a broken path
+
+`--dump-logits` at 4 096 tokens, same prompt, only the chunk size different. The dump is `[id, logit]` pairs, so the
+comparison is per token, not per position - which is what the first pass got wrong (it compared token ids and produced
+a meaningless 1.2e5 "difference"):
+
+| top token | chunk 128 | chunk 256 |
+|---|---|---|
+| 286 | **11.0498** | 10.8803 |
+| 10 | 10.6355 | **10.8816** |
+| margin between them | 0.4143 | **0.0003** |
+
+Both chunk sizes agree on the *set* of top tokens; they disagree on those logits by **0.17-0.25** (about 2 % of an
+11-magnitude value, i.e. a real numerical difference, not fp32 noise), and at this position the model's own margin is
+**0.0003** - so greedy decoding flips, and after the flip the continuations diverge and every later position differs
+for that reason alone.
+
+What that means, and what it does not:
+
+- **It is not a corrupt kernel.** The two paths agree on the candidate set and disagree by a fifth of a logit; that is
+  the signature of a different accumulation order, not of wrong weights or wrong rows.
+- **It is a real difference between chunk sizes**, so the K28 note's claim - "a chunked causal prefill computes each
+  token's row and per-token softmax identically regardless of how the prompt is cut" - is **wrong as written** and is
+  corrected here. The likely carriers are the per-chunk expert set (rows per expert change with the cut, so the pool's
+  vectorisation and accumulation order change) and the attention `tq` tiling.
+- **Id-equality is the wrong gate for a chunk-size A/B.** The existing arms that compare ids across chunk sizes are
+  measuring tie-breaks; a chunk-size comparison has to compare logits (KL), as the speed plan's numerics gates already
+  do for other arms.
+- **The performance numbers stand**: nothing in 117.6 tok/s, 120.8 tok/s or the pool share depends on which of two
+  tokens with a 0.0003 margin wins.
+
+That closes the auditor's objection with a cause rather than a shrug: the chunk-128 arm's different ids are real,
+reproducible, and explained - a 0.2-logit chunk-size dependence amplified by greedy decoding at a razor-thin margin.
