@@ -1340,3 +1340,34 @@ path is untouched (oracle BITWISE, `pf_gate` GATE PASS, §T4).
 **What the two non-attempts (T7, T8) leave standing**, in the plan's own order of levers: the fused expert kernel
 (T11) for the 15.6 ms of per-pick work, and the attention path (T12) for the 100K decode, where §T1 measured attention
 at 2.55 ms of a 16.1 ms GPU token - a smaller absolute leg than the experts on this model.
+
+## T11 (2026-10-28): feasibility established, kernel not built - and the headroom is now a number
+
+Task 11 is a stretch item: a fused Q4_K -> WMMA expert kernel for gfx12. Before writing one, the question that decides
+whether a session should go into it is whether the instruction works on this card and what it pays. Both are measured.
+
+**The gfx12 WMMA intrinsic works on the R9700.** A standalone probe using the in-tree wrapper's exact form
+(`__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12`, `src/dsv41/ds4_iq_hip.inc:26`), 128 blocks x 4 waves x 4 independent
+accumulator chains x 20 000 iterations, `hipcc --offload-arch=gfx1201 -O3`:
+
+```
+gfx12 WMMA 16x16x16 f16: 3.033 ms per launch -> 110.64 TFLOPS (fp16 in, fp32 accumulate)
+last error: no error
+```
+
+**What that means against today's numbers.** The per-pick GEMV §T6 measured does 6 picks x 3 matrices x 2 x 512 x 2560
+x 50 layers = **2.36 GFLOP per token** in **15.6 ms**, i.e. **151 GFLOP/s** - 0.14 % of what the matrix cores deliver.
+The leg is not arithmetic-bound and never was; it is 875 three-launch picks. Its floor is bytes: 6 picks x 2.21 MB x
+50 layers = **663 MB per token** of VRAM reads, which at the ~600 GB/s this card streams is **~1.1 ms/token**.
+
+So a fused kernel that does gate/up/down for a pick in one pass has a floor of about 1.1 ms/token against today's
+15.6, and if everything else stayed put the decode wall would go from 62.9 ms to ~48 ms = **~20.7 tok/s**. That is the
+plan's 20-24 tok/s expectation, now grounded in two measurements instead of an analogy.
+
+**Not built this session, deliberately.** A correct fused Q4_K->WMMA expert kernel needs the nibble unpack into WMMA
+fragments, a parity arm against the staged fp16 path (`q4k_grouped_vram_parity --bench`), its own `pf_gate` expectation
+file plus a KL figure, and two-run identity - a session of work, not an hour. Shipping it half-verified would break
+this plan's own contract, and the numbers above say the session is worth spending rather than that it can be shortened.
+Recorded as the plan's top lever for the next one, with the probe reproducible in five minutes.
+
+No code changed, so no gate is owed: the shipped path is untouched (oracle BITWISE, `pf_gate` GATE PASS, §T4).
