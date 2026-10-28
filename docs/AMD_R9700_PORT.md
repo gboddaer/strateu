@@ -1398,3 +1398,37 @@ Note for whoever takes it: `STRATA_KOLIBRI_ATTN_MMA` is compiled out on HIP and 
 branch, so on this card that flag is silently inert. `ATTN_WMMA` is the AMD knob; do not reuse `ATTN_MMA` for it.
 
 No code changed, so no gate is owed: shipped path untouched (oracle BITWISE, `pf_gate` GATE PASS, §T4).
+
+## T14 (2026-10-28): the defaults block is re-derived, and nothing moves
+
+The launcher's `run-kolibri1.sh` comment block now carries a measured reason per default instead of a T4-era one
+(see the diff), and `docs/KOLIBRI1.md` gained the attribution in plain words. Every default stays:
+
+| knob | value | decision, and the measurement behind it |
+|---|---|---|
+| `EXPERT_F16` | 0 | already re-derived (§Speed table): cache-on costs a third of the prompt read, decode unchanged |
+| `ATTN_MB` | 512 | 1024 wins only at 99-128K, and draws on the same VRAM as the expert slots; documented as `ATTN_MB=1024` for long-prompt work, not as a default |
+| `RES_TOP` | 56 | inert at `EXPERT_F16=0`; it caps the prefill promotion, which needs the fp16 cache |
+| `ROUTER_TILE/TK/TJ` | T4 values | not re-derived on this card, and unmeasured here - kept with the note that says so |
+| `CTX` | 131072 | a bigger context is VRAM the slots and attention scratch want |
+| `THREADS` | physical cores (8) | 24 lanes halve decode (15.8 -> 7.6 tok/s) |
+| `--grouped` / graphs | untouched | graphs are off by construction whenever `--cpu-threads` is set |
+
+Two opt-in knobs were measured and **not** wired: `STRATA_HIPBLASLT_TUNING` (inert, §T9) and `STRATA_KOLIBRI_GEMV_GS`
+(+10.3 % at one shape, -29 % at the shapes this model runs, and it never fires here, §T3).
+
+**End-to-end check of the launcher path after the edit** (this is the user-facing route, so it was smoke-tested rather
+than assumed): `./run-kolibri1.sh --detach` came up on `127.0.0.1:8080`, the engine logged its pool warning as usual,
+and one chat completion with a tool came back as a proper call:
+
+```
+tool_calls: [{"id":"call_77c7e595…","type":"function","function":{"name":"emit","arguments":"{\"a\": 7, \"b\": 42}"}}]
+content: null     finish_reason: tool_calls
+[server.log] this model's chat template asks for tool calls as JSON inside <tool_call>: the parser reads that form
+[server.log] tool call complete: 54 of max 300 tokens, 17.9 tok/s, 5 s
+```
+
+One limit worth writing down, seen while testing it: when `max_tokens` truncates *inside* the block the reply is raw
+text with `finish_reason: length` - there is no complete JSON to recover. A 64-token cap did exactly that; 300 tokens
+produced the call above. Not a defect in the recovery, but a caller that caps at 64 tokens on this model will see the
+raw form.
