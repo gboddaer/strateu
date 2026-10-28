@@ -1912,3 +1912,16 @@ The shipped gate cannot see this: `prefill_mmq_parity` **builds its expert weigh
 `copy16_group_kernel` (`moe_mmq.cu`) is unambiguous about the layout it produces - `ab = gu_dst + q * ga.gu_stride` (16-byte units), gate at `[0, na)`, up at `[na, 2na)`, down at `cd + q * ga.d_stride`, tail zeroed only for `q == n - 1` - so the mismatch is in the arguments I feed it (`up_off`, `gu_half`, `gu_stride`, `d_sz`, `d_stride`) or in what `Product.expert_bytes` expects, not in the kernel's arithmetic.
 
 **Next step, small and decisive**: make the parity test *stage through `gather_native_group`* (host blobs → device staging → product) instead of building the weights directly. That reproduces the engine's failure in seconds instead of a 40-second arm, and the only remaining variables are then the five size arguments.
+
+### P4 debug, step 5 (2026-10-28): a 1-vs-2 expert control, in seconds, isolates the stride
+
+`mmq_pipeline_probe --parity --parity-experts N` (staging filled by `gather_native_group`, exactly as the engine does it):
+
+| experts | MMQ row 0, col 0 | reference | verdict |
+|---|---|---|---|
+| 1 | 2.443 (and it lands in `dst[ids[0]] = dst[1]`) | 2.4435 | **exact**, and the id mapping is right |
+| 2 | **24.629** | 2.4435 | wrong by 10x |
+
+Both runs stage **identical bytes into slot 0** (same blob, same gather arguments, only `g.n` differs), so the second expert's presence changes what the product computes **for expert 0**. That rules out bounds, `total_rows`, `max_rows`, the id table and the activation array - all of which the 1-expert case validates exactly - and leaves the agreement between the gather's `gu_stride` and the product's `expert_bytes` as the only untested term. Both are 2 x 737 280 B in this probe, and `copy16_group_kernel` writes `gu_dst + q * (gu_stride/16)` in uint4 units, so the next experiment is to print the staged bytes at `slot * gu_stride` for slot 0 and 1 and compare them with the blobs, then sweep `expert_bytes` against the observed placement.
+
+This is now a seconds-scale loop: `--parity-experts 1|2` and one staged-buffer dump, no engine arm needed.

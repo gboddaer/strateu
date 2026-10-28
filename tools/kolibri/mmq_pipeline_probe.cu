@@ -181,9 +181,11 @@ static int parity_mode(int R, int kN) {
 int main(int argc, char** argv) {
     int R = 10, groups = 1;
     bool parity = false, no_gather = false, no_down = false, identity_ids = false, dst_host = false, no_quant_ids = false;
+    int parity_experts = 1;
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
         if (!std::strcmp(a, "--parity")) parity = true;
+        else if (!std::strcmp(a, "--parity-experts") && i + 1 < argc) parity_experts = std::atoi(argv[++i]);
         if (!std::strcmp(a, "--rows") && i + 1 < argc) R = std::atoi(argv[++i]);
         else if (!std::strcmp(a, "--groups") && i + 1 < argc) groups = std::atoi(argv[++i]);
         else if (!std::strcmp(a, "--no-gather")) no_gather = true;
@@ -192,7 +194,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--dst-host")) dst_host = true;
         else if (!std::strcmp(a, "--no-quant-ids")) no_quant_ids = true;
     }
-    if (parity) return parity_mode(2, 2);
+    if (parity) return parity_mode(2, parity_experts);
     if (!mmq::built() || !mmq::supported(GGML_TYPE_Q4_K)) {
         std::printf("mmq: not built / Q4_K unsupported (needs STRATA_MMQ_KQ=1)\n");
         return 2;
@@ -205,6 +207,7 @@ int main(int argc, char** argv) {
     std::mt19937 rng(7);
     const size_t gu_half = mmq::matrix_bytes(GGML_TYPE_Q4_K, FF, N);
     const size_t d_sz = mmq::matrix_bytes(GGML_TYPE_Q4_K, N, FF);
+    const size_t gu_half_bytes_ref = mmq::matrix_bytes(GGML_TYPE_Q4_K, FF, N);
     auto wgu = weights_q4k(FF, N, kN, rng);   // one gate matrix per expert slot of a group
     auto wd = weights_q4k(N, FF, kN, rng);
 
@@ -322,6 +325,42 @@ int main(int argc, char** argv) {
             ck(hipGetLastError(), "down product");
             ck(hipDeviceSynchronize(), "sync down");
         }
+    }
+    // Independent timing of the number the P4 kill criterion rests on (mmq_q4k_bench reports the same shape from a
+    // different harness): one group of 16 experts, R rows each, gate+up as one [2*FF x N] product.
+    {
+        mmq::Product tp{};
+        tp.type = GGML_TYPE_Q4_K;
+        tp.n = kN;
+        tp.xq = d_xq;
+        tp.bounds = d_bounds;
+        tp.ids = d_row_sel;
+        tp.total_rows = rows;
+        tp.max_rows = R;
+        tp.w = gu_stage;
+        tp.w_rows = 2 * FF;
+        tp.w_cols = N;
+        tp.expert_bytes = 2 * gu_half_bytes_ref;
+        tp.dst = d_gu;
+        tp.ld_dst = 2 * FF;
+        for (int i = 0; i < 3; ++i) ctx.run(tp, nullptr);
+        ck(hipDeviceSynchronize(), "sync warm");
+        hipEvent_t e0, e1;
+        ck(hipEventCreate(&e0), "event");
+        ck(hipEventCreate(&e1), "event");
+        const int reps = 20;
+        ck(hipEventRecord(e0), "rec");
+        for (int i = 0; i < reps; ++i) ctx.run(tp, nullptr);
+        ck(hipEventRecord(e1), "rec");
+        ck(hipEventSynchronize(e1), "sync");
+        float ms = 0.f;
+        ck(hipEventElapsedTime(&ms, e0, e1), "elapsed");
+        ms /= (float) reps;
+        const double fl = 2.0 * (double) rows * 2.0 * FF * (double) N / 1e9;
+        std::printf("PROBE TIMING: rows %lld, gate+up %.4f ms -> %.0f GFLOP/s (mmq_q4k_bench reports the same shape "
+                    "from its own harness)\n", (long long) rows, ms, fl / (ms * 1e-3));
+        ck(hipEventDestroy(e0), "d");
+        ck(hipEventDestroy(e1), "d");
     }
     std::printf("PROBE OK: the engine's sequence completes\n");
     return 0;
