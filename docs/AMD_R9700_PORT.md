@@ -1722,3 +1722,27 @@ The debug list for the next session, in the order that would find it fastest (al
 
 None of that touches the measured kernel: **11.55 TFLOPS at 10 rows per expert, 36x the pool** (step 0b above), so the
 lever is real and only the orchestration is unfinished.
+
+### P4 debug, step 1 (2026-10-28): the sequence works standalone, and `GatherGroup::first` is not an expert index
+
+`tools/kolibri/mmq_pipeline_probe.cu` replays the engine's exact orchestration on synthetic Q4_K weights - bounds, a
+row->token table for `quantize`, `gather_native_group`, the gate+up product, `swiglu`, the hidden quantize, the down
+product writing through a permutation `ids` table - with switches that take one step out at a time. Results:
+
+| probe | result |
+|---|---|
+| engine's shape (R 10, 16 experts, permutation ids, device dst) | **completes** |
+| **dst = pinned host memory** (what `A.ey_h` is) | **completes** |
+| 10 groups x 100 rows/expert (the engine's layer-chunk scale) | **`gather_native_group` returns false on the second group** |
+
+That second-group failure is a real bug in the wiring, and it is in my code, not the library: `GatherGroup::first` is
+the index **within the group buffer** (0 for a fresh group, whose experts go to `gu_dst + q * gu_stride`), not a global
+expert index. I passed `first = g0` (0, 16, 32, ...), so every group after the first failed the library's range check
+and the arm fell back to the pool - which is why the first attempt could not have been computing what it claimed even
+if it had not hung.
+
+What the probe does **not** reproduce is the hang itself: the same sequence on the same shapes, writing into pinned
+host memory, finishes. So the engine's hang is outside the MMQ call sequence - the next diagnostic is the branch
+re-applied with `HIP_LAUNCH_BLOCKING=1` on a 64-token prompt, which turns an asynchronous hang into a named failing
+call, plus `grp.first = 0` and a per-group blob base (`d_blobs + g * kN * stride`, which the probe also got wrong and
+which no correctness check would have caught in the engine because the pointers happened to stay in bounds).

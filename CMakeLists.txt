@@ -2453,6 +2453,12 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(mmq_q4k_bench tools/kolibri/mmq_q4k_bench.cu)
     target_include_directories(mmq_q4k_bench PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}")
     target_link_libraries(mmq_q4k_bench PRIVATE strata_mmq ${_strata_gpu_runtime_target})
+    # the engine's MMQ orchestration replayed standalone (a hang is a 5-second experiment there, and the switches
+    # take one step out at a time): tools/kolibri/mmq_pipeline_probe.cu
+    set_source_files_properties(tools/kolibri/mmq_pipeline_probe.cu PROPERTIES LANGUAGE HIP)
+    add_executable(mmq_pipeline_probe tools/kolibri/mmq_pipeline_probe.cu)
+    target_include_directories(mmq_pipeline_probe PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}")
+    target_link_libraries(mmq_pipeline_probe PRIVATE strata_mmq ${_strata_gpu_runtime_target})
     target_include_directories(strata_mmq
       PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}"
       PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
