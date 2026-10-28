@@ -1510,6 +1510,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/kolibri/pf_partial_guard_test.cmake)
   set_tests_properties(kolibri_pf_partial_guard_explicit_zero_test PROPERTIES
       ENVIRONMENT "STRATA_KOLIBRI_PF_PARTIAL=1;STRATA_KOLIBRI_EXPERT_F16=0" TIMEOUT 120)
+  # T16 (plan 2026-10-28-kolibri-r9700-speed.md): --cpu-threads 1 clamps to 2 with a warning naming the count, before
+  # the model read (one lane = the degenerate 51 51 51 ... loop, measured 2026-10-28); no card or GGUF needed.
+  add_test(NAME kolibri_cpu_threads_floor_test
+    COMMAND ${CMAKE_COMMAND} -DENGINE=$<TARGET_FILE:strata-kolibri>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/kolibri/cpu_threads_floor_test.cmake)
+  set_tests_properties(kolibri_cpu_threads_floor_test PROPERTIES TIMEOUT 180)
   # #783 PR-c: the multi-token router and the k = 10 float4 combine, bitwise against the single-token contracts
   add_executable(native_multi_parity src/kernels/native_multi_parity.cpp)
   target_include_directories(native_multi_parity PRIVATE ${_strata_gpu_include_directories})

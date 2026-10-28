@@ -871,3 +871,38 @@ token.** That is the expected cross-backend split - `docs/AMD_HIP.md` states pla
 not claim bit-identical answers against CUDA, and hipBLAS and cuBLAS do not share an accumulation
 order. The usable gates on this box are therefore: two-run identity (met), an AMD-recorded oracle
 as the standing reference, and KL against a llama.cpp built on this box.
+
+## T16 (2026-10-28): `--cpu-threads 1` is not a valid pool, and the flag now says so
+
+Measured on the R9700 (gfx1201, `HIP_VISIBLE_DEVICES=0`), Kolibri-1-Q4_K_M, ctx 8192, pool on, `EXPERT_F16` unset
+(the engine default, 0), 7 pinnable physical cores, box idle, 90 GiB free, one arm per engine load.
+
+The flag was documented above as a trap without a guard: one lane emits `51 51 51 51 ...` for all 16 tokens, a
+degenerate loop that looks like an answer. The engine now clamps 1 to 2 while parsing the argument - before the
+model read, so the message arrives even when the load fails - and prints:
+
+```
+strata-kolibri: WARNING: --cpu-threads 1 is not a valid pool: one lane emits the degenerate 51 51 51 ... repeat loop (measured 2026-10-28); using 2
+```
+
+Measured, same prompt as the lane-count check above (`tools/kolibri/oracle_ids512.txt`, `--n 16`):
+
+| arm | banner | ids |
+|---|---|---|
+| `--cpu-threads 1` | `prefill pool: 2 lane(s) = the host + 1 thread(s), 7 pinnable physical core(s), pinned` + the warning | `gen: 286 3515 310 262 14292 1343 1444 46 17156 32 50 55 58 4037 262 7771` |
+| `--cpu-threads 2` | same banner, no warning | identical, byte for byte |
+
+Those are the same ids the 8-thread and 24-thread arms produced (§9.3), so lane count still moves the clock and not
+the result - now with no lane count that silently breaks it. `oracle.sh check` still reports BITWISE PASS (the plain
+path, no pool, untouched by this change).
+
+New test: `tests/kolibri/cpu_threads_floor_test.cmake` (`ctest -R kolibri_cpu_threads_floor`), 0.58 s, no card and no
+GGUF needed - it reads the warning, checks it names the clamped count, checks the run still reaches the model load
+instead of exiting at the clamp, and checks that 2 lanes and the pool-off default stay silent.
+
+**`ctest` denominator, corrected.** The gate line has been quoting 60/62; this tree registers **87** tests. The run
+after this change: **83/87 passed, 142.04 s**, four fails, all environment:
+`ple_parity` (wants a Qwen GGUF this box does not have), `platform_memory_test`, and two that were not in the earlier
+figure - `vmm_test` (a 3 GiB `cudaMemset` at a VMM offset fails) and `conversation_copy_streams_test` (the card's
+first copy stream and event "take under 16 MiB" assertion). Neither of those two links `strata_kolibri`, so this
+change cannot reach them; they are recorded here as box-scoped, not as a regression.

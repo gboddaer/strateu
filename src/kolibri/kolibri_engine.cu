@@ -4751,7 +4751,20 @@ int strata::kolibri::run(int argc, char** argv) {
         else if (a == "--force" && i + 1 < argc) force = argv[++i];
         else if (a == "--load-only") load_only = true;
         else if (a == "--serve") serve_mode = true;
-        else if (a == "--cpu-threads" && i + 1 < argc) cpu_threads = std::atoi(argv[++i]);
+        else if (a == "--cpu-threads" && i + 1 < argc) {
+            cpu_threads = std::atoi(argv[++i]);
+            // T16: ONE lane is not a valid pool.  The prefill fan-out gives each lane a shard of the expert rows
+            // and blocks on a barrier across them, so a single lane has nobody to wait for and the decode
+            // degenerates into the 51 51 51 ... repeat loop (measured on this box 2026-10-28, recorded in
+            // docs/AMD_R9700_PORT.md).  A lane count is a throughput knob, not a correctness switch, so refuse
+            // the silently-wrong case here - before any model read or CUDA init - and run the smallest count that
+            // works.  0 still means "no pool" (the opt-in absence, kolibri_engine.cu:4827).
+            if (cpu_threads == 1) {
+                std::fprintf(stderr, "strata-kolibri: WARNING: --cpu-threads 1 is not a valid pool: one lane emits "
+                                     "the degenerate 51 51 51 ... repeat loop (measured 2026-10-28); using 2\n");
+                cpu_threads = 2;
+            }
+        }
         else if (a == "--expert-slots" && i + 1 < argc) {
         // "auto" = fit the count to the VRAM that is still free once dense+KV+scratch are allocated.
         const std::string v = argv[i + 1];
