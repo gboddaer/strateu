@@ -3136,10 +3136,17 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                             grp.first = 0;   // a fresh group: its experts land at gu_dst + q * gu_stride
                             grp.n = gn;
                             for (int q = 0; q < gn; ++q) grp.blob[q] = b.table + (size_t) ml[j0 + (size_t) q] * b.stride;
-                            ok = strata::prefill::mmq::gather_native_group(grp, (size_t) b.L.up_off, gu_half,
-                                                                          (size_t) b.L.down_off, d_sz, s.mmq_gu_stage,
-                                                                          gu_stride, s.mmq_d_stage, d_sz, g_st);
-                            if (!ok) break;
+                            // ONE EXPERT A CALL, exactly as the working Qwen path stages it (prefill.cpp:4920 calls
+                            // gather_native per expert; gather_native_group is never used there).  The multi-expert
+                            // variant is the one that returned NaN from expert 1 on - docs/AMD_R9700_PORT.md §P4.
+                            for (int q = 0; q < gn; ++q) {
+                                const uint8_t* blob = b.table + (size_t) ml[j0 + (size_t) q] * b.stride;
+                                strata::prefill::mmq::gather_native(blob, blob + b.L.up_off, gu_half,
+                                                                    blob + b.L.down_off, d_sz,
+                                                                    (uint8_t*) s.mmq_gu_stage + (size_t) q * gu_stride,
+                                                                    (uint8_t*) s.mmq_d_stage + (size_t) q * d_sz, g_st);
+                            }
+                            KC(cudaGetLastError());
                             // the MMQ tile reads a tail past the group's last expert (prefill.cpp: MMQ_TAIL = 4096)
                             KC(cudaMemsetAsync((char*) s.mmq_gu_stage + (size_t) gn * gu_stride, 0, 4096, g_st));
                             KC(cudaMemsetAsync((char*) s.mmq_d_stage + (size_t) gn * d_sz, 0, 4096, g_st));

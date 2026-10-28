@@ -2029,3 +2029,25 @@ the head of the row says the product did write - with a zeroed weight or a zero-
 
 Not resolved. The 1-expert arm remains the only correct configuration measured, and it is 1.8x slower than the pool, so
 nothing ships from P4 yet.
+
+### P4 debug, step 8 (2026-10-28): aligned with the Qwen path - per-expert `gather_native` - and the symptom persists
+
+Following the working path exactly as the user insisted: `src/prefill/prefill.cpp:4920` stages **one expert per call**
+(`mmq::gather_native`), and `gather_native_group` is only a non-MMQ stub there (`:92`) - the multi-expert gather my
+engine used is a code path the shipped engine never exercises. Its sizes also match mine:
+`grp_gu = MMQ_GROUP * mp.gu_max + MMQ_TAIL` (`:1840`), i.e. **one tail after the group**, expert stride = the matrix
+size; `mmq_gub = mmq::matrix_bytes(mmq_gt, 1280, N)` (`:4661`); `maxr` is the max of the group's counts (`:4898-4901`),
+which is exactly what I compute.
+
+So the engine's staging now uses `gather_native` per expert, with the same strides. **Expert 1's first row is still
+0** (`gu[gate]=0 gu[up]=0 h=0`, first NaN at column 36 of that row), and the answer is still `gen: 0 0 0 0`.
+
+That leaves exactly one difference between the engine and every passing case, and it is in the *activations*:
+`prefill.cpp` and the parity test both quantize with `ids` = a **permutation** of source rows (each row used once),
+while the engine's `ids` = the token index per row, which **repeats** (K rows per token). If `quantize`'s `ids` is a
+destination map rather than a source map, repeated values scatter several rows onto the same slot and leave the rest
+untouched - which is the shape of the symptom (expert 0's rows right, the rest zero/garbage).
+
+**Next**: the parity test with repeated `src` rows (a 5-line change: reuse row 0 for several output rows). If it
+reproduces, the fix is `quantize_scatter` (which exists for exactly this: "token t's row of x is quantized once and
+stored at rows slot[t*k_used + k]", with `slot` the inverse of `src`) instead of `quantize`.
