@@ -1877,3 +1877,20 @@ Gates at the tip (after the engine revert and the CMake/tool additions): `oracle
 (`vmm_test`, `ple_parity`, `platform_memory_test`, `conversation_copy_streams_test`). No launcher default moved:
 `run-kolibri1.sh` is untouched in this session, and the one change inside the chunk rule is a defect fix (an
 exactly-8192-token request no longer takes the short-chunk branch).
+
+### P4 debug, step 3 (2026-10-28): the numerics are right, the multi-expert staging is not
+
+Three measurements settle where the fault is, and one of them is decisive:
+
+| arm | `gen` after a 512-token prefill | expert-leg NaN | prefill |
+|---|---|---|---|
+| pool (shipped) | `286 3515 310 262` | - | 4 810 ms |
+| **MMQ, one expert per group** (`STRATA_KOLIBRI_MMQ_GROUP=1`) | **`286 3515 310 262` — identical to the pool** | **0** | 8 863 ms |
+| MMQ, 16 experts per group (default) | `0 0 0 0` | 25 020 floats, first at row 198 = expert 0's row count | 2 011 ms |
+| 16 experts + 4 096 B tail per expert | `0 0 0 0` | **1 782 416** | 2 030 ms |
+
+So: **the per-group convention, the activation source (`A.h_m`), the identity id table, the weights, the product and the scatter are all correct** — with one expert a group the engine reproduces the pool's answer exactly. What fails is the *multi-expert* staging: every expert after the first in a group comes back NaN, and adding the 4 096-byte tail (`prefill.cpp`'s `MMQ_TAIL`) between experts made it five times worse rather than better. That means the placement of expert `q` inside the gather buffer is **not** `q * gu_stride` in the sense I passed it, and my `expert_bytes` for the product is correspondingly wrong.
+
+**Why the shipped gate did not catch it**: `prefill_mmq_parity` (which passes here, Q4_K `rel_l2 = 0.00198`) exercises the K-quants with **`experts=1`** — its multi-expert cases are Q2_0 only (`rows=7 experts=3`). The one layout the engine depends on is the one the gate does not cover. Extending that test's K-quant cases to 2–3 experts is therefore the next step, and it iterates in seconds instead of a 40-second engine arm.
+
+**Speed, meanwhile, is now measured for both shapes**: the broken 16-expert path runs the prompt leg in 2 011 ms against the pool's 4 810 ms (2.4x faster), and the correct one-expert path in 8 863 ms (1.8x *slower* — ~2 300 extra launches and a per-group hidden quantize that should be per-layer). So the win lives entirely in the multi-expert layout, which is exactly the piece still wrong.
