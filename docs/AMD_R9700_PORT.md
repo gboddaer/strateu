@@ -906,3 +906,45 @@ after this change: **83/87 passed, 142.04 s**, four fails, all environment:
 figure - `vmm_test` (a 3 GiB `cudaMemset` at a VMM offset fails) and `conversation_copy_streams_test` (the card's
 first copy stream and event "take under 16 MiB" assertion). Neither of those two links `strata_kolibri`, so this
 change cannot reach them; they are recorded here as box-scoped, not as a regression.
+
+## T13 (2026-10-28): the `RES_TOP=0` zero-block launch, found and guarded
+
+Filed as "`dequant launch: invalid configuration argument`, no `gen:` line" (§9.3). On this tip that symptom is
+**gone for the wrong reason**: `--prefill --cpu-threads 8`, `EXPERT_F16=24`, `RES_TOP=0`, 512-id prompt, ctx 8192
+completes in 19.68 s with `gen: 286 3515 310 262`. An instrumented build showed why it no longer reports:
+
+| arm | `b.f16` | resident blocks `nblk` | zero-block launches per 512-token prefill |
+|---|---|---|---|
+| `RES_TOP=0` | set | **0, every layer, every chunk** | 100 (2 chunks x 50 layers) |
+| `RES_TOP=56` | set | 33 … 60 per layer-chunk | 0 |
+
+So the launches were still happening with a zero grid - they simply stopped being *fatal*: the launch error is
+sticky, and the checks that would have reported it (`dequant_f16`'s `cudaGetLastError`) now early-return on a
+zero-size conversion (the guard added in `3b24d3f5`), while other calls in between clear the slot. Measured
+separately on this stack (ROCm 7.2.2, gfx1201): `k<<<dim3(0),128>>>` → `invalid configuration argument` (error 9),
+`k<<<dim3(1),128>>>` → no error. A zero-block launch is an error; whether anyone hears about it is luck.
+
+Root cause, with the data flow: with a zero promotion ceiling `res_eff = min(res_top, n_cached) = 0`, so `pf_res`
+stays empty, the block loop that builds the resident rows never runs, `nblk = 0`, and the section that follows
+launched `k_gather_f16`, `k_swiglu_rows`, `k_to_f16` and three `gemm.f16_batched` calls on that count. That is the
+whole defect - the dequant was the messenger.
+
+Fix: guard the section on `nblk > 0` (`kolibri_engine.cu`, one brace around the launch sequence, `rows` moved inside
+it). Nothing else moved. `RES_TOP=0` is a legal configuration again: the cache stays allocated, every touched expert
+goes to the pool, and the numbers are the same ones the unguarded build produced.
+
+| arm | wall | ids (512-id prompt, `--n 4`) |
+|---|---|---|
+| `RES_TOP=0`, before the guard | 19.78 s / 19.68 s | `286 3515 310 262` |
+| `RES_TOP=0`, after the guard | 19.7 s (ctest arm, 64 ids) | identical |
+| `RES_TOP=56`, before and after | 23.66 s | identical |
+
+Audit of the rest: the file has 83 `<<<>>>` launches (84 lines mention one, one of them inside a comment), 16 of them
+through `grid1(...)`. Every other count is
+`Tc * …`, `NKc * …` or `N * K` with `Tc >= 1`, `NKc = K >= 1` and `FS = n_ff_shexp > 0`; the one decode-side
+`nblk * FF` (`:2262`) is built from the token's own K selections and cannot be zero while a token exists. The
+resident prefill block was the only zero-capable one.
+
+Regression: `ctest -R kolibri_res_top_zero_test` (35.79 s) runs both arms and requires `RES_TOP=0` to finish with a
+`gen:` line whose ids equal `RES_TOP=56`'s; it skips (77) where the GGUF is absent. Gates after the change:
+`oracle.sh check` BITWISE PASS, full `ctest` 84/88 (same four box-scoped fails as after T16).

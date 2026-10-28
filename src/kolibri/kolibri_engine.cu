@@ -2876,34 +2876,45 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                     }
                     s.pf_nblk = nblk;
                     res_rows = (int64_t) nblk * M;
-                    const int64_t rows = res_rows;
-                    KC(cudaMemcpyAsync(s.res_tok, s.res_tok_h.data(), (size_t) rows * 4, cudaMemcpyHostToDevice, g_st));
-                    KC(cudaMemcpyAsync(s.pa_g, s.pa_g_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
-                    KC(cudaMemcpyAsync(s.pa_u, s.pa_u_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
-                    KC(cudaMemcpyAsync(s.pa_d, s.pa_d_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
-                    KC(cudaMemcpyAsync(s.pb_x, s.pb_x_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
-                    KC(cudaMemcpyAsync(s.pb_h, s.pb_h_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
-                    KC(cudaMemcpyAsync(s.pc_g, s.pc_g_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
-                    KC(cudaMemcpyAsync(s.pc_u, s.pc_u_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
-                    KC(cudaMemcpyAsync(s.pc_ey, s.pc_ey_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
-                    k_gather_f16<<<grid1(rows * N), kThreads>>>((const __half*) A.x16, s.res_tok, (__half*) s.res_x16, N);
-                    e.gemm.f16_batched(s.pa_g, s.pb_x, s.pc_g, M, FF, N, nblk);
-                    e.gemm.f16_batched(s.pa_u, s.pb_x, s.pc_u, M, FF, N, nblk);
-                    k_swiglu_rows<<<grid1(rows * FF), kThreads>>>(s.res_g, s.res_u, s.res_h, rows * FF);
-                    k_to_f16<<<grid1(rows * FF), kThreads>>>(s.res_h, (__half*) s.res_h16, rows * FF);
-                    e.gemm.f16_batched(s.pa_d, s.pb_h, s.pc_ey, M, N, FF, nblk);
-                    if (pf_partial_on()) {
-                        // G1: the resident rows STAY in s.res_ey.  Today this D2H lands rows*N floats (~27 MB at
-                        // ~85% coverage) that the host scatters and then ships straight back up as part of the
-                        // 31.5 MB block; here only the 64 KB selection map goes down, and the rows never leave.
-                        KC(cudaMemcpyAsync(A.rr_sel_m, s.rr_sel_h.data(), (size_t) rows * 4, cudaMemcpyHostToDevice, g_st));
-                        // G1 CNT coverage: the prefill staging legs were invisible to the byte counters, so the
-                        // "CNT bytes reconcile with the wall delta" gate could not be run on them.  Counted here,
-                        // under the same e.counters guard as the decode legs, so a rate run stays untouched.
-                        if (e.counters) { ++e.cnt.h2d_n; e.cnt.h2d_bytes += (long long) rows * 4; }
-                    } else {
-                        KC(cudaMemcpyAsync(s.res_ey_h, s.res_ey, (size_t) rows * N * 4, cudaMemcpyDeviceToHost, g_st));
-                        if (e.counters) { ++e.cnt.d2h_n; e.cnt.d2h_bytes += (long long) rows * N * 4; }
+                    // RES_TOP=0 is a legal configuration: the promotion ceiling is zero, pf_res stays empty and
+                    // every touched expert goes to the pool.  Nothing below may launch in that case.  A zero-block
+                    // <<<>>> is "invalid configuration argument" on this stack (measured on the R9700, ROCm
+                    // 7.2.2 / gfx1201: grid 0 -> error 9, one-block launch -> 0), and the launch error is STICKY:
+                    // it does not report at the launch, it reports at whatever check runs next.  On the pre-guard
+                    // binary that check was the next layer's dequant, which is why the ledger filed this as a
+                    // dequant defect (docs/AMD_R9700_PORT.md §10).  Reached with nblk = 0 once per layer per
+                    // chunk (100 times in a 512-token prefill: 2 chunks x 50 layers, measured), so the guard is
+                    // load-bearing, not defensive dressing.
+                    if (nblk > 0) {
+                        const int64_t rows = res_rows;
+                        KC(cudaMemcpyAsync(s.res_tok, s.res_tok_h.data(), (size_t) rows * 4, cudaMemcpyHostToDevice, g_st));
+                        KC(cudaMemcpyAsync(s.pa_g, s.pa_g_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
+                        KC(cudaMemcpyAsync(s.pa_u, s.pa_u_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
+                        KC(cudaMemcpyAsync(s.pa_d, s.pa_d_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
+                        KC(cudaMemcpyAsync(s.pb_x, s.pb_x_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
+                        KC(cudaMemcpyAsync(s.pb_h, s.pb_h_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
+                        KC(cudaMemcpyAsync(s.pc_g, s.pc_g_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
+                        KC(cudaMemcpyAsync(s.pc_u, s.pc_u_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
+                        KC(cudaMemcpyAsync(s.pc_ey, s.pc_ey_h.data(), (size_t) nblk * 8, cudaMemcpyHostToDevice, g_st));
+                        k_gather_f16<<<grid1(rows * N), kThreads>>>((const __half*) A.x16, s.res_tok, (__half*) s.res_x16, N);
+                        e.gemm.f16_batched(s.pa_g, s.pb_x, s.pc_g, M, FF, N, nblk);
+                        e.gemm.f16_batched(s.pa_u, s.pb_x, s.pc_u, M, FF, N, nblk);
+                        k_swiglu_rows<<<grid1(rows * FF), kThreads>>>(s.res_g, s.res_u, s.res_h, rows * FF);
+                        k_to_f16<<<grid1(rows * FF), kThreads>>>(s.res_h, (__half*) s.res_h16, rows * FF);
+                        e.gemm.f16_batched(s.pa_d, s.pb_h, s.pc_ey, M, N, FF, nblk);
+                        if (pf_partial_on()) {
+                            // G1: the resident rows STAY in s.res_ey.  Today this D2H lands rows*N floats (~27 MB at
+                            // ~85% coverage) that the host scatters and then ships straight back up as part of the
+                            // 31.5 MB block; here only the 64 KB selection map goes down, and the rows never leave.
+                            KC(cudaMemcpyAsync(A.rr_sel_m, s.rr_sel_h.data(), (size_t) rows * 4, cudaMemcpyHostToDevice, g_st));
+                            // G1 CNT coverage: the prefill staging legs were invisible to the byte counters, so the
+                            // "CNT bytes reconcile with the wall delta" gate could not be run on them.  Counted here,
+                            // under the same e.counters guard as the decode legs, so a rate run stays untouched.
+                            if (e.counters) { ++e.cnt.h2d_n; e.cnt.h2d_bytes += (long long) rows * 4; }
+                        } else {
+                            KC(cudaMemcpyAsync(s.res_ey_h, s.res_ey, (size_t) rows * N * 4, cudaMemcpyDeviceToHost, g_st));
+                            if (e.counters) { ++e.cnt.d2h_n; e.cnt.d2h_bytes += (long long) rows * N * 4; }
+                        }
                     }
                 }
                 const std::vector<int32_t>& pool_list = b.f16 ? s.pf_miss : s.pf_touch;

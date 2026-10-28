@@ -1516,6 +1516,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     COMMAND ${CMAKE_COMMAND} -DENGINE=$<TARGET_FILE:strata-kolibri>
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/kolibri/cpu_threads_floor_test.cmake)
   set_tests_properties(kolibri_cpu_threads_floor_test PROPERTIES TIMEOUT 180)
+  # T13 (plan 2026-10-28-kolibri-r9700-speed.md): RES_TOP=0 must complete, not die on a zero-block launch in the
+  # promotion path (the sticky error used to report at the next layer's dequant); its ids must equal RES_TOP=56's.
+  # Needs the 45 GB GGUF, so it skips (77) where the model is not present.
+  add_test(NAME kolibri_res_top_zero_test
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/kolibri/res_top_zero_test.sh)
+  set_tests_properties(kolibri_res_top_zero_test PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
   # #783 PR-c: the multi-token router and the k = 10 float4 combine, bitwise against the single-token contracts
   add_executable(native_multi_parity src/kernels/native_multi_parity.cpp)
   target_include_directories(native_multi_parity PRIVATE ${_strata_gpu_include_directories})
