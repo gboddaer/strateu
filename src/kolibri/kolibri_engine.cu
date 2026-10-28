@@ -3078,25 +3078,43 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                     }
                     const size_t gu_half = (size_t) b.L.up_off;      // one matrix: gate occupies [0, up_off)
                     const size_t gu_stride = (size_t) b.L.down_off;   // gate|up contiguous
-                    const size_t d_sz = b.stride > (size_t) b.L.down_off ? b.stride - (size_t) b.L.down_off : 0;
-                    if (!ml.empty() && rows > 0 && rows <= s.mmq_rows_cap && gu_half > 0 && d_sz > 0) {
+                    const size_t d_region = b.stride > (size_t) b.L.down_off ? b.stride - (size_t) b.L.down_off : 0;
+                    // Product derives its per-expert stride itself as expert_bytes / type_bytes(type) (integer
+                    // division, src/prefill/moe_mmq.cu:478), so the stride MUST be a whole number of weight blocks.
+                    // The blob's down region is not: 1,095,840 B / 210 B (Q6_K) = 5,218.28, truncated to 5,218 blocks,
+                    // which shifts expert z's down matrix by 60*z bytes - expert 0 exact (so a one-expert group is
+                    // perfect), expert 15 off by 900 B.  Stage and address the matrix itself instead.
+                    const size_t d_sz = strata::prefill::mmq::matrix_bytes(b.L.d_type, N, FF);
+                    if (!ml.empty() && rows > 0 && rows <= s.mmq_rows_cap && gu_half > 0 && d_sz > 0 &&
+                        d_region >= d_sz) {
                         // MMQ's scheduler degenerates when a group's max rows per expert is tiny (measured: groups with
                         // maxr=1 wrote NaN into their rows - docs/AMD_R9700_PORT.md P4).  Pad every expert to kMinRows:
                         // the filler rows repeat that expert's first activation row, and the scatter skips them (sel<0).
+                        bool ok = true;
                         constexpr int kMinRows = 8;
-                        int64_t r = 0, padded = 0;
+                        int64_t padded = 0;
                         for (int x : ml) {
-                            const int i0 = cnt[x];
-                            int m = cnt[x + 1] - i0;
-                            const int pr = m < kMinRows ? kMinRows : m;
-                            padded += pr;
-                            for (int q = 0; q < pr; ++q, ++r) {
-                                s.mmq_row_tok_h[(size_t) r] = ord[(size_t) (i0 + (q < m ? q : 0))] / K;
-                                s.mmq_row_sel_h[(size_t) r] = q < m ? (int32_t) ord[(size_t) (i0 + q)] : -1;
-                            }
+                            const int m2 = cnt[x + 1] - cnt[x];
+                            padded += m2 < kMinRows ? kMinRows : m2;
                         }
-                        if (padded > s.mmq_rows_cap) { r = 0; }
-                        rows = r;   // the padded row count is what the groups below walk
+                        // Test the size BEFORE writing: a chunk whose experts mostly hold one or two rows needs up to
+                        // 8 extra rows each, and writing past the table corrupted the heap at 8 191 tokens.  The table is
+                        // now reserved for the padding (rcap) and anything larger still falls back to the pool.
+                        if (padded > s.mmq_rows_cap) {
+                            ok = false;
+                        } else {
+                            int64_t r = 0;
+                            for (int x : ml) {
+                                const int i0 = cnt[x];
+                                int m = cnt[x + 1] - i0;
+                                const int pr = m < kMinRows ? kMinRows : m;
+                                for (int q = 0; q < pr; ++q, ++r) {
+                                    s.mmq_row_tok_h[(size_t) r] = ord[(size_t) (i0 + (q < m ? q : 0))] / K;
+                                    s.mmq_row_sel_h[(size_t) r] = q < m ? (int32_t) ord[(size_t) (i0 + q)] : -1;
+                                }
+                            }
+                            rows = r;   // the padded row count is what the groups below walk
+                        }
                         KC(cudaMemcpyAsync(s.mmq_row_tok, s.mmq_row_tok_h.data(), (size_t) rows * 4, cudaMemcpyHostToDevice, g_st));
                         KC(cudaMemcpyAsync(s.mmq_row_sel, s.mmq_row_sel_h.data(), (size_t) rows * 4, cudaMemcpyHostToDevice, g_st));
                         if (std::getenv("STRATA_KOLIBRI_MMQ_DEBUG") != nullptr) {
@@ -3104,7 +3122,6 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                             std::vector<float> ns((size_t) NKc * N, std::nanf(""));
                             KC(cudaMemcpy(A.gout_m, ns.data(), ns.size() * 4, cudaMemcpyHostToDevice));
                         }
-                        bool ok = true;
                         int64_t r0 = 0;
                         // STRATA_KOLIBRI_MMQ_GROUP=1 isolates the multi-expert staging layout: with one expert a group the
                         // product needs no expert stride at all (measured defect: experts 1..n of a 16-expert group came
@@ -3135,18 +3152,15 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                             strata::prefill::mmq::GatherGroup grp;
                             grp.first = 0;   // a fresh group: its experts land at gu_dst + q * gu_stride
                             grp.n = gn;
-                            for (int q = 0; q < gn; ++q) grp.blob[q] = b.table + (size_t) ml[j0 + (size_t) q] * b.stride;
-                            // ONE EXPERT A CALL, exactly as the working Qwen path stages it (prefill.cpp:4920 calls
-                            // gather_native per expert; gather_native_group is never used there).  The multi-expert
-                            // variant is the one that returned NaN from expert 1 on - docs/AMD_R9700_PORT.md §P4.
-                            for (int q = 0; q < gn; ++q) {
-                                const uint8_t* blob = b.table + (size_t) ml[j0 + (size_t) q] * b.stride;
-                                strata::prefill::mmq::gather_native(blob, blob + b.L.up_off, gu_half,
-                                                                    blob + b.L.down_off, d_sz,
-                                                                    (uint8_t*) s.mmq_gu_stage + (size_t) q * gu_stride,
-                                                                    (uint8_t*) s.mmq_d_stage + (size_t) q * d_sz, g_st);
-                            }
-                            KC(cudaGetLastError());
+                            // POSITIONAL TEST: every slot gets the SAME expert, so every slot's rows must produce
+                            // identical values.  Anything else is the staging or the product, not the data.
+                            static const bool same_exp = std::getenv("STRATA_KOLIBRI_MMQ_SAME") != nullptr;
+                            for (int q = 0; q < gn; ++q)
+                                grp.blob[q] = b.table + (size_t) ml[j0 + (same_exp ? 0 : (size_t) q)] * b.stride;
+                            ok = strata::prefill::mmq::gather_native_group(grp, (size_t) b.L.up_off, gu_half,
+                                                                          (size_t) b.L.down_off, d_sz, s.mmq_gu_stage,
+                                                                          gu_stride, s.mmq_d_stage, d_sz, g_st);
+                            if (!ok) break;
                             // the MMQ tile reads a tail past the group's last expert (prefill.cpp: MMQ_TAIL = 4096)
                             KC(cudaMemsetAsync((char*) s.mmq_gu_stage + (size_t) gn * gu_stride, 0, 4096, g_st));
                             KC(cudaMemsetAsync((char*) s.mmq_d_stage + (size_t) gn * d_sz, 0, 4096, g_st));
@@ -3170,17 +3184,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                             gp.ld_dst = 2 * FF;
                             e.mmq_ctx->run(gp, g_st);
                             strata::prefill::mmq::swiglu(s.mmq_gu, s.mmq_h, nr, FF, false, g_st);
-                            if (std::getenv("STRATA_KOLIBRI_MMQ_DEBUG") != nullptr && l == 0) {
-                                // split "the product emitted NaN" from "the NaN starts later": expert 1's first row, both stages
-                                const int64_t r1 = gn > 1 ? (int64_t) (s.mmq_bounds_h[1]) : 0;
-                                float a = 0, b2 = 0, c = 0;
-                                KC(cudaMemcpy(&a, s.mmq_gu + (size_t) r1 * 2 * FF, 4, cudaMemcpyDeviceToHost));
-                                KC(cudaMemcpy(&b2, s.mmq_gu + (size_t) r1 * 2 * FF + FF, 4, cudaMemcpyDeviceToHost));
-                                KC(cudaMemcpy(&c, s.mmq_h + (size_t) r1 * FF, 4, cudaMemcpyDeviceToHost));
-                                std::fprintf(stderr, "MMQSPLIT l=%d gn=%d row1=%lld gu[gate]=%.6g gu[up]=%.6g h=%.6g\n",
-                                             (int) l, gn, (long long) r1, (double) a, (double) b2, (double) c);
-                            }
-                            strata::prefill::mmq::quantize(s.mmq_h, nullptr, s.mmq_xqh, b.L.d_type, FF, FF, nr, g_st);
+                                                                                                                strata::prefill::mmq::quantize(s.mmq_h, nullptr, s.mmq_xqh, b.L.d_type, FF, FF, nr, g_st);
                             if (std::getenv("STRATA_KOLIBRI_MMQ_DEBUG") != nullptr) {
                                 // stamp dm so a product row that is never written is distinguishable from a NaN result
                                 std::vector<float> ns((size_t) nr * N, std::nanf(""));
@@ -3672,25 +3676,29 @@ void init_scratch(const Engine& e, Scratch& s) {
                 gu_max = std::max(gu_max, (size_t) b.L.down_off);
                 d_max = std::max(d_max, b.stride > (size_t) b.L.down_off ? b.stride - (size_t) b.L.down_off : 0);
             }
-            s.mmq_rows_cap = ents;
-            s.mmq_row_tok_h.resize((size_t) ents);
-            s.mmq_row_sel_h.resize((size_t) ents);
+            // The rows of a chunk are the chunk's selections PADDED to kMinRows per expert, so a chunk whose experts
+            // mostly hold one or two rows needs up to 8 extra rows for every expert it touches.  Sizing these by `ents`
+            // alone overflowed a std::vector at 8 191 tokens (glibc: free(): invalid next size).  Reserve the padding.
+            const int64_t rcap = ents + (int64_t) 8 * ((int64_t) e.g.n_expert + 1);
+            s.mmq_rows_cap = rcap;
+            s.mmq_row_tok_h.resize((size_t) rcap);
+            s.mmq_row_sel_h.resize((size_t) rcap);
             s.mmq_bounds_h.resize((size_t) e.g.n_expert + 1);
-            KC(cudaMalloc(&s.mmq_xq, strata::prefill::mmq::q8_bytes(ents, N) + 4096));
-            KC(cudaMalloc(&s.mmq_xqh, strata::prefill::mmq::q8_bytes(ents, FF) + 4096));
-            KC(cudaMalloc((void**) &s.mmq_gu, (size_t) ents * 2 * FF * 4));
-            KC(cudaMalloc((void**) &s.mmq_h, (size_t) ents * FF * 4));
-            KC(cudaMalloc((void**) &s.mmq_dm, (size_t) ents * N * 4));
+            KC(cudaMalloc(&s.mmq_xq, strata::prefill::mmq::q8_bytes(rcap, N) + 4096));
+            KC(cudaMalloc(&s.mmq_xqh, strata::prefill::mmq::q8_bytes(rcap, FF) + 4096));
+            KC(cudaMalloc((void**) &s.mmq_gu, (size_t) rcap * 2 * FF * 4));
+            KC(cudaMalloc((void**) &s.mmq_h, (size_t) rcap * FF * 4));
+            KC(cudaMalloc((void**) &s.mmq_dm, (size_t) rcap * N * 4));
             // MMQ reads up to 4096 bytes past an expert's matrix (prefill.cpp: MMQ_TAIL), so EVERY expert's slot in the
             // staging carries the tail - not just the last one.  Without it, expert 0's tile read expert 1's weights and
             // experts 1..n came back NaN (measured: first NaN at row = maxr, ledger §P4).
             KC(cudaMalloc(&s.mmq_gu_stage, 16 * gu_max + 8192));
             KC(cudaMalloc(&s.mmq_d_stage, 16 * d_max + 8192));
-            KC(cudaMalloc((void**) &s.mmq_row_tok, (size_t) ents * 4));
-            KC(cudaMalloc((void**) &s.mmq_row_sel, (size_t) ents * 4));
-            KC(cudaMalloc((void**) &s.mmq_ident, (size_t) ents * 4));
+            KC(cudaMalloc((void**) &s.mmq_row_tok, (size_t) rcap * 4));
+            KC(cudaMalloc((void**) &s.mmq_row_sel, (size_t) rcap * 4));
+            KC(cudaMalloc((void**) &s.mmq_ident, (size_t) rcap * 4));
             KC(cudaMalloc((void**) &s.mmq_bounds, ((size_t) e.g.n_expert + 1) * 4));
-            strata::prefill::mmq::iota(s.mmq_ident, ents, g_st);
+            strata::prefill::mmq::iota(s.mmq_ident, rcap, g_st);
             if (e.mmq_ctx == nullptr) e.mmq_ctx = std::make_unique<strata::prefill::mmq::Context>();
             std::fprintf(stderr, "strata-kolibri: STRATA_KOLIBRI_PF_MMQ: prompt experts on the int8 tensor units "
                                  "(gate/up %zu B, down %zu B per expert, %lld selections a chunk)\n",

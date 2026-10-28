@@ -2051,3 +2051,53 @@ untouched - which is the shape of the symptom (expert 0's rows right, the rest z
 **Next**: the parity test with repeated `src` rows (a 5-line change: reuse row 0 for several output rows). If it
 reproduces, the fix is `quantize_scatter` (which exists for exactly this: "token t's row of x is quantized once and
 stored at rows slot[t*k_used + k]", with `slot` the inverse of `src`) instead of `quantize`.
+
+### P4 SOLVED (2026-10-28): the per-expert stride must be a whole number of weight blocks
+
+The defect was one line, and it is exactly the kind the shipped path cannot hit. `Product` derives each expert's
+offset itself:
+
+```
+src/prefill/moe_mmq.cu:478   p.expert_bytes / type_bytes((int) t)     // integer division, in BLOCKS
+```
+
+I passed the blob's **down region size** as `expert_bytes`: `stride - down_off` = **1,095,840 B**. The down matrix is
+Q6_K, `type_bytes = 210`:
+
+```
+1,095,840 / 210 = 5,218.28...  ->  truncated to 5,218 blocks = 1,095,780 B
+```
+
+So expert z's down matrix was read **60 * z bytes off**: expert 0 exact (which is why a one-expert group reproduced
+the pool's answer perfectly), expert 1 shifted 60 bytes, expert 15 shifted 900 bytes. The numbers that came back
+looked plausible - 0.11, -0.38, -0.52 - and were garbage. The gate (1474560 / 144 = 10,240, exact) was always fine,
+which is why only the down product failed.
+
+Nothing else was wrong. Verified along the way, each by measurement rather than by reading:
+
+- the gather is byte-perfect: staging slot 1 vs the expert's own bytes in the blob, `differ=0` over all 1,474,560 B;
+- `ids` is identity and `bounds` reach the device as `0,198,364,521` (`ids_dst[j]` is the DESTINATION row, mmq.cuh:467);
+- staging one expert per call (`gather_native`, as `prefill.cpp:4920` does) is not better than `gather_native_group`
+  and in fact broke the one-expert case, so the group gather stays;
+- pre-zeroing the destination changed nothing: the zeros were computed, not unwritten.
+
+Two more defects found by running the arm at 8 191 tokens:
+
+- **heap corruption** (`free(): invalid next size`): the row table was reserved for `ents` rows, but a chunk pads every
+  expert to 8 rows, and the fill ran BEFORE the cap test. Reserved `ents + 8 * (n_expert + 1)` and moved the test
+  in front of the fill; a chunk that still would not fit falls back to the pool instead of overflowing.
+- the down staging stride is now `matrix_bytes(d_type, N, FF)`, block-aligned by construction, and the guard
+  `d_region >= d_sz` keeps a short blob from reading past the down region.
+
+Measured, card0, `--cpu-threads 8`, `EXPERT_F16 0`, `ATTN_MB 512`, `RES_TOP 56`, chunk 512, `STRATA_MMQ_KQ=1`,
+`STRATA_KOLIBRI_MMQ_GROUP=16`:
+
+| arm | 511 tok | 8 191 tok | ids |
+|---|---|---|---|
+| pool (shipped) | 4,710 ms / 108.6 tok/s | 66,449 ms / 123.3 tok/s | `286 3515 310 262 ...` |
+| MMQ, gn=16 | **3,072 / 2,966 ms**, 169 tok/s | **25,734 ms, 318.3 tok/s** | **identical to the pool** |
+
+8K: **2.58x**. 511: **1.56x** (two runs, 3,072 and 2,966 ms, ids bitwise identical). gn=1 is correct and 1.8x slower
+than gn=16; gn=4 differs in its last two tokens (a near-tie, as the chunk-size finding above predicts - compare logits,
+not ids, when changing the group size). The arm stays opt-in behind `STRATA_KOLIBRI_PF_MMQ` and exists only in
+`build-mmq`; `build/` does not compile the block at all.
