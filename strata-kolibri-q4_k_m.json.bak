@@ -1,0 +1,24 @@
+{
+ "exe": "/data2/develop/strateu-merge/build/strata-kolibri",
+ "args": [
+  "--model",
+  "/data4/strateu-merge-data/models/kolibri-Q4_K_M/Kolibri-1-Q4_K_M.gguf",
+  "--ctx",
+  "131072"
+ ],
+ "cwd": "/data2/develop/strateu-merge",
+ "tokenizer": "/data4/strateu-merge-data/packs/kolibri-q4_k_m/tokenizer",
+ "model_name": "kolibri-1-q4_k_m",
+ "arch": "kolibri1",
+ "log": "/data2/develop/strateu-merge/strata-kolibri-q4_k_m.log",
+ "lib_dirs": [],
+ "port": 8082,
+ "gpu": 0,
+ "gpus_asked": true,
+ "args_written": [
+  "--model",
+  "/data4/strateu-merge-data/models/kolibri-Q4_K_M/Kolibri-1-Q4_K_M.gguf",
+  "--ctx",
+  "131072"
+ ]
+}
