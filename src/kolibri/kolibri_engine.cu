@@ -4953,6 +4953,39 @@ int strata::kolibri::run(int argc, char** argv) {
                              "overwrites the whole sliding ring\n", (long long) e.g.n_swa, Scratch::kTmax);
         return 1;
     }
+    // T15 (plan 2026-10-28-kolibri-r9700-speed.md): the load-time warm-up, measured and therefore DEFAULT OFF.
+    // The LM head's first call costs more than its steady state (697.8 us against 519.8-520.3 us, docs/AMD_R9700_PORT.md
+    // §T1), and the question was whether that is code load.  It is not: warming the same kernel at n_out = 1 changed
+    // nothing (696.2 us), and warming it at the LM head's own 128000 rows moves the first real call to 618.4 us -
+    // 79.4 us (11 %) of a 178 us excess, bought with 2.9 ms of extra load and a 512 KB throwaway buffer.  What is
+    // left is the real output buffer's first touch and the weight's cold pages, which a warm-up cannot pre-pay
+    // because the buffers it would have to touch are the ones the first request allocates.  So the hook is here,
+    // opt-in, for a card or a kernel where the balance differs - STRATA_KOLIBRI_WARM=1 - and the shipped default is
+    // the un-warmed path, unchanged to the bit (ledger §T15).
+    if (env_on("STRATA_KOLIBRI_WARM")) {
+        const Dense& wo = e.dense.at("output.weight");
+        const bool quant = wo.d != nullptr &&
+                           (wo.type == T_Q8_0 || wo.type == T_Q4_K || wo.type == T_Q5_K || wo.type == T_Q6_K);
+        if (quant) {   // the LM head on this model is Q6_K, and its token path is exactly this kernel
+            // The row count MATTERS: a warm-up at n_out = 1 was measured and did NOT remove the first-call cost
+            // (696.2 us for the first real call against 697.8 us without any warm-up, ledger §T15), so the cost is
+            // not code load - it is the real grid and the real buffers.  Warm at the LM head's own n_out, into a
+            // throwaway buffer of the same size: that is the form worth 79.4 us.
+            const int64_t n_out = (int64_t) wo.shape[1];
+            if (n_out > 0 && n_out <= (1 << 20)) {
+                float* warm_y = nullptr;
+                KC(cudaMalloc((void**) &warm_y, (size_t) n_out * sizeof(float)));
+                KC(cudaMemsetAsync(g_q8, 0, strata::kernels::native_q8_1_bytes((int) e.g.n_embd, 1), g_st));
+                strata::kernels::native_mmvq(wo.type, wo.d, (const char*) g_q8, warm_y, (int) e.g.n_embd, (int) n_out,
+                                             1, g_st);
+                KC(cudaGetLastError());
+                KC(cudaStreamSynchronize(g_st));
+                KC(cudaFree(warm_y));
+            }
+        }
+        // An F32/F16/BF16 LM head takes k_gemv and is not warmed here: this model's is quantised, and warming a
+        // path the build does not run would be a line that never executes.
+    }
     e.cpu_threads = cpu_threads;
     e.grouped = grouped;
     // CUDA-graph decode rides the grouped path (device-side expert pointers); the slots/pool paths read host

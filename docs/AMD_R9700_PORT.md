@@ -1432,3 +1432,32 @@ One limit worth writing down, seen while testing it: when `max_tokens` truncates
 text with `finish_reason: length` - there is no complete JSON to recover. A 64-token cap did exactly that; 300 tokens
 produced the call above. Not a defect in the recovery, but a caller that caps at 64 tokens on this model will see the
 raw form.
+
+## T15 (2026-10-28): the warm-up hook lands opt-in, and the first-call cost is not code load
+
+The hook: at load, run the LM head's own kernel (`native_mmvq` at the head's real `n_out`) once into a throwaway
+buffer, behind `STRATA_KOLIBRI_WARM=1`. Measured with `rocprofv3 --kernel-trace` over an 8-token decode, three runs,
+the first LM-head dispatch of each (the same probe that measured the steady state in §T1):
+
+| arm | first LM-head call | steady | warm cost at load |
+|---|---|---|---|
+| shipped (no warm-up) | **697.8 µs** | 519.8-520.3 µs | - |
+| warm at `n_out = 1` | 696.2 µs | 520.3-520.8 µs | 1 launch, 4 B |
+| warm at `n_out = 128000` | **618.4 µs** | 519.8-520.8 µs | 2 948.3 µs + 512 KB |
+
+Two findings, both of which change what the hook should be:
+
+- **It is not code load.** A warm-up that launches the same kernel at one row removes nothing (696.2 against 697.8 µs):
+  the kernel's code is already resident after the first launch. The hypothesis the task was built on is refuted.
+- **The shape is what matters.** Warming at the head's own 128000 rows recovers 79.4 µs - 45 % of the 178 µs excess -
+  for 2.9 ms of extra load and a 512 KB buffer. What is left (618.4 against 520) is the first touch of the real logits
+  buffer and the weight's cold pages, which a warm-up cannot pre-pay: the buffers it would have to touch are the ones
+  the first request allocates.
+
+**Shipped default: off.** 79 µs once, against 2.9 ms added to every start, on a first token that is 62.9 ms and a
+prefill that is seconds - not a trade this launcher should make for everyone, and not one it makes silently for
+anyone. `STRATA_KOLIBRI_WARM=1` is there for a card or a kernel where the balance differs, and it changes no number:
+`oracle.sh check` is BITWISE PASS both unset and with the knob on.
+
+Gates after the change: oracle BITWISE PASS (knob unset, and `WARM=1`), `ctest` 85/89 with the same four box-scoped
+failures.
