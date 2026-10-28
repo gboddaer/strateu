@@ -1314,3 +1314,29 @@ computes gate/up/down for a pick in one pass, or one launch per layer, is the on
 
 No gate was run for this task because nothing was built: the shipped path is untouched (oracle BITWISE and `pf_gate`
 GATE PASS stand from §T4), and no pf_gate expectation was recorded or overwritten.
+
+## T8 (2026-10-28): not run - its own premise is now measured negative
+
+Task 8 adds `--miss-fetch-pcie F`: fetch a fraction of a layer's missing expert blobs over PCIe and compute them on
+the GPU through the per-pick GEMV instead of the pool. Its gate was "run only after Task 6's counters name the leg",
+and §T6 named it: **the per-pick GEMV, three launches each, 875 launches and 15.6 ms of GPU time per token.**
+
+Two consequences, both from measured numbers rather than assumption:
+
+1. The path T8 would fetch *into* is the path that already costs 15.6 ms/token. Adding fetched picks to it adds that
+   cost, so the arm starts 15.6 ms behind on the GPU leg before it saves anything on the pool leg - and the pool leg
+   is the one T6 already cut from 22.3 to 9.65 ms/token.
+2. The launch-count fix its own note demands (one launch per layer instead of three per pick) has a ceiling computed
+   in §T6: 67.3 ms/token = 14.86 tok/s, **6.5 % below** the shipped 15.90. Batching the picks is necessary for T8 to
+   be even coherent, and it is still not sufficient to beat streaming.
+
+The main engine's +9.9 % to +25.6 % precedent for `--pcie-frac 0.15` comes from a decode whose expert arithmetic runs
+on the GPU and whose bottleneck is the PCIe read. On this box the arithmetic is on the CPU pool at 30-32 GB/s and the
+GPU side is launch-bound, so the same knob would move work from a leg with spare capacity to the leg that has none.
+
+**Not run: measured premise, recorded before an arm was spent.** Nothing was built, so no gate is owed; the shipped
+path is untouched (oracle BITWISE, `pf_gate` GATE PASS, §T4).
+
+**What the two non-attempts (T7, T8) leave standing**, in the plan's own order of levers: the fused expert kernel
+(T11) for the 15.6 ms of per-pick work, and the attention path (T12) for the 100K decode, where §T1 measured attention
+at 2.55 ms of a 16.1 ms GPU token - a smaller absolute leg than the experts on this model.
