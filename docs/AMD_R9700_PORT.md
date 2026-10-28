@@ -970,7 +970,7 @@ load. `--n 4` is run in the same session as the second arm because the load line
 | wall, `--n 4` | 19.57 s | 19.63 s | `/usr/bin/time` |
 | wall, `--n 257` | 35.49 s | 35.57 s | `/usr/bin/time` |
 | **decode, ctx 131072** | **15.90 tok/s** | **15.87 tok/s** | **wall-derived**: (35.49-19.57)/253 = 62.9 ms/token, load cancels |
-| prefill, 511 tokens | 71.0 tok/s | 69.6 tok/s | engine chunk timers: 2568+4630 = 7198 ms / 2606+4730 = 7336 ms |
+| prefill, 511 tokens | **108.6 / 110.8 tok/s** (corrected, §P0) | - | last `PFchunk`, not the sum: 4.71 / 4.63 s. The 71.0 / 69.6 this row used to carry came from adding cumulative timers |
 
 The other two baselines in circulation are the same engine in different clothes, and this is where they now
 live: 15.8 tok/s (§Rate table, ctx 8192, same config) and the launcher sweep's 15.85-16.20 (engine-reported,
@@ -1020,7 +1020,8 @@ one cold call). That is 0.52 ms of the 62.9 ms wall, **0.8 %**. It is `Q6_K`, no
 dense `k_gemv_f32_v4` (that one runs 50x/token, i.e. per layer).
 
 Prefill, 511 tokens, 2 chunks: `CNT prefill pool: chunks=100 experts/chunk=117 bytes=28.05 GB (280 MB/chunk)
-pool=3660 ms (36.6 ms/chunk, 7.7 GB/s)`, against a chunk wall of 7198 ms - the pool's own run is **50.8 %** of
+pool=3660 ms (36.6 ms/chunk, 7.7 GB/s)`, against a chunk wall of **4.71 s** (§P0's correction; 7.20 s was the sum of
+cumulative timers) - the pool's own run is **79 %** of
 the prefill. The GPU side of that prefill (`--stats`): `k_router_tile_k<0,32,3>` 100 calls / 52 ms, `k_attn` 200 /
 41 ms, hipBLAS `Cijk_*` 800 calls / 47 ms, `dequant_kernel<12>` 600 / 11 ms - counts are usable, times are not
 (rocprof inflates launch-heavy code, the same trap the plan records for nsys).
@@ -1153,7 +1154,7 @@ Gates, R9700 (gfx1201) with the in-repo gfx1201 expectation files:
 | `pf_gate.sh` | - | **GATE PASS** (6 stages) |
 | two-run ids, standing arm | (§T1) identical | identical |
 | `ctest` | 85/89 (same four box-scoped) | - |
-| prefill, 511 tokens (engine chunk timers) | 7198 / 7336 ms | 7247 / 7185 ms |
+| prefill, 511 tokens (last `PFchunk`, §P0) | 4.71 / 4.63 s | 4.7 s (see §P0: the earlier sums mixed cumulative timers) |
 | decode, ctx 131072 | 15.90 / 15.87 tok/s | 15.50 / 16.10 tok/s |
 
 **The measured delta is zero, and the reason is structural.** `deq32<T_Q4_K>`/`<T_Q6_K>` are instantiated only by
@@ -1179,7 +1180,7 @@ a kolibri kernel, and outside Task 4's file list. Recorded as the plan's next le
 
 | config | table off (chunk timers) | table on | wall off / on |
 |---|---|---|---|
-| shipped (`EXPERT_F16=0`) | 2543+4623, 2593+4677 ms | 2588+4666, 2582+4673 ms | 19.63/19.73 vs 19.68/19.68 s |
+| shipped (`EXPERT_F16=0`) | 4.62 / 4.68 s (last `PFchunk`) | 4.69 / 4.67 s | 19.63/19.73 vs 19.68/19.68 s |
 | `EXPERT_F16=24` | 4916+8307, 5110+8601 ms | 4994+8391, 5129+8632 ms | 23.82/23.50 vs 23.56/23.83 s |
 | `DENSE_F16=1` | 2520+4582, 2528+4591 ms | 2568+4636, 2545+4609 ms | 19.72/19.74 vs 19.71/19.74 s |
 
@@ -1472,7 +1473,7 @@ idle, against §T1's baseline on the same shape and the same session protocol:
 |---|---|---|
 | wall, n=4 / n=257 | 19.57/19.63 s / 35.49/35.57 s | 23.66 s / 39.60 s |
 | decode | 62.9 ms/token = 15.90 tok/s | 63.0 ms/token = **15.87 tok/s** |
-| prefill, 511 tokens (chunk timers) | 2543+4623 = **7 166 ms** | 4867+8118 = **12 985 ms** |
+| prefill, 511 tokens (last `PFchunk`) | 4.62 s | **8.12 s** |
 
 Decode is unchanged (the T4 record's "must never go down" invariant holds: 15.87 against 15.90 is inside the
 run-to-run spread), and the **prompt is 81 % slower**. The 4.7e7-byte staging traffic that PF_STAGE adds is the
@@ -1486,3 +1487,54 @@ the earlier "inside the noise" note must not be quoted for `PF_STAGE`.
 **Decision: not adopted.** `run-kolibri1.sh` keeps no staging knobs, and Task 14's re-derivation has nothing to take
 from this arm. KL on the pooled path was moot: the arm does not win on speed, so it does not get to ask for a numerics
 budget.
+
+## P0 (2026-10-28): the prefill decomposition - and a correction to every prefill number this ledger quoted
+
+**The correction first, because it invalidates a baseline the speed plan was built on.** `PFchunk` prints
+`ms_since(tp0)` - **cumulative** time since the prompt started (`kolibri_engine.cu:5248`). Every prefill figure in this
+ledger that read "2543+4623 = 7198 ms" (or 7166, 7336, 7247, 7185, 12985) added cumulative timers together. The real
+511-token prefill is the **last** number, not the sum. Measured now, twice, same box and config:
+
+| arm (ctx 16384, `--prefill --cpu-threads 8`, `EXPERT_F16=0`) | wall | prefill (last `PFchunk`) | rate | pool | pool share |
+|---|---|---|---|---|---|
+| 511 tokens, 2 chunks of 256 | 20.72 s (load 14.4) | **4.710 s** | **108.6 tok/s** | 3.728 s | 79.2 % |
+| 8 192 tokens, 32 chunks of 256 | 85.08 s (load 13.7) | **69.66 s** | **117.6 tok/s** | 61.09 s | **87.7 %** |
+
+Run 1 of the 511-token arm took 175.95 s because the 45 GB model was still coming off disk (load line 169.5 s); it is
+recorded here so nobody mistakes it for a rate. The 8K arm reproduced to 0.5 % (69.33 / 69.66 s) and its pool to 0.5 %
+(60.81 / 61.09 s).
+
+**So the speed plan's "71 tok/s prefill" was wrong by 1.5x, and its "50.8 % is the pool" was wrong the other way: the
+pool is 88 % of a long prompt's prefill.** The earlier percentage came from dividing the pool's 3.66 s by the summed
+7.20 s. Corrected, at 511 tokens the pool is 79 %.
+
+**The decomposition P0 was built to answer:**
+
+| per token | 511 tok | 8 192 tok | what it is |
+|---|---|---|---|
+| prefill | 9.22 ms | 8.50 ms | wall between the first and last `PFchunk` |
+| pool | 7.30 ms | 7.46 ms | `CNT prefill pool`, 7.0-7.5 GB/s at 316-323 GFLOP/s of a 226 GFLOP/s roof |
+| **non-pool** | **1.92 ms** | **1.05 ms** | GPU kernels (~0.5 ms, §T1's rocprof) + host marshalling |
+
+**The 6.40 ms/token "host residual" does not exist.** It was the arithmetic of a wrong prefill wall (7.20 s) minus a
+pool measured over a different run. The real residual is **~1 ms/token**, and it is dominated by the GPU kernels the
+prompt needs anyway, not by host serialisation. There is no fourth leg to chase.
+
+**What this changes in the plan.** The pool *is* the prefill - 88 % at 8K, 426.69 GB streamed for 8 192 tokens
+(52 MB/token) at 7.0 GB/s - so P3 (residency: the bytes stop being streamed) and P4 (MMQ: the arithmetic stops running
+on eight cores) are the whole of the opportunity, and P2 (bigger chunks) is a minor term: chunk 256 against 512 at 8K
+moved the wall by -0.6 % in the one comparison that differed, and both arms here ran 256-token chunks because
+`g_pf_total` is unset on the CLI driver, so the K28 prefix-length rule falls back to the position rule.
+
+Projection with the pool gone, from the measured non-pool 8.57 s and the measured 19 325 GFLOP of expert work:
+
+| expert FLOPs on the GPU at | 8K prefill | 8K rate | TTFT |
+|---|---|---|---|
+| 3 TFLOPS | 15.0 s | 546 tok/s | 15 s |
+| 5 TFLOPS | 12.4 s | 659 tok/s | 12 s |
+| 10 TFLOPS | 10.5 s | 780 tok/s | 11 s |
+| 20 TFLOPS | 9.5 s | 859 tok/s | 10 s |
+| **today** | **69.7 s** | **118 tok/s** | **70 s** |
+
+That is 4.6-7.3x, not the 2-3x the plan projected from the (wrong) 71 tok/s baseline, and it lands Kolibri within
+2-3x of Swift IQ3_S's 1 865 tok/s at 7.2K instead of 18x behind it.

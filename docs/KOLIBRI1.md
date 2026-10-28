@@ -118,10 +118,12 @@ GPU is busy **16.1 ms** and the CPU expert pool **22.3 ms**; the rest is hand-of
 **1 347 kernel launches per token**, which is the shape of the problem: this model is not short of arithmetic, it is
 short of work per launch.
 
-- **The prompt is half CPU pool.** A 511-token prompt reads at 70 tok/s and **50.8 %** of that wall is the pool
-  streaming 280 MB per chunk at 7.7 GB/s. The pool already runs at its roof (32.1 GB/s, 326-329 GFLOP/s against a
-  226 GFLOP/s compute roof in its own accounting), so prompt gains have to come from *not* sending 117 experts per
-  layer through it.
+- **The prompt is almost entirely CPU pool.** A 511-token prompt reads at **109 tok/s** and an 8 192-token prompt at
+  **118 tok/s**, and **88 %** of the long prompt's wall is the pool - 426.69 GB streamed for 8K tokens (52 MB/token)
+  at 7.0 GB/s and 316 GFLOP/s against a 226 GFLOP/s compute roof in its own accounting. The GPU and the host together
+  are ~1 ms/token. Prompt gains therefore have to come from *not* sending the touched experts through the pool at all
+  (a correct earlier version of this paragraph said 70 tok/s and 50.8 %, from adding cumulative chunk timers; see
+  [AMD_R9700_PORT.md](AMD_R9700_PORT.md) §P0).
 - **The slot cache loses for a named reason.** At this box's VRAM it fits 214 experts per layer and serves **96.6 %**
   of picks from VRAM, which cuts the streamed leg from 714 to 291 MB/token - and still decodes at **14.21 tok/s**
   against 15.90. The reason is three launches per expert pick (gate, up, down): 875 launches and 15.6 ms of GPU time
