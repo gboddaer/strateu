@@ -71,6 +71,46 @@ VRAM slots per layer, the batch's other experts on the CPU pool (ggml-cpu's Q4_K
 chunks streamed. The router is Strata's `sigmoid_logit_add` top-k kernel (384/6), checked bitwise against a CPU
 reference. Full-attention layers keep fp16 KV rows; sliding-window layers keep a 513-cell ring.
 
+## Tuning it (auto-tuner, and what was measured on an R9700)
+
+Kolibri 1 is in the auto-tuner: `strata tune auto <config>` (and the app's Tune screen) now plans candidates for it
+instead of saying there is nothing to try. The family is named by the config's `arch` - `"kolibri1"` - because this
+engine path's arguments (`--model X.gguf`) look like a single-GGUF Flash-Next run. Its machine class is `K`: the expert
+table lives in system RAM and every expert layer is served by the CPU pool, so the levers are that pool's lanes and the
+VRAM the KV, the fp16 expert copy and the slot cache draw on together. What it tries: `--expert-slots auto`, with and
+without `--expert-slots-hot`, with a 1 GiB reserve and with the fp16 cache off; `STRATA_KOLIBRI_EXPERT_F16=0`;
+`STRATA_KOLIBRI_ATTN_MB` 256 and 1024; `STRATA_KOLIBRI_PF_PARTIAL`; one CPU lane per hyperthread; one lane fewer than
+the config names; `--prefill` where the config lacks it. `STRATA_KOLIBRI_DEC_RES` is on the never list: it made answers
+11x slower here ([AMD_R9700_PORT.md](AMD_R9700_PORT.md)).
+
+A run costs real time on this model - it writes 16-18 tokens/s and reads a prompt at 60-120 tok/s - so a Kolibri run in
+the tuner uses 2,048- and 8,192-token prompts and three 100-token decodes instead of the 4,096/96K prompts and five
+200-token decodes the Flash-Next families use. With `--time` a quick tune on an R9700 lands around an hour.
+
+Measured 2026-10-28 on this box (Radeon AI PRO R9700 32 GB, gfx1201, Ryzen 7 5700G, 93 GiB RAM, Q4_K_M, ctx 131072,
+8 CPU lanes, a 512-token prompt and 128 greedy tokens per request, two requests per start, one arm per engine start).
+Prompt read (pp) and generation (tg) in tokens/s, first and second request:
+
+| arm | pp | tg |
+| --- | --- | --- |
+| as shipped before this measurement (fp16 cache 24/layer) | 57.6 / 70.1, 60.1 / 71.8 | 15.85 / 15.85, 16.20 / 16.18 |
+| **fp16 cache off (`EXPERT_F16=0`, the new default)** | **108.3 / 116.3, 102.0 / 122.3, 74.7 / 83.4** | 15.89 / 15.78, 16.23 / 16.22, 16.07 / 16.09 |
+| fp16 cache off + CUDA graphs on | 75.0 / 81.7 | 16.07 / 16.06 |
+| CUDA graphs on (cache on) | 58.5 / 71.4 | 16.05 / 16.06 |
+| attention tile 256 MiB (cache on / off) | 58.7 / 70.2, 75.3 / 82.2 | 16.18 / 16.15, 16.07 / 16.12 |
+| 7 CPU lanes (cache on / off) | 58.2 / 71.0, 71.2 / 77.0 | 16.18 / 16.20, 16.09 / 15.97 |
+| `PF_PARTIAL=1` with `EXPERT_F16=28` | 62.0 / 73.3 | 15.99 / 16.07 |
+| `--expert-slots auto` (135 slots/layer, 15.08 GiB) | 59.4 / 72.3 | **13.02 / 12.99** |
+| `--expert-slots auto --expert-slots-hot` | 56.6 / 68.0 | **12.82 / 12.80** |
+
+What the numbers say on this card: the fp16 expert cache is a **T4 prefill helper that does not transfer** - with it the
+prompt read 57-72 tok/s in every run, without it 75-122 tok/s, and no run with the cache reached the slowest run
+without it; generation is the same either way. It is now `0` in `run-kolibri1.sh`, which is also the engine's own
+default, i.e. the path the bitwise oracle measures. The slot cache works (135 slots/layer fitted into the 15 GiB of free
+VRAM) and **costs a fifth of the generation speed** (16.2 -> 13.0 tok/s), so it stays off and stays an arm for the tuner
+to try on other cards. CUDA graphs, the attention tile at 256 MiB, 7 instead of 8 CPU lanes and the partial-sum prefill
+path were all inside the noise on this box.
+
 ## Validation
 
 Checked against the patched llama.cpp (`~/llama.cpp`, upstream + the conversion's 4-commit kolibri1 series) by

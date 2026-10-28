@@ -110,6 +110,36 @@ ARMS: tuple[Arm, ...] = (
         needs=("hybrid_experts",)),
     Arm("q36_hybrid_rows_256", "Larger hybrid row blocks", "placement", {"--hybrid-rows": 256}, families=("qwen36",),
         backends=("cuda", "hip"), classes=("D",), needs=("hybrid_experts",), deep_only=True),
+    # --- Kolibri 1 (class K): host-streaming, so the levers are the expert cache in graphics memory and the prompt
+    # path.  Measured on an R9700 (gfx1201), Q4_K_M, ctx 131072, 8 CPU lanes, 512-token prompt, 128 greedy tokens, two
+    # requests per start: shipped config pp 60.1 / 71.8, tg 16.20 / 16.18 tok/s.  The slot cache fitted 135 slots/layer
+    # (15.08 GiB) and read the same prompt (pp 59.4 / 72.3) but lost 20% of decode (tg 13.02 / 12.99), so it is a
+    # candidate here and not a default.  Every arm below is one knob off the user's own configuration.
+    Arm("k_slots_auto", "Keep the most-used experts in graphics memory", "exact", {"--expert-slots": "auto"},
+        families=("kolibri1",), classes=("K",), needs=("vram_ge_8g",)),
+    Arm("k_slots_hot", "Keep the most-used experts in graphics memory and follow what you use", "exact",
+        {"--expert-slots": "auto", "--expert-slots-hot": True}, families=("kolibri1",), classes=("K",),
+        needs=("vram_ge_8g",)),
+    Arm("k_slots_reserve_1g", "Leave a gigabyte of graphics memory for the runtime beside the expert cache", "exact",
+        {"--expert-slots": "auto", "--expert-slots-hot": True, "--vram-reserve-mib": 1024},
+        families=("kolibri1",), classes=("K",), needs=("vram_ge_8g",)),
+    Arm("k_f16_off", "Free the graphics memory an unused fp16 expert copy holds", "exact", {},
+        env={"STRATA_KOLIBRI_EXPERT_F16": "0"}, families=("kolibri1",), classes=("K",)),
+    Arm("k_f16_off_slots", "Free that memory for the expert cache", "exact", {"--expert-slots": "auto"},
+        env={"STRATA_KOLIBRI_EXPERT_F16": "0"}, families=("kolibri1",), classes=("K",), needs=("vram_ge_8g",)),
+    Arm("k_threads_minus1", "One fewer CPU expert worker, so no core hosts two", "exact", {},
+        dynamic={"--cpu-threads": "cpu_threads_minus1"}, families=("kolibri1",), classes=("K",)),
+    Arm("k_threads_logical", "One pool lane per hyperthread", "placement", {},
+        dynamic={"--cpu-threads": "logical_threads"}, families=("kolibri1",), classes=("K",)),
+    Arm("k_attn_mb_256", "Smaller attention tile", "exact", {}, env={"STRATA_KOLIBRI_ATTN_MB": "256"},
+        families=("kolibri1",), classes=("K",), metric="prompt"),
+    Arm("k_attn_mb_1024", "Larger attention tile", "exact", {}, env={"STRATA_KOLIBRI_ATTN_MB": "1024"},
+        families=("kolibri1",), classes=("K",), metric="prompt"),
+    Arm("k_pf_partial", "Keep each prompt token's expert sums on the card", "exact", {},
+        env={"STRATA_KOLIBRI_PF_PARTIAL": "1", "STRATA_KOLIBRI_EXPERT_F16": "28"}, families=("kolibri1",),
+        classes=("K",), metric="prompt"),
+    Arm("k_prefill", "Read prompts in chunks", "exact", {"--prefill": True}, families=("kolibri1",),
+        classes=("K",), metric="prompt"),
     # --- thorough only: measured as no effect (spec 4.2-4.4), tried last ------------------------------------------------------
     Arm("pin_by_need", "Pin memory only when needed", "exact", {}, {"STRATA_PIN_BY_NEED": "1"},
         backends=("cuda",), classes=("C",), needs=("one_gpu",), deep_only=True),
@@ -152,6 +182,8 @@ BOUNDS: dict[str, dict[str, Any]] = {
 #: The never-pick list (4.5), as rows: ``flag`` (or ``env``), a condition on the machine, the value test and the reason
 #: in plain words. ``when`` names facts from `condition_holds`; empty = always.
 NEVER: tuple[dict[str, Any], ...] = (
+    {"env": "STRATA_KOLIBRI_DEC_RES", "families": ("kolibri1",),
+     "reason": "it made answers 11x slower on an R9700 (360 s against 31 s for the same run)"},
     {"env": "STRATA_SH_STREAM", "when": ("gfx12",), "reason": "it halves decode speed on this graphics card"},
     {"env": "STRATA_SH_STREAM", "when": ("windows_amd_kv_stream",), "reason": "with KV streaming on Windows it made the engine fail on the first request on one RX 6000 PC (#3895)"},
     {"env": "STRATA_RDNA2_SGEMM", "value": "all", "when": ("gfx12",), "reason": "it makes long prompts five times slower"},
@@ -193,7 +225,7 @@ class Context:
     """The machine and the choices a candidate plan is made for."""
 
     backend: str = "cuda"                 # cuda | hip | sycl | metal | cpu
-    family: str = "flash-next"            # flash-next | qwen36
+    family: str = "flash-next"            # flash-next | qwen36 | kolibri1
     gpu_count: int = 1
     vram_mib: int = 0                     # the card the model runs on (smallest if several)
     ram_gib: int = 0
@@ -220,6 +252,7 @@ def condition_holds(name: str, ctx: Context) -> bool:
         "hybrid_cpu": ctx.hybrid_cpu,
         "hybrid_experts": bool(f.get("hybrid_experts")),
         "vram_ge_24g": ctx.vram_mib >= 24000,
+        "vram_ge_8g": ctx.vram_mib >= 8192,
         "vram_le_8g": 0 < ctx.vram_mib <= 8400,
         "gfx12": bool(ctx.arch and ctx.arch.startswith("gfx12")),
         "windows_amd_kv_stream": ctx.backend == "hip" and sys.platform == "win32" and "--kv-resident" in ctx.base_args,
@@ -236,6 +269,11 @@ def machine_classes(ctx: Context) -> list[str]:
     if ctx.family == "qwen36":
         classes.append("D" if ctx.facts.get("hybrid_experts") else "E")
         return classes
+    if ctx.family == "kolibri1":
+        # Kolibri 1 is host-streaming on every card: the 42.90 GiB expert table stays pinned in system RAM and every
+        # expert layer is served by the CPU pool, so its levers are that pool's lanes and the VRAM its KV, its fp16
+        # expert copy and its slot cache draw on together - class K, which no flash-next arm is on.
+        return ["K"]
     if ctx.backend == "sycl":
         return ["G"]
     if condition_holds("resident_ram", ctx) or (ctx.ram_gib and ctx.model_gib and ctx.ram_gib - ctx.model_gib < 12):
@@ -382,6 +420,11 @@ def dynamic_value(spec: str, ctx: Context) -> Any:
     workers = f.get("workers")
     if spec == "workers":
         return int(workers) if workers else None
+    if spec == "logical_threads":          # every hyperthread, against the physical cores a base run usually names
+        return int(ctx.logical_threads) if ctx.logical_threads else None
+    if spec == "cpu_threads_minus1":     # one expert worker per physical core: what the engine's own warning advises
+        base = _as_number(_current(ctx.base_args, "--cpu-threads"))
+        return int(base) - 1 if base is not None and int(base) > 2 else None
     if spec.startswith("workers-") and workers:
         value = int(workers) - int(spec[len("workers-"):])
         floor = max(2, int(workers) - 1)            # one step down at most (6.2 F); never two below (6.2 C)

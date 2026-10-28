@@ -17,7 +17,8 @@
 #   CTX        context tokens              (default 131072; 32768 leaves more VRAM headroom)
 #   PORT/HOST  service address             (default 8080 / 127.0.0.1 - see the binding note below)
 #   THREADS    prefill pool lanes          (default: this box's physical cores, one lane each)
-#   EXPERT_F16 fp16 expert slots per layer (default 24; lower it if a request OOMs)
+#   EXPERT_F16 fp16 expert slots per layer (default 0 = the engine's own path, measured fastest here;
+#                                     24 costs about a third of the prompt speed on an R9700)
 #   ATTN_MB    attention tile size         (default 512; 1024 may be faster at 32K - re-measure)
 #   RES_TOP    resident top-k per layer    (default 56, clamped to the slot count)
 #   VRAM_GUARD_PCT  warn when the card already has this share of its VRAM in use (default 25)
@@ -33,12 +34,19 @@
 #   EXE        engine binary               (default ./build/strata-kolibri)
 #   TOKENIZER  tokenizer pack dir          (default ./.tok/tokenizer)
 #
-# WHAT THE DEFAULTS ARE, AND WHERE THEY COME FROM.  EXPERT_F16 / ATTN_MB / RES_TOP / the router
-# tiles are the configuration measured on the CUDA campaign box (16 GB Tesla T4, 27 pinnable
-# cores) - docs/strateu-campaign-report.md.  On the AMD Radeon AI PRO R9700 (gfx1201, 32 GB) they
-# are starting points, not verdicts: that report's §9.3 lists exactly these as the verdicts that
-# must be re-derived on a 32 GB card rather than inherited.  No AMD number is claimed here until
-# it has been measured twice on this box.
+# WHAT THE DEFAULTS ARE, AND WHERE THEY COME FROM.  ATTN_MB / RES_TOP / the router tiles are the
+# configuration measured on the CUDA campaign box (16 GB Tesla T4, 27 pinnable cores) -
+# docs/strateu-campaign-report.md.  On the AMD Radeon AI PRO R9700 (gfx1201, 32 GB) they are
+# starting points, not verdicts: that report's §9.3 names them as the verdicts to re-derive on a
+# 32 GB card rather than inherit.  EXPERT_F16 has been re-derived here and is 0: see the sweep below.
+#
+# EXPERT_F16 (measured 2026-10-28 on this box: Radeon AI PRO R9700, gfx1201, Ryzen 7 5700G, 93 GiB,
+# Q4_K_M, ctx 131072, 8 lanes, a 512-token prompt and 128 greedy tokens per request, two requests
+# per start, one arm per load): with the fp16 expert cache at 24 slots/layer the prompt read
+# 57.6/70.1 and 60.1/71.8 tok/s; at 0 it read 108.3/116.3, 102.0/122.3 and 74.7/83.4 tok/s - every
+# run faster than every run with the cache, decode the same either way (15.8-16.2 tok/s both).  The
+# cache is the T4's prefill helper (it pays there with PF_PARTIAL); here it only costs the VRAM and
+# the time.  0 is also the engine's own default, i.e. the path the bitwise oracle measures.
 #
 # BINDING.  HOST defaults to 127.0.0.1.  Do not widen it to 0.0.0.0 without --api-key: an open
 # port on a machine that is not yours is an open inference endpoint (AGENTS.md).
@@ -50,7 +58,7 @@ MODEL=${MODEL:-/fast/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf}
 PORT=${PORT:-8080}
 HOST=${HOST:-127.0.0.1}
 CTX=${CTX:-131072}
-EXPERT_F16=${EXPERT_F16:-24}
+EXPERT_F16=${EXPERT_F16:-0}
 ATTN_MB=${ATTN_MB:-512}
 RES_TOP=${RES_TOP:-56}
 VRAM_GUARD_PCT=${VRAM_GUARD_PCT:-25}
@@ -193,19 +201,31 @@ fi
 mkdir -p "$RUNDIR"
 CFG="$RUNDIR/strata.json"
 "$PYTHON" - "$CFG" "$EXE" "$MODEL" "$HERE" "$CTX" "$THREADS" \
-          "$EXPERT_F16" "$ATTN_MB" "$RES_TOP" <<'PY'
+          "$EXPERT_F16" "$ATTN_MB" "$RES_TOP" "$HIP_VISIBLE_DEVICES" "$TOKENIZER" <<'PY'
 import json, sys
-cfg, exe, model, cwd, ctx, threads, slots, attn_mb, res_top = sys.argv[1:10]
+cfg, exe, model, cwd, ctx, threads, slots, attn_mb, res_top, gpu, tokenizer = sys.argv[1:12]
 json.dump({
     # the engine's own flags live in "args": the serve front-end passes them verbatim
     "exe": exe,
     "model_name": "kolibri-1",
+    # the family: the server takes the model card's sampling and its own turn/stop handling from it, and the auto-tuner
+    # (strata tune) reads it to pick this family's levers - its arguments alone look like a single-GGUF flash-next run
+    "arch": "kolibri1",
+    # the card, by the index resolved above: a config that names none leaves the tuner reading the smallest card in
+    # the machine, which on a box with an iGPU is not the card the model runs on
+    "gpu": int(gpu),
+    # the pack the tokenizer and the chat template are read from: the app and `strata tune` read it here, the
+    # server also accepts --tokenizer on the command line
+    "tokenizer": tokenizer,
     "cwd": cwd,
     "args": ["--model", model, "--prefill", "--cpu-threads", str(threads), "--ctx", str(ctx)],
     # the measured configuration (see STRATEU.md): staging on, bounded fp16 residency,
     # tiled router, larger attention tile.  These are the CUDA box's measured values; on AMD
     # they are the A/B baseline the §9.3 re-derivations start from.
     "env": {
+        # the card resolved by name above, kept in the config so a start that does not go through this script (the
+        # tuner, the app) gets the same one: without it the runtime exposes every card and the engine takes device 0
+        "HIP_VISIBLE_DEVICES": gpu,
         "STRATA_KOLIBRI_PF_STAGE": "1",
         "STRATA_KOLIBRI_EXPERT_F16": str(slots),
         "STRATA_KOLIBRI_ROUTER_TILE": "1",

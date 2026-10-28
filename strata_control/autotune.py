@@ -182,6 +182,34 @@ def rotate(items: list[Any], r: int) -> list[Any]:
 
 # --------------------------------------------------------------------------- the tuner
 
+#: The longest prompt and warm prompt a run reads, by family, where the standard sizes are out of reach.  A
+#: host-streaming model (Kolibri 1: 42.90 GiB of experts pinned in system RAM, every expert layer on the CPU pool) reads
+#: a prompt at ~60-100 tok/s on this box, so the 96K a 128K flash-next configuration measures would cost 16 minutes per
+#: run - with six to ten runs, a tune nobody waits for.  8K is still twice the warm prompt and shows the chunk-size and
+#: attention-tile levers, which is what a prompt case is for here.
+RUN_CAP: dict[str, dict[str, int]] = {
+    # decode: 3 x 100 tokens is 17 s at the 17.6 tok/s this card measures, and a median of 3 is what the 3% margin needs
+    "kolibri1": {"pp": 2048, "long": 8192, "decode_tokens": 100, "decodes": 3},
+}
+
+
+def request_set(ctx: tune_knobs.Context, *, thorough: bool = False, use: str = "chat") -> RequestSet:
+    """The fixed work a run does on this machine: the standard sizes, or the family's capped ones."""
+    cap = RUN_CAP.get(ctx.family, {})
+    long_tokens = 0
+    if ctx.context_tokens >= 65536:
+        # long contexts mean long prompts: the chunk size (spec 4.3) only shows on a long one
+        long_tokens = min(98304, int(0.75 * ctx.context_tokens))
+    elif use == "coding" and thorough:
+        long_tokens = min(28000, int(0.8 * ctx.context_tokens))
+    if long_tokens:
+        long_tokens = min(long_tokens, cap.get("long", long_tokens))
+    pp_tokens = 4096 if ctx.context_tokens >= 6000 else 1024
+    return RequestSet(warmups=2 if thorough else 1, decodes=cap.get("decodes", 5),
+                      decode_tokens=cap.get("decode_tokens", 200),
+                      pp_tokens=min(pp_tokens, cap.get("pp", pp_tokens)), long_tokens=long_tokens)
+
+
 class Tuner:
     def __init__(self, session: Session, base_args: list[str], base_env: dict[str, str], ctx: tune_knobs.Context,
                  options: Options, *, progress: Callable[[dict[str, Any]], None] | None = None,
@@ -367,14 +395,7 @@ class Tuner:
                     "minutes": round(r.seconds / 60.0 - r.waited_s / 60.0, 1), "pairs": r.pairs, "faster_pairs": r.faster_pairs}
 
     def _spec(self) -> RequestSet:
-        long_tokens = 0
-        if self.ctx.context_tokens >= 65536:
-            # long contexts mean long prompts: the chunk size (spec 4.3) only shows on a long one
-            long_tokens = min(98304, int(0.75 * self.ctx.context_tokens))
-        elif self.o.use == "coding" and self.o.mode == "thorough":
-            long_tokens = min(28000, int(0.8 * self.ctx.context_tokens))
-        return RequestSet(warmups=2 if self.o.mode == "thorough" else 1, decodes=5, decode_tokens=200,
-                          pp_tokens=4096 if self.ctx.context_tokens >= 6000 else 1024, long_tokens=long_tokens)
+        return request_set(self.ctx, thorough=self.o.mode == "thorough", use=self.o.use)
 
     def _run_stages(self) -> None:
         r, o = self.result, self.o
@@ -827,6 +848,12 @@ def detect_family(args: list[str]) -> str:
     return "flash-next"
 
 
+#: The config's own family name ("arch") -> the tuner's.  Kolibri 1's arguments cannot tell it apart from a single-GGUF
+#: flash-next run (both are `--model X.gguf`), so its config has to name it; every other family keeps the argument reading
+#: above, which is what their configurations have been tuned with.
+TUNER_FAMILY_OF_ARCH = {"kolibri1": "kolibri1"}
+
+
 def model_gib_of(args: list[str]) -> float:
     """Total size of the model files a configuration names, shards included."""
     from pathlib import Path
@@ -858,7 +885,9 @@ def context_from_config(cfg: dict[str, Any], *, engine_backend: str | None, opts
     used = [g for g in cards if not wanted or g.get("index") in wanted] or cards
     ctx_tokens = 32768
     for i, a in enumerate(args):
-        if a == "--max-context" and i + 1 < len(args) and str(args[i + 1]).isdigit():
+        # --max-context is the front end's flag; the Kolibri engine path spells the same thing --ctx, and a config that
+        # only carries that one must not be read as a 32K model (its VRAM budget is a different one at 128K)
+        if a in ("--max-context", "--ctx") and i + 1 < len(args) and str(args[i + 1]).isdigit():
             ctx_tokens = int(args[i + 1])
     mem = system.get("memory") or {}
     cpu = system.get("cpu") or {}
@@ -872,7 +901,9 @@ def context_from_config(cfg: dict[str, Any], *, engine_backend: str | None, opts
         except Exception:  # noqa: BLE001
             arch = None
     return tune_knobs.Context(
-        backend=backend, family=family or detect_family(args), gpu_count=max(1, len(used)),
+        backend=backend,
+        family=(family or TUNER_FAMILY_OF_ARCH.get(str(cfg.get("arch") or "")) or detect_family(args)),
+        gpu_count=max(1, len(used)),
         vram_mib=min((g["vram_total_mib"] for g in used if g.get("vram_total_mib")), default=0),
         ram_gib=int((mem.get("total_mib") or 0) // 1024), model_gib=model_gib_of(args),
         hybrid_cpu=bool(cpu.get("hybrid")), logical_threads=int(cpu.get("logical") or 0), arch=arch,
