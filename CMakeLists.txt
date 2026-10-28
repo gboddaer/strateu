@@ -2441,6 +2441,12 @@ if(STRATA_NATIVE_EXPERTS)
     set_source_files_properties(src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu src/prefill/moe_f16_kq.cu
                                 PROPERTIES INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
     add_library(strata_mmq STATIC ${_strata_mmq_sources})
+    # Kolibri's prompt-expert product at Kolibri's own shapes (plan 2026-10-28-kolibri-prefill-gap.md, P4): the number
+    # the kill criterion is measured against.  Built only in the STRATA_PREFILL_MMQ branch, like the library.
+    set_source_files_properties(tools/kolibri/mmq_q4k_bench.cu PROPERTIES LANGUAGE HIP)
+    add_executable(mmq_q4k_bench tools/kolibri/mmq_q4k_bench.cu)
+    target_include_directories(mmq_q4k_bench PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}")
+    target_link_libraries(mmq_q4k_bench PRIVATE strata_mmq ${_strata_gpu_runtime_target})
     target_include_directories(strata_mmq
       PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}"
       PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

@@ -1659,3 +1659,31 @@ What that means for this task, in order:
    the number to beat is the pool's **316-323 GFLOP/s at 7.0 GB/s**.
 
 That is the next step in this session; no engine code has been touched for P4 yet.
+
+### P4 step 0b (2026-10-28): the MMQ Q4_K product measures **11.55 TFLOPS** at Kolibri's own shape - 36x the pool
+
+Built `strata_mmq` for HIP in a second directory (`build-mmq`, `-DSTRATA_PREFILL_MMQ=ON`, `STRATA_MMQ_KQUANTS` on by
+default: the `q4_k q5_k q5_1 q6_k` instances compile with `GGML_USE_HIP=1`). Then a bench that did not exist for this
+shape: `tools/kolibri/mmq_q4k_bench.cu` (registered in the MMQ branch only, so `build/` is untouched), 16 experts a
+group, gate+up as one `[1024 x 2560]` (they are contiguous in Kolibri's blob) and down as `[2560 x 512]`, Q4_K weights
+with valid scales, q8_1 activations, `STRATA_MMQ_KQ=1`.
+
+| rows per expert | group rows | gate+up | GFLOP/s | down GFLOP/s |
+|---|---|---|---|---|
+| **10** (a 512-token chunk: 1 535.8 rows/layer-chunk over ~158 experts) | 160 | 0.0726 ms | **11 551** | 10 438 |
+| 160 | 2 560 | 0.3021 ms | 44 423 | 38 153 |
+| 626 | 10 016 | 0.9368 ms | 56 055 | 51 588 |
+
+**The kill criterion was 300 GFLOP/s. The measured number is 11 551 GFLOP/s at the shape that matters - 36x the CPU
+pool's 316-323 GFLOP/s.** So P4 is not marginal and not merely viable: the expert leg of an 8K prompt (19 325 GFLOP)
+would take **1.7 s** on the matrix units against **61.1 s** on the pool.
+
+Projection with that rate, on the measured non-pool 8.57 s: 8K prefill **10.3 s = 795 tok/s**, TTFT 10.3 s, against
+117.6 tok/s today - **6.8x**, and inside 2.3x of Swift IQ3_S's 1 865 tok/s at 7.2K.
+
+Two things this does not yet settle, and they are the wiring (Step 1): the pool serves the touches for *every* layer
+from one buffer, while MMQ needs the group's experts gathered (Kolibri's blob layout is exactly what
+`gather_native_group` takes: gate at +0, up at +up_off, down at +down_off), and the product needs a q8_1 activation
+array in expert order (`quantize_scatter` exists for that). Both are existing entry points; neither has been called
+from this engine yet. Numerics change (int8 tensor cores, q8_1 activations), so the arm needs its own `pf_gate`
+expectation file and a KL figure before anything is wired into a default.
