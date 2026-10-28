@@ -499,6 +499,10 @@ __device__ __forceinline__ void scale_min_k4(int j, const uint8_t* q, int& d, in
     if (j < 4) { d = q[j] & 63; m = q[j + 4] & 63; }
     else { d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
 }
+// T4: packed (32-bit, branch-free) Q4_K/Q6_K nibble extraction.  Same float expression per element as the scalar
+// form, so the two are bitwise identical by construction; mirrored from STRATA_KOLIBRI_PACKED_DEQ at startup, the
+// way g_attn_coalesced and g_rope_f64 are.
+__device__ int g_packed_deq = 0;
 template <int T> __device__ void deq32(const uint8_t* row, int c, float* out) {
     if constexpr (T == T_F32) { const float* r = (const float*) row + 32 * c; for (int l = 0; l < 32; ++l) out[l] = r[l]; }
     else if constexpr (T == T_F16) { const uint8_t* r = row + 64 * c; for (int l = 0; l < 32; ++l) out[l] = h2f(ld16(r + 2 * l)); }
@@ -510,7 +514,24 @@ template <int T> __device__ void deq32(const uint8_t* row, int c, float* out) {
         int sc, m; scale_min_k4(j, b + 4, sc, m);
         const float d1 = d * (float) sc, m1 = dmin * (float) m;
         const uint8_t* qs = b + 16 + 32 * (j >> 1);
-        for (int l = 0; l < 32; ++l) out[l] = d1 * (float) ((j & 1) ? (qs[l] >> 4) : (qs[l] & 0xF)) - m1;
+        // T4: the packed form loads 32 bytes as 8 words and selects the nibble by a uniform (hoisted) flag instead of
+        // a branch per element.  Measured on the R9700: +21 % on a [2560 x 2560] Q4_K GEMV, bitwise identical
+        // (tools/kolibri/grid_shape_bench.cu, docs/AMD_R9700_PORT.md §T2).
+        if (g_packed_deq) {
+            const uint32_t* w32 = (const uint32_t*) qs;
+            const bool hi = (j & 1) != 0;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                const uint32_t v = w32[w];
+                #pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const uint32_t byte = (v >> (8 * k)) & 0xFFu;
+                    out[w * 4 + k] = d1 * (float) (hi ? (int) (byte >> 4) : (int) (byte & 0xF)) - m1;
+                }
+            }
+        } else {
+            for (int l = 0; l < 32; ++l) out[l] = d1 * (float) ((j & 1) ? (qs[l] >> 4) : (qs[l] & 0xF)) - m1;
+        }
     } else if constexpr (T == T_Q5_K) {
         const uint8_t* b = row + 176 * (c >> 3); const int j = c & 7;
         const float d = h2f(ld16(b)), dmin = h2f(ld16(b + 2));
@@ -523,6 +544,28 @@ template <int T> __device__ void deq32(const uint8_t* row, int c, float* out) {
         const uint8_t* ql = b + 64 * n; const uint8_t* qh = b + 128 + 32 * n;
         const int8_t* sc = (const int8_t*) (b + 192) + 8 * n;
         const float d = h2f(ld16(b + 208));
+        if (g_packed_deq) {
+            // T4: the r branch hoisted out of the loop and the bytes read four at a time (the half of ql and the
+            // nibble are both fixed once r is), with the per-element float expression unchanged - bitwise against the
+            // scalar form, which the bench's parity arm asserts element by element.
+            const uint32_t* qhw = (const uint32_t*) qh;
+            // The two independent facts about r: the ql half (r odd takes ql + 32) and the nibble (r >= 2 takes the
+            // high one).  Conflating them is the bug the parity arm caught on its first run.
+            const uint32_t* src = (r & 1) ? ((const uint32_t*) ql + 8) : (const uint32_t*) ql;
+            const bool upper = (r >= 2);
+            const int sh = 2 * r;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                const uint32_t lw = src[w], hw = qhw[w];
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const int l = w * 4 + k;
+                    const int qlb = (int) ((lw >> (8 * k)) & 0xFFu), qhb = (int) ((hw >> (8 * k)) & 0xFFu);
+                    const int q = (upper ? (qlb >> 4) : (qlb & 0xF)) | (((qhb >> sh) & 3) << 4);
+                    out[l] = d * (float) sc[(l / 16) + 2 * r] * (float) (q - 32);
+                }
+            }
+        } else
         for (int l = 0; l < 32; ++l) {
             const int is = l / 16; int q;
             if (r == 0) q = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4);
@@ -4883,6 +4926,12 @@ int strata::kolibri::run(int argc, char** argv) {
     {   // S6: mirror the decode's coalesced-dot flag to the device (the kernel body is device code)
         const bool v = env_on("STRATA_KOLIBRI_ATTN_COALESCED");
         KC(cudaMemcpyToSymbol(g_attn_coalesced, &v, sizeof(bool)));
+    }
+    {   // T4: the packed Q4_K/Q6_K nibble extraction (bitwise; the parity arm in tools/kolibri/grid_shape_bench.cu
+        // asserts it element by element).  Its only consumers in this engine are the token-embedding gathers
+        // (`k_row`, `k_row_multi`) - the quantized dense chain goes to native_mmvq before it ever reaches deq32.
+        const int pd = env_on("STRATA_KOLIBRI_PACKED_DEQ") ? 1 : 0;
+        KC(cudaMemcpyToSymbol(g_packed_deq, &pd, sizeof(int)));
     }
     {   // S8b: and the PV 4-chain flag (a numerics change, so it is KL-gated rather than bitwise-gated).
         // It must go through attn_pv4_on(), whose host branch carries the default-ON logic: mirroring env_on() directly

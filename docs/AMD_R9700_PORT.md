@@ -1124,3 +1124,45 @@ the LM head, and its weight is Q6_K, so it takes the native path (measured at 0.
 So Task 3 is landed as an engine capability and collects **nothing** on this box: the +10.3 % it was built for is
 behind a shape this GGUF does not route through this kernel. It stays opt-in, and Task 14 must not adopt it as a
 default - there is no measurement on this card that would justify one.
+
+## T4 (2026-10-28): packed Q4_K/Q6_K deq32, its parity test - and where the win actually lives
+
+`STRATA_KOLIBRI_PACKED_DEQ=1` (default off) switches `deq32<T_Q4_K>` and `deq32<T_Q6_K>` to a packed form: 32-bit
+loads, the nibble selected by a hoisted uniform flag instead of a per-element branch, the same float expression per
+element. `g_packed_deq` is mirrored from the environment at startup the way `g_attn_coalesced` and `g_rope_f64` are.
+
+**The test caught a real bug before it shipped.** The first Q6_K packed form conflated two independent facts about
+`r = j & 3`: which half of `ql` to read (`r` odd takes `ql + 32`) and which nibble (`r >= 2` takes the high one). The
+fixture reported **5 222 544 of 10 485 760 values differing**; after the fix, **0**. That is the argument for an
+element-wise fixture of this size rather than a handful of blocks - the Q4_K form, written from the same pattern, was
+correct first time and would have carried the Q6_K mistake past any spot check.
+
+| arm | fixture | values compared | differ |
+|---|---|---|---|
+| `deq32 Q4_K` scalar vs packed | 5.9 MB (4096 rows x 2560) | 10 485 760 | 0 |
+| `deq32 Q6_K` scalar vs packed | 8.6 MB (4096 rows x 2560) | 10 485 760 | 0 |
+
+Both fixtures are deterministic (valid fp16 scales, no NaN/Inf), the comparison is on the float bits, and
+`grid_shape_bench --selftest` fails the ctest if either count is non-zero.
+
+Gates, R9700 (gfx1201) with the in-repo gfx1201 expectation files:
+
+| gate | knob off | knob on |
+|---|---|---|
+| `oracle.sh check` | BITWISE PASS | BITWISE PASS |
+| `pf_gate.sh` | - | **GATE PASS** (6 stages) |
+| two-run ids, standing arm | (§T1) identical | identical |
+| `ctest` | 85/89 (same four box-scoped) | - |
+| prefill, 511 tokens (engine chunk timers) | 7198 / 7336 ms | 7247 / 7185 ms |
+| decode, ctx 131072 | 15.90 / 15.87 tok/s | 15.50 / 16.10 tok/s |
+
+**The measured delta is zero, and the reason is structural.** `deq32<T_Q4_K>`/`<T_Q6_K>` are instantiated only by
+`k_row`, `k_row_p` and `k_row_multi` - the **token-embedding gather**, one row per token in decode and one row per
+prompt token in prefill. A 511-token prefill dequantizes 511 x 10 KB of embedding rows, which is a few hundred
+microseconds of a 7.2 s chunk; the packed form shaves part of that and the wall cannot see it. Every other quantized
+dense weight in this engine goes to `native_mmvq` before `deq32` is ever reached, which §T1 measured directly: the
+`native_q4_k_mmvq` kernel is **5.8 ms of the 16.1 ms/token of GPU time**, 275 launches per token.
+
+So the +21 % the micro-bench measures on a Q4_K GEMV (§T2) is real, and it is *not reachable from this file*. The
+kernel that would collect it is `src/kernels/cuda/native_mmvq.cu` - a shared kernel with the main engine's users, not
+a kolibri kernel, and outside Task 4's file list. Recorded as the plan's next lever rather than silently banked here.

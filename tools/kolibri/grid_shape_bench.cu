@@ -87,6 +87,75 @@ __device__ void deq32_q4k_packed(const uint8_t* row, int c, float* out) {
         }
     }
 }
+// Q6_K: the same pair, mirroring kolibri_engine.cu's `deq32<T_Q6_K>` scalar and packed forms (kept in lockstep by
+// this comment and by the parity arm below, which compares them element by element).
+__device__ void deq32_q6k_scalar(const uint8_t* row, int c, float* out) {
+    const uint8_t* b = row + 210 * (c >> 3);
+    const int j = c & 7, n = j >> 2, r = j & 3;
+    const uint8_t* ql = b + 64 * n;
+    const uint8_t* qh = b + 128 + 32 * n;
+    const int8_t* sc = (const int8_t*) (b + 192) + 8 * n;
+    const float d = h2f(ld16(b + 208));
+    for (int l = 0; l < 32; ++l) {
+        const int is = l / 16;
+        int q;
+        if (r == 0) q = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4);
+        else if (r == 1) q = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4);
+        else if (r == 2) q = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4);
+        else q = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
+        out[l] = d * (float) sc[is + 2 * r] * (float) (q - 32);
+    }
+}
+__device__ void deq32_q6k_packed(const uint8_t* row, int c, float* out) {
+    const uint8_t* b = row + 210 * (c >> 3);
+    const int j = c & 7, n = j >> 2, r = j & 3;
+    const uint8_t* ql = b + 64 * n;
+    const uint8_t* qh = b + 128 + 32 * n;
+    const int8_t* sc = (const int8_t*) (b + 192) + 8 * n;
+    const float d = h2f(ld16(b + 208));
+    const uint32_t* qhw = (const uint32_t*) qh;
+    const uint32_t* src = (r & 1) ? ((const uint32_t*) ql + 8) : (const uint32_t*) ql;   // r odd -> ql + 32
+    const bool upper = (r >= 2);                                                        // r >= 2 -> high nibble
+    const int sh = 2 * r;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+        const uint32_t lw = src[w], hw = qhw[w];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int l = w * 4 + k;
+            const int qlb = (int) ((lw >> (8 * k)) & 0xFFu), qhb = (int) ((hw >> (8 * k)) & 0xFFu);
+            const int q = (upper ? (qlb >> 4) : (qlb & 0xF)) | (((qhb >> sh) & 3) << 4);
+            out[l] = d * (float) sc[(l / 16) + 2 * r] * (float) (q - 32);
+        }
+    }
+}
+
+// The parity arm: both forms over a whole fixture, element by element.  This is the unit test the plan asks for -
+// a 4 MB-class fixture, not a handful of blocks, and it reports the number of differing values rather than a verdict.
+enum { kParityTypeQ4K = 0, kParityTypeQ6K = 1 };
+__global__ void k_parity_q4k(const uint8_t* W, int rows, int n_in, float* a, float* b) {
+    const int row_bytes = (n_in / 256) * kQ4KBlock;
+    const int r = blockIdx.y;
+    if (r >= rows) return;
+    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < n_in / 32; c += gridDim.x * blockDim.x) {
+        float va[32], vb[32];
+        deq32_q4k_scalar(W + (size_t) r * row_bytes, c, va);
+        deq32_q4k_packed(W + (size_t) r * row_bytes, c, vb);
+        for (int l = 0; l < 32; ++l) { a[(size_t) r * n_in + 32 * c + l] = va[l]; b[(size_t) r * n_in + 32 * c + l] = vb[l]; }
+    }
+}
+__global__ void k_parity_q6k(const uint8_t* W, int rows, int n_in, float* a, float* b) {
+    const int row_bytes = (n_in / 256) * 210;
+    const int r = blockIdx.y;
+    if (r >= rows) return;
+    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < n_in / 32; c += gridDim.x * blockDim.x) {
+        float va[32], vb[32];
+        deq32_q6k_scalar(W + (size_t) r * row_bytes, c, va);
+        deq32_q6k_packed(W + (size_t) r * row_bytes, c, vb);
+        for (int l = 0; l < 32; ++l) { a[(size_t) r * n_in + 32 * c + l] = va[l]; b[(size_t) r * n_in + 32 * c + l] = vb[l]; }
+    }
+}
+
 __device__ float block_sum(float v, float* sh) {
     sh[threadIdx.x] = v;
     __syncthreads();
@@ -241,6 +310,7 @@ int main(int argc, char** argv) {
 
     if (reps <= 0) reps = selftest ? 8 : 30;
     const int reps_f16 = selftest ? 4 : 20, reps_q4k = reps * 8;
+    bool parity_ok = false;
 
     __half *W16 = nullptr, *x16 = nullptr;
     float *y1 = nullptr, *y2 = nullptr, *y3 = nullptr, *x = nullptr;
@@ -285,6 +355,65 @@ int main(int argc, char** argv) {
     k_quant_a<<<(n_in_q4k / 32 + 127) / 128, 128>>>(x, n_in_q4k, aq, ad);
     KC(hipGetLastError());
     KC(hipDeviceSynchronize());
+
+    // ---- P: the dequant parity arm (the plan's element-wise unit test): a 4096-row fixture of each type, both
+    // forms, compared value by value.  Also times the two forms so the packed gain is recorded where it lands.
+    {
+        const int prows = 4096, pn = n_in_q4k;
+        const size_t q4_row = (size_t) (pn / 256) * kQ4KBlock, q6_row = (size_t) (pn / 256) * 210;
+        uint8_t *Wq4 = nullptr, *Wq6 = nullptr;
+        float *pa = nullptr, *pb = nullptr;
+        KC(hipMalloc(&Wq4, q4_row * prows));
+        KC(hipMalloc(&Wq6, q6_row * prows));
+        KC(hipMalloc(&pa, (size_t) prows * pn * 4));
+        KC(hipMalloc(&pb, (size_t) prows * pn * 4));
+        {   // deterministic filler with valid fp16 scales, so no NaN/Inf sneaks in through a random exponent
+            std::vector<uint8_t> h4(q4_row * prows), h6(q6_row * prows);
+            for (size_t i = 0; i < h4.size(); ++i) h4[i] = (uint8_t) ((i * 1664525u + 1013904223u) >> 13);
+            for (size_t i = 0; i < h6.size(); ++i) h6[i] = (uint8_t) ((i * 22695477u + 1u) >> 11);
+            for (int r = 0; r < prows; ++r) {
+                for (int blk = 0; blk < pn / 256; ++blk) {
+                    const size_t o4 = (size_t) r * q4_row + (size_t) blk * kQ4KBlock;
+                    const __half sc = __float2half_rn(0.03f + (float) ((r + blk) % 9) * 0.01f);
+                    std::memcpy(&h4[o4], &sc, 2);
+                    std::memcpy(&h4[o4 + 2], &sc, 2);
+                    const size_t o6 = (size_t) r * q6_row + (size_t) blk * 210;
+                    std::memcpy(&h6[o6 + 208], &sc, 2);
+                }
+            }
+            KC(hipMemcpy(Wq4, h4.data(), q4_row * prows, hipMemcpyHostToDevice));
+            KC(hipMemcpy(Wq6, h6.data(), q6_row * prows, hipMemcpyHostToDevice));
+        }
+        const dim3 pg(8, prows);
+        k_parity_q4k<<<pg, kThreads>>>(Wq4, prows, pn, pa, pb);
+        KC(hipGetLastError());
+        KC(hipDeviceSynchronize());
+        std::vector<float> fa((size_t) prows * pn), fb((size_t) prows * pn);
+        KC(hipMemcpy(fa.data(), pa, (size_t) prows * pn * 4, hipMemcpyDeviceToHost));
+        KC(hipMemcpy(fb.data(), pb, (size_t) prows * pn * 4, hipMemcpyDeviceToHost));
+        size_t diff4 = 0;
+        for (size_t i = 0; i < fa.size(); ++i) if (std::memcmp(&fa[i], &fb[i], 4) != 0) ++diff4;
+        k_parity_q6k<<<pg, kThreads>>>(Wq6, prows, pn, pa, pb);
+        KC(hipGetLastError());
+        KC(hipDeviceSynchronize());
+        KC(hipMemcpy(fa.data(), pa, (size_t) prows * pn * 4, hipMemcpyDeviceToHost));
+        KC(hipMemcpy(fb.data(), pb, (size_t) prows * pn * 4, hipMemcpyDeviceToHost));
+        size_t diff6 = 0;
+        for (size_t i = 0; i < fa.size(); ++i) if (std::memcmp(&fa[i], &fb[i], 4) != 0) ++diff6;
+        const double mb4 = (double) q4_row * prows / 1e6, mb6 = (double) q6_row * prows / 1e6;
+        std::printf("P  deq32 Q4_K parity  %.1f MB fixture, %zu value(s) differ\n", mb4, diff4);
+        std::printf("P  deq32 Q6_K parity  %.1f MB fixture, %zu value(s) differ\n", mb6, diff6);
+        std::fflush(stdout);
+        const float p4s = bench([&] { k_parity_q4k<<<pg, kThreads>>>(Wq4, prows, pn, pa, pb); }, selftest ? 2 : 10);
+        const float p6s = bench([&] { k_parity_q6k<<<pg, kThreads>>>(Wq6, prows, pn, pa, pb); }, selftest ? 2 : 10);
+        report("P  Q4_K deq32 both forms (fixture)", p4s, mb4 * 1e6);
+        report("P  Q6_K deq32 both forms (fixture)", p6s, mb6 * 1e6);
+        parity_ok = (diff4 == 0 && diff6 == 0);
+        KC(hipFree(Wq4));
+        KC(hipFree(Wq6));
+        KC(hipFree(pa));
+        KC(hipFree(pb));
+    }
 
     // ---- A: F16 GEMV, the LM head's shape
     const float a_row = bench([&] { k_f16_row<<<n_out_f16, kThreads>>>(W16, x16, n_in_f16, y1); }, reps_f16);
@@ -353,8 +482,9 @@ int main(int argc, char** argv) {
     std::printf("NOTE E launch overhead: %.2f us per launch (18-launch arm minus batched arm, / 17)\n",
                 (e18 - e1) * 1e3 / 17.0);
 
-    const bool ok = a_ok && b_ok && c_ok;
-    std::printf("%s\n", ok ? "SELFTEST PASS: A, B and C bitwise" : "SELFTEST FAIL");
+    const bool ok = a_ok && b_ok && c_ok && parity_ok;
+    std::printf("%s\n", ok ? "SELFTEST PASS: A, B, C and the Q4_K/Q6_K deq32 parity arm bitwise"
+                                 : "SELFTEST FAIL");
     KC(hipFree(touch));
     return ok ? 0 : 1;
 }
