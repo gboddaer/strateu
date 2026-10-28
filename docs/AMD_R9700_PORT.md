@@ -1851,3 +1851,29 @@ The three card-specific terms to record on each machine, because they are what m
 
 And the T4 baseline the next person must beat, per its own campaign report: **150-160 tok/s prefill with the pool on**,
 22.7 tok/s decode, `ctest` 60/62.
+
+## P7 (2026-10-28): the standing rows at 511, 8K and 28K, and the gates at the tip
+
+Both TTFT arms P7 asks for, twice each, plus the 511-token row for scale. Same box, `--prefill --cpu-threads 8`,
+`EXPERT_F16=0`, `ATTN_MB=512`, `RES_TOP=56`, `--counters`, one arm per load:
+
+| arm | tokens | wall | prefill | pool | pool share | expert bytes | rate |
+|---|---|---|---|---|---|---|---|
+| 511 | 511 | 20.72 s | 4.710 s | 3.728 s | 79.2 % | 28.05 GB | **108.6 tok/s** |
+| 8K | 8 191 | 84.69 / 85.08 s | 69.33 / 69.66 s | 60.81 / 61.09 s | 87.7 % | 426.69 GB | **117.6 tok/s** |
+| 28K | 28 671 | 259.56 / 262.22 s | 243.77 / 246.57 s | 215.04 / 217.57 s | **88.2 %** | 977.83 GB | **117.6 / 116.3 tok/s** |
+
+Two things fall out of that table:
+
+- **The rate is flat from 511 to 28 671 tokens (108.6 → 117.6 → 116.3 tok/s).** Kolibri's prefill is not
+  length-limited at these sizes; the pool's per-token cost is the same at 28K as at 8K (34.1 MB/token streamed either
+  way), and attention - which does grow - is still inside the 12 % that is not the pool. So there is no cliff to fix
+  before the expert leg: the pool is the whole shape of the curve.
+- At 28K this is **21x behind Swift IQ3_S** (116.3 against 2 437 tok/s), and the gap does not close with length -
+  which is exactly why the fix has to be the expert leg rather than anything size-specific.
+
+Gates at the tip (after the engine revert and the CMake/tool additions): `oracle.sh check` **BITWISE PASS**,
+`pf_gate.sh` **GATE PASS** (all six stages), `ctest` **85/89** - the same four box-scoped failures
+(`vmm_test`, `ple_parity`, `platform_memory_test`, `conversation_copy_streams_test`). No launcher default moved:
+`run-kolibri1.sh` is untouched in this session, and the one change inside the chunk rule is a defect fix (an
+exactly-8192-token request no longer takes the short-chunk branch).
