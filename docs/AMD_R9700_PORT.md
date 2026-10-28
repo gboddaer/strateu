@@ -1925,3 +1925,22 @@ The shipped gate cannot see this: `prefill_mmq_parity` **builds its expert weigh
 Both runs stage **identical bytes into slot 0** (same blob, same gather arguments, only `g.n` differs), so the second expert's presence changes what the product computes **for expert 0**. That rules out bounds, `total_rows`, `max_rows`, the id table and the activation array - all of which the 1-expert case validates exactly - and leaves the agreement between the gather's `gu_stride` and the product's `expert_bytes` as the only untested term. Both are 2 x 737 280 B in this probe, and `copy16_group_kernel` writes `gu_dst + q * (gu_stride/16)` in uint4 units, so the next experiment is to print the staged bytes at `slot * gu_stride` for slot 0 and 1 and compare them with the blobs, then sweep `expert_bytes` against the observed placement.
 
 This is now a seconds-scale loop: `--parity-experts 1|2` and one staged-buffer dump, no engine arm needed.
+
+### P4 debug, step 6 (2026-10-28): a retraction - the probe's "10x" was two different experts
+
+Recorded because it nearly became a false finding. The probe's parity dump showed `out rows 0..3 col0: 24.6292 24.6292
+2.44303 2.44303` for two experts, and I read that as a stride bug. It is not:
+
+- the probe's `ids` table is a **reversal** (`sel[i] = rows-1-i`), so dst rows 0,1 belong to **expert 1**;
+- `weights_q4k(FF, N, kN, rng)` gives each of the kN experts **different** random weights, so expert 1's product is
+  legitimately 24.63 while expert 0's is 2.443 - and only expert 0's reference was ever printed;
+- with `PROBE_STRIDE_HALF=1` (`expert_bytes = gu_half`) all four rows read 2.443 because expert 1 then reads expert 0's
+  copy, which is the *wrong* behaviour, not the right one.
+
+So the probe neither finds nor reproduces a stride bug: the product's expert addressing is consistent. The engine's
+NaN (1 expert a group correct, >= 2 experts NaN from expert 1's rows on, at every group size) therefore has a
+different cause, and the probe's parity arm needs expert 1's reference computed before it can judge anything.
+
+**Next**: print, in the *engine*, the gu product's output rows for expert 1 (`mmq_gu` rows [bounds[1], bounds[2])) next
+to `swiglu`'s output for the same rows, which splits "the product emitted NaN" from "the NaN appears in swiglu/down".
+That is one build and one arm, and it is the last link in the chain that has not been looked at directly.

@@ -147,9 +147,11 @@ static int parity_mode(int R, int kN) {
     p.w = gu_stage;
     p.w_rows = 2 * FF;
     p.w_cols = N;
-    p.expert_bytes = 2 * gu_bytes;
+    // the product's per-expert stride: test one matrix (gu_bytes) against the gather's two (2*gu_bytes)
+    p.expert_bytes = std::getenv("PROBE_STRIDE_HALF") ? gu_bytes : 2 * gu_bytes;
     p.dst = d_gu;
     p.ld_dst = 2 * FF;
+    ck(hipMemset(d_gu, 0, (size_t) rows * 2 * FF * 4), "zero dst");   // does the product ACCUMULATE into dst (fixup)?
     ctx.run(p, nullptr);
     ck(hipDeviceSynchronize(), "sync");
 
@@ -158,6 +160,21 @@ static int parity_mode(int R, int kN) {
     // reference for row 0, columns 0, 1 and FF (gate vs up), and column FF+1
     std::vector<float> wr((size_t) std::max(N, FF)), gater((size_t) N), upr((size_t) N);
     const int64_t cols_gate[4] = {0, 1, 7, (int64_t) FF - 1};
+    {   // dump the staged slots and the product's output rows: does slot 0 hold expert 0's gate, and is out row 0 its result?
+        std::vector<uint8_t> st((size_t) kN * 2 * gu_bytes);
+        ck(hipMemcpy(st.data(), gu_stage, st.size(), hipMemcpyDeviceToHost), "copy staging");
+        const uint64_t* w0 = (const uint64_t*) st.data();
+        const uint64_t* w1 = (const uint64_t*) (st.data() + 2 * gu_bytes);
+        const uint64_t* b0 = (const uint64_t*) blobs.data();
+        const uint64_t* b1 = (const uint64_t*) (blobs.data() + 2 * gu_bytes + d_bytes);
+        std::printf("staging slot0[0..1]=%016llx %016llx  blob0[0..1]=%016llx %016llx  slot1==blob1? %d  slot0==blob0? %d\n",
+                    (unsigned long long) w0[0], (unsigned long long) w0[1],
+                    (unsigned long long) b0[0], (unsigned long long) b0[1],
+                    std::memcmp(w1, b1, 64) == 0, std::memcmp(w0, b0, 64) == 0);
+        std::printf("out rows 0..3 col0: %.6g %.6g %.6g %.6g  (ref row0 = 2.4435)\n",
+                    (double) gu[0], (double) gu[(size_t) 1 * 2 * FF], (double) gu[(size_t) 2 * 2 * FF],
+                    (double) gu[(size_t) 3 * 2 * FF]);
+    }
     std::printf("row 0 reference (fp32 dequant x fp32 x) against MMQ's gathered gate/up block:\n");
     std::printf("%-8s %-14s %-14s %-14s\n", "col", "MMQ out", "ref gate", "ref up");
     for (int64_t ci = 0; ci < 4; ++ci) {
