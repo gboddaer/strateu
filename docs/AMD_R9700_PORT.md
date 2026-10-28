@@ -2124,3 +2124,33 @@ Still open, and not claimed as done: the arm has no recorded pf_gate expectation
 numerics-changing arm needs one before it could ever become a default), valgrind was not run on this host-side edit,
 and the new 25.7 s wall has not been decomposed - so what the next lever is (attention, the activation quantize, the
 staging copies) is unknown until that is measured.
+
+### P4 determinism (2026-10-28): the K-quant product is not reproducible here, and that is why it is not a default
+
+The int8 path is fast - 2.55x at 8K - and it was **not stable**, which three of my earlier "two identical runs"
+statements hid. Measured, same binary, same prompt, only the environment different:
+
+| configuration | runs | collapsed to garbage | notes |
+|---|---|---|---|
+| no drain (`STRATA_KOLIBRI_MMQ_ASYNC=1`) | 6 | **2** | the collapsing runs are also 5-10 % *faster*, i.e. work is skipped |
+| `cudaStreamSynchronize` per group | 6 | 2 | a stream-only drain does **not** help |
+| `cudaDeviceSynchronize` per group (now the default) | 12 | **0** | drain is the arm's default; `ASYNC=1` opts out |
+
+How it was localized, each step by measurement:
+
+1. The pool path is stable (**5/5 identical ids**), so the fault is in the arm.
+2. The failing run's **host** numbers are identical to a good run's for layers 0-31 (printed `experts`, `rows`,
+   `ngroups`, the router's `ord[0]`, layer by layer), and by layer 32 the router has **collapsed to a single expert**
+   with 1 530 picks. So the host inputs are not the variable - the GPU values are.
+3. A per-layer device->host probe (4 floats per group) made it stable 10/10, and a per-group
+   `cudaStreamSynchronize` did not - the difference is that the probe waits for the **whole device**, not one stream.
+4. `g_st` is created with `cudaStreamCreate` (blocking), so ordering with the legacy stream is not the explanation
+   either; the cause is inside the K-quant product's own execution and is **still unexplained**.
+
+The drain costs little: 8 191 tokens is 26 100 ms with it against 25 734 ms without (1.4 %), and 511 tokens is
+3 155 / 2 982 ms. Ids with the drain: **identical to the pool at 8K** (three runs now) and **identical to the plain-path
+oracle at 511** - the pool itself is the path that differs from the oracle at 511, in its last three tokens.
+
+Verdict: **not a default.** The workaround holds 12/12, and twelve is not proof; the failure mode is a silent total
+collapse, which is exactly the "unexplained failure" the plan says to stop on. The arm stays opt-in, prints a
+MEASUREMENT-ONLY warning when enabled, and `build/` does not compile it at all.

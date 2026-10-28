@@ -138,10 +138,14 @@ short of work per launch.
 
   | prompt | CPU pool (shipped) | int8 tensor units | ids |
   |---|---|---|---|
-  | 511 tokens | 4 710 ms, 108.6 tok/s | **3 072 / 2 966 ms, 169 tok/s** | equal to the plain-path oracle |
-  | 8 191 tokens | 66 449 ms, 123.3 tok/s | **25 734 ms, 318.3 tok/s** | identical to the pool |
+  | 511 tokens | 4 710 ms, 108.6 tok/s | **3 155 / 2 982 ms, 165 tok/s** | equal to the plain-path oracle |
+  | 8 191 tokens | 66 449 ms, 123.3 tok/s | **26 100 ms, 313.8 tok/s** | identical to the pool |
 
-  That is **2.58x** at 8K. The projection in the previous revision (795 tok/s) was too optimistic: it assumed the
+  That is **2.55x** at 8K. The arm is **measurement-only, not a default**: the K-quant product is not reproducible
+  here - with identical inputs the ids change between runs and about one run in three used to collapse the router to a
+  single expert. Draining the device after every expert group removed the collapse in 12 consecutive runs (and costs
+  1.4 % at 8K), but the cause is still unknown, so it stays opt-in
+  ([AMD_R9700_PORT.md](AMD_R9700_PORT.md) §P4 determinism). The projection in the previous revision (795 tok/s) was too optimistic: it assumed the
   expert leg would vanish, and the measured 25.7 s says the remaining wall is now something else - the new wall has
   not been decomposed yet, so nothing is claimed about it. The arm is opt-in and off by default; `build/` does not
   compile it. The one-line cause of the first attempt's wrong numbers is in

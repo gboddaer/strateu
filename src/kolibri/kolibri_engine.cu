@@ -3090,7 +3090,33 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                         // MMQ's scheduler degenerates when a group's max rows per expert is tiny (measured: groups with
                         // maxr=1 wrote NaN into their rows - docs/AMD_R9700_PORT.md P4).  Pad every expert to kMinRows:
                         // the filler rows repeat that expert's first activation row, and the scatter skips them (sel<0).
+                        // STRATA_KOLIBRI_MMQ_GROUP=1 isolates the multi-expert staging layout: with one expert a group the
+                        // product needs no expert stride at all.
+static const int grp_max = [] {
+                            const char* v = std::getenv("STRATA_KOLIBRI_MMQ_GROUP");
+                            int n = v ? std::atoi(v) : 16;
+                            if (n < 1) n = 1;
+                            if (n > strata::prefill::mmq::kGatherGroupMax) n = strata::prefill::mmq::kGatherGroupMax;
+                            return n;
+                        }();
                         bool ok = true;
+                        const int bstride = strata::prefill::mmq::kGatherGroupMax + 1;
+                        size_t ngroups = 0;
+                        for (size_t j0p = 0; j0p < ml.size(); j0p += (size_t) grp_max) ++ngroups;
+                        {
+                            size_t gi = 0;
+                            for (size_t j0p = 0; j0p < ml.size(); j0p += (size_t) grp_max, ++gi) {
+                                const int gnp = (int) std::min<size_t>((size_t) grp_max, ml.size() - j0p);
+                                int64_t acc = 0;
+                                s.mmq_bounds_h[(size_t) gi * (size_t) bstride] = 0;
+                                for (int q = 0; q < gnp; ++q) {
+                                    const int x = ml[j0p + (size_t) q];
+                                    const int m = cnt[x + 1] - cnt[x];
+                                    acc += m < 8 ? 8 : m;
+                                    s.mmq_bounds_h[(size_t) gi * (size_t) bstride + (size_t) q + 1] = (int32_t) acc;
+                                }
+                            }
+                        }
                         constexpr int kMinRows = 8;
                         int64_t padded = 0;
                         for (int x : ml) {
@@ -3117,36 +3143,53 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                         }
                         KC(cudaMemcpyAsync(s.mmq_row_tok, s.mmq_row_tok_h.data(), (size_t) rows * 4, cudaMemcpyHostToDevice, g_st));
                         KC(cudaMemcpyAsync(s.mmq_row_sel, s.mmq_row_sel_h.data(), (size_t) rows * 4, cudaMemcpyHostToDevice, g_st));
+                        KC(cudaMemcpyAsync(s.mmq_bounds, s.mmq_bounds_h.data(),
+                                           (size_t) ngroups * (size_t) bstride * 4, cudaMemcpyHostToDevice, g_st));
                         if (std::getenv("STRATA_KOLIBRI_MMQ_DEBUG") != nullptr) {
                             // coverage probe: stamp gout with NaN; anything still NaN after the scatter was never written
                             std::vector<float> ns((size_t) NKc * N, std::nanf(""));
                             KC(cudaMemcpy(A.gout_m, ns.data(), ns.size() * 4, cudaMemcpyHostToDevice));
                         }
+                        if (std::getenv("STRATA_KOLIBRI_MMQ_HOSTDBG") != nullptr) {
+                            // Host-side only (no device reads, so nothing is serialized): do two runs hand the product
+                            // the same numbers?  If yes, the run-to-run difference is inside the product.
+                            int64_t nrsum = 0, maxsum = 0;
+                            for (size_t j0p = 0; j0p < ml.size(); j0p += (size_t) grp_max) {
+                                const int gnp = (int) std::min<size_t>((size_t) grp_max, ml.size() - j0p);
+                                int64_t nrg = 0;
+                                int mxg = 0;
+                                for (int q = 0; q < gnp; ++q) {
+                                    const int x = ml[j0p + (size_t) q];
+                                    const int m = cnt[x + 1] - cnt[x];
+                                    const int pr = m < 8 ? 8 : m;
+                                    nrg += pr;
+                                    mxg = std::max(mxg, pr);
+                                }
+                                nrsum += nrg;
+                                maxsum += mxg;
+                            }
+                            std::fprintf(stderr, "MMQH l=%d experts=%zu rows=%lld ngroups=%zu nrsum=%lld maxsum=%lld sel0=%d sel1=%d\n",
+                                         (int) l, ml.size(), (long long) rows, ngroups, (long long) nrsum,
+                                         (long long) maxsum, (int) ord[0], ml.empty() ? -1 : ml[0]);
+                        }
                         int64_t r0 = 0;
                         // STRATA_KOLIBRI_MMQ_GROUP=1 isolates the multi-expert staging layout: with one expert a group the
                         // product needs no expert stride at all (measured defect: experts 1..n of a 16-expert group came
                         // back NaN, ledger §P4).
-                        static const int grp_max = [] {
-                            const char* v = std::getenv("STRATA_KOLIBRI_MMQ_GROUP");
-                            int n = v ? std::atoi(v) : 16;
-                            if (n < 1) n = 1;
-                            if (n > strata::prefill::mmq::kGatherGroupMax) n = strata::prefill::mmq::kGatherGroupMax;
-                            return n;
-                        }();
+                        
                         for (size_t j0 = 0; ok && j0 < ml.size(); j0 += (size_t) grp_max) {
                             const int gn = (int) std::min<size_t>((size_t) grp_max, ml.size() - j0);
+                            const size_t gi = j0 / (size_t) grp_max;
+                            const int32_t* brel = s.mmq_bounds + gi * (size_t) bstride;   // this group's slice, uploaded once
                             int64_t nr = 0;
                             int maxr = 0;
-                            s.mmq_bounds_h[0] = 0;
                             for (int q = 0; q < gn; ++q) {
                                 const int x = ml[j0 + (size_t) q];
                                 const int m = cnt[x + 1] - cnt[x];
                                 const int pr = m < 8 ? 8 : m;   // the same padding the row walk above used
                                 nr += pr;
                                 maxr = std::max(maxr, pr);
-                                s.mmq_bounds_h[(size_t) q + 1] = (int32_t) nr;   // group-relative, starting at 0
                             }
-                            KC(cudaMemcpyAsync(s.mmq_bounds, s.mmq_bounds_h.data(), (size_t) (gn + 1) * 4, cudaMemcpyHostToDevice, g_st));
                             KC(cudaMemsetAsync(s.mmq_gu_stage, 0, (size_t) strata::prefill::mmq::kGatherGroupMax * gu_stride + 4096, g_st));
                             KC(cudaMemsetAsync(s.mmq_d_stage, 0, (size_t) strata::prefill::mmq::kGatherGroupMax * d_sz + 4096, g_st));
                             strata::prefill::mmq::GatherGroup grp;
@@ -3172,7 +3215,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                             gp.type = b.L.gu_type;
                             gp.n = gn;
                             gp.xq = s.mmq_xq;
-                            gp.bounds = s.mmq_bounds;
+                            gp.bounds = brel;
                             gp.ids = s.mmq_ident;
                             gp.total_rows = nr;
                             gp.max_rows = maxr;
@@ -3182,6 +3225,11 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                             gp.expert_bytes = gu_stride;
                             gp.dst = s.mmq_gu;
                             gp.ld_dst = 2 * FF;
+                            // The stream-k path on this card writes its partial tiles through a fixup that ACCUMULATES
+                            // (dst[...] += sum, mmq.cuh:1367), so the destination must start at zero: without this the
+                            // group's result depended on what the buffer held from earlier work and the generated ids
+                            // changed from run to run (measured: same binary, same prompt, three runs, two answers).
+                            KC(cudaMemsetAsync(s.mmq_gu, 0, (size_t) nr * 2 * FF * 4, g_st));
                             e.mmq_ctx->run(gp, g_st);
                             strata::prefill::mmq::swiglu(s.mmq_gu, s.mmq_h, nr, FF, false, g_st);
                                                                                                                 strata::prefill::mmq::quantize(s.mmq_h, nullptr, s.mmq_xqh, b.L.d_type, FF, FF, nr, g_st);
@@ -3199,6 +3247,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                             dp.expert_bytes = d_sz;
                             dp.dst = s.mmq_dm;
                             dp.ld_dst = N;
+                            KC(cudaMemsetAsync(s.mmq_dm, 0, (size_t) nr * N * 4, g_st));
                             e.mmq_ctx->run(dp, g_st);
                             // Into the DEVICE buffer the MoE combine reads (k_moe_sum_rows), not the pool's pinned host
                             // staging: the main engine never writes a product's output to host memory (prefill.cpp writes
@@ -3215,6 +3264,21 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                                 std::fprintf(stderr, "MMQDM l=%d gn=%d nr=%lld dm_nan=%lld first_nan_float=%lld row=%lld col=%lld\n",
                                              (int) l, gn, (long long) nr, (long long) nans, (long long) first,
                                              (long long) (first / N), (long long) (first % N));
+                            }
+                            if (std::getenv("STRATA_KOLIBRI_MMQ_DEBUG") != nullptr) {
+                                // One line per layer-chunk-group: is the DEVICE bounds table still what the host wrote, and
+                                // did the two products produce anything?  A failing run is localized by diffing two logs.
+                                int32_t bd4[4] = {0, 0, 0, 0};
+                                float g0 = 0, g1 = 0, d0 = 0, h0 = 0;
+                                KC(cudaMemcpy(bd4, s.mmq_bounds, (size_t) std::min<int>((gn + 1), 4) * 4,
+                                              cudaMemcpyDeviceToHost));
+                                KC(cudaMemcpy(&g0, s.mmq_gu, 4, cudaMemcpyDeviceToHost));
+                                KC(cudaMemcpy(&g1, s.mmq_gu + (size_t) (nr / 2) * 2 * FF, 4, cudaMemcpyDeviceToHost));
+                                KC(cudaMemcpy(&d0, s.mmq_dm, 4, cudaMemcpyDeviceToHost));
+                                KC(cudaMemcpy(&h0, s.mmq_h, 4, cudaMemcpyDeviceToHost));
+                                std::fprintf(stderr, "MMQL l=%d g0=%zu gn=%d nr=%lld bd=%d,%d,%d,%d gu0=%.6g guM=%.6g dm0=%.6g h0=%.6g\n",
+                                             (int) l, j0, gn, (long long) nr, bd4[0], bd4[1], bd4[2], bd4[3],
+                                             (double) g0, (double) g1, (double) d0, (double) h0);
                             }
                             k_scatter_rows<<<grid1(nr * N), kThreads, 0, g_st>>>(s.mmq_dm, s.mmq_row_sel + r0, nr, A.gout_m, N);
                             if (std::getenv("STRATA_KOLIBRI_MMQ_DEBUG") != nullptr) {
@@ -3242,6 +3306,13 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                                              (double) xh, (double) xx, (int) b.L.gu_type, (int) b.L.d_type,
                                              (long long) b.L.up_off, (long long) b.L.down_off, b.stride);
                             }
+                            // The K-quant product is NOT deterministic in this call pattern (docs/AMD_R9700_PORT.md
+                            // §P4 determinism): identical host inputs, different generated ids, and 1 run in 3 collapsing
+                            // the router to a single expert.  STRATA_KOLIBRI_MMQ_SYNC=1 drains the device after every
+                            // group, which did not collapse in 6 consecutive runs - six is not proof, so this is off by
+                            // default and the arm is measurement-only until the cause is found.
+                            static const bool mmq_async = std::getenv("STRATA_KOLIBRI_MMQ_ASYNC") != nullptr;
+                            if (!mmq_async) KC(cudaDeviceSynchronize());
                             r0 += nr;
                         }
                         if (ok) {
@@ -3683,7 +3754,11 @@ void init_scratch(const Engine& e, Scratch& s) {
             s.mmq_rows_cap = rcap;
             s.mmq_row_tok_h.resize((size_t) rcap);
             s.mmq_row_sel_h.resize((size_t) rcap);
-            s.mmq_bounds_h.resize((size_t) e.g.n_expert + 1);
+            // One bounds slice PER GROUP, filled and uploaded once per chunk: a per-group upload reused the same
+            // small host array while the GPU could still be reading it (pageable H2D is not guaranteed to be copied
+            // at call time), which intermittently fed the product col_diff = 0 - every tile returns early
+            // (mmq.cuh:1017) and the layer came out all zeros: gen 0 0 0 ... once in five runs.
+            s.mmq_bounds_h.resize((size_t) (e.g.n_expert + 1) * (strata::prefill::mmq::kGatherGroupMax + 1));
             KC(cudaMalloc(&s.mmq_xq, strata::prefill::mmq::q8_bytes(rcap, N) + 4096));
             KC(cudaMalloc(&s.mmq_xqh, strata::prefill::mmq::q8_bytes(rcap, FF) + 4096));
             KC(cudaMalloc((void**) &s.mmq_gu, (size_t) rcap * 2 * FF * 4));
@@ -3697,12 +3772,27 @@ void init_scratch(const Engine& e, Scratch& s) {
             KC(cudaMalloc((void**) &s.mmq_row_tok, (size_t) rcap * 4));
             KC(cudaMalloc((void**) &s.mmq_row_sel, (size_t) rcap * 4));
             KC(cudaMalloc((void**) &s.mmq_ident, (size_t) rcap * 4));
-            KC(cudaMalloc((void**) &s.mmq_bounds, ((size_t) e.g.n_expert + 1) * 4));
+            KC(cudaMalloc((void**) &s.mmq_bounds,
+                          (size_t) (e.g.n_expert + 1) * (strata::prefill::mmq::kGatherGroupMax + 1) * 4));
             strata::prefill::mmq::iota(s.mmq_ident, rcap, g_st);
+            if (gu_max == 0) {
+                // An arm that is switched on but cannot run must say so: the guard above falls through to the CPU pool
+                // for every layer, so without this line the operator sees "on" and measures pool speed.
+                std::fprintf(stderr, "strata-kolibri: STRATA_KOLIBRI_PF_MMQ is set, but no expert type in this model has an "
+                                     "MMQ path here - K-quants need STRATA_MMQ_KQ=1 with the strata_kq library beside the "
+                                     "engine. Falling back to the CPU pool.\n");
+            }
             if (e.mmq_ctx == nullptr) e.mmq_ctx = std::make_unique<strata::prefill::mmq::Context>();
             std::fprintf(stderr, "strata-kolibri: STRATA_KOLIBRI_PF_MMQ: prompt experts on the int8 tensor units "
                                  "(gate/up %zu B, down %zu B per expert, %lld selections a chunk)\n",
                          gu_max, d_max, (long long) ents);
+            if (gu_max != 0) {
+                // Honesty beats a fast wrong answer: this arm is 2.6x faster at 8K and is NOT deterministic yet.
+                std::fprintf(stderr, "strata-kolibri: STRATA_KOLIBRI_PF_MMQ is MEASUREMENT-ONLY: the K-quant product is "
+                                     "not reproducible here (measured: ids change between runs with identical inputs, "
+                                     "and about one run in three collapses). It is not a default. See "
+                                     "docs/AMD_R9700_PORT.md \xc2\xa7P4 determinism.\n");
+            }
         }
 #endif
         if (pf_pipe_on()) {
