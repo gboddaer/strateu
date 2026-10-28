@@ -1619,3 +1619,43 @@ One loose end recorded rather than explained: the chunk-128 arm alone produced d
 (`gen: 10 127908 263 50` against `286 3515 310 262`), while chunk 64, 256 and 512 all matched. One arm out of four, not
 reproduced; the plan's two-runs-per-arm rule is what caught it, and it is why a single id comparison cannot certify
 chunk invariance.
+
+## P4 (2026-10-28): `strata::prefill::mmq` is not in this build - it is one CMake option away, and the K-quants come with it
+
+Before any wiring: the library the plan wants to call **does not exist in this build**. `ls build/*.a` has core, engine,
+kernels, kernels_cpu, ri, prefill, qwen35, spec - **no `strata_mmq`**, and `build/build.ninja` never mentions
+`STRATA_KQ_DSO`. So the grouped Q4_K expert product is not missing because it is slow; it is not compiled.
+
+It is available, though, on this backend: `CMakeLists.txt:2400` opens
+
+```cmake
+  elseif(STRATA_PREFILL_MMQ)
+    # Compile only the pinned GGML MMQ and activation-quantizer sources used by prefill. This uses
+    # common.cuh's native HIP path without enabling a second GGML HIP backend.
+    ...
+    if(STRATA_MMQ_KQUANTS)
+      # the same K-quant instances as the CUDA branch: on HIP they serve the dense GGUF projections
+      list(APPEND _strata_mmq_types q4_k q5_k q5_1 q6_k)
+    endif()
+    foreach(_t IN LISTS _strata_mmq_types) ... mmq-instance-${_t}.cu
+    set_source_files_properties(${_strata_mmq_sources} PROPERTIES LANGUAGE HIP)
+    add_library(strata_mmq STATIC ${_strata_mmq_sources})
+```
+
+so `-DSTRATA_PREFILL_MMQ=ON` (with `STRATA_MMQ_KQUANTS=ON`, already the default) builds the Q4_K instances for HIP. A
+runtime switch is still needed on this backend: `kq_ok()` (`src/prefill/moe_mmq.cu:44`) returns `kq::available()` only
+under `STRATA_KQ_DSO` (the CUDA library), so on HIP it falls back to **`STRATA_MMQ_KQ=1`** as an env opt-in.
+
+What that means for this task, in order:
+
+1. Build the library in a **second build directory** (`build-mmq`, same options plus `-DSTRATA_PREFILL_MMQ=ON`) so the
+   working `build/` is not disturbed; the MMQ instance TUs are many and slow to compile.
+2. There is no benchmark for Kolibri's shape on HIP: `mmq_expert_bench` is a CUDA-CMake target (links `CUDA::cudart`) and
+   its cases are Qwen's shapes and NVFP4/Q8_0/IQ3_S formats. Kolibri needs **Q4_K at gate/up [512 x 2560] and down
+   [2560 x 512]**, with the rows per expert a chunk actually produces: at 512-token chunks the counters give 1 535.8
+   rows/layer-chunk over ~158 touched experts, i.e. **~10 rows per expert** - a skinny grouped GEMM, which is exactly
+   where MMQ's advantage is thinnest.
+3. So P4's kill criterion (300 GFLOP/s on the grouped product) has to be measured on that shape before any wiring, and
+   the number to beat is the pool's **316-323 GFLOP/s at 7.0 GB/s**.
+
+That is the next step in this session; no engine code has been touched for P4 yet.
