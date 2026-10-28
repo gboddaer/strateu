@@ -1371,3 +1371,30 @@ this plan's own contract, and the numbers above say the session is worth spendin
 Recorded as the plan's top lever for the next one, with the probe reproducible in five minutes.
 
 No code changed, so no gate is owed: the shipped path is untouched (oracle BITWISE, `pf_gate` GATE PASS, §T4).
+
+## T12 (2026-10-28): feasibility established, kernel not built - and why the session is worth spending
+
+Task 12 is the WMMA attention arm: replace the `#if defined(__HIPCC__) -> MMA off` gate (`kolibri_engine.cu:969`)
+with a gfx12 path and give `k_attn_flash_mma` an AMD sibling, behind `STRATA_KOLIBRI_ATTN_WMMA`. As with T11 the
+instructive step this session was feasibility, and the two measurements that bound the payoff are already in hand:
+
+- **At short ctx, attention is small**: §T1's profile has `k_attn` at 50 calls/token, 50.9 us each = **2.55 ms of the
+  16.1 ms GPU token**, i.e. **4 % of the 62.9 ms wall**. A WMMA attention kernel cannot matter here even if it were
+  free.
+- **At long ctx it is the wall**: the ledger's long-context row is **6.7 tok/s at 100K = 149 ms/token**, and the plan's
+  own reasoning puts the attention GEMM class at the centre of that. This is the only decode number on this box where
+  a 5-7x kernel-class change moves the total.
+
+**The instruction is real and fast here** (§T11's probe): 110.64 TFLOPS fp16-in/fp32-accumulate on gfx1201, using the
+in-tree gfx12 wrapper. The existing flash path's structure (scores + online softmax + PV in one launch per layer) is
+already the right shape; what is missing is the AMD fragment layout and its parity evidence.
+
+**Not built this session.** The work is: the gfx12 WMMA score/PV path, parity at 512 tokens against the shipped
+tiled path (the CUDA `mma` precedent is KL-neutral there), two-run identity, then the long-context validation - which
+by the plan's own budget is **one 99K arm per session (16+ min per run)**, and a 99K comparison needs two runs, plus
+the re-measured rate. That is a session of its own, and the correctness contract does not survive shortening it.
+
+Note for whoever takes it: `STRATA_KOLIBRI_ATTN_MMA` is compiled out on HIP and `attn_mma_on()` exists only in the CUDA
+branch, so on this card that flag is silently inert. `ATTN_WMMA` is the AMD knob; do not reuse `ATTN_MMA` for it.
+
+No code changed, so no gate is owed: shipped path untouched (oracle BITWISE, `pf_gate` GATE PASS, §T4).
