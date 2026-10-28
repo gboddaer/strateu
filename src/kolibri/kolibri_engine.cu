@@ -5205,7 +5205,11 @@ int strata::kolibri::run(int argc, char** argv) {
         int64_t i = 0;
         const int64_t n = (int64_t) ids.size() - 1;
         e.pf_total = n;   // the POOL_ALL rule: one decision for the whole prompt
-        g_pf_total = n;   // K28: and the chunk rule keys on it (see pf_chunk_at)
+        // K28: the chunk rule keys on the PREFIX LENGTH.  `n` is ids.size() - 1 (the last id seeds generation), so an
+        // 8192-token request prefills 8191 and fell on the SHORT side of the rule's 8192 threshold: 32 chunks of 256
+        // where 16 of 512 were intended (docs/AMD_R9700_PORT.md §P2).  Key on the request's length, which is what the
+        // rule's constant was measured against.
+        g_pf_total = (int64_t) ids.size();   // K28: and the chunk rule keys on it (see pf_chunk_at)
         const auto tp0 = Clock::now();
         // **THE HOST IS A POOL LANE, SO IT MUST SIT ON ITS OWN CORE.**  The prefill fan-out runs shard 0 on the
         // calling thread; leaving that thread unpinned lets it land on a worker's core (or its SMT sibling) and

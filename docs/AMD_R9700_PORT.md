@@ -1589,3 +1589,33 @@ loop has to change shape - either (a) **layer-outer over a wave of W chunks**: r
 (each ring-safe), then one pool call covering W x 512 rows for that layer - which extends the `PF_PIPE` two-chunk
 wavefront that already exists; or (b) grow the SWA ring to the chunk, which changes the sliding semantics' cache shape
 and costs VRAM. (a) is the one that keeps the attention contract intact.
+
+### P2 addendum (2026-10-28): the reachable range is +2.7 %, and the pool's rate falls as chunks grow
+
+One real defect found and fixed on the way: the chunk rule keys on the prefix length and compares it with 8192, but
+`n = ids.size() - 1` (the last id seeds generation), so an **8192-token request prefilled 8191 and fell on the short
+side** - 32 chunks of 256 where 16 of 512 were intended. `g_pf_total` now takes `ids.size()` (`kolibri_engine.cu`), and
+an 8 192-token prompt runs 512-token chunks. Gates: the 511-token oracle is unaffected (still below the threshold) and
+the 8K ids are **bitwise identical** to the chunk-256 arm on both runs (`gen: 286 3515 310 262`), so chunk 256 against
+512 changes no number - the K28 claim holds between those two sizes.
+
+| 8 192 tokens, ctx 16384 | chunks | prefill | pool | expert bytes | rate |
+|---|---|---|---|---|---|
+| chunk 256 (before) | 32 | 69.33 / 69.66 s | 60.81 / 61.09 s | 426.69 GB (267 MB/chunk) | 117.6 tok/s |
+| **chunk 512 (after the fix)** | 16 | **68.76 / 66.91 s** | 61.72 / 59.93 s | **279.82 GB (350 MB/chunk)** | **120.8 tok/s (+2.7 %)** |
+
+**Why so little, and what it does to the P2 projection.** The bytes fell 34 %, and the pool time did not move at all,
+because the pool's own throughput fell with them: **7.0 GB/s at 267 MB/chunk against 4.5 GB/s at 350 MB/chunk**. The pool
+is not bandwidth-bound; it loses efficiency as a chunk touches more distinct experts. Applying that measured trend to
+a 2 048-token chunk (170 GB at ~3.5-4 GB/s) gives a pool of 43-49 s, not the 24 s the earlier projection assumed - so the
+reshape's realistic ceiling is **+25-30 %, not +130 %**.
+
+**Verdict, per this task's kill criterion (+15 % at 8K): it fires.** The reachable range (256 -> 512) is +2.7 %, and
+the measured rate trend caps the >512 reshape well below the criterion. The loop reshape is therefore **not** carried
+out; the fix above is kept (it is a defect fix with a bitwise gate, and it is what makes 512-token chunks reachable at
+all), and the effort goes to P3+P4, which attack the pool itself rather than the shape of its work.
+
+One loose end recorded rather than explained: the chunk-128 arm alone produced different ids
+(`gen: 10 127908 263 50` against `286 3515 310 262`), while chunk 64, 256 and 512 all matched. One arm out of four, not
+reproduced; the plan's two-runs-per-arm rule is what caught it, and it is why a single id comparison cannot certify
+chunk invariance.
