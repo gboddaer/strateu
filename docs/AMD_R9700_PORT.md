@@ -2008,3 +2008,24 @@ What that means, and what it does not:
 
 That closes the auditor's objection with a cause rather than a shrug: the chunk-128 arm's different ids are real,
 reproducible, and explained - a 0.2-logit chunk-size dependence amplified by greedy decoding at a razor-thin margin.
+
+### P4 debug, step 7 (2026-10-28): expert 1's first row is exactly ZERO at the gu product, and NaN only from col 36
+
+The promised split (print expert 1's first row at each stage, `l=0`) answers which stage goes bad:
+
+```
+MMQSPLIT l=0 gn=16 row1=198 gu[gate]=0 gu[up]=0 h=0
+MMQSPLIT l=0 gn=16 row1=27  gu[gate]=0 gu[up]=0 h=0
+MMQSPLIT l=0 gn=14 row1=8   gu[gate]=0 gu[up]=0 h=0
+```
+
+So the *gu product itself* returns **0** at expert 1's first row - not NaN - and the earlier scan found the first NaN
+at row 198, **col 36**. Columns 0..35 of that row are finite (0) and the tail is not written. Two rows of the same group
+therefore behave differently, and the boundary sits 36 values into the row rather than on a 32-value block edge.
+
+That narrows the remaining candidates to the two things the 1-expert case cannot exercise: how `bounds` maps experts to
+rows when `n > 1`, and how `total_rows`/`max_rows` size the launch that writes them. A zero (rather than garbage) at
+the head of the row says the product did write - with a zeroed weight or a zero-length row - and then stopped.
+
+Not resolved. The 1-expert arm remains the only correct configuration measured, and it is 1.8x slower than the pool, so
+nothing ships from P4 yet.
