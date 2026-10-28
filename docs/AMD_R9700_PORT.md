@@ -1045,3 +1045,52 @@ its roof (32.1 GB/s streaming, 326-329 GFLOP/s of compute, `146 % of the 226 GFL
 accounting) - so prefill gains have to come from *not* running 117 experts per layer through the pool, which is
 what residency (T6/T7) and the fused WMMA expert kernel (T11) are for. It also weakens Task 5's speed premise
 outright: the LM head is 0.8 % of decode, so that task is a numerics/VRAM question at best.
+
+## T2 (2026-10-28): the grid-shape micro-bench, and what it says about T3, T4 and T5
+
+New opt-in tool, `tools/kolibri/grid_shape_bench.cu` (`ctest -R kolibri_grid_shape_bench`, `--selftest`, 20 s), built
+from the engine's own `deq32<T_Q4_K>`, `k_gemv_f16` body and `block_sum`, so a number here transfers to the engine's
+kernels by construction. It does not link `strata_kolibri`. Every arm runs with its output hashed and the bit
+patterns are compared between two runs.
+
+Measured on the R9700 (gfx1201, 32 CUs, `HIP_VISIBLE_DEVICES=0`), box idle, two runs each:
+
+| arm | run 1 | run 2 | GB/s | bitwise |
+|---|---|---|---|---|
+| A1 F16 GEMV [128000 x 2560], block-per-row (128000 blocks) | 2.1200 ms | 2.1253 ms | 309 | reference |
+| A2 same, grid-stride (1024 blocks) | **1.9020 ms** | 1.9026 ms | **345** | identical to A1 |
+| B1 Q4_K GEMV [2560 x 2560], block-per-row (2560 blocks) | **0.0261 ms** | 0.0263 ms | 141 | reference |
+| B2 same, grid-stride (256 blocks) | 0.0336 ms | 0.0337 ms | 110 | identical to B1 |
+| C1 same shape, packed deq32 (32-bit loads, no branch) | **0.0216 ms** | 0.0217 ms | **171** | identical to B1 |
+| D1 same shape, int8 dot (dot1 emulated) | 0.0388 ms | 0.0386 ms | 95 | own numerics (probe) |
+| E1 18 tiny launches (6 picks x 3 slices) | 0.0665 ms | 0.0666 ms | - | - |
+| E2 1 batched launch (18 blocks) | 0.0037 ms | 0.0037 ms | - | - |
+
+Bit patterns identical across the two runs and across the pairs (`A 7469326e6c9f7383`, `B/C 24df816513f487f6`).
+
+**Verdict 1 - the grid cap is a size-conditional win, not a free one.** At the LM head's `n_out = 128000` the
+grid-stride form is **10.3 % faster** (1.902 against 2.120 ms: 128000 single-row blocks cost more than the extra
+strided loop). At a dense projection's `n_out = 2560` the *same* change is **29 % slower** (0.0336 against 0.0261 ms)
+- 256 blocks leave the 32 CUs under-fed on a shape that fits in 3.7 MB. So Task 3's knob cannot be applied blanket:
+it has to gate on `n_out` (a threshold near 16k rows separates the two regimes by a factor of 10 in block count),
+and on the shapes the engine actually runs, which are 2560 far more often than 128000.
+
+**Verdict 2 - the packed deq32 buys what the T4 record promised, and it is free of numerics risk.** +21 % on the
+Q4_K GEMV (0.0216 against 0.0261 ms), bitwise identical by construction - the same float expression per element,
+only the nibble extraction changes (32-bit loads, no per-element branch). That is the "+15 % on gfx1201" class from the
+main engine, measured on this card.
+
+**Verdict 3 - a real dp4a arm cannot be built on gfx1201.** `__builtin_amdgcn_sdot4` refuses to compile for this
+architecture ("needs target feature dot1-insts"), so the int8 arm here is the emulated 32-MAD form, and it is
+**1.5x slower** than the scalar fp32 dot (0.0388 against 0.0261 ms). Any gfx12 int8 plan pays that emulation; there is
+no dot-instruction path to price.
+
+**Verdict 4 - a launch costs 3.69 us.** 18 tiny launches take 66.5 us where the one batched launch doing the same
+work takes 3.7 us. With Task 1's 1347 launches per decode token, launch issue alone is ~5 ms/token of the 63 ms wall,
+before any handoff. This is the number Task 8's per-pick arms must beat by batching.
+
+**Verdict 5 - the fp16 LM head (Task 5) would be four times slower, not faster.** The bench's A arm is exactly that
+proposal's data path: 128000 x 2560 of F16 at 2.12 ms, against the shipped Q6_K `native_q6_k_mmvq` for the same
+projection measured at **0.52 ms** (Task 1). The fp16 form doubles the bytes read and the card is bandwidth-bound at
+309-345 GB/s on that shape. Combined with Task 1's finding that the LM head is 0.8 % of decode, Task 5's speed premise
+is dead on this box; it can only be argued as a numerics experiment, and the shipped Q6_K path already wins on speed.
