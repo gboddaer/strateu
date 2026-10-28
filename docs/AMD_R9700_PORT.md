@@ -1461,3 +1461,28 @@ anyone. `STRATA_KOLIBRI_WARM=1` is there for a card or a kernel where the balanc
 
 Gates after the change: oracle BITWISE PASS (knob unset, and `WARM=1`), `ctest` 85/89 with the same four box-scoped
 failures.
+
+## T10 (2026-10-28): the `PF_PARTIAL` arm, measured as specified - a slower prompt, unchanged decode
+
+Arm exactly as the plan writes it: `STRATA_KOLIBRI_PF_STAGE=1 STRATA_KOLIBRI_PF_PARTIAL=1
+STRATA_KOLIBRI_EXPERT_F16=28`, ctx 8192 (the ledger's short shape), 512-id prompt, `--prefill --cpu-threads 8`, box
+idle, against §T1's baseline on the same shape and the same session protocol:
+
+| quantity | baseline (ctx 8192) | `PF_STAGE` + `PF_PARTIAL` + `F16=28` |
+|---|---|---|
+| wall, n=4 / n=257 | 19.57/19.63 s / 35.49/35.57 s | 23.66 s / 39.60 s |
+| decode | 62.9 ms/token = 15.90 tok/s | 63.0 ms/token = **15.87 tok/s** |
+| prefill, 511 tokens (chunk timers) | 2543+4623 = **7 166 ms** | 4867+8118 = **12 985 ms** |
+
+Decode is unchanged (the T4 record's "must never go down" invariant holds: 15.87 against 15.90 is inside the
+run-to-run spread), and the **prompt is 81 % slower**. The 4.7e7-byte staging traffic that PF_STAGE adds is the
+explanation worth testing next time, but it is not this task's question: as specified, the arm loses.
+
+One correction to how this arm was described earlier: the earlier sample at ctx 131072 (62.0/73.3 tok/s prompt against
+57.6/70.1 with the cache) set `PF_PARTIAL` and `EXPERT_F16` but **not** `PF_STAGE`, and it read "inside the noise". The
+two arms are not comparable, and the difference between them is exactly the knob that now shows the regression - so
+the earlier "inside the noise" note must not be quoted for `PF_STAGE`.
+
+**Decision: not adopted.** `run-kolibri1.sh` keeps no staging knobs, and Task 14's re-derivation has nothing to take
+from this arm. KL on the pooled path was moot: the arm does not win on speed, so it does not get to ask for a numerics
+budget.
