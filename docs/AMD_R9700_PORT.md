@@ -1894,3 +1894,21 @@ So: **the per-group convention, the activation source (`A.h_m`), the identity id
 **Why the shipped gate did not catch it**: `prefill_mmq_parity` (which passes here, Q4_K `rel_l2 = 0.00198`) exercises the K-quants with **`experts=1`** — its multi-expert cases are Q2_0 only (`rows=7 experts=3`). The one layout the engine depends on is the one the gate does not cover. Extending that test's K-quant cases to 2–3 experts is therefore the next step, and it iterates in seconds instead of a 40-second engine arm.
 
 **Speed, meanwhile, is now measured for both shapes**: the broken 16-expert path runs the prompt leg in 2 011 ms against the pool's 4 810 ms (2.4x faster), and the correct one-expert path in 8 863 ms (1.8x *slower* — ~2 300 extra launches and a per-group hidden quantize that should be per-layer). So the win lives entirely in the multi-expert layout, which is exactly the piece still wrong.
+
+### P4 debug, step 4 (2026-10-28): it fails from the second expert, at any group size - and the gate never tests the gather
+
+| group size | `gen` | expert-leg NaN | first bad float |
+|---|---|---|---|
+| 1 | `286 3515 310 262` (matches the pool) | 0 | - |
+| 2 | `0 0 0 0` | 4 980 | row 198, col 36 |
+| 4 | `0 0 0 0` | 13 754 | row 198, col 36 |
+| 8 | `0 0 0 0` | 17 970 | row 198, col 36 |
+| 16 | `0 0 0 0` | 25 020 | row 198, col 36 |
+
+Row 198 is exactly expert 0's row count in that group, and the offset is the same at every group size - so it is not a count limit or a bounds problem: **the second and later experts' staged data is wrong**, whatever the group size.
+
+The shipped gate cannot see this: `prefill_mmq_parity` **builds its expert weights on the host** (`std::vector<uint8_t> w(experts * expert_bytes + tail)`) and never calls `gather_native_group`, which is the function the engine uses to fill the staging from the model's blobs. Its new 3-expert K-quant cases pass (`Q4_K-x3 rel_l2 = 0.00197`, `zero_row_max = 0`), which proves the *product* is fine and leaves the gather as the only untested link.
+
+`copy16_group_kernel` (`moe_mmq.cu`) is unambiguous about the layout it produces - `ab = gu_dst + q * ga.gu_stride` (16-byte units), gate at `[0, na)`, up at `[na, 2na)`, down at `cd + q * ga.d_stride`, tail zeroed only for `q == n - 1` - so the mismatch is in the arguments I feed it (`up_off`, `gu_half`, `gu_stride`, `d_sz`, `d_stride`) or in what `Product.expert_bytes` expects, not in the kernel's arithmetic.
+
+**Next step, small and decisive**: make the parity test *stage through `gather_native_group`* (host blobs → device staging → product) instead of building the weights directly. That reproduces the engine's failure in seconds instead of a 40-second arm, and the only remaining variables are then the five size arguments.
