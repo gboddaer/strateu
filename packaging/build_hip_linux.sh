@@ -106,9 +106,13 @@ EOJ
 DATA=(--data "$LIBW/lib/rocblas/library=rocblas/library" --data "$LIBW/lib/hipblaslt/library=hipblaslt/library" --data-arch "$DATAARCH")
 BINS=("$OUT/b/strata" "$OUT/bh/bin/strata-vision-hip"); [ "$DSV41" = 1 ] && BINS+=("$OUT/bd/strata-dsv41")
 [ "$KOLIBRI" = 1 ] && BINS+=("$OUT/b/strata-kolibri")
+# Newer ROCm's libamd_comgr imports zstd. Force it into the opt-in Kolibri package rather than relying on
+# the collector's broad OS-library classification (the component verifier correctly requires it bundled).
+KOLIBRI_LIBS=()
+[ "$KOLIBRI" = 1 ] && KOLIBRI_LIBS=(--search /lib/x86_64-linux-gnu --search /usr/lib/x86_64-linux-gnu --also libzstd.so.1)
 for b in "${BINS[@]}"; do
   python3 packaging/collect_libs.py --binary "$b" --search "$LIBW/lib" --search "$HP/lib" --search "$CORE/lib" --search "$CORE/lib/llvm/lib" ${SYSDEPS:+--search "$HP/lib/rocm_sysdeps/lib"} \
-    --also 'libamd_comgr.so*' --also 'libhiprtc*.so*' --out "$STAGE" \
+    --also 'libamd_comgr.so*' --also 'libhiprtc*.so*' "${KOLIBRI_LIBS[@]}" --out "$STAGE" \
     "${DATA[@]}" >> "$OUT/collect.log" 2>&1
   chk $? "collected for $(basename "$b")"
   DATA=()                                              # the kernel data once

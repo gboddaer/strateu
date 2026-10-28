@@ -112,7 +112,10 @@ the new automatic default is restricted to Linux gfx1201. No performance result 
 
 The HIP release recipe accepts **`KOLIBRI=1`** to build, collect dependencies for, and include `strata-kolibri` beside
 the primary engine. It already enables MMQ and stages the exact-version tuning tables. The component manifest and
-Unix executable permissions now include Kolibri. With KOLIBRI absent, this extra engine is not built or added.
+Unix executable permissions now include Kolibri. The opt-in recipe explicitly bundles `libzstd.so.1`, which this
+ROCm's `libamd_comgr` imports: the first package verification correctly rejected it when it was absent. The explicit
+collector path and the complete component then passed verification. With KOLIBRI absent, this extra engine and
+library-selection override are not added.
 
 A local text-only gfx1201 Kolibri component is staged with the matching ROCm libraries, filtered GPU kernel data,
 licenses, tuning table and validation records. Its relocatable `$ORIGIN` runtime is tested on this box. The final
