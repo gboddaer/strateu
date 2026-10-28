@@ -948,3 +948,100 @@ resident prefill block was the only zero-capable one.
 Regression: `ctest -R kolibri_res_top_zero_test` (35.79 s) runs both arms and requires `RES_TOP=0` to finish with a
 `gen:` line whose ids equal `RES_TOP=56`'s; it skips (77) where the GGUF is absent. Gates after the change:
 `oracle.sh check` BITWISE PASS, full `ctest` 84/88 (same four box-scoped fails as after T16).
+
+## T1 (2026-10-28): the standing baseline arm, and where the decode's 63 ms/token goes
+
+### `baseline-standing` — the one arm every later row cites
+
+```sh
+HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 \
+STRATA_KOLIBRI_EXPERT_F16=0 STRATA_KOLIBRI_ATTN_MB=512 STRATA_KOLIBRI_RES_TOP=56 \
+build/strata-kolibri --model /fast/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf \
+  --tokens-file tools/kolibri/oracle_ids512.txt --n 257 --ctx 131072 --cpu-threads 8 --prefill
+```
+
+That is the launcher's own command line (`run-kolibri1.sh`: `--prefill --cpu-threads $(physical cores) --ctx 131072`
+plus the `EXPERT_F16=0 / ATTN_MB=512 / RES_TOP=56` defaults), run twice, box idle, 90 GiB free, one arm per engine
+load. `--n 4` is run in the same session as the second arm because the load line is not subtractable: the reported
+"13.4 s" covers the file read, not the pinned repack that follows it.
+
+| quantity | run 1 | run 2 | how |
+|---|---|---|---|
+| wall, `--n 4` | 19.57 s | 19.63 s | `/usr/bin/time` |
+| wall, `--n 257` | 35.49 s | 35.57 s | `/usr/bin/time` |
+| **decode, ctx 131072** | **15.90 tok/s** | **15.87 tok/s** | **wall-derived**: (35.49-19.57)/253 = 62.9 ms/token, load cancels |
+| prefill, 511 tokens | 71.0 tok/s | 69.6 tok/s | engine chunk timers: 2568+4630 = 7198 ms / 2606+4730 = 7336 ms |
+
+The other two baselines in circulation are the same engine in different clothes, and this is where they now
+live: 15.8 tok/s (§Rate table, ctx 8192, same config) and the launcher sweep's 15.85-16.20 (engine-reported,
+ctx 131072). The tuner's 17.6-18.2 was a different request set. Cite this table; cite the others as context.
+
+### The leg split, counted and profiled
+
+Attribution runs, untimed by the engine, same config, 512-token prompt, ctx 8192 (the shape the ledger's rate
+table uses), `--counters`:
+
+```
+CNT run tok=257 | slot hits=0 miss=0 (-nan% hit) expert PCIe=0.0 MB/tok | d2h=13107/263168000 B (1.0 MB/tok)
+                  h2d=12950/2359296000 B (9.2 MB/tok) | reset=0 ms / 0 (0.00 ms)
+CNT pool workers=8 | streamed 714.2 MB/tok (183.56 GB total) | gu 3516 ms q 33 ms down 2178 ms = 5727 ms
+                  (22.28 ms/tok, 32.1 GB/s)
+CNT pool phases: wait_park 0 ms drain 5764 ms repark 0 ms = 5764 ms (22.43 ms/tok) vs work 22.28 ms/tok
+CNT branches per tok: pool 50.0 gpu-expert 0.0 slots-path 0.0 grouped 0.0 (layers/token total 50.0 of 50)
+```
+
+**`CNT decode phases: pre/d2h/pool/post` does not print on this path.** The marks are incremented only in the
+slots branch (`:2196`, `:2222`) and the native/grouped branch (`:2281-2282`); the shipped pool-only decode
+increments nothing, so `dec_layers` stays 0. That is the instrument gap the plan suspected, stated precisely:
+at the shipped config there are no GPU-side phase marks to read, and the pool's own `phase_ms` line is what
+stands in for them. For the same reason `CNT prefill phases:` prints all zeros - those marks are only written
+where the prefill runs its own resident path.
+
+`rocprof --stats` over a 128-token decode (`--tokens 286 --n 128 --ctx 8192`, same knobs):
+
+| kernel | calls | total | per token | µs/call |
+|---|---|---|---|---|
+| `native_q4_k_mmvq_kernel<false>` | 35 200 | 744.5 ms | 275 | 21.2 |
+| `k_attn` | 6 400 | 326.1 ms | 50 | 50.9 |
+| `k_rms_add` | 12 800 | 249.1 ms | 100 | 19.5 |
+| `k_rms` | 12 928 | 198.7 ms | 101 | 15.4 |
+| `native_q6_k_mmvq_kernel<false>` | 3 328 | 128.7 ms | 26 | 38.7 |
+| `native_quantize_q8_1_kernel` | 44 928 | 115.7 ms | 351 | 2.6 |
+| `k_gemv_f32_v4` | 6 400 | 61.2 ms | 50 | 9.6 |
+| `route_sigmoid_logit_add<384,6>` | 6 400 | 45.4 ms | 50 | 7.1 |
+| `__amd_rocclr_copyBuffer` | 13 154 | 45.0 ms | 103 | 3.4 |
+| `k_attn_prep`, `k_moe_sum`, `k_swiglu`, `k_kt_window` | - | 41.1 / 20.7 / 15.5 / 15.1 ms | 50 / 50 / 50 / 40 | - |
+| **sum** | **172 514** | **2.065 s** | **1 347 launches** | 12.0 |
+
+**The LM head**, measured per dispatch with `rocprofv3 --kernel-trace` (8-token decode): a `native_q6_k_mmvq`
+launched exactly once per token, the last dispatch of every token - **519.8-520.3 µs in steady state**, and
+**697.2 µs on the first token** (+34 %, which is a warm-up datum for Task 15: the same kernel, the same shape,
+one cold call). That is 0.52 ms of the 62.9 ms wall, **0.8 %**. It is `Q6_K`, not `Q4_K`, and it is not the
+dense `k_gemv_f32_v4` (that one runs 50x/token, i.e. per layer).
+
+Prefill, 511 tokens, 2 chunks: `CNT prefill pool: chunks=100 experts/chunk=117 bytes=28.05 GB (280 MB/chunk)
+pool=3660 ms (36.6 ms/chunk, 7.7 GB/s)`, against a chunk wall of 7198 ms - the pool's own run is **50.8 %** of
+the prefill. The GPU side of that prefill (`--stats`): `k_router_tile_k<0,32,3>` 100 calls / 52 ms, `k_attn` 200 /
+41 ms, hipBLAS `Cijk_*` 800 calls / 47 ms, `dequant_kernel<12>` 600 / 11 ms - counts are usable, times are not
+(rocprof inflates launch-heavy code, the same trap the plan records for nsys).
+
+### Attribution table (decode, ctx 8192, shipped config)
+
+| leg | ms/token | source |
+|---|---|---|
+| wall | **62.9** | wall-derived, `--n 4` vs `--n 257` |
+| GPU kernels | **16.1** | rocprof `--stats`, 172 514 launches / 128 tokens |
+| CPU pool work | **22.3** | engine `CNT pool workers` + `drain 22.43 ms/tok` |
+| not covered by either: driver/handoff, non-overlapped pool wait | **~24.5** | subtraction |
+
+The trace shows what that 24.5 ms is made of: 1 404 dispatches per token with a **median inter-dispatch gap of
+11.8 µs** (p90 40 µs), and the stream idle for ~82 % of the decode window. Per token the GPU is busy 16 ms out
+of 63; the biggest single kernel in the whole decode is the LM head's 520 µs.
+
+**What this changes in the plan.** The decode is launch- and handoff-bound, not arithmetic-bound: halving every
+GEMV kernel (Tasks 3, 4) can recover at most ~7 ms of the 63, while 1 347 launches and a 22 ms serialized CPU
+pool leg sit on either side of it. The prefill is the opposite - half of its wall is a pool that already runs at
+its roof (32.1 GB/s streaming, 326-329 GFLOP/s of compute, `146 % of the 226 GFLOP/s roof` in the pool's own
+accounting) - so prefill gains have to come from *not* running 117 experts per layer through the pool, which is
+what residency (T6/T7) and the fused WMMA expert kernel (T11) are for. It also weakens Task 5's speed premise
+outright: the LM head is 0.8 % of decode, so that task is a numerics/VRAM question at best.
