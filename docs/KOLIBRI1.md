@@ -132,13 +132,20 @@ short of work per launch.
   it loads, but the engine never asks it - the only GEMMs that consult it are the single-projection forms Kolibri
   does not call. The grid-capped GEMV (`STRATA_KOLIBRI_GEMV_GS`) is +10 % at a 128 000-row shape and -29 % at the
   2 560-row shapes this model runs, and never fires at all.
-- **What is worth doing next: the prompt's experts on the matrix units.** The library for it is in this tree
-  (`strata::prefill::mmq`, built with `-DSTRATA_PREFILL_MMQ=ON`) and on this card its grouped Q4_K product measures
-  **11 551 GFLOP/s** at the shape a 512-token chunk actually produces (10 rows per expert), against the CPU pool's
-  **316-323 GFLOP/s** - a factor of 36. If the engine used it, an 8K prompt's expert work would be **1.7 s instead of
-  61.1 s**, i.e. a prefill near **795 tok/s** and a first token in about ten seconds. It is not wired yet: the first
-  attempt ran and produced wrong numbers, and it is out of the tree until a parity arm passes
-  ([AMD_R9700_PORT.md](AMD_R9700_PORT.md) §P4).
+- **The prompt's experts now run on the int8 tensor units (measured 2026-10-28).** Behind
+  `STRATA_KOLIBRI_PF_MMQ=1` in a `-DSTRATA_PREFILL_MMQ=ON` build, the engine hands a chunk's experts to
+  `strata::prefill::mmq` in groups of 16, exactly as the Qwen path does. On this card, `--cpu-threads 8`, chunk 512:
+
+  | prompt | CPU pool (shipped) | int8 tensor units | ids |
+  |---|---|---|---|
+  | 511 tokens | 4 710 ms, 108.6 tok/s | **3 072 / 2 966 ms, 169 tok/s** | equal to the plain-path oracle |
+  | 8 191 tokens | 66 449 ms, 123.3 tok/s | **25 734 ms, 318.3 tok/s** | identical to the pool |
+
+  That is **2.58x** at 8K. The projection in the previous revision (795 tok/s) was too optimistic: it assumed the
+  expert leg would vanish, and the measured 25.7 s says the remaining wall is now something else - the new wall has
+  not been decomposed yet, so nothing is claimed about it. The arm is opt-in and off by default; `build/` does not
+  compile it. The one-line cause of the first attempt's wrong numbers is in
+  [AMD_R9700_PORT.md](AMD_R9700_PORT.md) §P4 (a per-expert stride that was not a whole number of weight blocks).
 - **One real defect fixed on the way**: an exactly-8 192-token request used to take the *short*-chunk branch and run
   32 chunks of 256 where 16 of 512 were intended; it now runs the long chunk (+2.7 %, ids bitwise).
 - **Attention is the second lever**, not the first: 4 % of the wall at short context, the wall itself at 100K.
