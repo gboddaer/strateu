@@ -1237,3 +1237,59 @@ arithmetic the oracle pins, and nothing measured here suggests an fp16 dequant o
 
 **Shipped path untouched:** no code changed, so the gate set is the one already recorded on this binary - oracle
 BITWISE PASS and `pf_gate.sh` GATE PASS (§T4).
+
+## T6 (2026-10-28): the slot path's leg is named - 3 launches per pick, not the kernel
+
+Arm: `--expert-slots auto --expert-slots-hot --vram-reserve-mib 1024`, ctx 131072, `--prefill --cpu-threads 8`,
+`EXPERT_F16=0`, 512-id prompt. Box idle, one arm per engine load.
+
+**The fit, and a warning worth keeping.** `expert cache fit: 25652 MiB free after dense+KV+scratch -> 214 slots/layer
+(24.02 GiB), 1024 MiB kept for the runtime, 33 MiB left`, then `1002 MiB free is below the 1024 MiB reserve: a long
+prompt can run the card out`. 214 slots/layer here, against the 135/layer of the earlier arm - the count moves with
+ctx, which is another reason the earlier number was not comparable.
+
+**The served hit rate, finally recorded** (the plan's own complaint): `CNT run tok=64 | slot hits=18544 miss=656
+(96.6% hit) expert PCIe=24.4 MB/tok`, streamed `290.6 MB/tok` against the pooled path's `714.2 MB/tok`, pool work
+`9.65 ms/tok` (30.1 GB/s) against `22.28 ms/tok`.
+
+**The phase split still cannot be read.** `CNT decode phases: pre=… d2h=… pool=… post=…` does not print even on this
+path: `dec_layers` is incremented in exactly one place (`kolibri_engine.cu:2388`, the grouped/native branch), so a
+slots run reports 0 and the line is suppressed. The legs have to come from the pool's own counters and the profiler,
+which is what the two tables below are.
+
+Timed arms in the same session (wall, `/usr/bin/time`):
+
+| arm | n=4 | n=257 | decode | vs standing arm |
+|---|---|---|---|---|
+| standing (§T1) | 19.57 / 19.63 s | 35.49 / 35.57 s | 62.9 ms/token = 15.90 tok/s | - |
+| slots, 214/layer | 22.38 s | 40.20 s | **70.4 ms/token = 14.21 tok/s** | **-10.6 %** |
+
+Prefill pays for the promotion too: `hot slots [after prompt]: 2048 expert(s) newly resident after 153300 picks
+(mean gain 30.02+), 4680 MiB over PCIe in 382.7 ms`, which is most of the n=4 difference (22.38 against 19.57 s).
+During decode the hot policy keeps re-selecting: `96 expert(s) … 218 MiB over PCIe in 17.9 ms` per round.
+
+`rocprof --stats` over 32 decode tokens of the same arm - **and this is the verdict**:
+
+| | shipped (§T1) | slots arm | delta |
+|---|---|---|---|
+| launches per token | 1 347 | **2 511** | +1 164 |
+| GPU time per token | 16.1 ms | **26.0 ms** | +9.9 |
+| of which the slot GEMV | - | 875 launches, 15.6 ms | new |
+| `native_quantize_q8_1` | 351 | 501 | +150 |
+| copies | 103 | 161 | +58 |
+| pool leg (CPU) | 22.3 ms | 9.65 ms | -12.6 |
+| wall | 62.9 ms | 70.4 ms | +7.5 |
+
+**Named leg: the slot path's own GEMV, at three launches per pick.** 875 `q4_K mmvq` launches per token = 50 layers x
+~5.8 picks x 3 (gate, up, down), 15.6 ms of new GPU time per token, plus 1 164 new launches of issue overhead at
+3.69 us each (~4.3 ms) and +150 quantise launches. The streamed leg gave up 12.6 ms/token and the GPU side took back
+9.9 ms of kernel time and ~4.3 ms of launch issue, so the arm loses 7.5 ms/token net - **-10.6 % decode**, and
+**+14 % prefill** for the 4.7 GB prompt-end promotion.
+
+**Verdict recorded, no default moved** (`--expert-slots` stays an opt-in CLI flag; the launcher still ships
+`EXPERT_F16=0` and no slots). The plan's candidate (a) - "3 GEMV launches per pick at T=1" - is the measured answer;
+(b) pointer/index marshalling and (c) VRAM pressure were not needed to explain the sign. Arithmetic for the follow-on
+tasks, using T2's 3.69 us per launch: batching the picks into one launch per layer would remove ~850 launches/token,
+~3.1 ms, and leave 67.3 ms/token = 14.86 tok/s - **still 6.5 % below the shipped arm**. That is the ceiling for any
+launch-count fix, which is why T7 and T8 cannot flip the sign by rerouting or splitting: the work itself (15.6 ms of
+3-launch-per-pick GEMV) has to shrink, and that is T11's fused kernel.
