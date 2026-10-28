@@ -1538,3 +1538,54 @@ Projection with the pool gone, from the measured non-pool 8.57 s and the measure
 
 That is 4.6-7.3x, not the 2-3x the plan projected from the (wrong) 71 tok/s baseline, and it lands Kolibri within
 2-3x of Swift IQ3_S's 1 865 tok/s at 7.2K instead of 18x behind it.
+
+## P1 (2026-10-28): `prefill-standing`
+
+Two commands, cited verbatim; every later row is held against them. Box idle, 91 GiB free, `HIP_VISIBLE_DEVICES=0`,
+R9700 gfx1201, `EXPERT_F16=0`, `ATTN_MB=512`, `RES_TOP=56`, `--cpu-threads 8`, `--prefill --counters`.
+
+| row | command | wall | prefill (last `PFchunk`) | rate |
+|---|---|---|---|---|
+| 511 tokens, ctx 8192 | `--tokens-file tools/kolibri/oracle_ids512.txt --n 4 --ctx 8192` | 20.20 / 20.20 s | 4.71 s | **108.6 tok/s** |
+| 511 tokens, ctx 16384 | same, `--ctx 16384` | 20.72 s | 4.710 s | 108.6 tok/s |
+| 8 192 tokens, ctx 16384 | `--tokens-file /tmp/ids8k.txt --n 4 --ctx 16384` | 84.69 / 85.08 s | 69.33 / 69.66 s | **117.6-118.2 tok/s** |
+
+`/tmp/ids8k.txt` is `oracle_ids512.txt` repeated 16 times (8 192 ids, 36 144 bytes) — a timing fixture, not a text: the
+content does not affect the prefill split, and routing-dependent effects would show up as run-to-run spread, which was
+0.5 %.
+
+## P2 (2026-10-28): the chunk sweep - bigger chunks are worth ~2.3x, and they are blocked by the SWA ring
+
+`STRATA_KOLIBRI_PF_CHUNK` caps the chunk, so the sweep ran without code changes (8 192 tokens, ctx 16384, counters):
+
+| cap | chunks | prefill | pool | non-pool | rate |
+|---|---|---|---|---|---|
+| 64 | 128 | 83.349 s | 65.891 s | 17.46 s | 98.3 tok/s |
+| 128 | 64 | 75.531 s | 63.484 s | 12.05 s | 108.5 tok/s |
+| 256 | 32 | 70.863 s | 61.070 s | 9.79 s | 115.6 tok/s |
+| 512 | **32** | 69.562 s | 60.930 s | 8.63 s | 117.8 tok/s |
+
+**`512` is not a 512-token chunk.** With `g_pf_total` unset on the CLI driver the K28 prefix-length rule falls back to
+the position rule, so every chunk at an 8K prefix is 256 tokens; the 512 arm is the 256 arm (69.56 against 70.86 s is
+run-to-run spread). Chunks above 256 are **unreachable today** because `kTmax = 512` and the sliding-window invariant
+refuses `kTmax >= n_swa` (513).
+
+**What the sweep says:** each extra chunk-layer costs **143.6 ms** (51.7 pool + 91.9 non-pool). At 32 chunks that is
+4.6 s of the 69.7 s; at 128 chunks it is 18.4 s. And larger chunks also dedup the experts: 256-token chunks touch 111
+experts/layer (427 GB for the prompt), while a 2 048-token chunk would touch the full 384 (170 GB for the same
+prompt). Projected at 2 048-token chunks, from those two measured terms:
+
+| | 256-token chunks (today) | 2 048-token chunks (projected) |
+|---|---|---|
+| expert bytes, 8K prompt | 426.69 GB | 170 GB |
+| pool | 61.09 s | 24.2 s |
+| non-pool | 8.57 s | 6.1 s |
+| prefill | 69.66 s | **30.3 s** |
+| rate | 117.6 tok/s | **270 tok/s (+130 %)** |
+
+**The blocker, and the two ways through.** The layer loop is chunk-outer, layer-inner, and the SWA layers cannot see
+more than `n_swa - 1 = 512` tokens per pass (the ring would wrap mid-chunk). To get a 2 048-token expert batch the
+loop has to change shape - either (a) **layer-outer over a wave of W chunks**: run attention for W chunks of 512
+(each ring-safe), then one pool call covering W x 512 rows for that layer - which extends the `PF_PIPE` two-chunk
+wavefront that already exists; or (b) grow the SWA ring to the chunk, which changes the sliding semantics' cache shape
+and costs VRAM. (a) is the one that keeps the attention contract intact.
