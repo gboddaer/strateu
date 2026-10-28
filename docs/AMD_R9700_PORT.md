@@ -1166,3 +1166,43 @@ dense weight in this engine goes to `native_mmvq` before `deq32` is ever reached
 So the +21 % the micro-bench measures on a Q4_K GEMV (§T2) is real, and it is *not reachable from this file*. The
 kernel that would collect it is `src/kernels/cuda/native_mmvq.cu` - a shared kernel with the main engine's users, not
 a kolibri kernel, and outside Task 4's file list. Recorded as the plan's next lever rather than silently banked here.
+
+## T9 (2026-10-28): the hipBLASLt table is inert on this engine, at every reachable config
+
+**Version and file match, as the plan predicted.** `/opt/rocm/include/hipblaslt/hipblaslt-version.h` says hipBLASLt
+1.2.2 → `100202`, which is exactly `tools/hip/gfx1201-hipblaslt-100202.txt`'s header
+(`STRATA_HIPBLASLT_TUNING_V1 gfx1201 100202`, 24 rows). The engine confirms it at startup:
+`prefill gemm: hipBLASLt tuning enabled (24 rows, gfx1201, version 100202)`.
+
+**A/B, three configurations, two runs each**, same 512-id prompt, ctx 8192, `--prefill --cpu-threads 8`,
+`STRATA_HIPBLASLT_TUNING=tools/hip/gfx1201-hipblaslt-100202.txt` against `STRATA_HIPBLASLT_TABLE=off`:
+
+| config | table off (chunk timers) | table on | wall off / on |
+|---|---|---|---|
+| shipped (`EXPERT_F16=0`) | 2543+4623, 2593+4677 ms | 2588+4666, 2582+4673 ms | 19.63/19.73 vs 19.68/19.68 s |
+| `EXPERT_F16=24` | 4916+8307, 5110+8601 ms | 4994+8391, 5129+8632 ms | 23.82/23.50 vs 23.56/23.83 s |
+| `DENSE_F16=1` | 2520+4582, 2528+4591 ms | 2568+4636, 2545+4609 ms | 19.72/19.74 vs 19.71/19.74 s |
+
+Flat within run-to-run spread in all three, and **the resolver never runs**: not one `Lt solution=`, `Lt fallback`
+or `no calibration for` line appears in any table arm, at any of the three configurations. The table loads and is
+then never consulted.
+
+Why, from the code: the tuning table is read only by `resolve_hipblaslt_algo`, reached from exactly two entry points
+- `hipblaslt_solution_for` (`src/prefill/gemm.cu:386`) and `try_hipblaslt` (`:396`) - and both are called only from
+`Gemm::bf16` (`:931`, `:1080`) and `Gemm::f16` (`:1197`), the **single**-product forms. `Gemm::f16_batched`, the only
+prefill GEMM form Kolibri reaches for its resident experts, does not consult the table at all. The engine's other
+prefill GEMMs are `Gemm::native` (the quantized `native_mmvq` chain), which is not hipBLAS at all. So:
+
+- shipped config: no `Gemm::f16`/`bf16` call exists on this model ('s attention and shexp weights are quantized),
+- `EXPERT_F16=24`: `f16_batched` runs, and it is not table-aware,
+- `DENSE_F16=1`: the 4.85 GiB fp16 dense cache loads, and the attention projections still take the quantized path,
+  so `Gemm::f16` is not entered.
+
+**Verdict: no win is available here, and none is lost either.** The table stays exactly as shipped - this task changed
+no code - and Task 14 must not wire `STRATA_HIPBLASLT_TUNING` as a default for this model: there is no shape on
+Kolibri-1 that would read it. The ≈2x prefill-dense precedent in the plan is from a stack (ROCm 7.2.4 / hipBLASLt 1.5)
+and a shape set whose GEMMs go through `Gemm::f16`; this engine's do not.
+
+**Not run:** the pooled-KL 0.00162 re-measurement. It exists to catch numerics drift from an *algorithm swap*, and
+this task swapped nothing - the shipped table is byte-identical before and after, and `pf_gate.sh` on the same binary
+(§T4) already reports GATE PASS with its oracle stage BITWISE. Recorded as unnecessary rather than skipped.
