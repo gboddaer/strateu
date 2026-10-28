@@ -1746,3 +1746,30 @@ host memory, finishes. So the engine's hang is outside the MMQ call sequence - t
 re-applied with `HIP_LAUNCH_BLOCKING=1` on a 64-token prompt, which turns an asynchronous hang into a named failing
 call, plus `grp.first = 0` and a per-group blob base (`d_blobs + g * kN * stride`, which the probe also got wrong and
 which no correctness check would have caught in the engine because the pointers happened to stay in bounds).
+
+### P4 debug, step 2 (2026-10-28): the hang was an overrun, and the arm now runs - with the wrong numbers
+
+With `HIP_LAUNCH_BLOCKING=1` the hang became a named failure:
+`prefill mmq: gather_native_group: an illegal memory access was encountered`. Two bugs, both in my wiring:
+
+1. **The staging buffers were sized from `matrix_bytes` of a guessed type.** A Kolibri layer's down matrix is **Q6_K**
+   while gate/up are Q4_K - the startup line says so once the sizes are printed from the blob: `gate/up 1474560 B, down
+   1095840 B`. `matrix_bytes(Q4_K, ...)` for the down slot is 737 280, so the gather wrote past the staging buffer.
+2. Consequently `GatherGroup::first` semantics (`0` per fresh group) and the per-group blob base were also wrong, as the
+   standalone probe had already shown.
+
+The fix that matters is to take every size from the blob's own offsets, which are self-describing:
+`[0, up_off)` gate, `[up_off, down_off)` up, `[down_off, stride)` down - so `gu_half = up_off`, `gu_stride = down_off`,
+`d_sz = stride - down_off`, and the staging buffers are sized from the maxima of those over the layers.
+
+After that the arm **completes**: 64-token prompt, rc 0, `gen: 0 0 0 0`. **The numbers are wrong**, which is the next
+problem and exactly what the plan's "parity first" step exists for. Candidate causes, in the order a parity arm will
+settle them: (a) the gate/up column order inside the gathered `[2*FF x N]` block (`swiglu` expects "split", gate at
+k, up at n_ff + k - the blob's up_off may hold them the other way round), (b) the hidden's quantize `ld` (I pass `FF`
+for both `cols` and `ld`), (c) whether the *down* product wants its activations quantized with the weight type or with
+Q4_K, (d) the `ids` mapping's base (dst row = `ids[row]` counts rows of `ld_dst`, and `A.ey_h` is indexed by selection).
+
+**Reverted again**, rebuilt, `oracle.sh check` BITWISE PASS: a knob that computes garbage is not shipped, off by
+default or not. The probe (`tools/kolibri/mmq_pipeline_probe.cu`) is where this gets settled - it needs a parity arm
+that compares one group's MMQ product against a CPU reference, which is the only way to tell (a) from (d) without
+guessing.
