@@ -41,13 +41,13 @@ EXPERT_F16=0, ATTN_MB=48, direct tuning and deterministic GEMMs:
 
 | Prompt ids / allocated ctx | Handoff + stream | Segments | Layer stack |
 |---|---:|---:|---:|
-| 512 / 8192 | 20.17 tok/s | 19.86 tok/s | **23.91 tok/s** |
-| 8191 / 12288 | 13.91 tok/s | 13.43 tok/s | **17.98 tok/s** |
+| 512 / 8192 | 20.17 tok/s | 19.73 tok/s | **23.91 tok/s** |
+| 8191 / 12288 | 13.60 tok/s | 13.43 tok/s | **17.98 tok/s** |
 
 These are median DONE decode times converted to rates on the final source, excluding load and prefill
 and including cold capture encountered during generation. Generated histories match across all nine
 runs per workload. Request-time reductions versus handoff+stream are 15.63% and 24.38%; versus
-segments, 9.86% and 11.30%. No default promotion follows from them. Commands, binary identities, raw
+segments, 17.46% and 25.29%. No default promotion follows from them. Commands, binary identities, raw
 times and limitations are in the
 [validation ledger](plans/2026-10-29-kolibri-decode-validation-progress.md).
 
