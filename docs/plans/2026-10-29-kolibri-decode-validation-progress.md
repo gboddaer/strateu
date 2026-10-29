@@ -78,9 +78,13 @@ looked like a graph error; artifact hashes showed most graph runs matched the OR
 verified reference exactly. A fresh same-binary audit then ran two no-graph processes and one graph
 process, all producing the same complete nine-record SHA256:
 `93274a15a769b28b4e4ea57e5ae5289fd624d01a172f9872aaa4ac27f1105c88`.
-The cause of the earlier anomalies is not established. Retain them; do not call them explained by a
+The prefix fingerprint later located the source of that class of difference before decode: six no-graph runs
+produced five identical incoming KV states and one different one, first differing in a retained full-attention
+layer, so at least one anomalous reference was prefill state rather than graph scheduling. The exact vendor
+internal cause is still not proven; paired decode comparisons therefore run with
+`STRATA_GEMM_DETERMINISTIC=1` in both arms. Retain the raw records and do not call them explained by a
 stream fix, transfer fix, or graph architecture. Raw records: `/tmp/kolibri-dec2/reference-audit/`,
-`segmented-boundaries/`, and `long-layer-probe/`.
+`segmented-boundaries/`, `long-layer-probe/`, `prefix-repeat-audit/`, `deterministic-prefix-audit/`.
 
 A hypothesis that moving CPU-result transfer from DMA into the compute queue would fix the mismatch
 was NOT supported: its output was identical to the preceding graph output. The mapped result path is
@@ -249,9 +253,11 @@ targets). The full HIP build then passed. No model/runtime default changed.
 The fresh full CTest run has **188** tests: **171 passed, 11 skipped, 6 failed**. Failures are
 kolibri_load_test (hard-coded /data4 model path absent), vmm_test, ple_parity (missing Qwen fixture),
 platform_memory_test, conversation_copy_streams_test (first stream allocation exceeds its threshold),
-and isa_guard_check (two unlisted iq_avx512 public functions). These are not waived; baseline
-reproduction/classification remains to be completed. This replaces the old 94-test totals, not vice
-versa. Full logs: `final-prefill-and-ctest/{build-all-fixed,ctest}.log`.
+and isa_guard_check (two unlisted iq_avx512 public functions). These are not waived: all six were rebuilt
+and reproduced in a separate worktree at committed baseline `057d42a6`, so they are pre-existing on this
+box and not introduced here. This replaces the old 94-test totals, not vice versa. Full logs:
+`final-prefill-and-ctest/{build-all-fixed,ctest}.log`; baseline reproduction:
+`baseline-six-failures/{configure-fixed,build,ctest}.log`.
 
 The CPU/no-model decode/tool suite now passes **88 tests** (`guard-restored.log`). A proposed guard
 for `--graphs` was withdrawn after checking the actual parser: no such option exists, and legacy graphs
