@@ -376,6 +376,25 @@ No drafter, MTP, speculation, or extra sequence is required for the scheduling w
 - Numerical changes and a default change require a separate decision after actual measurements.
   An optimization is rejected if correctness fails, regardless of speed.
 
+## Verification record (2026-10-29, card0, ROCm 7.2.2, gfx1201)
+
+Everything below was run on this box; nothing is inferred from a previous session.
+
+| Check | Result |
+|---|---|
+| `tools/kolibri/test_decode_bench.py` + `test_check_decode.py` | 55 tests, all pass (no GPU) |
+| `ctest` in `build-mmq` (MMQ build, `HIP_VISIBLE_DEVICES=0`) | 94 tests: **84 passed, 6 skipped, 4 failed** |
+| the four failures | `vmm_test`, `ple_parity` (needs a Qwen fixture), `platform_memory_test`, `conversation_copy_streams_test` — the same four as before this work |
+| `hip_handoff`, `hip_kolibri_decode_handoff` | pass (1.18 s, 0.52 s) |
+| prefill gate, `KOLIBRI_GATE_PROFILE=mmq-gfx1201` | PASS, all stages (`PF_HASH`, plain oracle bitwise, reuse) |
+| prefill gate, `KOLIBRI_GATE_PROFILE=pool` | PASS, all stages |
+| decode gate, `STRATA_KOLIBRI_DEC_HANDOFF=1` | DECODE GATE PASS |
+| decode gate, `STRATA_KOLIBRI_DEC_ATTN_DP=1` | DECODE GATE PASS |
+
+Not run, and not implied: a CUDA build (`nvcc` is not installed on this box) and any SYCL build (the Kolibri
+engine path is CUDA/HIP only; the changes here do not touch a SYCL translation unit). No second GPU was used,
+and every run set `HIP_VISIBLE_DEVICES=0`.
+
 ## Limits and next step
 
 The T4/R9700 gap is not yet an apples-to-apples GPU comparison. The hosts, active expert work,

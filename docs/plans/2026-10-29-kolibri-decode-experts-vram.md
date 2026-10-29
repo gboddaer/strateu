@@ -1,279 +1,251 @@
-# Kolibri decode: experts from VRAM, grouped Implementation Plan
+# Kolibri decode: host-assisted scheduling implementation plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Use `superpowers:executing-plans` for native execution, or
+> `superpowers:subagent-driven-development` only if the operator explicitly chooses delegation.
+> This is a revised plan for review, not authorization to implement or change a default.
 
-**Goal:** Move the decode token's routed experts off the 32.4 GB/s host leg onto the card (grouped,
-VRAM-resident, device-side grouping), then make the token host-free so it can be captured as one graph.
-Target: 67.4 ms → ~33 ms per token (14.7 → ~30 tok/s) on the R9700, where the GPU is idle 64 % of a token.
+**Goal:** Improve exact single-stream decode on the R9700 without a drafter. First transfer
+Flash-Next's host-assisted scheduling while preserving Kolibri's CPU expert arithmetic. Measure the
+result before choosing a separate placement or kernel optimization.
 
-**Architecture:** Kolibri's 42.90 GiB of expert blobs cannot fit in 32 GB, but **253 slots/layer
-(28.38 GiB) do**, and 214 slots already served 96.6 % of picks on this box. Today the slot path costs
-**3 launches per pick**, and the pool path costs a **blocking D2H + pool drain + H2D per layer**, which is
-where the GPU sits idle. The plan reuses two pieces that already exist on either side of the gap: the
-prefill's `native_expert_grouped` (one launch per layer, takes a **per-group pointer array**, so a table
-mixing VRAM slots and the pinned host table needs no new kernel) and the prefill's device-side `k_group`.
-Once the host no longer takes part in the token, the whole token becomes capturable, which removes the
-1 344 launches and the 17.7 ms of dispatch gaps.
+**Architecture:** Actual Flash-Next can keep CPU misses inside its execution protocol: a captured
+GPU segment publishes normalized input, ids and weights; CPU work overlaps independent shared/resident
+GPU work; this layer's results are combined before the next layer begins. Start with two graph segments
+per layer, then consider a whole-layer-stack graph with acknowledgement waits. **CPU misses do not need
+to move to PCIe weight reads to make capture possible.**
 
-**Tech Stack:** C++17, HIP/CUDA, `src/kolibri/kolibri_engine.cu`, `src/kernels/cuda/native_moe*`,
-CMake + Ninja, `rocprofv3`, `tools/kolibri/{decode_bench,kl,pf_gate.sh,check_repeat}.py`.
+**Tech stack:** Existing C++20 host code and project HIP/CUDA compilation settings, mapped pinned
+memory, existing pool and elementwise primitives, Python serve-protocol harness, CMake/CTest.
 
-**Spec:** [docs/KOLIBRI_DECODE.md](../KOLIBRI_DECODE.md) — every number below is measured there.
+**Spec:** [docs/KOLIBRI_DECODE.md](../KOLIBRI_DECODE.md).
+The historical filename is retained so existing links continue to work; this no longer starts with VRAM.
 
-## Global Constraints
+## Status (2026-10-29)
 
-- **GPU: card0 only.** Every command runs with `HIP_VISIBLE_DEVICES=0`. Never card1/card2.
-- **The default path stays byte-identical.** Every new arm is behind `STRATA_KOLIBRI_DEC_SLOTS_GROUPED`
-  (Task 3) and `STRATA_KOLIBRI_DEC_GRAPH` (Task 4), both default off.
-- **Never `--record` over the pool's expectation files.** `pf_gate_expect_{smoke,hash}_gfx1201.txt` are the
-  pool's; a numerical arm gets its own pair, as the P4 arm did.
-- **A numerics-changing arm ships only with its own KL gate**: mean KL against the default arm, top-1
-  agreement, and two identical runs. Bit-equality claims need `--dump-full-logits` (`--dump-logits` writes
-  only the top-two records).
-- **Every ledger row states** ctx, prompt length, decode length, threads, box load, and how the number was
-  obtained (trace window, never a wall difference between two `--n` values).
-- **A spike that shows no speed-up stops the plan.** Task 2 is a measurement, not a promise.
-- Commit titles start with `kolibri(r9700):`.
-- Model `/fast/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf`; build tree `build-mmq/`; fixture
-  `tools/kolibri/oracle_ids512.txt`.
+- **Task 1 — done** (`ffc1e536`): `tools/kolibri/decode_bench.py` + 46 tests, the unprofiled baseline
+  (six identical runs, 0.4 % spread) and the `DEC_XEXP` arm measured as a one-variable pair (−5.2 % short,
+  −4.2 % long) with marker-proven activation.
+- **Task 2 — done** (`41b2a91b`): `tests/hip/kolibri_decode_handoff.cpp` proves the per-layer
+  publish/wait/answer protocol with a payload that changes on every replay, plus reset, 30/30 ring visibility
+  with the graph still running, and a bounded no-ring failure. Negative control run (exit 12 in 5.1 s).
+- **Task 3 — done, as a publication handoff rather than captured segments** (`eb752473`):
+  `STRATA_KOLIBRI_DEC_HANDOFF=1` measured −10.1 % (512 ids) and −7.5 % (8191 ids), bitwise against the plain
+  engine through `tools/kolibri/decode_gate.sh` at 16/511/512/513 ids and on the reused-prefix path, six
+  repeats, both prefill profiles unchanged. Capture was **not** part of it: see the next item.
+- **Task 4 — prerequisite delivered, capture not built** (`0ca15a37`): `k_attn_dp`
+  (`STRATA_KOLIBRI_DEC_ATTN_DP=1`) is the bitwise device-position *single-pass* kernel a capture needs, gated
+  bitwise on the same cases and costing nothing measurable. What remains before a capture arm can be gated:
+  move the eager decode off the legacy stream (`st = 0`) and the router off `g_st` onto one explicitly
+  ordered stream - a legacy stream cannot be captured at all - then capture the per-layer segments keyed by
+  `n_vis` bucket, and only after that consider the whole-stack graph with its acknowledgement/abort path.
 
-## Review Focus
+## Global constraints
 
-- **A pick that misses the slot table.** Roughly 3.4 % of picks at 214 slots. The grouped table must cover
-  them from the pinned host table, or the layer must fall back as a whole — mixing the two inside one
-  launch is the point of the change, and a mistake here silently computes a wrong expert.
-- **`Q6_K` down projections.** Blobs are `[gate | up | down]`; the down half is Q6_K on 25 of 50 layers and
-  the grouped kernel historically refused it. If it still refuses, those layers must keep a working path
-  rather than drop their down contribution.
-- **A fresh process with cold VRAM.** The slot set is filled after the prompt; the first decoded token must
-  not read an unfilled slot.
-- **The 42.90 GiB pinned table plus 28.38 GiB of slots at once.** `hiptrunc`/OOM on a 32 GB card must be a
-  refusal with a message, not a crash.
-- **Id equality is the wrong gate across arms.** Residency moves bytes between stores whose arithmetic
-  differs (measured 0.855 mean |Δlogit|); judge by KL, and by two identical runs of the *same* arm.
+- Card0 only: `HIP_VISIBLE_DEVICES=0`. No other GPU, drafter, MTP, speculative proposal or extra sequence.
+- No promised tok/s target. The former 30–38 tok/s forecast and 42.6 ms spike threshold are withdrawn.
+- New runtime arms default off. Existing prefill, serving protocol and off-arm outputs stay unchanged.
+- Scheduling-only means bit-identical **full logits**, not merely finite output, equal ids or acceptable KL.
+- Keep expert format, CPU kernel, quantization, selection order and combine arithmetic unchanged first.
+- Do not use profiling as the primary speed measurement. Do not subtract load-inclusive process walls.
+- Never record over either existing pool or MMQ prefill expectation files. Decode has a separate gate.
+- Bound every child run; reap its own process group on timeout. Poll completion, never blind-wait for a run.
+  On a crash, zero-block launch or unexplained failure, stop and report it rather than adding a timing fix.
+- Benchmark without logits dumps or tracing. Run correctness dumps and diagnostic traces separately.
+- Builds touched by shared code need backend compilation checks before review; list unavailable backends
+  explicitly. No CUDA/SYCL/Windows or other-card pass is implied by a HIP/card0 run.
+- Model: `/fast/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf`; build: `build-mmq/`;
+  short fixture: `tools/kolibri/oracle_ids512.txt`.
+
+## Source audit completed for this revision
+
+- Flash-Next reference: `src/program/generate.cpp` selects `session_loop` / `session_run_token`;
+  `src/core/session.cpp` contains the per-layer and whole-stack graph protocols. `q36_engine.cu` is
+  a different model engine and is no longer the primary reference.
+- `src/core/layer.cpp:moe_route` publishes work; `block_layer_pre` can then execute the shared expert.
+- `src/kernels/cuda/elementwise.cu` implements publication, waits and mapped-result copying, including
+  HIP visibility provisions. `tests/hip/handoff.cpp` already tests changing mapped payloads and replay.
+- Kolibri already has `s.pos_d`, `k_attn_prep_p`, `k_attn_p` and `STRATA_KOLIBRI_DEC_XEXP`.
+  Its current `graph=true` attention is not the same path/launch shape as eager attention. Do not silently
+  substitute it while claiming a scheduling-only change.
+- The GGUF has Q4_K gate/up in all layers, Q6_K down in 25 and Q4_K down in 25. The current grouped
+  dispatch includes Q6_K down when built with `STRATA_Q6K_EXPERTS=ON`; it lacks Q4_K down.
+  Grouped-expert type expansion is not needed for the CPU-preserving first arm.
+
+## Review focus
+
+1. **Stale layer/token payload:** the CPU must consume this layer's input and ids; this layer's combine
+   must consume its results. Capture-time literals must not freeze token, position or sequence numbers.
+2. **Visibility and buffer lifetime:** publish input before announcing readiness; publish results before
+   acknowledging them. Do not reuse/free mapped buffers or update slots while readers are active.
+3. **Failure during a wait:** missing publication/acknowledgement, CPU failure, cancel and reset must not
+   leave an unbounded GPU wait or emit a token computed from stale results.
+4. **Capture changes the math or state:** attention branch, sliding-window wrap, transposed-K mirrors,
+   scratch aliases and first-use initialization must behave identically before and after replay.
+5. **False speed or correctness pass:** exclude loading/prefill from decode timing; reject early EOF,
+   malformed protocols, unaligned histories, incomplete logits and silently inactive candidate arms.
 
 ---
 
-### Task 1: An exact decode instrument (`tools/kolibri/decode_bench.py`)
+### Task 1: Reliable baseline and candidate comparison
 
 **Files:**
-- Create: `tools/kolibri/decode_bench.py`
-- Test: `tools/kolibri/test_decode_bench.py`
+- Create: `tools/kolibri/decode_bench.py`, `tools/kolibri/test_decode_bench.py`.
+- Reference, do not replace blindly: `tools/kolibri/bench.py`, engine `serve_loop` and its `DONE` line.
+- Update measured results only: `docs/KOLIBRI_DECODE.md`.
 
 **Interfaces:**
-- Produces: `parse_token_periods(csv_path: Path) -> TokenStats` with fields `tokens`, `ms_per_token`,
-  `tok_per_s`, `gpu_busy_ms`, `gpu_busy_share`, `kernels_per_token`, `layer_gaps`, `gap_ms`.
-- Produces: CLI `decode_bench.py [--runs N] [--out DIR] -- <engine> <args...>`, printing that as JSON.
+- `parse_done(line: str) -> dict`: fields `produced`, `prompt_ids`, `prompt_ms`, `decode_ms`,
+  `reused`, `hits`, `lookups`, `tok_per_s`; validate the actual engine field positions.
+- `parse_token_times(times_ns: list[int]) -> dict`: completed interval count, mean/median interval
+  milliseconds and elapsed-window tok/s. At least four intervals; strictly increasing timestamps.
+- CLI: `decode_bench.py --bin PATH --model PATH --tokens-file PATH --ctx N --n N --threads N
+  --pairs N --out DIR [--extra TEXT] [--candidate-env NAME=VALUE ...]`.
+  A pair runs baseline/candidate with candidate controls unset/set in child environments; reverse order
+  on alternate pairs. Each engine uses the same prompt/prefill/sampling settings and a fresh session.
+  Loading may happen per process, but it is outside the reported `DONE` decode interval.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] Write failing parser tests: a valid `DONE` with 128 produced tokens and 8000 decode ms yields
+  exactly 16 tok/s; zero/negative/NaN times, missing fields, unexpected EOF and nonzero exit all fail.
+  Token timestamps at 0, 60, 120, 180, 240, 300 ms yield five 60 ms intervals and 16.6667 tok/s.
+- [ ] Run `.venv/bin/python -m pytest tools/kolibri/test_decode_bench.py -q`; verify the tests fail
+  because the new module does not exist, then implement the parser/harness and make them pass.
+- [ ] Test harness cleanup with a fake child that never sends `DONE`: deadline reached, only its own
+  process group terminated, logs retained, benchmark fails. Test an inactive candidate marker and an
+  early-EOS request: neither may silently count as a successful fixed-length paired benchmark.
+- [ ] Capture monotonic timestamps on flushed `T` lines, retain all intervals, and report both engine
+  `DONE` throughput and the T-to-T window. Drain stdout/stderr concurrently. Keep prompt, decode and
+  post-request reselection accounting separate; report first-token timing separately from steady decode.
+- [ ] Add optional diagnostic trace parsing with explicit phase metadata (`prompt_forwards`,
+  `generation_forwards`, reuse/prefill mode). Parse with `csv.DictReader`, not comma splitting. Test
+  names with commas and `void (anonymous namespace)::k_row<12>` using `csv.writer`, shuffled rows,
+  overlapping streams, phase boundaries and missing markers. Report kernel interval union and gap
+  distribution; label large gaps as gaps, not as established driver cost. If phase boundaries cannot
+  be established, refuse a decode attribution rather than guessing from the last 17 markers.
+- [ ] Run an unprofiled baseline twice first, without any candidate. Record raw intervals, actual
+  token counts and protocol fields. Do not require it to match the old profiled 14–17 tok/s claim.
+  Assess the existing `DEC_XEXP` arm as a separate one-variable comparison before new overlap code.
+- [ ] For later candidate runs, use at least three alternating pairs with these workloads:
 
-```python
-# tools/kolibri/test_decode_bench.py
-import sys, tempfile, unittest
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import decode_bench
+  | Prompt ids | Allocated ctx | New tokens | Prefix state |
+  |---:|---:|---:|---|
+  | 512 | 8192 | 128 | cold request |
+  | 8191 | 12288 | 128 | cold request |
 
-HDR = ("Kind,Agent_Id,Queue_Id,Stream_Id,Thread_Id,Dispatch_Id,Kernel_Id,Kernel_Name,Correlation_Id,"
-       "Start_Timestamp,End_Timestamp,LDS_Block_Size,Scratch_Size,VGPR_Count,Accum_VGPR_Count,SGPR_Count,"
-       "Workgroup_Size_X,Workgroup_Size_Y,Workgroup_Size_Z,Grid_Size_X,Grid_Size_Y,Grid_Size_Z\n")
+  Assert fixture lengths and context capacity. Keep P4/chunk settings identical between arms. Record
+  `EXPERT_F16`, pool mode, threads, full environment, model/binary hash, host load and memory state.
+  Longer visible histories are a later acceptance check; a large allocated ctx is not a long history.
+- [ ] Commit the instrument only after its CPU tests and baseline protocol checks pass.
 
-def row(start_us, dur_us, name):
-    return (f"KERNEL_DISPATCH,Agent 1,2,1,1,1,1,{name},1,{start_us*1000},{start_us*1000+dur_us*1000},"
-            "0,0,0,0,0,128,1,1,1,1,1\n")
-
-def make_csv(path, tokens=6, per_token_us=60000):
-    # The real trace prefixes the marker with "void (anonymous namespace)::". A parser that matches the
-    # bare name finds nothing - that is exactly how the first attempt failed.
-    lines = [HDR]; t = 0
-    for _ in range(tokens):
-        lines.append(row(t, 5, "void (anonymous namespace)::k_row<12>(unsigned char const*, unsigned long, int, int, float*)"))
-        for _ in range(9):
-            t += 6000
-            lines.append(row(t, 5900, "void strata::kernels::(anonymous namespace)::native_q4_k_mmvq_kernel<false>(x, y)"))
-        t += per_token_us
-    Path(path).write_text("".join(lines))
-
-class Parse(unittest.TestCase):
-    def test_finds_the_token_period_through_the_void_prefix(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = Path(d) / "t.csv"; make_csv(p)
-            s = decode_bench.parse_token_periods(p)
-            self.assertEqual(s.tokens, 5)
-            self.assertAlmostEqual(s.ms_per_token, 60.0, delta=1.0)
-            self.assertAlmostEqual(s.tok_per_s, 1000 / 60.0, delta=0.5)
-            self.assertGreater(s.kernels_per_token, 5)
-
-    def test_refuses_a_trace_with_no_decode(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = Path(d) / "t.csv"; make_csv(p, tokens=2)
-            with self.assertRaises(SystemExit):
-                decode_bench.parse_token_periods(p)
-
-if __name__ == "__main__":
-    unittest.main()
-```
-
-- [ ] **Step 2: Run the test to verify it fails**
-
-Run: `.venv/bin/python -m pytest tools/kolibri/test_decode_bench.py -q`
-Expected: FAIL — `ModuleNotFoundError: No module named 'decode_bench'`.
-
-- [ ] **Step 3: Implement `decode_bench.py`**
-
-Stream the CSV (a real trace is ~180 MB) and keep only `KERNEL_DISPATCH` rows. A token boundary is a kernel
-whose name contains `k_row<`. `ms_per_token` is the median of consecutive-mark periods over the last
-`min(len(periods), 17)`; `gpu_busy_ms` is the union of kernel intervals inside the last full token;
-`layer_gaps` counts intervals longer than 100 µs inside that token and `gap_ms` sums them. The CLI runs
-`rocprofv3 --kernel-trace --output-format csv -d <out> -o dec -- <cmd>` and prints the JSON.
-
-- [ ] **Step 4: Run the test to verify it passes**
-
-Run: `.venv/bin/python -m pytest tools/kolibri/test_decode_bench.py -q`
-Expected: `2 passed`.
-
-- [ ] **Step 5: Measure the baseline twice and record both ledger rows**
-
-```sh
-HIP_VISIBLE_DEVICES=0 .venv/bin/python tools/kolibri/decode_bench.py --runs 2 --out /tmp/dec-base -- \
-  ./build-mmq/strata-kolibri --model /fast/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf \
-  --tokens-file tools/kolibri/oracle_ids512.txt --n 17 --ctx 8192 --cpu-threads 8
-```
-
-Expected: `ms_per_token` 60-70, `tok_per_s` 14-17, `gpu_busy_share` 0.3-0.4, `kernels_per_token` ≈ 1344,
-`layer_gaps` = 50. Two runs within 5 %, or fix the instrument before changing any kernel.
-
-- [ ] **Step 6: Commit**
-
-```sh
-git add tools/kolibri/decode_bench.py tools/kolibri/test_decode_bench.py
-git commit -m "kolibri(r9700): an exact decode instrument - the trace's own token periods, not a wall difference"
-```
-
----
-
-### Task 2: Spike — can the grouped kernel serve a decode token from VRAM?
-
-**This task changes nothing that ships. It answers one question before the build.**
+### Task 2: Prove the publication protocol before model capture
 
 **Files:**
-- Modify: `src/kolibri/kolibri_engine.cu` (decode slot branch only, behind `STRATA_KOLIBRI_DEC_SLOTS_GROUPED`)
-- Test: `tools/kolibri/decode_bench.py` (Task 1)
+- Extend: `tests/hip/handoff.cpp` and its existing `hip_handoff` CMake wiring if needed.
+- New safety test if necessary: `tests/hip/kolibri_decode_handoff.cpp`, wired in `CMakeLists.txt`.
+- Reference: `src/kernels/cuda/elementwise.cu`, `include/strata/kernels/elementwise.hpp`.
 
 **Interfaces:**
-- Consumes: `native_expert_grouped(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, n_ent, xq8, scratch, gout, st)`, already used at line ~2272 for prefill; `k_group(...)` at line ~1372.
-- Produces: the answer, recorded in [docs/KOLIBRI_DECODE.md](../KOLIBRI_DECODE.md): whether grouped-from-VRAM
-  beats **both** the pool (67.4 ms) and the 3-launch slot arm (42.6 ms), and by how much.
+- Reuse `doorbell_publish`, `doorbell_ring`, `copy_from_mapped` and their ordering contract.
+- Request identity is `(token_generation, layer)`, never a value read from host memory during capture.
+  Buffers and controls stay alive until completion. Sequence reset requires a quiescent stream.
+- For the first per-layer-graph arm, no device acknowledgement wait is required: the host enqueues
+  the post graph after its pool call. Whole-stack waits are deferred to Task 4.
 
-- [ ] **Step 1: Answer the two interface questions by reading, before writing code**
+- [ ] Run the existing `hip_handoff` test on card0 under an external deadline and retain its actual
+  result; its existence is not proof that this driver/configuration passed today.
+- [ ] Write failing tests for a 50-layer, multi-replay changing payload with N=2560 and top-k=6.
+  Encode token and layer in inputs and outputs; assert exact values, ids and selection order every time.
+  Include token reset, stale sequence, delayed publication and altered weights between replays.
+- [ ] Implement only the additional synthetic test/control plumbing needed to pass. Preserve the
+  existing HIP fences/coherence behavior; do not replace the protocol with a volatile-only assumption.
+- [ ] Prove the host can observe publication while the pre graph has not yet finished independent
+  work. Report ordering separately from timing; a final stream sync must not manufacture visibility.
+- [ ] Test errors and cleanup with bounded children. If the handoff is not reliable, stop before model
+  integration and investigate; no global serialize-kernel or per-layer sync workaround counts as a fix.
+- [ ] Commit the passing synthetic proof separately. No new expert kernel or placement policy here.
 
-Report in the task's notes: (a) does `native_expert_grouped` accept a `grp_ptr` entry that points at
-pinned host memory while another points at VRAM? (b) does it handle a Q6_K down blob, or refuse it as the
-prefill comment says. If (b) refuses, the 25 Q4_K-down layers use the grouped path and the 25 Q6_K layers
-keep the slot GEMV — say so in the ledger rather than averaging the two.
-
-- [ ] **Step 2: Wire the arm behind the knob, decode only**
-
-With `STRATA_KOLIBRI_DEC_SLOTS_GROUPED=1` and `--expert-slots auto --expert-slots-hot`: for each decode
-layer, build `grp_ptr`/`grp_start` on the device from the slot map (as prefill's `k_group` does), call
-`native_expert_grouped` once for the layer's slotted picks, and leave non-slotted picks on the existing
-path. Unset, the binary is unchanged.
-
-- [ ] **Step 3: Build, then measure with Task 1's instrument against both references**
-
-```sh
-# arm
-HIP_VISIBLE_DEVICES=0 STRATA_KOLIBRI_DEC_SLOTS_GROUPED=1 .venv/bin/python tools/kolibri/decode_bench.py \
-  --runs 2 --out /tmp/dec-grp -- ./build-mmq/strata-kolibri --model <model> \
-  --tokens-file tools/kolibri/oracle_ids512.txt --n 17 --ctx 8192 --cpu-threads 8 \
-  --expert-slots auto --expert-slots-hot
-```
-
-Expected if the recipe transfers: `ms_per_token` well under 42.6. **If it is not under 42.6, stop here** and
-report that grouped-from-VRAM does not beat the existing slot path on this card; do not proceed to Task 3.
-
-- [ ] **Step 4: Record the KL against the default arm**
-
-Run both arms with `--dump-full-logits` over the 8 parity prompts and `tools/kolibri/kl.py`, exactly as the
-P4 arm did. Expected: finite logits, mean KL of the same order as the P4 arm's 0.00236, top-1 well above
-90 %. Write the numbers into the ledger row.
-
-- [ ] **Step 5: Check the two failure modes the Review Focus names, before any shipping claim**
-
-(a) Ask for slots that cannot fit (`--vram-reserve-mib` large enough to leave no room) and confirm the
-engine prints a refusal and exits non-zero instead of crashing or silently dropping layers. (b) Run a
-fresh process and check the first decoded token after the prompt does not read an unfilled slot — the
-repeated-run check in Task 3 covers this only if the first token's ids are compared, so compare them here.
-
-- [ ] **Step 6: Commit (spike only, arm off by default)**
-
-```sh
-git add src/kolibri/kolibri_engine.cu docs/KOLIBRI_DECODE.md
-git commit -m "kolibri(r9700): decode experts grouped from VRAM slots - the spike's measurement, arm off"
-```
-
----
-
-### Task 3: Ship the arm, with its own gate
+### Task 3: Two graph segments per layer, CPU arithmetic unchanged
 
 **Files:**
-- Modify: `src/kolibri/kolibri_engine.cu`, `tools/kolibri/pf_gate.sh`
-- Test: `tools/kolibri/check_repeat.py`, `tools/kolibri/pf_gate.sh`
+- Modify: `src/kolibri/kolibri_engine.cu` (Scratch/lifecycle, decode enqueue boundaries, forward dispatch).
+- Create: `tools/kolibri/check_decode.py`, `tools/kolibri/test_check_decode.py`.
+- Retain existing `tools/kolibri/check_repeat.py` and both `pf_gate.sh` profiles unchanged.
 
 **Interfaces:**
-- Consumes: Task 2's measured arm.
-- Produces: a `KOLIBRI_GATE_PROFILE=dec-slots-gfx1201` profile with its own
-  `pf_gate_expect_{smoke,hash}_dec_slots_gfx1201.txt` and an assertion that the arm activated.
+- New opt-in `STRATA_KOLIBRI_DEC_HANDOFF=1`; reject unsupported combinations explicitly before work.
+  First supported combination is the CPU pool, no routed VRAM slots, no grouped-expert override and
+  no FP16 decode residency. Prefill still uses its existing configuration.
+- Model-specific adapter stays in Kolibri. Do not import Qwen's SessionState or its expert math wholesale.
+  Per-layer order: attention/FFN norm/router → publish → independent shared expert → pool-result
+  join → existing combine/residual. CPU runs the existing `pool_experts` on the published payload.
+- `check_decode.py --baseline FILE --candidate FILE --vocab N --records N`: require exact byte counts,
+  finite float32 values and bitwise equality at each aligned forced position. No truncating to the
+  smaller record count, and no unforced cross-arm KL comparison.
 
-- [ ] **Step 1: Add the profile to `pf_gate.sh`** with its own expectation files and the activation
-  assertion, following the `mmq-gfx1201` profile's exact shape (it must refuse a silent fallback, and it must
-  propagate a failed engine).
+- [ ] First add comparator tests: identical arrays pass; one changed bit, NaN, trailing/missing record
+  and mismatched vocab each fail. Run them red, implement the comparator, then run them green.
+- [ ] Establish baseline full-logit outputs for identical forced histories before editing decode.
+  Write an activation test that fails when the requested arm is ignored. Record first-token and
+  subsequent replay results separately; the latter is what catches frozen capture arguments.
+- [ ] Audit all position-dependent state before capture: `s.pos_d`, RoPE/store indices, attention
+  visible range, sliding rings, transposed-K first-fill/increment, scratch reuse and graph lifetime.
+  Preserve eager arithmetic. Dynamic positions must not freeze launch bounds or cause a stale
+  first-fill path. If graph buckets are needed for unchanged attention, key and invalidate them explicitly.
+- [ ] Refactor only the opt-in path into capturable GPU pre/post segments. Keep the off path intact.
+  Put arm GPU work on an explicitly ordered stream or use explicit events; legacy/default-stream
+  side effects are not a synchronization contract. Prewarm lazy dispatch/handles without retaining
+  warmup KV, counters or mirror readiness in the real request.
+- [ ] Wire publication after routing, CPU computation on current-layer payload, and result transfer
+  before this layer's post graph. Shared-expert work may run after publication while the CPU computes.
+  Do not feed layer L results to layer L+1, or change expert quantization/combine order.
+- [ ] Gate complete full logits and hidden/KV state where needed: tiny prompts; a chunk boundary;
+  512- and 8191-id prompts; sliding-window wrap; extended/reused prefix; cold graph creation; repeat
+  and changing requests. Explicit off must match the pre-change binary. Arm on must match aligned
+  eager full logits. If it cannot, classify it as a numerical change and stop for a separate design.
+- [ ] Test cancel/reset, initialization failure and allocation failure. No partial token is emitted
+  as successful, buffers stay alive until GPU users finish, and only owned processes are terminated.
+- [ ] Require the activation assertion and six same-arm full-logit repeats. Run both existing prefill
+  gates against their unchanged expectation files, including plain oracle/reuse, then full CTest at
+  the resulting test count. Reproduce and list any baseline failures; do not automatically excuse a
+  newly failing test because an older report also had four failures.
+- [ ] Use Task 1's unprofiled alternating pairs. Continue only when all three short-workload pairs
+  favor the candidate, median decode-time reduction is at least 5%, and no tested workload's median
+  regresses more than 2%. These are proposed engineering acceptance rules, not measured gains.
+  If noisy/inconclusive, collect more paired data or defer; do not tune the rule after seeing results.
+- [ ] Commit the opt-in arm and ledger. A default change remains a separate final acceptance decision.
 
-  **The misses must also leave the host.** A pick that is not in a slot has to be served from the pinned host
-  table *inside the same grouped launch* (the mixed pointer array this plan's architecture relies on), with
-  no host call. Verify it by measurement: with the arm on, Task 1's instrument must show the 50 per-layer
-  `layer_gaps` collapsing — if they do not, the host is still in the token and Task 4 is illegal.
-- [ ] **Step 2: `--record` into the arm's own files, then `check`** — `GATE PASS`, and the pool profile still
-  passes unchanged:
-
-  ```sh
-  HIP_VISIBLE_DEVICES=0 STRATA_HIPBLASLT_TUNING=$PWD/tools/hip/gfx1201-hipblaslt-100202.txt \
-    KOLIBRI_MODEL=/fast/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf KOLIBRI_CM=$(command -v cmake) \
-    KOLIBRI_BUILD=build-mmq KOLIBRI_BIN=$PWD/build-mmq/strata-kolibri \
-    KOLIBRI_GATE_PROFILE=dec-slots-gfx1201 bash tools/kolibri/pf_gate.sh check
-  ```
-- [ ] **Step 3: `check_repeat.py --runs 6` on the arm** — bit-identical full logits across runs, ids stable.
-- [ ] **Step 4: Full CTest on `build-mmq`** — record the count; the four known baseline failures are `vmm_test`, `ple_parity`, `platform_memory_test`, `conversation_copy_streams_test`.
-- [ ] **Step 5: Commit.**
-
----
-
-### Task 4: The whole-token graph (the multiplier)
+### Task 4: Conditional whole-layer-stack graph, still with CPU misses
 
 **Files:**
-- Modify: `src/kolibri/kolibri_engine.cu`
-- Test: `tools/kolibri/decode_bench.py`, Task 3's gate
+- Modify: `src/kolibri/kolibri_engine.cu` and the dedicated handoff/decode tests above.
+- Reference: `session_capture_token` / `session_run_token` in `src/core/session.cpp`.
 
 **Interfaces:**
-- Consumes: Task 3's arm, which leaves no host call inside the token.
-- Produces: `STRATA_KOLIBRI_DEC_GRAPH=1`, capturing the token once and replaying it; the position becomes a device scalar (`s.pos_d`) as `PF_PIPE` already does for prefill and as the Flash-Next engine does with `d_delta`.
+- New `STRATA_KOLIBRI_DEC_HANDOFF_GRAPH=1`, requiring the proven handoff arm.
+- The CPU services each layer during replay. This is not a host callback inside capture and it does
+  not require misses to move to GPU weight reads. Embedding and logits/sampling can remain outside.
+- A wait/abort protocol is required before capture: on CPU error or cancel, all outstanding waits can
+  terminate, the token is invalidated, and no normal token output is emitted. The existing unbounded
+  `doorbell_wait` alone is insufficient for deliberate missing-ack tests. Do not add a waiting graph
+  before a bounded failure path is designed and tested.
 
-- [ ] **Step 1: Confirm the precondition by measurement, not assumption** — with Task 3's arm on, Task 1's instrument must show `gap_ms` for the 50 layer gaps near zero. If the host is still in the token, stop: the graph is illegal and the answer is a different placement.
-- [ ] **Step 2: Move the position to a device scalar and re-run Task 1's instrument unchanged** — same ids, same KL, and `gap_ms` should fall.
-- [ ] **Step 3: Capture and replay the token behind `STRATA_KOLIBRI_DEC_GRAPH=1`** — `cudaStreamBeginCapture`/`EndCapture`/`GraphInstantiate`, one `cudaGraphLaunch` per token.
-- [ ] **Step 4: Measure, and confirm `kernels_per_token` still counts what runs while the host launches one graph** — the expected end state is ~33 ms/token (~30 tok/s).
-- [ ] **Step 5: Gate as in Task 3, and commit** — the arm becomes a default only with two identical runs, the KL bound, and the measured gain, exactly the P4 bar.
+- [ ] Write failing synthetic multi-layer/replay tests for acknowledgements, withheld ack, stale ack,
+  CPU failure and cancel while the graph waits. Require bounded termination without freeing live buffers.
+- [ ] Implement and validate the abort-aware wait/control path, then capture the already-proven
+  per-layer work. Reset counters only after prior completion; prevent wraparound/stale replay values.
+- [ ] Run the full aligned-logit, state, lifecycle and repeatability suite from Task 3 against both
+  eager and segmented-graph execution. Keep expert arithmetic and cache placement unchanged.
+- [ ] Benchmark unprofiled against **both** eager and segmented execution. A kernel-gap plot with a
+  long spin kernel is not success. Keep this stage only if it improves the measured critical path.
+- [ ] Build/validate touched backends and document unavailable checks; run full gates/CTest again.
+  Decide deployment/default scope only after correctness and paired performance have passed.
 
----
+## Follow-up decisions, not prerequisites
 
-## What this plan deliberately does not do
-
-- **No layer overlap for a single token.** The spec shows the per-layer chain forbids it; the prefill's
-  `PF_PIPE` overlap works only because two *chunks* are independent. Overlap becomes available only with
-  concurrent sequences (serve throughput) or batched verify (speculation).
-- **No standalone per-layer graphs.** The spec lists B as its own step; here it is folded into Task 4,
-  because per-layer capture still needs the position moved to the device and pays off mainly once the host
-  has left the token. Doing it after Task 3 is the smaller total change, not the shorter path.
-- **No attention work.** Measured: the layout fix is 1.01x (bitwise but worthless), and attention is 16 % of
-  the token. It is worth its own plan after this one, for the 100K regime.
-- **No new default** on the strength of one run.
+- Residency/grouped GPU hits: measure per-decode hit/miss deltas at each context and evaluate overlap
+  with CPU misses. Support Q4_K-down correctly before claiming all-layer grouped coverage. Keep a
+  separate numerical gate if compute moves from CPU to GPU. Static slot updates happen only when safe.
+- Direct GPU reads of pinned expert weights: optional PCIe arm with measured card0 traffic/latency;
+  do not reuse the T4's bandwidth figure or assume scattered reads achieve bulk DMA bandwidth.
+- Attention/full-kernel, dense/shared fusion and CPU-format kernels remain open after the new profile.
+- No drafter or speculation is included. No engine implementation, GPU benchmark or default change was
+  performed while writing this reassessment.
