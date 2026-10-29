@@ -1,13 +1,62 @@
-# Kolibri-1 decode on the R9700: reassessed investigation
+# Kolibri-1 decode on the R9700
 
-This supersedes the conclusions in the first version of this document. The old raw runs remain useful,
-but several interpretations were wrong. No engine change or new speed-up is claimed by this reassessment.
+The first reassessment corrected several wrong interpretations. The historical runs below are retained.
+The current implementation is an opt-in host-assisted layer-stack graph. It keeps the CPU experts and
+has passed the full decode gate; final review and final-source timing reconciliation are still pending.
 
 Scope: single-stream Kolibri decode, **no drafter**, card0 only (`HIP_VISIBLE_DEVICES=0`).
 Box: Ryzen 7 5700G, 93 GiB RAM, R9700 32 GB, ROCm 7.2.2. Model: Kolibri-1-Q4_K_M.
 P4 improves prefill; the next work must preserve that path and establish decode gains separately.
 
-## Review findings
+## Current opt-in layer-stack graph
+
+`STRATA_KOLIBRI_DEC_HANDOFF_GRAPH=1` selects segmented PRE/POST replay.
+`STRATA_KOLIBRI_DEC_TOKEN_GRAPH=1` adds one parent executable containing all 50 layers:
+PRE → bounded GPU acknowledgement wait → POST. The host services each publication during replay.
+Embedding and the logits head remain outside. Cold mirrors and new attention buckets warm through
+segments; an actual `DEC_TOKEN_GRAPH replay active` marker distinguishes replay from warmup.
+Both graph switches require HANDOFF and STREAM. Every new arm is **off by default**.
+
+Test configuration, not a production default change:
+
+```sh
+HIP_VISIBLE_DEVICES=0 \
+STRATA_GEMM_DETERMINISTIC=1 \
+STRATA_HIPBLASLT_TUNING="$PWD/tools/hip/gfx1201-hipblaslt-100202.txt" \
+STRATA_KOLIBRI_DEC_HANDOFF=1 STRATA_KOLIBRI_DEC_STREAM=1 \
+STRATA_KOLIBRI_DEC_HANDOFF_GRAPH=1 STRATA_KOLIBRI_DEC_TOKEN_GRAPH=1 \
+./build-mmq/strata-kolibri --model /fast/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf \
+  --serve --prefill --cpu-threads 8 --expert-slots 0 --ctx 12288
+```
+
+The deterministic GEMM setting is explicit in **both** control and candidate. A six-run no-graph audit
+found one different KV state before decode; this invalidated that run as a paired decode reference.
+With the existing deterministic setting, three controls and three parent-graph runs had identical
+incoming fingerprints and nine finite full-logit records, crossing position 8192. This locates the
+observed variability in prefill; the exact library-internal source is not proven.
+
+Three rotating-order blocks per workload, 96 generated tokens, card0, eight pool threads, no slots,
+EXPERT_F16=0, ATTN_MB=48, direct tuning and deterministic GEMMs:
+
+| Prompt ids / allocated ctx | Handoff + stream | Segments | Layer stack |
+|---|---:|---:|---:|
+| 512 / 8192 | 20.43 tok/s | 20.30 tok/s | **24.28 tok/s** |
+| 8191 / 12288 | 13.76 tok/s | 13.63 tok/s | **18.20 tok/s** |
+
+These are median DONE decode times converted to rates, excluding load and prefill and including cold
+capture encountered during generation. Generated histories match across all nine runs per workload.
+Request-time reductions versus handoff+stream are 15.83% and 24.39%. These measurements predate the
+subsequent cold-counter rollover safety patch; final-source remeasurement is pending. No default
+promotion follows from them. Commands, binary identities, raw times and limitations are in the
+[validation ledger](plans/2026-10-29-kolibri-decode-validation-progress.md).
+
+Correctness now covers the full short/chunk/reuse/six-repeat gate, 8192 and 11000 attention transitions,
+sequence/generation rollover during cold warmup, missing publication/ACK, STOP and cold recovery,
+mapped/parent allocation failure and a CPU producer exception. Failed steps emit no logit record.
+CPU expert arithmetic and placement are unchanged. Process-lifetime graph caches retain the same
+model, context and buffer addresses across requests; model replacement in-process is not supported.
+
+## Historical reassessment findings
 
 1. **The wrong Qwen engine was studied.** `src/qwen35/q36_engine.cu` is Qwen3.6-35B-A3B, not
    Qwen3.8-Flash-Next. Its all-in-VRAM recipe is not an adequate description of Flash-Next's hybrid path.
@@ -419,7 +468,7 @@ No drafter, MTP, speculation, or extra sequence is required for the scheduling w
 - Numerical changes and a default change require a separate decision after actual measurements.
   An optimization is rejected if correctness fails, regardless of speed.
 
-## Segmented-graph experiment: rejected
+## Historical segmented experiment: initial rejection superseded
 
 The uncommitted segmented-graph arm passed the short full-logit/reuse/repeat gate, but its initial speed
 comparison against plain eager execution credited it with gains from handoff and stream changes. The direct
@@ -434,10 +483,10 @@ All three pairs lost: graphs increased median request decode time **1.5%**. Stea
 48.7 versus 49.1 ms. These are unprofiled `DONE` timings, excluding model load and prefill; capture creation
 within decode is included. Raw logs, environment and JSON are in `/tmp/kolibri-dec2/graph-v-stream/`.
 
-**Ruling:** stop the graph stage under the goal's failed-performance-gate rule. Save the experimental patch
-and source in `/tmp/kolibri-dec2/rejected-segments/`, restore the committed engine source, and do not start
-whole-stack waits/capture. No graph code was committed and no default changed. This does not measure a
-whole-stack graph or prove it cannot improve; investigating that is a separate decision.
+That experiment was initially stopped and saved under `/tmp/kolibri-dec2/rejected-segments/`.
+The user then explicitly directed continued investigation: a 1.5% prerequisite regression is not a
+reason to abandon a larger combined gain. Segments were restored and hardened, then used to build the
+parent graph described above. The initial rejection is historical, not the current execution decision.
 
 ## Verification record (2026-10-29, card0, ROCm 7.2.2, gfx1201)
 
@@ -446,8 +495,14 @@ Everything below was run on this box; nothing is inferred from a previous sessio
 | Check | Result |
 |---|---|
 | `tools/kolibri/test_decode_bench.py` + `test_check_decode.py` | 55 tests, all pass (no GPU) |
-| `ctest` in `build-mmq` (MMQ build, `HIP_VISIBLE_DEVICES=0`) | 94 tests: **84 passed, 6 skipped, 4 failed** |
-| the four failures | `vmm_test`, `ple_parity` (needs a Qwen fixture), `platform_memory_test`, `conversation_copy_streams_test` — the same four as before this work |
+| Fresh full HIP build with STRATA_BUILD_TESTS=ON | PASS; optional CUDA-only test links fixed |
+| Fresh `ctest`, card0 | **188 tests: 171 passed, 11 skipped, 6 failed** |
+| Six failures, also rebuilt/reproduced at committed baseline 057d42a6 | `kolibri_load_test` (missing hard-coded model path), `vmm_test`, `ple_parity` (missing Qwen fixture), `platform_memory_test`, `conversation_copy_streams_test`, `isa_guard_check` |
+| CPU/no-model decode/tool regressions | 88 passed |
+| Real-model whole-stack integration | 7 passed, including rollover and allocation/producer failures |
+| Dependent eight-layer wait/publication chain | PASS |
+| Whole-stack full decode gate | PASS: four prompt boundaries, actual prefix reuse, six repeats |
+| Whole-stack 11000-id transition | PASS: nine finite full-logit records bitwise |
 | `hip_handoff`, `hip_kolibri_decode_handoff` | pass (1.18 s, 0.52 s) |
 | prefill gate, `KOLIBRI_GATE_PROFILE=mmq-gfx1201` | PASS, all stages (`PF_HASH`, plain oracle bitwise, reuse) |
 | prefill gate, `KOLIBRI_GATE_PROFILE=pool` | PASS, all stages |
@@ -467,6 +522,7 @@ recorded above. The GGUF type inventory came from reading only metadata.
 
 The corrected plan is [the decode plan](plans/2026-10-29-kolibri-decode-experts-vram.md). Its filename is
 retained for existing links; its first implementation target is now host-assisted scheduling, not VRAM
-placement. There is no supported 30–38 tok/s forecast. Execution is paused after the segmented-graph
-performance rejection. The full goal is **not complete**: whole-stack abort/wait safety, long-context aligned
-logit coverage, comprehensive lifecycle/failure tests and independent final review remain unverified.
+placement. There is no supported 30–38 tok/s forecast. Execution continues; the initial segmented
+rejection no longer controls it. Final-source remeasurement, documentation reconciliation and final
+review remain. The fresh baseline also reproduces all six broad-suite failures; they are limitations,
+not a green-suite claim. The full goal is not yet declared complete.

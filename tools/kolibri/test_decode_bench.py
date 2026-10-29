@@ -300,6 +300,7 @@ def test_run_request_collects_tokens_and_done(tmp_path):
     # time to the first token is measured from the GEN write, in the same clock as the T timestamps
     assert 0.0 <= r.gen_to_first_t_ms < r.wall_s * 1e3
     assert r.load_before is not None
+    assert r.as_dict()['token_times_ns'] == r.token_times_ns
 
 
 def test_run_request_fails_when_the_candidate_marker_never_appears(tmp_path):

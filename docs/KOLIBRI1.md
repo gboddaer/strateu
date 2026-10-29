@@ -169,16 +169,27 @@ enqueues the shared expert while the host waits: 56.9 ms/token (17.7 tok/s, −1
 (−7.5 %). `STRATA_KOLIBRI_DEC_STREAM=1` then moves the decode off the legacy default stream onto one
 explicit non-blocking stream: together they reach **49.3 ms/token (20.33 tok/s, −21.5 %)** and
 **73.1 ms (−15.1 %)** after 8191 ids, three alternating pairs each, every pair favouring the arm.
-`tools/kolibri/decode_gate.sh` shows the combination bit-identical to the plain engine at 16/511/512/513
+
+A third, larger step is also opt-in. `STRATA_KOLIBRI_DEC_HANDOFF_GRAPH=1` captures per-layer pre/post
+segments; `STRATA_KOLIBRI_DEC_TOKEN_GRAPH=1` joins them into one parent executable per geometry with a
+bounded acknowledgement wait between segments, so the host still computes every routed expert during
+replay. On final-source binaries, three rotating-order blocks per workload gave **24.0 tok/s** at 512
+prompt ids and **18.0 tok/s** after 8191 ids, 15.6 % and 24.4 % below handoff-plus-stream and 17.5 %/
+25.3 % below segments; all nine generated histories matched within each workload. The full decode gate
+passes against both the plain and segmented engines, including a real reused prefix and six repeats.
+Neither graph switch is a default.
+
+`tools/kolibri/decode_gate.sh` shows the combinations bit-identical at 16/511/512/513
 ids and on the reused-prefix path, six repeats included, and the plain path's own logits are byte-identical
-to the build before any arm existed. Both prefill gate profiles still pass. The earlier
-`STRATA_KOLIBRI_DEC_XEXP` arm on its own measured 5.2 % and 4.2 %.
+to the build before any arm existed. Both prefill gate profiles still pass against their unchanged
+expectations. The earlier `STRATA_KOLIBRI_DEC_XEXP` arm on its own measured 5.2 % and 4.2 %.
 
 The earlier kernel trace (about 1 344 dispatches and 67.9 ms between forward markers) is a profiled
 diagnostic, not an unprofiled speed baseline, and the original wall-based slot comparisons and
 30–38 tok/s projections are withdrawn. [KOLIBRI_DECODE.md](KOLIBRI_DECODE.md) has the measurements, the
-reassessment, and why a captured graph is not yet part of the arm: the capturable attention path forces
-the two-pass arithmetic, and the full logits then differ at record 0 while the greedy ids still agree.
+reassessment, and the device-position attention plus explicit-stream prerequisites that let capture keep the
+eager single-pass arithmetic: the capturable legacy path forced two-pass arithmetic, whose full logits differ
+at record 0 while the greedy ids still agree.
 
 ## Validation
 

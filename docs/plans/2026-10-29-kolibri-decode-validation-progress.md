@@ -124,9 +124,127 @@ executable. No performance claim is made for the hardened segmented variant, and
 1.5% comparison nor the unexplained reference anomalies are a reason to promote or abandon the final
 architecture. All new runtime switches remain off by default; nothing was pushed.
 
+## Whole-stack integration and the incoming-state audit
+
+`STRATA_KOLIBRI_DEC_TOKEN_GRAPH=1` now assembles a parent executable from retained segment graphs:
+PRE → bounded ACK wait → POST for all 50 layers. CPU expert arithmetic stays unchanged. Embedding
+and the logits head remain outside. Cold mirrors and new attention buckets warm through segments.
+The arm requires HANDOFF, STREAM and HANDOFF_GRAPH; it rejects unsupported segment/debug combinations.
+All runtime switches remain default-off. Nothing has been pushed.
+
+Initial real-model tests passed: active replay and finite bit-identical short full logits, a forced
+zero-tick timeout without an invalid logit record, and STOP during publication followed by a cold,
+bit-identical next request. These three tests passed in 77.64 s; final reruns remain necessary.
+Malformed or effectively unbounded tick overrides now fail before model loading. Six no-model tests
+were observed RED, then GREEN; guard + benchmark unit tests currently report 60 passed.
+
+### The long-reference discrepancy is present before decode
+
+An opt-in `STRATA_KOLIBRI_PREFIX_FINGERPRINT=<path>` diagnostic copies/hashes only valid KV bytes
+at the already-quiescent prefill/decode boundary. It adds no decode-layer drains. Six independent
+**no-graph** 8191-id runs produced five identical prefixes/logits and one different prefix/logit dump.
+The first differing retained cache was layer 34, before any generation forward. This proves that
+at least this discrepancy is incoming prefill state, not a scheduling-only decode difference.
+Artifacts: `/tmp/kolibri-dec2/prefix-repeat-audit/` (run 5 differs).
+
+Ruling: use the existing `STRATA_GEMM_DETERMINISTIC=1` option in **both** arms of paired decode
+validation/measurement — bitwise comparisons need repeatable incoming state. This changes no
+production default or prefill expectation file. It is an explicit test configuration, not a fallback.
+Cost if wrong: a library path could still vary outside these fixtures, so retain state diagnostics
+and do not claim a general vendor-internal root cause. The option affects both GEMM handles; the
+exact internal source of the earlier variation is not proven.
+
+With that option, three no-graph and three whole-stack runs, in alternating order, had identical
+prefix fingerprints and nine finite full-logit records each, crossing position 8192. Every run
+confirmed MMQ activation with direct shared-expert tuning. Full-logit SHA256 remains
+`93274a15a769b28b4e4ea57e5ae5289fd624d01a172f9872aaa4ac27f1105c88`.
+Artifacts: `/tmp/kolibri-dec2/deterministic-prefix-audit/`.
+
+### Fresh unprofiled three-arm measurements
+
+Card0/gfx1201, eight CPU pool threads, Q4_K_M model, zero expert slots, EXPERT_F16=0,
+ATTN_MB=48, GEMM_DETERMINISTIC=1 and the direct gfx1201 tuning table. Each workload uses
+96 generated tokens, one stream, no drafter. Three rotating-order blocks contain handoff+stream,
+segmented and whole-stack arms. All nine generated histories match within each workload. These
+are DONE.decode_ms medians, **milliseconds per request**, excluding loading and prefill; cold
+capture work encountered during generation is included. Raw token timestamps, INFO/DONE fields,
+commands, environment, hashes and output logs are retained.
+
+| prompt ids / allocated ctx | handoff+stream ms | segmented ms | whole-stack ms | whole-stack tok/s |
+|---|---:|---:|---:|---:|
+| 512 / 8192 | 4698.1 | 4728.7 | 3954.5 | 24.28 |
+| 8191 / 12288 | 6978.1 | 7042.4 | 5276.1 | 18.20 |
+
+Whole-stack reductions versus handoff+stream are 15.83% short and 24.39% long; versus segmented,
+16.37% and 25.08%. Keep the short eager outlier (5186.3 ms) in the record; it is not discarded.
+Artifacts: `/tmp/kolibri-dec2/final-three-arm/{short,long}/runs.json` and logs.
+The runner is `/tmp/kolibri-dec2/three-arm-bench.py`. These results supersede the earlier short
+segmented +1.5% prerequisite comparison, but do not by themselves complete the correctness contract.
+
+## Subsequent lifecycle and protocol checks
+
+The full whole-stack gate now passes on current source with GEMM_DETERMINISTIC=1 in both arms:
+`/tmp/kolibri-dec2/token-current-full-gate/driver.log`. This includes four prompt/chunk boundaries,
+true reused prefix with generated ids retained, six identical repetitions, finite complete full-logit
+records and an actual replay marker absent from controls.
+
+The expanded `kolibri_decode_wait_test` passes (1.48 s). Its dependent eight-layer chain replays
+changing N=2560 activations and top-six ids/weights, feeds each CPU result into the next publication,
+rejects future ACKs and previous generations, drains missing publication/ACK, cancel and simulated
+CPU failure, then successfully resets/replays. It uses real doorbell publication and the real bounded
+wait. This strengthens coverage beyond the earlier isolated-wait test.
+
+A real-engine test-only TU (`tests/kolibri/decode_rollover.cu`) seeds private descriptor state without
+adding production test knobs. It found a real defect: the overflow reset lived inside the parent-only
+path, after eligibility checks, so cold segmented warmup could wrap through the unpublished zero
+identity. RED: seeded nine-forward test ended at 424/424 rather than 450/450 publications. The reset
+now reserves a whole token's nonzero identities before **any** decode publication. Its rare reset
+quiesces the queue before descriptor reuse; this is not a per-layer timing workaround. The same TU
+also seeds generation UINT32_MAX, proving the parent skips zero on generation rollover.
+RED/GREEN logs: `/tmp/kolibri-dec2/rollover-{red,green}.log`.
+
+All seven current real-model integration cases passed in 178.02 s:
+normal and seeded-rollover full-logit parity, mapped allocation failure before loading, parent
+executable allocation failure before replay, a CPU producer exception after publication with the
+graph already quiescent on return (query only, no test-side drain), bounded missing ACK, and STOP
+followed by a cold bit-identical request. Fault injection is confined to the test TU. Completed logit
+records before a failure are checked against the same forced baseline; no failed-step record is
+accepted. Log: `/tmp/kolibri-dec2/model-failure-tests.log`.
+
+## Fresh broad verification (not the historical stale CTest tree)
+
+The current 11000-id pair crosses single-pass/online attention and passes nine finite, full 128000-logit
+records bitwise. Actual whole-stack replay is required. Artifacts: `/tmp/kolibri-dec2/token-11000-current/`.
+
+Both original prefill profiles now pass, with unchanged in-repo smoke/hash expectations. The first pool
+attempt failed because the explicit hipBLASLt tuning override was still set. TABLE=off disables table
+auto-discovery but does not override an explicit TUNING path. Removing that explicit override restores
+all 100 original pool hashes exactly. The pool gate is run with TABLE=off and **no** TUNING override;
+the MMQ gate uses the direct gfx1201 tuning table. This is matching the original numerical profiles,
+not updating an expectation to accept new output. Logs under
+`/tmp/kolibri-dec2/final-prefill-and-ctest/`: `pool-original-no-explicit-table.log` and
+`mmq-gfx1201-qualified.log` (both GATE PASS). Retain earlier failures as configuration evidence.
+
+A fresh full build exposed unconditional links from q4k_grouped_vram_parity to CUDA-only optional
+libraries absent on HIP. The actual link failed for strata_mmq_w4a4/strata_kq; target-existence generator
+expressions now retain those dependencies only when their targets exist (including later-defined CUDA
+targets). The full HIP build then passed. No model/runtime default changed.
+
+The fresh full CTest run has **188** tests: **171 passed, 11 skipped, 6 failed**. Failures are
+kolibri_load_test (hard-coded /data4 model path absent), vmm_test, ple_parity (missing Qwen fixture),
+platform_memory_test, conversation_copy_streams_test (first stream allocation exceeds its threshold),
+and isa_guard_check (two unlisted iq_avx512 public functions). These are not waived; baseline
+reproduction/classification remains to be completed. This replaces the old 94-test totals, not vice
+versa. Full logs: `final-prefill-and-ctest/{build-all-fixed,ctest}.log`.
+
+The CPU/no-model decode/tool suite now passes **88 tests** (`guard-restored.log`). A proposed guard
+for `--graphs` was withdrawn after checking the actual parser: no such option exists, and legacy graphs
+are selected internally only for a non-pool path. The mistaken guard and its test are both removed;
+the restored engine builds. Do not describe that discarded test as an engine defect.
+
 ## Remaining work
 
-Restore and harden segmented capture; prove changing positions, bucket transitions and request reset.
-Before any whole-stack graph waits, write and run the bounded acknowledgement/abort tests. Then gate
-full logits/state/repeatability and measure the combined design. Do not claim the goal complete from
-historical task labels or from the earlier short-only gates.
+Reproduce/classify the six current CTest failures against baseline, separate capture creation from
+steady replay timing, reconcile main docs and perform the final review. Benchmark artifacts above
+predate the cold-counter safety patch; retain that binary identity and remeasure if claiming
+final-source numbers. No completion claim yet.

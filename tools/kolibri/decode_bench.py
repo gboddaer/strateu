@@ -345,6 +345,7 @@ class RunResult:
         return {
             "done": self.done,
             "intervals": self.intervals(),
+            "token_times_ns": self.token_times_ns,
             "gen_to_first_t_ms": self.gen_to_first_t_ms,
             "info": self.info,
             "marker_seen": self.marker_seen,
