@@ -3,7 +3,8 @@
 The first reassessment corrected several wrong interpretations. The historical runs below are retained.
 The current implementation is an opt-in host-assisted layer-stack graph. It keeps the CPU experts and
 has passed the full decode gate against both the plain and the segmented engines, including the final
-8191-id KV-wrap parity. Every switch is off by default and no default was promoted.
+8191-id KV-wrap parity. The four decode arms are **on by default** where the engine supports them, and each has an
+explicit off switch (`=0`); a configuration they cannot serve runs the plain decode with one line saying why.
 
 Scope: single-stream Kolibri decode, **no drafter**, card0 only (`HIP_VISIBLE_DEVICES=0`).
 Box: Ryzen 7 5700G, 93 GiB RAM, R9700 32 GB, ROCm 7.2.2. Model: Kolibri-1-Q4_K_M.
@@ -16,7 +17,11 @@ P4 improves prefill; the next work must preserve that path and establish decode 
 PRE → bounded GPU acknowledgement wait → POST. The host services each publication during replay.
 Embedding and the logits head remain outside. Cold mirrors and new attention buckets warm through
 segments; an actual `DEC_TOKEN_GRAPH replay active` marker distinguishes replay from warmup.
-Both graph switches require HANDOFF and STREAM. Every new arm is **off by default**.
+Both graph switches require HANDOFF and STREAM. All four arms are on by default since the flip recorded in the
+[validation ledger](plans/2026-10-29-kolibri-decode-validation-progress.md):
+`STRATA_KOLIBRI_DEC_HANDOFF=0` (or STREAM/HANDOFF_GRAPH/TOKEN_GRAPH) turns one off, and a configuration the arms
+cannot serve (no CPU pool, `--grouped`, non-zero `--expert-slots`, an fp16 expert cache, `--dump-layers`) runs the
+plain decode and prints why. An explicit `=1` for such a configuration is still a named error, not a fallback.
 
 Test configuration, not a production default change:
 
@@ -536,4 +541,5 @@ rejection no longer controls it. The fresh baseline also reproduces all six broa
 are limitations, not a green-suite claim. Limits that remain: no independent reviewer has run
 (delegation was not authorized), CUDA and SYCL were not built, and the occasional prefill KV variation
 is handled by an explicit deterministic test configuration rather than a proven vendor fix. Within those
-stated limits the objective is met and no default was promoted.
+stated limits the objective is met. The decode arms were then promoted to the default path for the configuration
+they support, with the gates re-run against an explicit-off control.

@@ -53,7 +53,8 @@ record of what ran.
   HANDOFF_GRAPH and all segments, warms cold mirrors/buckets through segments, and refuses layer dumps.
   Final-source three rotating-order blocks per workload measure **23.91 tok/s** (512 ids) and **17.98 tok/s**
   (8191 ids) against 20.17/13.60 for handoff-plus-stream and 19.73/13.43 for segments: 15.63 %/24.38 % and
-  17.46 %/25.29 % less decode time, every generated history matching. It is off by default.
+  17.46 %/25.29 % less decode time, every generated history matching. It is the default wherever the engine
+  supports it (`=0` is the off switch), promoted after the gates below.
 - **Final verification**: the full decode gate passes against both plain and segmented controls; a final-binary
   8191-id KV-wrap pair (two runs per arm) is bitwise; the 11000-id attention transition is bitwise; a dependent
   eight-layer publication chain, seeded sequence/generation rollover, missing publication/ACK, STOP recovery,

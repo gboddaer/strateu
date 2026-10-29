@@ -130,7 +130,8 @@ only after a PRE executable is actually launched, not merely because an environm
 The wait primitive was committed separately from model integration and is now used by the whole-token
 executable described in the next section; the segmented stage alone carried no performance claim.
 Neither the earlier 1.5% comparison nor the reference anomalies are a reason to promote or abandon the
-final architecture. All runtime switches in this section remain off by default; nothing was pushed.
+final architecture. The arms were later promoted to the default path (see the promotion section below); nothing was
+pushed.
 
 ## Whole-stack integration and the incoming-state audit
 
@@ -307,4 +308,6 @@ What remains is not unfinished work but a boundary on the claims:
 - **Prefill KV variability** is characterized but not root-caused inside the vendor library; paired decode
   comparisons therefore run with the existing `STRATA_GEMM_DETERMINISTIC=1` in both arms. No
   synchronization workaround was added to either path.
-- **No default was promoted and nothing was pushed.** Both graph switches remain opt-in.
+- **The decode arms are the default path** (promoted with the user's explicit instruction) and nothing was pushed.
+  Each arm keeps a `=0` off switch; unsupported configurations run the plain decode and say why, while an explicit
+  `=1` is still a named startup error.

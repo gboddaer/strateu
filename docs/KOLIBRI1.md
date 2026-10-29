@@ -163,26 +163,27 @@ P4 left decode unchanged. Measured with `tools/kolibri/decode_bench.py` on card0
 --cpu-threads 8`, no expert slots, ctx 8192), 96 new tokens cost 62.1 ms/token (16.1 tok/s) and 85.4
 ms/token after an 8191-token prompt at ctx 12288 (11.7 tok/s); six identical runs spread 0.4 %.
 
-Two opt-in arms (both off by default) now cut that. `STRATA_KOLIBRI_DEC_HANDOFF=1` replaces the decode's
-two blocking per-layer device-to-host copies with one publication kernel plus a bounded host spin and
-enqueues the shared expert while the host waits: 56.9 ms/token (17.7 tok/s, −10.1 %) and 81.5 ms
-(−7.5 %). `STRATA_KOLIBRI_DEC_STREAM=1` then moves the decode off the legacy default stream onto one
-explicit non-blocking stream: together they reach **49.3 ms/token (20.33 tok/s, −21.5 %)** and
-**73.1 ms (−15.1 %)** after 8191 ids, three alternating pairs each, every pair favouring the arm.
+Four arms cut that, and they are now the **default decode path** where the engine supports them; each has a `=0`
+off switch. `STRATA_KOLIBRI_DEC_HANDOFF` replaces the decode's two blocking per-layer device-to-host copies with
+one publication kernel plus a bounded host spin and enqueues the shared expert while the host waits: 56.9
+ms/token (17.7 tok/s, −10.1 %) and 81.5 ms (−7.5 %). `STRATA_KOLIBRI_DEC_STREAM` moves the decode off the legacy
+default stream onto one explicit non-blocking stream: together they reached 49.3 ms/token (20.33 tok/s, −21.5 %)
+and 73.1 ms (−15.1 %) after 8191 ids in the arm-by-arm measurements.
 
-A third, larger step is also opt-in. `STRATA_KOLIBRI_DEC_HANDOFF_GRAPH=1` captures per-layer pre/post
-segments; `STRATA_KOLIBRI_DEC_TOKEN_GRAPH=1` joins them into one parent executable per geometry with a
-bounded acknowledgement wait between segments, so the host still computes every routed expert during
-replay. On final-source binaries, three rotating-order blocks per workload gave **24.0 tok/s** at 512
-prompt ids and **18.0 tok/s** after 8191 ids, 15.6 % and 24.4 % below handoff-plus-stream and 17.5 %/
-25.3 % below segments; all nine generated histories matched within each workload. The full decode gate
-passes against both the plain and segmented engines, including a real reused prefix and six repeats.
-Neither graph switch is a default.
+`STRATA_KOLIBRI_DEC_HANDOFF_GRAPH` captures per-layer pre/post segments and `STRATA_KOLIBRI_DEC_TOKEN_GRAPH` joins
+them into one parent executable per geometry with a bounded acknowledgement wait between segments, so the host
+still computes every routed expert during replay. On final-source binaries, three rotating-order blocks per
+workload gave **24.0 tok/s** at 512 prompt ids and **18.0 tok/s** after 8191 ids — 15.6 % and 24.4 % below
+handoff-plus-stream, 17.5 %/25.3 % below segments — with all nine generated histories matching inside each
+workload.
 
-`tools/kolibri/decode_gate.sh` shows the combinations bit-identical at 16/511/512/513
-ids and on the reused-prefix path, six repeats included, and the plain path's own logits are byte-identical
-to the build before any arm existed. Both prefill gate profiles still pass against their unchanged
-expectations. The earlier `STRATA_KOLIBRI_DEC_XEXP` arm on its own measured 5.2 % and 4.2 %.
+`tools/kolibri/decode_gate.sh` passes with the default path as candidate and an explicit `=0` control: bitwise
+full logits at 16/511/512/513 ids, a real reused prefix, six identical repeats, and the plain path's own logits
+byte-identical to the build before any arm existed. Both prefill gate profiles still pass against unchanged
+expectations; in the pool profile the arms step aside by name, because its fp16 expert cache is not a combination
+they serve. A configuration they cannot serve runs the plain decode and prints why instead of failing, and an
+explicit `=1` for such a configuration is still a named error. The earlier `STRATA_KOLIBRI_DEC_XEXP` arm on its
+own measured 5.2 % and 4.2 %.
 
 The earlier kernel trace (about 1 344 dispatches and 67.9 ms between forward markers) is a profiled
 diagnostic, not an unprofiled speed baseline, and the original wall-based slot comparisons and
