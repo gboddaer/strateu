@@ -29,6 +29,21 @@ def test_bucket_covers_positions_without_exceeding_single_pass_cap(bucket, n, ca
     assert n <= bucket(n, cap) <= cap
 
 
+def test_online_graph_key_cannot_reuse_a_single_pass_graph(tmp_path):
+    source = (Path(__file__).resolve().parents[2] / "src/kolibri/kolibri_engine.cu").read_text()
+    functions = []
+    for name in ('attn_dp_bucket', 'attn_graph_key'):
+        match = re.search(r'static inline int ' + name + r'\([^\n]+\) \{\n.*?\n\}', source, re.S)
+        assert match, f'production {name} is needed to distinguish launch geometries'
+        functions.append(match.group())
+    cpp = tmp_path / 'keys.cpp'
+    cpp.write_text('\n'.join(functions) + '\nint main() { return attn_graph_key(11000,11000) == '
+                   'attn_graph_key(11001,11000) || attn_graph_key(8193,11000) != 11000; }\n')
+    binary = tmp_path / 'keys'
+    subprocess.run(['c++', '-std=c++20', str(cpp), '-o', str(binary)], check=True, capture_output=True)
+    assert subprocess.run([str(binary)]).returncode == 0
+
+
 @pytest.mark.parametrize("n,want", [(1, 512), (512, 512), (513, 1024), (8192, 8192)])
 def test_existing_in_range_bucket_sizes_unchanged(bucket, n, want):
     assert bucket(n, 11000) == want

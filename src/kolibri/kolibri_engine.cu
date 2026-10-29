@@ -821,6 +821,11 @@ __global__ void k_add(float* x, const float* y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] += y[i];
 }
+// Diagnostic snapshot on the same compute queue; --dump-layers must not add per-layer host drains.
+__global__ void k_layer_snapshot(const float* src, float* dst, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[i];
+}
 // S6 (per-layer round-trip removal, the cheap half): rmsnorm followed by the residual add in ONE launch.  The decode's
 // chain is launch-latency bound - ~15 launches a layer at ~44 us of exposed latency each, because the host stalls on
 // the per-layer D2H - so removing a launch is worth about as much as removing its arithmetic (which is trivial here).
@@ -1506,6 +1511,23 @@ __global__ void k_kt_window(const __half* kc, const __half* vc, __half* kt, __ha
     vt[dst] = vc[src];   // V gets the same mirror: its PV accumulation walks positions at stride D, uncoalesced too
 }
 
+/// STRATA_KOLIBRI_DEC_HANDOFF_GRAPH: the STEADY (incremental) form of the kt window with the position from device
+/// memory - one row appended per token, at slot ((sliding) ? pos % swa : pos).  Bitwise the eager `k_kt_window` for
+/// the same position: same index arithmetic, same stores.  The first decode token of a request takes the EAGER
+/// whole-window form instead, so a captured graph only ever holds this steady shape.
+__global__ void k_kt_window_dp(const __half* kc, const __half* vc, __half* kt, __half* vt, int64_t rows,
+                               const int* pos_p, int64_t swa, int D, int HKV, bool sliding) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t pos = *pos_p;
+    const int64_t per = (int64_t) D;
+    if (i >= (int64_t) HKV * per) return;
+    const int64_t kvh = i / per, d = i % per;
+    const int64_t slot = sliding ? pos % swa : pos;
+    const int64_t src = ((size_t) kvh * rows + slot) * D + d, dst = ((size_t) kvh * D + d) * rows + slot;
+    kt[dst] = kc[src];
+    vt[dst] = vc[src];
+}
+
 __device__ void k_attn_body(const float* q, const __half* kc, const __half* vc, float* out, int H, int HKV, int D, int pos,
                        int64_t swa, int ctx, float scale, bool sliding, bool force_2pass = false, int bench_mode = 0,
                        int two_pass_max = 11000, const __half* ktc = nullptr, const __half* vtc = nullptr) {
@@ -1743,6 +1765,12 @@ static inline int attn_dp_bucket(int n_vis, int two_pass_max) {
     return b > two_pass_max ? two_pass_max : b;
 }
 
+// Positive keys are single-pass score capacities (128 threads). Negative keys name online attention
+// (512 threads and 4096 scratch floats). They must never share a captured launch, even at a bucket boundary.
+static inline int attn_graph_key(int n_vis, int two_pass_max) {
+    return n_vis <= two_pass_max ? attn_dp_bucket(n_vis, two_pass_max) : -4096;
+}
+
 
 __half* halloc(size_t n) {
     __half* p = nullptr;
@@ -1918,6 +1946,7 @@ struct Scratch {
     // row per token costs 1/513th of rebuilding the window every token - which the profile showed as 6.5% of the
     // decode's GPU time (578 calls x 36.9 us; it was my own overhead, the largest single line I had added).
     std::vector<char> kt_ready;
+    float* layer_trace_d = nullptr;   // --dump-layers snapshots, downloaded only after token completion
     // the CPU expert path's pinned host side: the layer's h, its quantized activations, the FF rows, the down rows
     float* h_host = nullptr; char* act = nullptr; float* ff = nullptr; char* hq = nullptr; float* ey_h = nullptr;
     // A2b: the SECOND host working set.  Only ey_h was double-buffered; h_host/act/ff/hq were shared between the two
@@ -2183,6 +2212,59 @@ static inline bool dec_attn_dp_on() { return env_on("STRATA_KOLIBRI_DEC_ATTN_DP"
 /// The arithmetic is untouched: same kernels, same buffers, same order - only which queue they are submitted to.
 static inline bool dec_stream_on() { return env_on("STRATA_KOLIBRI_DEC_STREAM"); }
 
+/// STRATA_KOLIBRI_DEC_HANDOFF_GRAPH: per-layer graph segments.  The GPU's half of a layer before the CPU pool
+/// (attention through the router and the publication) and the half after it (the MoE sum and the residual) are
+/// captured once per (layer, position bucket) and replayed.  The CPU still computes every routed expert with the
+/// same kernels, and it still services the layer in the middle of the token - no host callback runs inside a
+/// capture, and no device acknowledgement is needed because the HOST enqueues the post segment after its own work.
+/// Requires STRATA_KOLIBRI_DEC_STREAM (a legacy stream cannot be captured) and STRATA_KOLIBRI_DEC_HANDOFF (the
+/// publication is what the captured pre segment ends with).
+static inline bool dec_graph_on() { return env_on("STRATA_KOLIBRI_DEC_HANDOFF_GRAPH"); }
+
+struct DecGraphArm {
+    std::vector<std::map<int, cudaGraphExec_t>> pre;   // [layer][geometry key] -> captured pre segment
+    std::vector<cudaGraphExec_t> post;                // [layer] -> captured post segment
+    long long captures = 0;
+};
+
+static DecGraphArm& dec_graph_arm(int64_t n_layers) {
+    static DecGraphArm a;
+    if (a.pre.empty()) {
+        a.pre.resize((size_t) n_layers);
+        a.post.assign((size_t) n_layers, nullptr);
+    }
+    return a;
+}
+
+/// Capture `body` on `stream` and instantiate it.  Any failure is fatal and named: a half-captured graph that was
+/// silently ignored would make the arm look active while it ran the eager path.
+template <class F>
+static cudaGraphExec_t dec_capture_graph(F body, cudaStream_t stream, const char* what, int64_t layer) {
+    cudaGraph_t gr = nullptr;
+    cudaGraphExec_t ex = nullptr;
+    if (cudaStreamSynchronize(stream) != cudaSuccess) {   // capture starts from a quiescent point
+        std::fprintf(stderr, "kolibri: DEC_GRAPH: %s: cannot quiesce the decode stream at layer %lld\n", what,
+                     (long long) layer);
+        std::exit(1);
+    }
+    if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+        std::fprintf(stderr, "kolibri: DEC_GRAPH: %s: capture begin failed at layer %lld\n", what, (long long) layer);
+        std::exit(1);
+    }
+    body();
+    if (cudaStreamEndCapture(stream, &gr) != cudaSuccess) {
+        std::fprintf(stderr, "kolibri: DEC_GRAPH: %s: capture end failed at layer %lld\n", what, (long long) layer);
+        std::exit(1);
+    }
+    if (cudaGraphInstantiate(&ex, gr, 0) != cudaSuccess) {
+        cudaGraphDestroy(gr);
+        std::fprintf(stderr, "kolibri: DEC_GRAPH: %s: instantiate failed at layer %lld\n", what, (long long) layer);
+        std::exit(1);
+    }
+    cudaGraphDestroy(gr);
+    return ex;
+}
+
 /// The decode's own stream, created on first use.  Non-blocking, so it does not implicitly synchronise with the
 /// legacy stream; ordering against the prefill and the logits read is established by the end-of-token device
 /// synchronise and by the per-token position copy being on this same stream.
@@ -2204,6 +2286,8 @@ struct HandoffBuffers {
     float* hx = nullptr;        // device aliases of mapped host memory
     int32_t* ids = nullptr;
     float* w = nullptr;
+    float* y = nullptr;        // mapped CPU result, device alias for the compute-queue copy
+    float* h_y = nullptr;
     uint32_t* seq = nullptr;
     uint32_t* h_seq = nullptr;  // the host's own view of the same word
     uint32_t expect = 0;
@@ -2226,10 +2310,12 @@ static HandoffBuffers* handoff_buffers(int64_t n, int64_t k) {
     mapped((void**) &hx, (size_t) n * 4);
     mapped((void**) &ids, (size_t) k * 4);
     mapped((void**) &w, (size_t) k * 4);
+    mapped((void**) &b.h_y, (size_t) k * n * 4);
     mapped((void**) &seq, 64);   // the sequence word plus room for the documented tag/checksum slots
     if (cudaHostGetDevicePointer((void**) &b.hx, hx, 0) != cudaSuccess ||
         cudaHostGetDevicePointer((void**) &b.ids, ids, 0) != cudaSuccess ||
         cudaHostGetDevicePointer((void**) &b.w, w, 0) != cudaSuccess ||
+        cudaHostGetDevicePointer((void**) &b.y, b.h_y, 0) != cudaSuccess ||
         cudaHostGetDevicePointer((void**) &b.seq, seq, 0) != cudaSuccess) {
         std::fprintf(stderr, "kolibri: DEC_HANDOFF: mapped host memory has no device alias on this stack\n");
         std::exit(1);
@@ -2326,12 +2412,43 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
 
         const bool sliding = strata::core::is_swa_layer(g, l);
         const LayerBlobs& b = e.blobs[(size_t) l];
+        const int vis_cap = (int) (sliding ? g.n_swa : s.ctx);
+        const int n_vis = (int) (s.pos + 1 < (int64_t) vis_cap ? s.pos + 1 : (int64_t) vis_cap);
+        // K27's transposed mirror, resolved on the host: the first decode token of a request copies the whole
+        // window, every later token appends one row.  A captured graph may only hold the steady form, so the
+        // first token runs eager.
+        const __half* ktc = nullptr;
+        const __half* vtc = nullptr;
+        bool kt_full = false;
+        if (!graph && (size_t) l < s.kt.size() && s.kt[(size_t) l] != nullptr && n_vis <= g_two_pass_max) {
+            kt_full = s.kt_ready[(size_t) l] == 0;
+            ktc = s.kt[(size_t) l];
+            vtc = s.vt[(size_t) l];
+        }
+        const int geometry_key = attn_graph_key(n_vis, g_two_pass_max);
+        const int smem_rows = geometry_key > 0 ? geometry_key : -geometry_key;
+        HandoffBuffers* hbp = dec_handoff_on() ? handoff_buffers(N, K) : nullptr;
+        bool pre_published = false;
+        bool shexp_done = false;
+        auto run_shexp = [&] {
+            gemv_dec(e.dense.at(L(l, "ffn_gate_shexp.weight")), s.h, s.dec_h16, s.sg, st);
+            gemv_dec(e.dense.at(L(l, "ffn_up_shexp.weight")), s.h, s.dec_h16, s.su, st);
+            k_swiglu<<<(FS + B - 1) / B, B, 0, st>>>(s.sg, s.su, s.sh, FS);
+            if (s.dec_h16) k_to_f16<<<dim3((FS + 127) / 128), 128, 0, st>>>(s.sh, s.dec_h16, FS);
+            gemv_dec(e.dense.at(L(l, "ffn_down_shexp.weight")), s.sh, s.dec_h16, s.sy, st);
+            shexp_done = true;
+        };
+        // THE GPU'S HALF OF THE LAYER, up to and including the publication.  One lambda, because the arm captures
+        // exactly this sequence and the eager path runs it; `steady` selects the device-position kernels and the
+        // incremental mirror row, which is what a captured graph may contain.  With `steady == false` this is the
+        // eager sequence, unchanged, branch for branch.
+        auto pre_body = [&](bool steady) {
         k_rms<<<1, kThreads, 0, st>>>(s.x, e.f32.at(L(l, "attn_norm.weight")), s.h, N, e.eps);
         if (s.dec_h16) k_to_f16<<<dim3((N + 127) / 128), 128, 0, st>>>(s.h, s.dec_h16, N);   // S6: the fp16 copy for the dense gemvs
         gemv_dec(e.dense.at(L(l, "attn_q.weight")), s.h, s.dec_h16, s.q, st);
         gemv_dec(e.dense.at(L(l, "attn_k.weight")), s.h, s.dec_h16, s.k, st);
         gemv_dec(e.dense.at(L(l, "attn_v.weight")), s.h, s.dec_h16, s.v, st);
-        if (graph)
+        if (graph || steady || dec_attn_dp_on())
             k_attn_prep_p<<<H + HKV, kThreads, 0, st>>>(s.q, s.k, s.v, e.f32.at(L(l, "attn_q_norm.weight")),
                                            e.f32.at(L(l, "attn_k_norm.weight")), s.q, s.kc[l], s.vc[l], H, D, s.pos_d,
                                            g.n_swa, s.ctx, e.rope_base, e.eps, sliding);
@@ -2339,39 +2456,34 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
             k_attn_prep<<<H + HKV, kThreads, 0, st>>>(s.q, s.k, s.v, e.f32.at(L(l, "attn_q_norm.weight")),
                                            e.f32.at(L(l, "attn_k_norm.weight")), s.q, s.kc[l], s.vc[l], H, D, s.pos,
                                            g.n_swa, s.ctx, e.rope_base, e.eps, sliding);
-        const int n_vis = (int) (s.pos + 1 < (int64_t) (sliding ? g.n_swa : s.ctx) ? s.pos + 1
-                                                                            : (int64_t) (sliding ? g.n_swa : s.ctx));
         if (graph)
             k_attn_p<<<H, 512, (size_t) 4096 * sizeof(float), st>>>(
                 s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos_d, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding);
         else {
-            // K27: the transposed mirror the score dot reads.  K27b makes it incremental: the window is copied ONCE
-            // per layer per request (the first decode token, which also covers everything a prefill wrote) and one row
-            // is appended per token after that - 1/513th of the work, and it was 6.5% of the decode's GPU busy.
-            const __half* ktc = nullptr;
-            const __half* vtc = nullptr;
-            if ((size_t) l < s.kt.size() && s.kt[(size_t) l] != nullptr && n_vis <= g_two_pass_max) {
-                const bool full_kt = s.kt_ready[(size_t) l] == 0;
-                const int64_t n_kt = full_kt ? n_vis : 1;
-                const int64_t first_kt = sliding ? (full_kt ? (int64_t) s.pos + 1 - n_vis : (int64_t) s.pos) : 0;
+            if (ktc != nullptr) {
                 const int64_t rows_kt = s.kt_rows[(size_t) l];
-                const int64_t total = (int64_t) HKV * n_kt * (int64_t) D;
-                k_kt_window<<<(unsigned) ((total + 255) / 256), 256, 0, st>>>(
-                    s.kc[l], s.vc[l], s.kt[(size_t) l], s.vt[(size_t) l], rows_kt, (int) n_kt, first_kt, g.n_swa, D,
-                    HKV, sliding);
-                if (full_kt) s.kt_ready[(size_t) l] = 1;
-                ktc = s.kt[(size_t) l];
-                vtc = s.vt[(size_t) l];
+                if (steady) {   // one row: the position is on the device, so a replay appends the current one
+                    k_kt_window_dp<<<(unsigned) ((HKV * D + 255) / 256), 256, 0, st>>>(
+                        s.kc[l], s.vc[l], s.kt[(size_t) l], s.vt[(size_t) l], rows_kt, s.pos_d, g.n_swa, D, HKV, sliding);
+                } else {
+                    const int64_t n_kt = kt_full ? n_vis : 1;
+                    const int64_t first_kt = sliding ? (kt_full ? (int64_t) s.pos + 1 - n_vis : (int64_t) s.pos) : 0;
+                    const int64_t total = (int64_t) HKV * n_kt * (int64_t) D;
+                    k_kt_window<<<(unsigned) ((total + 255) / 256), 256, 0, st>>>(
+                        s.kc[l], s.vc[l], s.kt[(size_t) l], s.vt[(size_t) l], rows_kt, (int) n_kt, first_kt, g.n_swa, D,
+                        HKV, sliding);
+                }
             }
-            if (dec_attn_dp_on() && n_vis <= g_two_pass_max)
-                k_attn_dp<<<H, kThreads, (size_t) attn_dp_bucket(n_vis, g_two_pass_max) * sizeof(float), st>>>(
+            if (steady || (dec_attn_dp_on() && n_vis <= g_two_pass_max))
+                k_attn_dp<<<H, geometry_key > 0 ? kThreads : 512, (size_t) smem_rows * sizeof(float), st>>>(
                     s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos_d, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding,
                     g_two_pass_max, ktc, vtc);
             else
             k_attn<<<H, n_vis <= g_two_pass_max ? kThreads : 512, n_vis <= g_two_pass_max ? (size_t) n_vis * sizeof(float) : (size_t) 4096 * sizeof(float), st>>>(
                 s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding, 0, g_two_pass_max, ktc, vtc);
         }
-        if (reuse_gate_kv_path() && (int) l == attn_dump_layer()) {
+        if (ktc != nullptr && !steady) s.kt_ready[(size_t) l] = 1;   // host bookkeeping: the eager form ran
+        if (!steady && reuse_gate_kv_path() && (int) l == attn_dump_layer()) {
             const int64_t stride = sliding ? (int64_t) g.n_swa : (int64_t) s.ctx;
             const int64_t rows = std::min<int64_t>((int64_t) s.pos + 1, stride);
             std::vector<__half> kh, vh;
@@ -2393,6 +2505,27 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
         gemv_dec(e.dense.at(L(l, "ffn_gate_inp.weight")), s.h, s.dec_h16, s.router, st);
         strata::kernels::native_router_sigmoid_logit_add(s.router, e.f32.at(L(l, "exp_probs_b.bias")), s.ids, s.wts, 1,
                                                          dec_stream_on() ? st : g_st);
+        if (steady) {   // the captured segment ends with the publication the CPU is waiting for
+            strata::kernels::doorbell_publish(s.h, s.ids, s.wts, N, K, hbp->hx, hbp->ids, hbp->w, hbp->seq, st);
+            pre_published = true;
+            if (env_on_default_on("STRATA_KOLIBRI_DEC_GRAPH_SHARED"))
+                run_shexp();   // diagnostic control: capture shared work, or enqueue it after pre replay
+        }
+        };
+        // The eager sequence runs for every token when the arm is off, and for the request's FIRST token (the
+        // whole-window mirror copy) when it is on.  Later tokens go through the captured pre segment below.
+        if (!dec_graph_on() || kt_full || !env_on_default_on("STRATA_KOLIBRI_DEC_GRAPH_PRE"))
+            pre_body(false);
+        // The layer's half AFTER the CPU: the MoE sum and the residual.  Also a lambda, for the same reason.
+        bool post_done = false;
+        auto post_body = [&] {
+            if (dec_graph_on())
+                strata::kernels::copy_from_mapped(s.ey, hbp->y, (int64_t) K * N, st);
+            if (e.grouped > 0 && b.native_ok) k_moe_sum<<<(N + B - 1) / B, B, 0, st>>>(s.moe, s.gout, s.wts, K, s.sy, N);
+            else if (e.slots > 0) k_moe_sum2<<<(N + B - 1) / B, B, 0, st>>>(s.moe, s.ey2, s.yc, s.wts, K, s.sy, N);
+            else k_moe_sum<<<(N + B - 1) / B, B, 0, st>>>(s.moe, s.ey, s.wts, K, s.sy, N);
+            k_rms_add<<<1, kThreads, 0, st>>>(s.moe, e.f32.at(L(l, "post_ffw_norm.weight")), s.x, N, e.eps);
+        };
         const bool dph = dec_phases_on();
         std::chrono::steady_clock::time_point dpt{};
         if (dph) { KC(cudaStreamSynchronize(st)); dpt = std::chrono::steady_clock::now(); }
@@ -2404,15 +2537,6 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
             } else
             KC(cudaMemcpy(g_ids_host.data(), s.ids, K * sizeof(int), cudaMemcpyDeviceToHost));
         }
-        bool shexp_done = false;
-        auto run_shexp = [&] {
-            gemv_dec(e.dense.at(L(l, "ffn_gate_shexp.weight")), s.h, s.dec_h16, s.sg, st);
-            gemv_dec(e.dense.at(L(l, "ffn_up_shexp.weight")), s.h, s.dec_h16, s.su, st);
-            k_swiglu<<<(FS + B - 1) / B, B, 0, st>>>(s.sg, s.su, s.sh, FS);
-            if (s.dec_h16) k_to_f16<<<dim3((FS + 127) / 128), 128, 0, st>>>(s.sh, s.dec_h16, FS);
-            gemv_dec(e.dense.at(L(l, "ffn_down_shexp.weight")), s.sh, s.dec_h16, s.sy, st);
-            shexp_done = true;
-        };
         Dense gu; gu.type = b.L.gu_type; gu.shape = {g.n_embd, g.n_ff, g.n_expert}; gu.row_bytes = b.L.gu_row;
         Dense dn; dn.type = b.L.d_type; dn.shape = {g.n_ff, g.n_embd, g.n_expert}; dn.row_bytes = b.L.d_row;
         // --grouped: one native_expert_grouped launch per layer reads the blobs from the pinned table over UVA
@@ -2508,9 +2632,36 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                 // ONE publication node for the activation, the picks and the weights, then a bounded host spin.
                 // Nothing about the arithmetic changes: the CPU is handed the same bytes the blocking copies
                 // would have handed it, and the same kernels consume them afterwards.
-                HandoffBuffers& hb = *handoff_buffers(N, K);
-                strata::kernels::doorbell_publish(s.h, s.ids, s.wts, N, K, hb.hx, hb.ids, hb.w, hb.seq, st);
-                run_shexp();   // the GPU's independent half runs while the host waits and then computes
+                HandoffBuffers& hb = *hbp;
+                cudaGraphExec_t pre_ex = nullptr;
+                if (dec_graph_on() && !kt_full && env_on_default_on("STRATA_KOLIBRI_DEC_GRAPH_PRE")) {
+                    // The steady GPU half of this layer, captured once per (layer, shared-memory bucket) and then
+                    // replayed.  The capture IS this same sequence: no launch in it is a capture-time constant, and
+                    // the position reaches the device-position kernels through s.pos_d.
+                    DecGraphArm& dga = dec_graph_arm((int64_t) e.blobs.size());
+                    auto& slot = dga.pre[(size_t) l][geometry_key];
+                    if (slot == nullptr) {
+                        // Capture must not count as a publication: pre_body(true) ends with the publish, and during
+                        // capture those launches are recorded, not executed.  The ring is incremented by the REPLAY.
+                        const bool saved = pre_published;
+                        slot = dec_capture_graph([&] { pre_body(true); }, st, "pre", l);
+                        pre_published = saved;
+                        ++dga.captures;
+                    }
+                    pre_ex = slot;
+                    KC(cudaGraphLaunch(pre_ex, st));
+                    shexp_done = env_on_default_on("STRATA_KOLIBRI_DEC_GRAPH_SHARED");
+                    static bool announced_replay = false;
+                    if (!announced_replay) {
+                        std::fprintf(stderr, "kolibri: DEC_HANDOFF_GRAPH replay active\n");
+                        announced_replay = true;
+                    }
+                }
+                // A replayed pre segment published from inside the graph; the eager forms (arm off, or the request's
+                // first token) publish here.  Publishing twice would advance the ring past the host's expectation.
+                if (pre_ex == nullptr)
+                    strata::kernels::doorbell_publish(s.h, s.ids, s.wts, N, K, hb.hx, hb.ids, hb.w, hb.seq, st);
+                if (!shexp_done) run_shexp();   // eager first use; replays already contain the shared expert
                 const uint32_t want = ++hb.expect;
                 if (!handoff_wait(hb.h_seq, want, dec_handoff_timeout_ms())) {
                     std::fprintf(stderr, "kolibri: DEC_HANDOFF: layer %lld: no publication within %d ms (ring %u); "
@@ -2557,7 +2708,23 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                        e.cnt.dec_pool_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(n - dpt).count();
                        dpt = n; }
             // K15/K18: async on the compute stream (pinned source); see the slots path above for why.
-            KC(cudaMemcpyAsync(s.ey, s.ey_h, (size_t) K * N * 4, cudaMemcpyHostToDevice, dec_stream_on() ? st : g_st));
+            if (dec_graph_on()) {
+                std::memcpy(hbp->h_y, s.ey_h, (size_t) K * N * 4);
+                std::atomic_thread_fence(std::memory_order_release);
+            } else {
+                KC(cudaMemcpyAsync(s.ey, s.ey_h, (size_t) K * N * 4, cudaMemcpyHostToDevice,
+                                   dec_stream_on() ? st : g_st));
+            }
+            if (dec_graph_on() && env_on_default_on("STRATA_KOLIBRI_DEC_GRAPH_POST")) {
+                // The layer's half after the CPU - the MoE sum and the residual - replayed from a captured graph.
+                // No device acknowledgement is needed for this shape: the HOST enqueues it after its own work, so
+                // stream order is the whole contract, and a CPU failure simply never launches it.
+                DecGraphArm& dga = dec_graph_arm((int64_t) e.blobs.size());
+                if (dga.post[(size_t) l] == nullptr)
+                    dga.post[(size_t) l] = dec_capture_graph([&] { post_body(); }, st, "post", l);
+                KC(cudaGraphLaunch(dga.post[(size_t) l], st));
+                post_done = true;
+            }
             if (e.counters) { ++e.cnt.h2d_n; e.cnt.h2d_bytes += (long long) K * N * 4; }   // was uncounted
             // K29: the resident rows are written AFTER the copy above (same stream), so they win over whatever the
             // pool left in s.ey_h for those rows.  No new kernel: gemm.f16 takes f16 weights and T = 1.
@@ -2607,11 +2774,9 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
         }
         }
         if (!shexp_done) run_shexp();
-        if (e.grouped > 0 && b.native_ok) k_moe_sum<<<(N + B - 1) / B, B, 0, st>>>(s.moe, s.gout, s.wts, K, s.sy, N);
-        else if (e.slots > 0) k_moe_sum2<<<(N + B - 1) / B, B, 0, st>>>(s.moe, s.ey2, s.yc, s.wts, K, s.sy, N);
-        else k_moe_sum<<<(N + B - 1) / B, B, 0, st>>>(s.moe, s.ey, s.wts, K, s.sy, N);
-        k_rms_add<<<1, kThreads, 0, st>>>(s.moe, e.f32.at(L(l, "post_ffw_norm.weight")), s.x, N, e.eps);
-        if (layers_host && !graph) KC(cudaMemcpy(layers_host + (size_t) l * N, s.x, N * 4, cudaMemcpyDeviceToHost));
+        if (!post_done) post_body();
+        if (layers_host && !graph)
+            k_layer_snapshot<<<(N + 255) / 256, 256, 0, st>>>(s.x, s.layer_trace_d + (size_t) l * N, N);
         if (dph) { KC(cudaStreamSynchronize(st)); const auto n = std::chrono::steady_clock::now();
                    e.cnt.dec_post_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(n - dpt).count();
                    e.cnt.dec_pre_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(dpt - dp0).count();
@@ -3764,6 +3929,7 @@ void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
     const int H = (int) g.n_head, HKV = (int) g.n_head_kv, D = (int) g.head_dim;
     const int B = 256;
     const Dense& emb = e.dense.at("token_embd.weight");
+    if (layers_host && s.layer_trace_d == nullptr) s.layer_trace_d = dalloc((size_t) g.n_layers * N);
         if (e.graphs > 0 && layers_host == nullptr) {
         cudaMemcpyAsync(s.tok_d, &tok, 4, cudaMemcpyHostToDevice, g_st);
         switch (emb.type) {
@@ -3790,7 +3956,7 @@ void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
         }
         // The device-position attention reads s.pos from s.pos_d, so the host's position must be there before the
         // first layer runs.  One 4-byte copy per token, on the same stream the layers use.
-        if (dec_attn_dp_on()) {
+        if (dec_attn_dp_on() || dec_graph_on()) {
             if (dec_stream_on()) KC(cudaMemcpyAsync(s.pos_d, &s.pos, 4, cudaMemcpyHostToDevice, dec_stream()));
             else KC(cudaMemcpy(s.pos_d, &s.pos, 4, cudaMemcpyHostToDevice));
         }
@@ -3800,6 +3966,8 @@ void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
     k_rms<<<1, kThreads, 0, dec_stream_on() ? dec_stream() : 0>>>(s.x, e.f32.at("output_norm.weight"), s.h, N, e.eps);
     gemv_dec(e.dense.at("output.weight"), s.h, s.dec_h16, s.logits, dec_stream_on() ? dec_stream() : 0);
     KC(cudaDeviceSynchronize());
+    if (layers_host)
+        KC(cudaMemcpy(layers_host, s.layer_trace_d, (size_t) g.n_layers * N * 4, cudaMemcpyDeviceToHost));
     ++s.pos;
     if (hit_trace) {   // pos is 0-based after the increment: the first decoded token prints pos=1
         const long long h = e.cnt.slot_hits - hit0, m = e.cnt.slot_miss - miss0;
@@ -5526,6 +5694,18 @@ int strata::kolibri::run(int argc, char** argv) {
         std::fprintf(stderr, "strata-kolibri: the Kolibri 1 engine path (plan T7); --model GGUF [--load-only] for now\n");
         return 2;
     }
+    if (dec_handoff_on() || dec_stream_on()) {
+        const char* arm = dec_handoff_on() ? "STRATA_KOLIBRI_DEC_HANDOFF" : "STRATA_KOLIBRI_DEC_STREAM";
+        const char* why = nullptr;
+        if (cpu_threads <= 0) why = "--cpu-threads must select the CPU pool";
+        else if (grouped != 0) why = "--grouped is incompatible with this CPU-pool arm";
+        else if (slots != 0) why = "--expert-slots must be zero";
+        else if (expert_f16_n() > 0 || dec_res_on()) why = "the fp16 expert cache must be off";
+        if (why) {
+            std::fprintf(stderr, "kolibri: %s is set but not supported: %s\n", arm, why);
+            return 2;   // reject before model I/O or GPU allocation
+        }
+    }
     Engine e;
     std::string err;
     KC(cudaStreamCreate(&g_st));
@@ -5757,7 +5937,8 @@ int strata::kolibri::run(int argc, char** argv) {
     // The handoff arm is a scheduling change, so it is only allowed where the arithmetic is the plain pool's:
     // the pool feeds the routed experts, nothing else serves a pick, and no slot or fp16 cache moves bytes.  Any
     // other combination is refused here, by name, instead of silently degrading into a different arm.
-    if (dec_handoff_on()) {
+    if (dec_handoff_on() || dec_stream_on()) {
+        const char* arm = dec_handoff_on() ? "STRATA_KOLIBRI_DEC_HANDOFF" : "STRATA_KOLIBRI_DEC_STREAM";
         const char* why = nullptr;
         if (cpu_threads <= 0) why = "--cpu-threads is required (the CPU pool computes the routed experts)";
         else if (slots != 0) why = "--expert-slots must be 0 (resident slots move where experts are computed)";
@@ -5768,12 +5949,13 @@ int strata::kolibri::run(int argc, char** argv) {
                 if (!e.blobs[li].pool_ok) { why = "a layer's experts cannot run in the CPU pool"; break; }
         }
         if (why != nullptr) {
-            std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_DEC_HANDOFF is set but not supported: %s.\n"
+            std::fprintf(stderr, "kolibri: %s is set but not supported: %s.\n"
                                  "The arm is a scheduling change over the plain CPU-pool decode; see "
-                                 "docs/KOLIBRI_DECODE.md.\n", why);
+                                 "docs/KOLIBRI_DECODE.md.\n", arm, why);
             std::fflush(stderr);
             return 2;
         }
+        if (dec_handoff_on())
         std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_DEC_HANDOFF active: the layer publishes its FFN input, picks "
                              "and weights in one kernel and the host waits on the ring (bounded at %d ms)\n",
                      dec_handoff_timeout_ms());
@@ -5784,6 +5966,20 @@ int strata::kolibri::run(int argc, char** argv) {
     if (dec_stream_on())
         std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_DEC_STREAM active: the decode runs on one explicit "
                              "non-blocking stream (router and pool result copy included)\n");
+    if (dec_graph_on()) {
+        const char* why = nullptr;
+        if (!dec_handoff_on()) why = "STRATA_KOLIBRI_DEC_HANDOFF is required (the captured pre segment ends with the publication)";
+        else if (!dec_stream_on()) why = "STRATA_KOLIBRI_DEC_STREAM is required (a legacy stream cannot be captured)";
+        else if (reuse_gate_kv_path() != nullptr) why = "STRATA_KOLIBRI_KV_DUMP does host I/O inside the layer";
+        else if (dec_phases_on()) why = "STRATA_KOLIBRI_DEC_PHASES synchronises inside the layer";
+        if (why != nullptr) {
+            std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_DEC_HANDOFF_GRAPH is set but not supported: %s.\n", why);
+            std::fflush(stderr);
+            return 2;
+        }
+        std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_DEC_HANDOFF_GRAPH active: per-layer pre/post graph segments, "
+                             "CPU pool unchanged\n");
+    }
     if (serve_mode) {
         Scratch s;
         s.ctx = ctx;
