@@ -172,14 +172,30 @@ commands, environment, hashes and output logs are retained.
 
 | prompt ids / allocated ctx | handoff+stream ms | segmented ms | whole-stack ms | whole-stack tok/s |
 |---|---:|---:|---:|---:|
-| 512 / 8192 | 4698.1 | 4728.7 | 3954.5 | 24.28 |
-| 8191 / 12288 | 6978.1 | 7042.4 | 5276.1 | 18.20 |
+| 512 / 8192 | 4759.1 | 4864.8 | 4015.2 | 23.91 |
+| 8191 / 12288 | 7061.0 | 7146.8 | 5339.7 | 17.98 |
 
-Whole-stack reductions versus handoff+stream are 15.83% short and 24.39% long; versus segmented,
-16.37% and 25.08%. Keep the short eager outlier (5186.3 ms) in the record; it is not discarded.
+Whole-stack reductions versus handoff+stream are 15.63% short and 24.38% long; versus segmented,
+17.46% and 25.29%. No arm's own spread exceeds its measured difference. These are the **final-source**
+numbers, taken after the cold-counter rollover patch; the earlier pre-patch block is preserved
+separately at `/tmp/kolibri-dec2/three-arm-before-rollover/` and is not reported as the result.
 Artifacts: `/tmp/kolibri-dec2/final-three-arm/{short,long}/runs.json` and logs.
 The runner is `/tmp/kolibri-dec2/three-arm-bench.py`. These results supersede the earlier short
-segmented +1.5% prerequisite comparison, but do not by themselves complete the correctness contract.
+segmented +1.5% prerequisite comparison.
+
+Per request that is 41.8 ms and 55.6 ms of decode per token: cold capture is inside those numbers and is
+small against them (111 segment captures totalling ~72 ms plus 5.5 ms / 13.0 ms of parent instantiation,
+from the profiled diagnostic trace, not a throughput measurement). Steady `T`-to-`T` medians after the
+first five tokens were ~40.5 ms and ~53.8 ms.
+
+### Final-binary 8191-id KV-wrap parity
+
+Two plain and two whole-stack runs of the 8191-id prompt on the measurement binary each produced nine
+finite 128000-value records with the identical SHA256
+`93274a15a769b28b4e4ea57e5ae5289fd624d01a172f9872aaa4ac27f1105c88`; all four cross-comparisons were
+bitwise, the arm marker was present only in the two arm runs, and the binary hash was unchanged before
+and after. This is the case that crosses position 8192 during generation, the KV-wrap concern the
+earlier audit was taken from a different build. Artifacts: `/tmp/kolibri-dec2/final-8191-parity/`.
 
 ## Subsequent lifecycle and protocol checks
 
@@ -266,9 +282,19 @@ A separate pass over the final diff, after the last task line. What it confirms 
 A self-review by the author is weaker than a fresh reviewer. The goal's remaining verification gap is that no
 independent reviewer has run.
 
-## Remaining work
+## Status: complete, with stated limits
 
-Reproduce/classify the six current CTest failures against baseline, separate capture creation from
-steady replay timing, reconcile main docs and perform the final review. Benchmark artifacts above
-predate the cold-counter safety patch; retain that binary identity and remeasure if claiming
-final-source numbers. No completion claim yet.
+All five tracked tasks are done and every contractual gate above has a recorded, inspectable artifact.
+What remains is not unfinished work but a boundary on the claims:
+
+- **No independent reviewer ran.** Delegation was not authorized, so the final pass was a self-review
+  (recorded above) by the author. That is weaker than a fresh reviewer.
+- **CUDA and SYCL were not built.** `nvcc` is absent on this box and the Kolibri engine path is CUDA/HIP only.
+  The `CMakeLists.txt` change is a target-existence guard and is backend-neutral, but only HIP was compiled.
+- **Six broad-suite failures** (`kolibri_load_test`, `vmm_test`, `ple_parity`, `platform_memory_test`,
+  `conversation_copy_streams_test`, `isa_guard_check`) were rebuilt and reproduced at committed baseline
+  `057d42a6`. They are pre-existing environment/fixture issues, not waivers for a regression here.
+- **Prefill KV variability** is characterized but not root-caused inside the vendor library; paired decode
+  comparisons therefore run with the existing `STRATA_GEMM_DETERMINISTIC=1` in both arms. No
+  synchronization workaround was added to either path.
+- **No default was promoted and nothing was pushed.** Both graph switches remain opt-in.

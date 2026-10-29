@@ -2,7 +2,8 @@
 
 The first reassessment corrected several wrong interpretations. The historical runs below are retained.
 The current implementation is an opt-in host-assisted layer-stack graph. It keeps the CPU experts and
-has passed the full decode gate; final review and final-source timing reconciliation are still pending.
+has passed the full decode gate against both the plain and the segmented engines, including the final
+8191-id KV-wrap parity. Every switch is off by default and no default was promoted.
 
 Scope: single-stream Kolibri decode, **no drafter**, card0 only (`HIP_VISIBLE_DEVICES=0`).
 Box: Ryzen 7 5700G, 93 GiB RAM, R9700 32 GB, ROCm 7.2.2. Model: Kolibri-1-Q4_K_M.
@@ -40,19 +41,25 @@ EXPERT_F16=0, ATTN_MB=48, direct tuning and deterministic GEMMs:
 
 | Prompt ids / allocated ctx | Handoff + stream | Segments | Layer stack |
 |---|---:|---:|---:|
-| 512 / 8192 | 20.43 tok/s | 20.30 tok/s | **24.28 tok/s** |
-| 8191 / 12288 | 13.76 tok/s | 13.63 tok/s | **18.20 tok/s** |
+| 512 / 8192 | 20.17 tok/s | 19.86 tok/s | **23.91 tok/s** |
+| 8191 / 12288 | 13.91 tok/s | 13.43 tok/s | **17.98 tok/s** |
 
-These are median DONE decode times converted to rates, excluding load and prefill and including cold
-capture encountered during generation. Generated histories match across all nine runs per workload.
-Request-time reductions versus handoff+stream are 15.83% and 24.39%. These measurements predate the
-subsequent cold-counter rollover safety patch; final-source remeasurement is pending. No default
-promotion follows from them. Commands, binary identities, raw times and limitations are in the
+These are median DONE decode times converted to rates on the final source, excluding load and prefill
+and including cold capture encountered during generation. Generated histories match across all nine
+runs per workload. Request-time reductions versus handoff+stream are 15.63% and 24.38%; versus
+segments, 9.86% and 11.30%. No default promotion follows from them. Commands, binary identities, raw
+times and limitations are in the
 [validation ledger](plans/2026-10-29-kolibri-decode-validation-progress.md).
 
-Correctness now covers the full short/chunk/reuse/six-repeat gate, 8192 and 11000 attention transitions,
-sequence/generation rollover during cold warmup, missing publication/ACK, STOP and cold recovery,
-mapped/parent allocation failure and a CPU producer exception. Failed steps emit no logit record.
+Parity on that same final binary at the KV-wrap boundary: two plain and two whole-stack runs of the
+8191-id prompt each produced nine finite 128000-value records with the identical SHA256
+`93274a15a769b28b4e4ea57e5ae5289fd624d01a172f9872aaa4ac27f1105c88`, and all four cross-comparisons were
+bitwise. Artifacts: `/tmp/kolibri-dec2/final-8191-parity/`.
+
+Correctness covers the full short/chunk/reuse/six-repeat gate, the 8192 and 11000 attention
+transitions, sequence/generation rollover during cold warmup, missing publication/ACK, STOP and cold
+recovery, mapped/parent allocation failure and a CPU producer exception. Failed steps emit no logit
+record.
 CPU expert arithmetic and placement are unchanged. Process-lifetime graph caches retain the same
 model, context and buffer addresses across requests; model replacement in-process is not supported.
 
@@ -160,9 +167,9 @@ scored. The 8191-id prompt is `docs/DETAILS.md` tokenized by `tools/kolibri/make
 `tools/kolibri/decode_ids8191.txt`, so the long case has the KV length and a mixed routing pattern
 rather than one 512-id block tiled 16 times.
 
-### Noise floor: six runs of one configuration
+### Noise floor
 
-Both arms ran the identical configuration; the "candidate" arm differed only by being launched second.
+Six identical short runs measured the resolution this box gives one run:
 
 | Short workload, 96 tokens | Per token |
 |---|---:|
@@ -170,7 +177,9 @@ Both arms ran the identical configuration; the "candidate" arm differed only by 
 | Median | 62.14 ms (16.10 tok/s) |
 | Spread | 0.25 ms (0.4 %) |
 
-A 0.4 % spread is the resolution this box gives a single short run. An earlier four-run set contained
+The long workload has **no** six-run noise floor: 85.42 ms/token is the median of three baseline runs
+taken inside the `DEC_XEXP` pairs, whose spread was about 2.7 %. The 0.4 % figure therefore applies to
+the short workload only and is not used to resolve long-workload differences. An earlier four-run set contained
 one 99.7 ms/token outlier with the same configuration and no load difference we could identify; it did
 not recur in these six. That is why the arm comparison below uses alternating pairs and medians rather
 than one run per arm.
@@ -523,6 +532,8 @@ recorded above. The GGUF type inventory came from reading only metadata.
 The corrected plan is [the decode plan](plans/2026-10-29-kolibri-decode-experts-vram.md). Its filename is
 retained for existing links; its first implementation target is now host-assisted scheduling, not VRAM
 placement. There is no supported 30–38 tok/s forecast. Execution continues; the initial segmented
-rejection no longer controls it. Final-source remeasurement, documentation reconciliation and final
-review remain. The fresh baseline also reproduces all six broad-suite failures; they are limitations,
-not a green-suite claim. The full goal is not yet declared complete.
+rejection no longer controls it. The fresh baseline also reproduces all six broad-suite failures; they
+are limitations, not a green-suite claim. Limits that remain: no independent reviewer has run
+(delegation was not authorized), CUDA and SYCL were not built, and the occasional prefill KV variation
+is handled by an explicit deterministic test configuration rather than a proven vendor fix. Within those
+stated limits the objective is met and no default was promoted.

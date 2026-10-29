@@ -3,7 +3,8 @@
 > **For agentic workers:** Use `superpowers:executing-plans` for native execution, or
 > `superpowers:subagent-driven-development` only if the operator explicitly chooses delegation.
 > Implementation was authorized through goal `mvticbbf-mb0flp`. Defaults remain unchanged.
-> The segmented-graph experiment failed its direct performance comparison; execution is paused below.
+> The segmented stage first compared slower and was saved; the user directed continued investigation, and the
+> whole-stack graph built on those segments now measures 15.6%/24.4% less decode time than handoff-plus-stream.
 
 **Goal:** Improve exact single-stream decode on the R9700 without a drafter. First transfer
 Flash-Next's host-assisted scheduling while preserving Kolibri's CPU expert arithmetic. Measure the
@@ -29,27 +30,34 @@ The historical filename is retained so existing links continue to work; this no 
 - **Task 2 — done** (`41b2a91b`): `tests/hip/kolibri_decode_handoff.cpp` proves the per-layer
   publish/wait/answer protocol with a payload that changes on every replay, plus reset, 30/30 ring visibility
   with the graph still running, and a bounded no-ring failure. Negative control run (exit 12 in 5.1 s).
-- **Task 3 — partial, not the contracted captured-segment deliverable** (`eb752473`):
-  `STRATA_KOLIBRI_DEC_HANDOFF=1` measured −10.1 % (512 ids) and −7.5 % (8191 ids), bitwise against the plain
-  engine through `tools/kolibri/decode_gate.sh` at 16/511/512/513 ids and on the reused-prefix path, six
-  repeats, both prefill profiles unchanged. Capture was **not** part of it: see the next item.
-- **Capture prerequisites delivered**: device-position attention (`0ca15a37`) and the explicit-stream arm
-  (`072e99c9`). The handoff-plus-stream arm remains opt-in. Earlier goal task-completion labels do not
-  establish that the full original acceptance contract was met.
-- **Segmented graphs tested, rejected and removed from the working source**: three alternating direct pairs
-  at 512 prompt ids / ctx 8192 / 96 generated tokens gave 4657.7 ms/request for handoff-plus-stream versus
-  4728.8 ms/request with segmented graphs: **1.5% slower**, every pair losing. The earlier comparison against
-  plain eager execution was insufficient because it credited graphs with gains already supplied by the other
-  arms. Raw records: `/tmp/kolibri-dec2/graph-v-stream/`; rejected patch/source:
-  `/tmp/kolibri-dec2/rejected-segments/`. No graph code was committed.
-- **Task 4 — not implemented**: whole-stack capture and its abort-aware wait tests were not started. Under
-  the goal's failed-stage rule, stop here rather than force the next stage through. A different graph design
-  or longer amortization study needs an explicit follow-up decision; this result does not prove that every
-  possible whole-stack graph would be slower.
-- **Final verification incomplete**: recorded gates cover the cases listed in the ledger, not every promised
-  acceptance case. In particular, long-context aligned full-logit checks for the new arms, comprehensive
-  cancel/allocation-failure coverage, cross-backend compilation and an independent final review are not
-  established. Do not promote a default or mark the entire goal complete from these measurements.
+- **Task 3 — done** (`eb752473`, `057d42a6`): `STRATA_KOLIBRI_DEC_HANDOFF=1` measured −10.1 % (512 ids) and
+  −7.5 % (8191 ids), bitwise against the plain engine through `tools/kolibri/decode_gate.sh` at
+  16/511/512/513 ids and on the reused-prefix path, six repeats, both prefill profiles unchanged. Capture
+  followed as `STRATA_KOLIBRI_DEC_HANDOFF_GRAPH=1`: device-position attention and the explicit stream keep the
+  eager single-pass arithmetic, PRE/POST segments retain the CPU pool, and the same gate reports DECODE GATE
+  PASS against the plain engine. Unsupported segment/debug combinations are refused by name.
+- **Initial segment measurement, superseded**: three alternating direct pairs at 512 prompt ids / ctx 8192 /
+  96 generated tokens gave 4657.7 ms/request for handoff-plus-stream versus 4728.8 ms/request with segmented
+  graphs, 1.5 % slower with every pair losing. That was a prerequisite cost, not the final design; the user
+  directed continued investigation, the patch and source were saved at
+  `/tmp/kolibri-dec2/rejected-segments/` and restored, and the segments were then hardened and joined. The
+  pre-patch records are kept at `/tmp/kolibri-dec2/graph-v-stream/` and are not presented as the final result.
+- **Task 4 — done** (`e449dfbb`): `STRATA_KOLIBRI_DEC_TOKEN_GRAPH=1` assembles one parent executable per
+  attention geometry from PRE → bounded acknowledgement wait → POST over all 50 layers, with the host servicing
+  every publication during replay and CPU expert arithmetic unchanged. It requires HANDOFF, STREAM,
+  HANDOFF_GRAPH and all segments, warms cold mirrors/buckets through segments, and refuses layer dumps.
+  Final-source three rotating-order blocks per workload measure **23.91 tok/s** (512 ids) and **17.98 tok/s**
+  (8191 ids) against 20.17/13.91 for handoff-plus-stream and 19.86/13.43 for segments: 15.63 %/24.38 % and
+  17.46 %/25.29 % less decode time, every generated history matching. It is off by default.
+- **Final verification**: the full decode gate passes against both plain and segmented controls; a final-binary
+  8191-id KV-wrap pair (two runs per arm) is bitwise; the 11000-id attention transition is bitwise; a dependent
+  eight-layer publication chain, seeded sequence/generation rollover, missing publication/ACK, STOP recovery,
+  mapped and parent allocation failure and a CPU producer exception all pass without emitting a failed record;
+  88 CPU/no-model tests pass; both prefill profiles pass with unmodified expectations; a fresh full build passes
+  and CTest reports 188 tests = 171 passed / 11 skipped / 6 failed, all six reproduced at committed baseline
+  `057d42a6`. Not established: no independent reviewer ran (delegation was not authorized), CUDA and SYCL were
+  not built, and the occasional prefill KV variation has a deterministic test configuration rather than a
+  proven vendor fix.
 
 ## Global constraints
 
