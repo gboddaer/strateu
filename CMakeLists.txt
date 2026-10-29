@@ -1069,6 +1069,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       add_test(NAME hip_handoff COMMAND hip_handoff)
       list(APPEND _strata_hip_tests hip_handoff)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip/kolibri_decode_handoff.cpp")
+      # The decode plan's Task 2 gate: the per-layer publish/wait/answer protocol with a payload that changes on
+      # every replay, plus a bounded-failure case.  Separate from hip_handoff, which proves the primitive only.
+      add_executable(hip_kolibri_decode_handoff tests/hip/kolibri_decode_handoff.cpp)
+      target_link_libraries(hip_kolibri_decode_handoff PRIVATE strata_kernels strata_hip_runtime)
+      add_test(NAME hip_kolibri_decode_handoff COMMAND hip_kolibri_decode_handoff)
+      list(APPEND _strata_hip_tests hip_kolibri_decode_handoff)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip/mapped_alias.cpp")
       # #325: reports what a hipHostGetDevicePointer alias is on this stack (on Windows: the host pointer, and a
       # D2D copy into it does not land - hip_handoff's timeout there). A diagnosis: exits 0 whenever it ran.

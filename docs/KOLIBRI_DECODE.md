@@ -153,6 +153,41 @@ The shipped default is unchanged: `STRATA_KOLIBRI_DEC_XEXP` is still off unless 
 scheduling work in the plan is still worth attempting, but the ceiling it can reach is now partly
 measured: overlapping the shared expert with the pool drain is worth about 3.7 ms of a 62 ms token.
 
+## Protocol proof on this box (gfx1201)
+
+Before any model code, the plan's Task 2 asks for the per-layer publication protocol to be proven with a
+payload that changes on every replay. Two tests now cover it:
+
+| Test | What it proves | Result on card0 |
+|---|---|---|
+| `tests/hip/handoff.cpp` (existing) | the primitives: waits, separate copy/rings, fused publishes | PASS, 1.18 s |
+| `tests/hip/kolibri_decode_handoff.cpp` (new) | the protocol: 150 layer steps over 3 tokens, bitwise | PASS, 0.50 s |
+
+Both run under `ctest -R handoff` and under an external deadline. The new test's cases:
+
+- **A** — 50 layers × 3 tokens through one captured publish graph and one captured answer graph, launched 150
+  times. The payload encodes `(token, layer)`, so a capture-time literal cannot pass; the CPU's answer is
+  copied back by `copy_from_mapped` and accumulated on the device, so a stale answer cannot pass either. All
+  2 560 accumulator values match bitwise (`memcmp`, not a tolerance).
+- **B** — the sequence is reset to 0 after the stream goes idle, then the same 50 layers replay identically.
+  The first version of this case failed because the expected ring value kept counting across the reset; a
+  reset has to restart the expectation too, which is exactly the kind of thing the arm must not get wrong.
+- **C** — 30 rings, host spinning with no driver call: the ring was seen 30/30 times, and the captured graph's
+  ~3 ms of independent GPU work was still running in 30/30 of them. So on this driver a mapped publication is
+  visible to a pure host spin, and the host really does get to run while the GPU is busy.
+- **D** — a graph with no publish node does not ring; the host's 250 ms deadline fires and the buffers are
+  released only after the stream is quiesced.
+
+**A negative control was run, not assumed**: with the pre-graph launch commented out, case A timed out at its
+bounded wait and exited 12 in 5.1 s instead of hanging, and the unmodified test was restored and re-run green.
+
+One consequence for the design: `src/core/session.cpp` records that on this driver the per-layer poll must
+call the driver (`cudaEventQuery`) for the mapped write to become host-visible, and three of its experiments
+broke when that call was throttled. Case C does not reproduce that requirement for `doorbell_publish` (which
+carries a `__threadfence_system()` after the store on HIP). Two claims are now on record with different
+results in different graphs, so the arm must measure its own loop rather than inherit either. What must not
+happen is a per-layer stream sync presented as a fix; that would serialise the very overlap being bought.
+
 ## The actual Flash-Next recipe
 
 Start with these source paths and entry points, not Qwen3.6's driver:
