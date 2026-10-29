@@ -1,244 +1,294 @@
-# Kolibri-1 decode on the R9700: where the time goes, and what can move
+# Kolibri-1 decode on the R9700: reassessed investigation
 
-Measured on card0 only, Ryzen 7 5700G (8 cores), 93 GiB, Radeon AI PRO R9700 32 GB, ROCm 7.2.2,
-engine 0.1.52, `Kolibri-1-Q4_K_M.gguf` (50 layers, 384 experts, top-6, 42.90 GiB pinned).
-Unless stated otherwise: ctx 8192, a 512-token prompt, `--cpu-threads 8`, the shipped default path.
+This supersedes the conclusions in the first version of this document. The old raw runs remain useful,
+but several interpretations were wrong. No engine change or new speed-up is claimed by this reassessment.
 
-This is the decode companion to [KOLIBRI_P4_SHIPPING.md](KOLIBRI_P4_SHIPPING.md). P4 changed the prompt
-read and left decode untouched; this file is about decode.
+Scope: single-stream Kolibri decode, **no drafter**, card0 only (`HIP_VISIBLE_DEVICES=0`).
+Box: Ryzen 7 5700G, 93 GiB RAM, R9700 32 GB, ROCm 7.2.2. Model: Kolibri-1-Q4_K_M.
+P4 improves prefill; the next work must preserve that path and establish decode gains separately.
 
-## The measurement that frames everything
+## Review findings
 
-`rocprofv3 --kernel-trace` over 17 decode tokens, one steady token taken from the end:
+1. **The wrong Qwen engine was studied.** `src/qwen35/q36_engine.cu` is Qwen3.6-35B-A3B, not
+   Qwen3.8-Flash-Next. Its all-in-VRAM recipe is not an adequate description of Flash-Next's hybrid path.
+2. **CPU participation does not prohibit a whole-layer-stack graph.** Actual Flash-Next has a captured
+   graph that publishes work to the CPU and waits for the CPU's answer through mapped-memory flags.
+3. **The old slot comparison cannot decide a winner.** Its 42.6 ms/token and the grouped arm's 65.9 ms
+   came from separate process-wall differences, including model load. Rejecting that method for the
+   baseline but trusting it for the alternatives was inconsistent.
+4. **The format limitation was reversed.** In this build, grouped Q6_K down is compiled in; Q4_K down
+   is absent from the grouped down dispatch list. A stale Kolibri comment says the opposite.
+5. **The instrument and gates were underspecified.** A trace is not an unprofiled latency measurement;
+   the proposed CSV fixture was malformed and its supposed 60 ms period was actually 114 ms. Prefill
+   hashes do not validate decode results. Free-running outputs cannot be used as aligned KL inputs.
+6. **The 30–38 tok/s projections are withdrawn.** Neither a valid paired baseline nor the proposed
+   execution path has been measured. The earlier 96.6% hit rate is not a guarantee for another prompt,
+   context, slot budget, or part of a run.
 
-| | per token | share |
-|---|---|---|
-| wall | **67.4 ms = 14.7 tok/s** | |
-| GPU busy (sum of kernel time) | 24.3 ms | 36 % |
-| **50 host round trips, one per layer** (~550 µs each) | **25.4 ms** | **38 %** |
-| dispatch gaps, 1 343 × median 11.7 µs | 17.7 ms | 26 % |
-| kernel launches | **1 344** | |
-| routed-expert bytes through the CPU pool | **714.2 MB at 32.4 GB/s** | |
+## What the old measurements actually establish
 
-Every one of the 50 large gaps begins immediately after a `copyBuffer` and ends at the next
-`quantize_q8_1`: the GPU has finished a layer, has handed that layer's expert rows to the host, and is
-waiting while the CPU pool computes those six experts. The engine's own counters agree — `CNT pool
-phases: ... drain 22.33 ms/tok` against 22.18 ms of pool work, i.e. the pool is never idle-waiting; it is
-computing, and the GPU is doing nothing beside it.
+These are historical observations, not new measurements from this review.
 
-GPU busy, by kernel, same token:
+### Kernel trace: diagnostic, not a performance baseline
 
-| kernel | launches | ms/token | share of GPU busy |
-|---|---|---|---|
-| `k_attn` (attention) | 50 | **10.57** | 43.5 % |
+Artifact: `/tmp/kolibri-dec/trace/dec_kernel_trace.csv`. Invocation: plain prompt processing,
+512 prompt ids, 17 generated tokens, ctx 8192, eight CPU threads, card0, kernel tracing enabled.
+The file has 528 embedding-gather markers: 511 plain-prompt forwards plus 17 generation forwards — the
+counts `tools/kolibri/decode_bench.py --trace` requires callers to declare before it will attribute
+anything to decode. The last complete generation interval contains 1,344 dispatches.
 
-Read that 43.5 % as a share of *GPU busy*, not of the token: attention is **16 % of the token**
-(10.57 of 67.4 ms). Zeroing it entirely would take 15.9 → 18.1 tok/s. The host leg and the dispatch are
-the token.
-| dense + shared-expert `mmvq` | 351 | 7.31 | 30.1 % |
-| `k_rms` + `k_rms_add` | 201 | 3.54 | 14.6 % |
-| `quantize_q8_1` | 351 | 0.92 | 3.8 % |
-| router (`k_gemv_f32_v4` + `route_sigmoid_logit_add`) | 100 | 0.84 | 3.5 % |
-| `copyBuffer` + rest | 291 | 1.11 | 4.5 % |
+Reproduced by `parse_trace(..., prompt_forwards=511, generation_forwards=17)` on 2026-10-29, per token:
 
-An unprofiled run of the same shape measured by the engine's own counters earlier in this campaign was
-**62.9 ms (15.90 tok/s), GPU busy 16.1 ms, pool 22.3 ms** at ctx 131072
-([KOLIBRI1.md](KOLIBRI1.md#where-the-speed-goes-and-what-is-left-measured-2026-10-28-on-the-same-r9700)).
-The two agree on the shape; treat GPU busy as 16-24 ms and the host leg as 22 ms.
+| Observation in the traced decode window (17 tokens) | Per token |
+|---|---:|
+| Marker-to-marker window | 67.9 ms |
+| Interval union of kernel durations | 24.2 ms |
+| Attention kernels | 10.5 ms |
+| Gaps longer than 100 µs | 51; 26.0 ms |
+| Remaining inter-kernel gaps | about 17.7 ms |
 
-## The host leg is at its hardware ceiling
+A marker-to-marker window excludes the final host sampling interval; neither statistic should be
+relabelled as unprofiled end-to-end latency. Report interval-union time as **kernel execution
+coverage**, not general GPU utilization: a kernel-only trace does not include every copy-engine
+transfer or explain every uncovered interval.
 
-`pool_bench` on this box, cold blobs, six experts per call:
+The 51 large gaps are consistent with the source's per-layer CPU work. They are not a measurement of
+26.0 ms of removable driver overhead: most of that gap can be necessary expert computation. The other
+17.7 ms is not proven to be entirely launch overhead either. HIP API correlation and unprofiled runs
+are needed before assigning a cause or a speed-up budget. Profiling itself can perturb these gaps,
+and this traced run does not reproduce the unprofiled rate below, so its gaps cannot be subtracted
+from an unprofiled measurement.
 
-| workers | GB/s | ms/token |
-|---|---|---|
-| 1 | 27.1 | 24.5 |
-| **6** | **32.3** | **20.6** |
-| 12 | 30.6 | 21.7 |
-| 24 | 16.4 | 40.5 |
-| 48 | 7.7 | 86.5 |
+### Counters include plain-prompt processing
 
-The engine already runs at 32.4 GB/s. 714 MB/token at 32.3 GB/s is **22.1 ms**, so the pool leg cannot be
-tuned further on this CPU. Raising `--cpu-threads` past 8 makes decode worse, as the table predicts.
+`/tmp/kolibri-dec/base-65.err` reports `tok=576`: **511 prompt forwards + 65 generation forwards**.
+Its 714.2 MB/token and 22.04 ms/token pool work are averages over both phases, not isolated decode.
+The corresponding slots log reports 72.0% aggregate hits and 222.7 MB/token CPU traffic. That also mixes
+prompt and generation; it does not establish the hot cache's decode hit rate after prompt reselection.
 
-## The dependency that forbids the obvious overlap
+The serve path already takes hit/miss counter snapshots before generation and reports the deltas in
+`DONE`. Use those rather than an all-run cache average. See `src/kolibri/kolibri_engine.cu:4974–5031`.
 
-Decode is a strict chain, one layer at a time:
+### CPU benchmark: best observed rate, not a hardware impossibility proof
+
+The earlier cold-blob `pool_bench` sweep reported 27.1 / 32.3 / 30.6 / 16.4 / 7.7 GB/s at
+1 / 6 / 12 / 24 / 48 workers. It supports avoiding oversubscription. It does **not** prove that no CPU
+kernel, work partition, format-specific path, or overlap can improve the current implementation.
+The synthetic blob shape and the model's mixed formats must also be kept distinct.
+
+### Attention layout: one narrow result
+
+A manually built HIP `attn_k_parity --bench` reported 0.0605 ms row-major versus 0.0601 ms transposed,
+with seven synthetic parity cases passing. This is a score-only microbenchmark with 256 threads.
+The selected engine trace used 128-thread attention blocks and includes score, normalization and PV.
+Subtracting the microbenchmark from that trace does not establish a 28% score fraction or locate the
+remainder. It does not close attention optimization at other positions or rule out full-kernel gains.
+
+## Measured: the unprofiled baseline and the existing overlap arm
+
+Instrument: `tools/kolibri/decode_bench.py`, tested by `tools/kolibri/test_decode_bench.py` (46 CPU
+tests, no GPU). It scores the engine's own `DONE` `decode_ms` — which starts after the prompt has been
+consumed — and reports the `T`-to-`T` interval medians beside it. A candidate arm must print a marker
+that the baseline run must not print, so an arm that is switched on but inert fails instead of being
+scored. Every run is a fresh engine process, and the arms alternate order across pairs.
+
+Configuration for every run below, card0 only (`HIP_VISIBLE_DEVICES=0`):
+
+| Item | Value |
+|---|---|
+| Engine | `build-mmq/strata-kolibri`, sha256 `5a4b5766…26f0cd` |
+| Model | `Kolibri-1-Q4_K_M.gguf`, 47,454,113,472 B |
+| Flags | `--serve --prefill --cpu-threads 8`, no expert slots (`slots=0`, all 50 layers pool) |
+| Prompt path | P4 MMQ active, `STRATA_HIPBLASLT_TUNING=tools/hip/gfx1201-hipblaslt-100202.txt` |
+| Prompt chunk | 256 (the `pf_chunk_at` rule for a prefix below 8192 tokens) |
+| New tokens | 96 per request |
+| Workloads | 512 ids, ctx 8192 · 8191 ids, ctx 12288 |
+| Load average before the runs | 3.0–5.3 (1 min) |
+
+96 rather than 128 new tokens because the 512-id prompt's greedy continuation reaches end-of-sequence
+at token 117 on this prompt path; a shorter-than-requested request is refused by the harness, not
+scored. The 8191-id prompt is `docs/DETAILS.md` tokenized by `tools/kolibri/make_decode_ids.py` into
+`tools/kolibri/decode_ids8191.txt`, so the long case has the KV length and a mixed routing pattern
+rather than one 512-id block tiled 16 times.
+
+### Noise floor: six runs of one configuration
+
+Both arms ran the identical configuration; the "candidate" arm differed only by being launched second.
+
+| Short workload, 96 tokens | Per token |
+|---|---:|
+| Six runs | 62.10, 62.13, 62.13, 62.14, 62.20, 62.35 ms |
+| Median | 62.14 ms (16.10 tok/s) |
+| Spread | 0.25 ms (0.4 %) |
+
+A 0.4 % spread is the resolution this box gives a single short run. An earlier four-run set contained
+one 99.7 ms/token outlier with the same configuration and no load difference we could identify; it did
+not recur in these six. That is why the arm comparison below uses alternating pairs and medians rather
+than one run per arm.
+
+### `STRATA_KOLIBRI_DEC_XEXP`: the existing overlap arm
+
+The arm enqueues the layer's shared expert before the CPU pool drain. Same kernels, same stream, same
+arithmetic — only the enqueue point moves, so it is bitwise by construction rather than by measurement.
+`--require-marker "DEC_XEXP active"` proved it live: the marker appeared in all six candidate logs and
+in none of the six baseline logs.
+
+| Workload | Baseline median | Candidate median | Change |
+|---|---:|---:|---:|
+| 512 ids, ctx 8192 | 62.10 ms (16.10 tok/s) | 58.86 ms (16.99 tok/s) | **−5.2 %** |
+| 8191 ids, ctx 12288 | 85.42 ms (11.71 tok/s) | 81.86 ms (12.22 tok/s) | **−4.2 %** |
+
+All six pairs favoured the candidate, and the `T`-to-`T` medians agree (62.44 → 59.26 ms; 86.36 →
+83.21 ms). Run-to-run spread inside an arm stayed under 0.7 % on the short workload and 2.8 % on the
+long one. This satisfies the revised plan's acceptance rule (all pairs favour, median reduction at
+least 5 %, no workload regressing more than 2 %) for the short workload, and comes close on the long
+one; it is a small gain from an arm that already existed, not a new mechanism.
+
+Raw records, including per-run intervals, environment, load average and logs:
+`/tmp/kolibri-dec2/{baseline3,xexp,xexp-long}/`.
+
+### What this does and does not change
+
+The shipped default is unchanged: `STRATA_KOLIBRI_DEC_XEXP` is still off unless it is set. The
+scheduling work in the plan is still worth attempting, but the ceiling it can reach is now partly
+measured: overlapping the shared expert with the pool drain is worth about 3.7 ms of a 62 ms token.
+
+## The actual Flash-Next recipe
+
+Start with these source paths and entry points, not Qwen3.6's driver:
+
+| Source | Mechanism and applicability |
+|---|---|
+| `src/program/generate.cpp:8245–8344` | Selects token capture; static-profile resident hits can be decided on-device. Capture is conditional: native-pack, multi-GPU and dump paths have different eligibility. |
+| `src/program/generate.cpp:17596–17612` | Live call to `session_run_token`, otherwise `session_loop`. |
+| `src/core/session.cpp:session_capture_token` | Captures all layers as publish → shared/resident work → wait → mapped result read → combine. |
+| `src/core/session.cpp:session_run_token` | Launches the graph, polls each layer sequence, runs the CPU pool, publishes the acknowledgement, then waits for token completion. |
+| `src/core/session.cpp:session_loop` | Alternative two-graph-per-layer path; starts GPU hit work before CPU misses, then combines this layer's outputs with this layer's routing weights. |
+| `src/core/layer.cpp:moe_route`, `block_layer_pre` | Publishes normalized input, ids and weights before shared-expert work (`g_shared_early` defaults true). |
+| `src/kernels/cuda/elementwise.cu` | `doorbell_publish`, `doorbell_ring`, `doorbell_wait`, `copy_from_mapped`; explicit system fences and HIP visibility provisions. |
+| `tests/hip/handoff.cpp` | Existing asynchronous mapped-memory and graph-replay tests, including changing payloads. Tests exist; they were not rerun in this reassessment. |
+
+The whole-token graph here means **the layer stack**. Embedding, per-token staging, logits handling and
+sampling still have work outside it. Graph replay reduces host submissions; it does not eliminate the
+kernels inside the graph or make CPU expert work disappear.
+
+The key distinction is between a CPU function invoked *during capture* (which would execute only once)
+and a CPU participant servicing a graph *during replay*. The latter is precisely Flash-Next's protocol.
+A static profile permits GPU resident work inside that graph while the CPU handles misses. An on-demand
+cache that needs host placement decisions can instead use the per-layer graph path.
+
+This is an architectural reference, not proof that Flash-Next's S-form expert kernels are drop-in
+replacements for Kolibri's Q4_K/Q6_K blobs. Reuse the scheduling protocol; validate each numerical path.
+
+## Dependencies and useful overlap
+
+Layer L+1 must consume layer L's completed MoE residual. Exact single-stream decoding cannot bypass
+that dependency by double-buffering layer outputs. Different prefill chunks are not a template for
+removing this dependency in one-token decode.
+
+There is useful **within-layer** independence:
 
 ```mermaid
-graph LR
-  X[x] --> R1[rms] --> A["attention + o (GPU)"]
-  A --> X1["x' = x + o"]
-  X1 --> R2[rms] --> RT["router (GPU)"]
-  RT --> RE["routed experts<br/>CPU pool"]
-  RT --> SH["shared expert (GPU)"]
-  RE --> C["combine"]
-  SH --> C
-  C --> X2["x'' -> layer+1"]
+flowchart TD
+  A[Attention and normalized FFN input] --> R[Router]
+  R --> P[Publish input, ids, weights]
+  P --> CPU[CPU experts or misses]
+  P --> GPU[GPU shared expert and resident hits]
+  CPU --> J[Join, combine, residual]
+  GPU --> J
+  J --> N[Next layer]
 ```
 
-Layer L+1 cannot start before layer L's combine, because its attention input is `x''`. So the 22 ms of
-host expert work **cannot hide behind the GPU's own work**, and a "pipeline the layers" change is not
-available for a single token. The prefill's existing overlap (`STRATA_KOLIBRI_PF_PIPE`, "A2b: THE
-OVERLAP") works only because two *chunks* are genuinely independent of each other.
+Kolibri already has `STRATA_KOLIBRI_DEC_XEXP` to enqueue the shared expert before the pool drain.
+Inspect and measure that existing arm before inventing another overlap mechanism. Its gain is not
+known from counting shared GEMVs; those GEMVs do not all have equal durations.
 
-The one independent pair inside a layer is the shared expert and the routed experts. Overlapping them is
-worth at most ~1.0 ms/token, because the shared expert is one of the seven `mmvq` products per layer.
+A graph may spend time waiting on a doorbell and still improve latency by avoiding host dispatch and
+blocking-copy overhead. Conversely, making that wait disappear from a kernel-gap plot does not prove
+less CPU waiting: the wait can now be inside a running kernel. Measure unprofiled generation time.
 
-Two ways to get real overlap remain, and both need more than one sequence or more than one token in
-flight: **concurrent requests** (serve throughput, not single-stream latency) and **batched verify**
-(speculative decoding, [trajectory E](#e-drafter-free-speculation-orthogonal)).
+## What can transfer, in the right order
 
-## How the Flash-Next engine gets its decode speed
+### 1. Establish an unprofiled, phase-separated baseline — done, see above
 
-From `src/qwen35/q36_engine.cu`:
+`tools/kolibri/decode_bench.py` does this: serve-protocol `DONE` `decode_ms`, flushed `T` timestamps,
+alternating pairs in fresh processes, environment and load recorded, marker-proven candidate arms.
+The six-run noise floor (0.4 %) and the measured `DEC_XEXP` gain (−5.2 % short, −4.2 % long) are in
+[Measured](#measured-the-unprofiled-baseline-and-the-existing-overlap-arm).
 
-1. **The whole token is one captured graph** (`graph_run`, `forward(1, pos, 1, use_graph, false)`), with
-   the position in a device scalar. One host launch per token instead of ~1 300.
-2. **Every routed expert lives in VRAM, and VRAM is reallocated to make them fit**: it gives back the
-   packed Q8_0 copies, shrinks the attention score buffer 256 → 64 MB and the reserve 768 → 256 MiB,
-   and sets `n_slots = ne`.
-3. **`route_group()` fuses router + top-k + grouping** in one launch, and the shared expert's gate rides
-   as an extra row of the router matrix (`router_ext`, `n_expert + 1` rows).
-4. **One grouped expert launch per layer**, blobs repacked at load as `[gate | up | down]`.
-5. **`native_swiglu_quantize_q8_1`**: SwiGLU and its q8_1 image in one launch.
-6. **Decode attention is split-K** (`k_attn_part` over 256-cell chunks + `k_attn_merge` with LSE).
-7. **The hybrid mode is named as a slowdown**: `if (main_hybrid) use_graph = false; // the host takes
-   part in every layer`.
+The unprofiled number did differ from the profiled one: 62.1 ms/token against the trace's 67.9. The
+response was to report the trace as a diagnostic rather than to calibrate against it, and no budget
+derived from trace gaps is used anywhere below.
 
-Point 7 is the whole difference. Kolibri's 42.90 GiB of experts cannot fit in 32 GB, so the host takes
-part in every layer, so the graph is illegal, so the token pays 1 344 launches and 50 round trips. The
-R9700 is idle for two thirds of the token: **its extra compute over a T4 is not being used at all.**
+### 2. Transfer the scheduling protocol, retaining CPU arithmetic
 
-## What has already been tried on this box, and lost
+First prove publication and replay on gfx1201, then try two graph segments per layer around the existing
+pool call. Publish early so the shared expert can overlap the pool. Keep **all experts on the same CPU
+kernels** for this first arm: no slot hit-rate assumption, no missing grouped format, no numerical
+placement change. A graph that reduces dispatch is useful even while the pool remains.
 
-| arm | bytes/token | pool leg | decode | why it lost |
-|---|---|---|---|---|
-| shipped (pool) | 714.2 MB | 22.04 ms | **67.4 ms** | — |
-| `--grouped` | 331.8 MB | 10.46 ms | 65.9 ms¹ | the 25 grouped layers read their blobs from the pinned table **over PCIe (5.7-6.1 GB/s)**, not from VRAM |
-| `--expert-slots auto --expert-slots-hot` | 222.7 MB | 7.25 ms | 42.6 ms¹ | 253 slots/layer fit, but the slot path costs **3 launches per pick** |
-| `--cpu-threads 24` | — | — | 7.6 tok/s | oversubscribes 8 physical cores |
-| K stored transposed (coalesced score dot) | — | — | 1.01x on the score pass | measured, see below |
-| wall-difference from `--n 1` vs `--n 65` | — | — | (24.0)² | page-cache variance in the 45 GB load, not a real result |
+Only after this works should a whole-layer-stack graph with doorbell waits be attempted. It can retain
+the CPU pool. Abort/cancel, memory visibility, stale sequence numbers, scratch ownership and graph
+lifecycle are correctness requirements, not cleanup after a timing experiment.
 
-¹ measured over a 512-token prompt by the same difference method, so the *comparison* is valid even
-though the absolute figure carries load variance. ² retracted; the trace and the counters agree at ~15.
+Existing Kolibri `s.pos_d` and `k_attn_prep_p` already demonstrate device position handling. However,
+its current `graph=true` attention uses a different launch shape/path from eager attention and omits
+the eager transposed-K mirror handling. Reusing that branch is not proof of bitwise equivalence.
+Preserve the eager arithmetic and explicitly audit position-dependent grids and mirror initialization.
 
-**Cutting bytes on the host does not help** — both byte-cutting arms are slower, because neither removes
-the per-layer hand-off and both add launch or PCIe cost.
+### 3. Revisit residency and grouped work as a separate decision
 
-### The attention layout question is closed
+CPU misses and GPU hits should overlap, not force all misses into fine-grained PCIe reads just to make
+capture possible. Direct mapped-weight reads remain an optional arm to measure, not a prerequisite.
+Cache capacity and hit rates depend on context, prompt and reselection. Freeze placement for the first
+comparison; add adaptive updates only at a proven quiescent boundary.
 
-`src/kolibri/attn_k_parity.cu` (built by hand as HIP for this run, since its CMake target is CUDA-gated)
-proves the transposed K layout is **bitwise identical** to row-major in all 7 synthetic shapes, and prices
-both at the short-decode geometry (H = 48 blocks, 256 threads, sw 513, pos 1000):
+A metadata-only inspection of this model during reassessment found:
 
-| layout | score pass | effective rate |
-|---|---|---|
-| row-major (shipped) | 0.0605 ms | 104.2 GB/s |
-| transposed (bitwise) | 0.0601 ms | 104.9 GB/s (**1.01x**) |
+| Projection | GGML type | Shape | Layer count |
+|---|---:|---|---:|
+| Gate and up | Q4_K (12) | (2560, 512, 384) | 50 each |
+| Down | Q6_K (14) | (512, 2560, 384) | 25 |
+| Down | Q4_K (12) | (512, 2560, 384) | 25 |
 
-So the coalescing fix is safe but worthless *on this card*, and the score dot is only 0.06 ms of the
-0.211 ms per-layer attention: 28 %, not the 91 % the T4 ledger recorded. What is left is the softmax and
-the PV pass, which re-read K/V per head instead of tiling them once per KV head. That is the shape a
-split-K + GQA-tiled decode attention would fix, and it is bounded by attention's 16 % of the token.
+`build-mmq/CMakeCache.txt` has `STRATA_Q6K_EXPERTS=ON`. In
+`src/kernels/cuda/iq_kernels.cu:STRATA_D_FMTS`, type 14 is enabled with that option, but type 12 is absent.
+Do not trust the old comment that says Q6_K down is the unsupported half. A grouped arm needs an exact
+per-format capability test and a correct fallback, or a separately tested Q4_K-down implementation.
+`native_expert_grouped` is a host API that can launch multiple kernels; it is not one GPU launch per layer.
 
-## Trajectories
+Purely relocating identical weights with identical GPU arithmetic should preserve bits. Switching
+between CPU and GPU arithmetic can change logits and needs aligned teacher-forced accuracy checks.
+The former difference is not an excuse to waive correctness for the latter.
 
-**The ranking changed once the attention layout was measured.** Three facts decide it:
+### 4. Keep attention and CPU-kernel work open
 
-- The host leg is **38 %** of the token and the dispatch gaps **26 %**; attention is **16 %**.
-- The host leg cannot be overlapped within a token (the dependency above) and is at its hardware ceiling.
-- A whole-token graph is illegal while the host is in every layer, so B is a *precondition* of C, not an
-alternative to it.
+After a trustworthy phase profile, rank full attention, dense/shared fusions, pool format kernels and
+residency by their **unprofiled critical-path cost**, not by peak TFLOPS or a share of traced kernel time.
+No drafter, MTP, speculation, or extra sequence is required for the scheduling work above.
 
-So: **B → C is the road, D rides along, E is orthogonal.** B alone is ~1.2x; C is the class change.
+## Gates and decision rules
 
-| step | token | tok/s | numerics |
-|---|---|---|---|
-| today | 67.4 ms | 14.7 | — |
-| **B** per-layer graphs | ~52 ms | **~19** | none |
-| **B + D** | ~45 ms | ~22 | D needs a KL gate |
-| **B + C** | ~33 ms | **~30** | C moves ids |
-| **B + C + D** | ~26 ms | **~38** | |
+- Scheduling-only arms: finite **bit-identical full logits** on identical forced histories, including
+  first use and graph replay, plus six-run repeatability. Equal greedy ids alone are insufficient.
+- Prefill must remain unchanged: retain both existing pool and MMQ gate profiles and their expectations.
+  `PF_HASH` instruments prefill; do not create decode expectations by recording over it.
+- Decode gets a dedicated gate: activation assertion, exact record counts, full-logit comparison,
+  changing input/position tests, reset/reuse/cancel tests, and no silent fallback.
+- A future CPU/GPU placement arm must use aligned forced tokens and independent reference accuracy,
+  not KL on divergent greedy histories. `kl.py` drives a reference executable using `--ref`, `--dump`,
+  `--model`, `--parity`, `--out`; it is not a generic two-file `--a/--b` comparator.
+- Numerical changes and a default change require a separate decision after actual measurements.
+  An optimization is rejected if correctness fails, regardless of speed.
 
-### B. Per-layer graph segments (the 17.7 ms of dispatch) — **first**
+## Limits and next step
 
-The GPU-only part of a layer (attention → dense → router) contains no host call and is capturable; the
-pool drain splits the layer, so the region after it is a second capture. Two graphs per layer, 100 host
-launches instead of ~950. `--grouped` already captures per-layer graphs, so the mechanism exists.
+The T4/R9700 gap is not yet an apples-to-apples GPU comparison. The hosts, active expert work,
+harnesses, visible positions and profiling state differ. No T4 GPU or other local GPU was used in this
+review, and no new GPU tests or performance runs were made. Source findings above are static analysis;
+the GGUF type inventory came from reading only metadata.
 
-One prerequisite, and it is the real work: **a captured graph's kernel arguments are frozen**, so the
-current position cannot stay a host value (`s.pos` is passed to `k_attn`, the KV store and the merge). It
-must become a device scalar, exactly as the Flash-Next engine keeps `d_delta` and as this engine already
-keeps `s.toks_d` for `PF_PIPE`. Expected: 17.7 → ~4 ms. Effort: medium. Numerics: none, if the kernels and
-their order are unchanged — and that is testable, because a frozen graph either produces the same ids or it
-does not.
-
-### C. Move the expert bytes to VRAM — the Flash-Next recipe, adapted
-
-The only thing that removes the 22 ms host tax. Two sub-steps, in this order:
-
-- **C1, grouped decode from VRAM slots.** Replace the 3-launches-per-pick slot path with the grouped
-  kernel the prefill already uses (`native_expert_grouped` takes a per-group pointer array, so a table
-  that mixes VRAM slots and the pinned host table needs no new kernel — it needs the slot map and the
-  group build on the device, as `k_group` already does for prefill). 253 slots/layer fit (measured by the
-  engine's own fitter), and 214 slots already served **96.6 %** of picks. Misses then cost
-  0.034 × 714 MB = 24 MB over PCIe ≈ 4 ms.
-- **C2, the whole-token graph.** Legal only once no host call remains inside the token.
-
-Expected: C1 ~45-50 ms, C1+C2 (with B) ~30 ms, and with D ~26 ms → 30-38 tok/s. Effort: large.
-Numerics: changes ids — residency moves bytes between stores (measured 0.855 mean |Δlogit|, id flips).
-
-**Structural ceiling without C: about 28 tok/s.** Even with zero dispatch gaps and free attention, the
-token still pays the serial 22 ms host leg plus real GPU work. Only C breaks that.
-
-### D. Decode attention: bounded, do it after C
-
-`k_attn` is 43.5 % of GPU busy but **16 % of the token**: 10.57 ms/token at 513 visible positions, geometry
-H = 48, HKV = 4, D = 128, one block per head, 128 threads. Its score pass already runs at 104 GB/s and the
-layout fix measures 1.01x, so the remaining cost is the softmax and PV re-reading K/V 12 times (the GQA
-ratio) instead of tiling them once per KV head the way `k_attn_flash` does in prefill.
-
-Expected: **+2 tok/s** at short context (67.4 → ~60 ms), more at 100K, where attention is the wall.
-Effort: medium (fused, split-K, GQA-tiled). Numerics: the fused/split forms change the sum order, so it
-needs its own KL gate; the bitwise route (transposed layout) is refuted on speed.
-
-### E. Drafter-free speculation (orthogonal)
-
-`src/ngram` and `src/spec` exist, and Flash-Next already runs MTP/verify. Without a drafter, prompt-lookup
-/ n-gram proposals are the option. Note the MoE arithmetic: verifying T rows touches roughly T× more
-distinct experts out of 384 top-6, so **bytes per accepted token barely improve** (4 rows ≈ 3.3× the
-bytes ≈ 0.83× per token). What amortizes well is the *structure*: one round trip and one grouped launch
-serve T rows, so the 25.4 ms of host gaps and most of the dispatch divide by the batch size. Acceptance
-on free text is the open question; on code and quoted spans it is much higher.
-
-## Open questions this measurement cannot settle
-
-- **Why the T4 box measured 30.3 tok/s where this box measures 14.7-15.9.** Its host streams at
-  43.4 GB/s against 32.4 here, which explains only ~5.5 ms of the difference; plugging that in gives
-  ~17 tok/s, not 30. Candidates: attention behaviour at the T4's geometry, or a different harness window
-  (here, tokens 2-129 run 21.3 tok/s against 15.8 steady). Needs the T4 arm re-measured on the same
-  harness, and is not claimed.
-- **Whether `k_attn_flash` at decode geometry is numerically identical or merely close.** It changes ids
-  in prefill, so assume it changes them here and gate it as a numerical arm.
-- **The real hit rate at 253 slots on this card.** 96.6 % was measured at 214 slots on this box, and
-  253/layer is what fits here; the figure for 253 with `--expert-slots-hot` has not been measured.
-- **Whether a grouped decode GEMV can reach VRAM bandwidth** (640 GB/s class) or is latency-bound at
-  one row. The prefill grouped kernel's shape is not the decode shape.
-
-## Reproduce
-
-```sh
-# the trace behind every number in the first table
-HIP_VISIBLE_DEVICES=0 rocprofv3 --kernel-trace --output-format csv -d /tmp/dec -o dec -- \
-  ./build-mmq/strata-kolibri --model /fast/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf \
-  --tokens-file tools/kolibri/oracle_ids512.txt --n 17 --ctx 8192 --cpu-threads 8
-
-# the host ceiling
-./build-mmq/pool_bench
-```
-
-Two cautions for anyone repeating this: `--dump-logits` writes only the top-two records, so bit-equality
-claims need `--dump-full-logits`; and a wall difference between two `--n` values is dominated by the
-45 GB model load unless the page cache is warm — use the trace's per-token timestamps instead.
+The corrected plan is [the decode plan](plans/2026-10-29-kolibri-decode-experts-vram.md). Its filename is
+retained for existing links; its first implementation target is now host-assisted scheduling, not VRAM
+placement. There is no supported 30–38 tok/s forecast. Measure the first scheduling arm before choosing
+the next optimization.

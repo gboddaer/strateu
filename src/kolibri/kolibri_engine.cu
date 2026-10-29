@@ -4724,6 +4724,12 @@ int serve(Engine& e, Scratch& s) {
                     (long long) e.slots * (long long) e.g.n_layers, e.slots, cache_bytes >> 20, cache_bytes >> 20,
                     have ? (long long) (fb >> 20) : -1LL, e.cpu_threads, e.prefill, e.slots);
     }
+    // Measurement only: an arm that is switched on must say so, so a benchmark can prove that the run it
+    // scored was the arm it asked for (tools/kolibri/decode_bench.py --require-marker).  Default off, so the
+    // output of the plain path is unchanged.
+    if (dec_xexp_on())
+        std::fprintf(stderr, "strata-kolibri: STRATA_KOLIBRI_DEC_XEXP active: the shared expert is enqueued "
+                             "before the pool drain\n");
     std::printf("READY %d stop\n", s.ctx);
     std::fflush(stdout);
     std::mutex mu;

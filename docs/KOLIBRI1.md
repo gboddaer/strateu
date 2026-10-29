@@ -159,12 +159,19 @@ All of it, with the commands and the per-arm tables, is in [AMD_R9700_PORT.md](A
 
 ## Decode
 
-Decode did not change with P4, and it is where the R9700 disappoints: one token costs 67.4 ms (14.7 tok/s)
-of which the GPU is busy 24.3 ms, **25.4 ms is one host round trip per layer**, and 17.7 ms is dispatch
-overhead across 1 344 launches. The 714.2 MB of expert bytes per token come from system RAM at the host's
-measured ceiling of 32.3 GB/s, and the per-layer dependency means that leg cannot be overlapped with the
-GPU's own work for a single token. [KOLIBRI_DECODE.md](KOLIBRI_DECODE.md) has the trace, the host ceiling
-sweep, the Flash-Next recipe, the two arms that cut bytes and were slower anyway, and the ranking.
+P4 left decode unchanged. Measured with `tools/kolibri/decode_bench.py` on card0 (`--serve --prefill
+--cpu-threads 8`, no expert slots, ctx 8192), 96 new tokens cost 62.1 ms/token (16.1 tok/s) and 85.4
+ms/token after an 8191-token prompt at ctx 12288 (11.7 tok/s); six identical runs spread 0.4 %. The
+existing `STRATA_KOLIBRI_DEC_XEXP` arm, which enqueues the shared expert before the CPU pool drain,
+measured 5.2 % faster at the short prompt and 4.2 % faster at 8K; it is still off by default.
+
+The earlier kernel trace (about 1 344 dispatches and 67.9 ms between forward markers) is a profiled
+diagnostic, not an unprofiled speed baseline, and the original wall-based slot comparisons and
+30–38 tok/s projections are withdrawn. [KOLIBRI_DECODE.md](KOLIBRI_DECODE.md) has the measurements and
+the reassessment; it follows the actual Flash-Next engine's `session_loop` and `session_run_token`,
+where CPU misses participate in a captured graph through mapped publication and acknowledgements.
+The next proposed step is to validate that scheduling protocol while retaining Kolibri's CPU
+arithmetic, then measure it before choosing a separate residency change.
 
 ## Validation
 
