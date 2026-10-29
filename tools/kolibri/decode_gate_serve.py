@@ -55,14 +55,19 @@ def drive(engine, model, ids, timeout_s):
                 break
             if line.startswith("ERR"):
                 raise BenchError(line)
-        for label, tokens in (("cold", ids), ("extend", ids + ids[:64])):
+        cold_generated = []
+        for label in ('cold', 'extend'):
+            held = ids + cold_generated
+            tokens = ids if label == 'cold' else held + ids[:64]
             proc.stdin.write("GEN 4 " + ",".join(tokens) + "\n")
             proc.stdin.flush()
             produced = 0
             while True:
                 line = next_line()
                 if line.startswith("T "):
-                    int(line.split()[1])
+                    token = str(int(line.split()[1]))
+                    if label == 'cold':
+                        cold_generated.append(token)
                     produced += 1
                 elif line.startswith("DONE "):
                     done = parse_done(line)
@@ -72,7 +77,7 @@ def drive(engine, model, ids, timeout_s):
                         raise BenchError(f"{label}: unexpected prompt length: {line}")
                     if label == 'cold' and done['reused'] != 0:
                         raise BenchError("cold request unexpectedly reused a prefix")
-                    if label == 'extend' and not 0 < done['reused'] <= len(ids):
+                    if label == 'extend' and not 0 < done['reused'] <= len(held):
                         raise BenchError("extended request did not exercise valid prefix reuse")
                     print(f"{label}: {line}", flush=True)
                     break

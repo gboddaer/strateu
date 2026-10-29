@@ -125,8 +125,10 @@ done
 # so the two requests' records are directly comparable between arms.
 reuse_case() {   # reuse_case <arm-env-or-empty> <out.bin> <err> <log>
     rm -f "$2"
-    ( env ${1:+$1} STRATA_KOLIBRI_LOGITS_DUMP="$2" timeout -k 5 "$TMO" "$PY" tools/kolibri/decode_gate_serve.py \
-        "$BIN" "$M" "$IDS" >"$4" 2>"$3" )
+    # The driver owns its engine process group and enforces this deadline internally. An outer timeout
+    # could terminate Python before its finally block reaps that separate group.
+    ( env ${1:+$1} STRATA_KOLIBRI_LOGITS_DUMP="$2" KOLIBRI_DEC_GATE_TIMEOUT="$TMO" \
+        "$PY" tools/kolibri/decode_gate_serve.py "$BIN" "$M" "$IDS" >"$4" 2>"$3" )
 }
 if [ -f tools/kolibri/decode_gate_serve.py ]; then
     rm -f "$OUT/reuse-base.bin" "$OUT/reuse-arm.bin"

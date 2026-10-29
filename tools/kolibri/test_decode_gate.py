@@ -44,7 +44,7 @@ def test_serve_dump_requires_declared_vocab(tmp_path):
         cd.compare_serve(a, b, vocab=2, records=1)
 
 
-def fake_engine(tmp_path, *, reuse=512, exit_code=0, hang=False):
+def fake_engine(tmp_path, *, reuse=512, exit_code=0, hang=False, require_live=False):
     p = tmp_path / 'engine'
     pid_file = tmp_path / 'engine.pid'
     p.write_text(f'''#!{sys.executable}
@@ -55,6 +55,9 @@ for i in range(2):
     line = sys.stdin.readline()
     if {hang!r}: time.sleep(60)
     toks = line.split()[-1].split(',')
+    if i == 1 and {require_live!r} and toks[:516] != [str(j) for j in range(512)] + ['10'] * 4:
+        print('ERR next request omitted generated prefix', flush=True)
+        sys.exit(2)
     for j in range(4): print('T 10', flush=True)
     reuse = 0 if i == 0 else {reuse}
     print('DONE 4 %d 10.0 20.0 length 0 0 %d 0 0 0 0 0.0 %d 0' % (len(toks), reuse, len(toks)-reuse), flush=True)
@@ -91,4 +94,9 @@ def test_serve_driver_deadline_reaps_engine(tmp_path, monkeypatch):
 
 def test_serve_driver_accepts_two_complete_requests(tmp_path):
     engine, ids, _ = fake_engine(tmp_path)
+    assert dg.main(['gate', str(engine), 'unused', str(ids)]) == 0
+
+
+def test_serve_driver_extends_generated_history_not_only_prompt(tmp_path):
+    engine, ids, _ = fake_engine(tmp_path, require_live=True)
     assert dg.main(['gate', str(engine), 'unused', str(ids)]) == 0
