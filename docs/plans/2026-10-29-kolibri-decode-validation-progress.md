@@ -119,10 +119,10 @@ The complete repaired gate was rerun on the current mapped-result/shared-in-PRE 
 and six bit-identical repetitions. The marker required is `DEC_HANDOFF_GRAPH replay active`, emitted
 only after a PRE executable is actually launched, not merely because an environment switch was set.
 
-The wait primitive is committed separately from model integration. It is not yet used by a whole-token
-executable. No performance claim is made for the hardened segmented variant, and neither the earlier
-1.5% comparison nor the unexplained reference anomalies are a reason to promote or abandon the final
-architecture. All new runtime switches remain off by default; nothing was pushed.
+The wait primitive was committed separately from model integration and is now used by the whole-token
+executable described in the next section; the segmented stage alone carried no performance claim.
+Neither the earlier 1.5% comparison nor the reference anomalies are a reason to promote or abandon the
+final architecture. All runtime switches in this section remain off by default; nothing was pushed.
 
 ## Whole-stack integration and the incoming-state audit
 
