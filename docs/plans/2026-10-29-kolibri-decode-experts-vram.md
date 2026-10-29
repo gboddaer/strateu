@@ -24,6 +24,11 @@ The historical filename is retained so existing links continue to work; this no 
 
 ## Status (2026-10-29)
 
+The `- [ ]` boxes in the task sections below are the plan **as written**, kept verbatim so the
+reasoning and ordering stay readable; they are not a progress tracker. This status list and
+[the validation ledger](2026-10-29-kolibri-decode-validation-progress.md) are the authoritative
+record of what ran.
+
 - **Task 1 — done** (`ffc1e536`): `tools/kolibri/decode_bench.py` + 46 tests, the unprofiled baseline
   (six identical runs, 0.4 % spread) and the `DEC_XEXP` arm measured as a one-variable pair (−5.2 % short,
   −4.2 % long) with marker-proven activation.

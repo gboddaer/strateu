@@ -95,7 +95,11 @@ A separate matched 11000-id baseline/graph pair at ctx 12288 crossed from the si
 branch to online attention; nine complete full-logit records match bitwise. This checks the distinct
 cache-key/launch-geometry transition. It does not establish all-context repeatability.
 
-## Bounded wait prerequisite (not yet integrated into model replay)
+## Bounded wait prerequisite (now used by the whole-token graph)
+
+This primitive was written before model integration and is the mechanism the parent executable below
+waits on. Its own guarantees are unchanged; the model-level invalidation is described in the
+whole-stack section.
 
 `DecodeWaitControl` and `enqueue_decode_wait` are in `include/strata/kolibri/decode_wait.hpp` and
 `src/kolibri/decode_wait.cu`. A captured wait reads sequence and generation on EVERY replay. It rejects
