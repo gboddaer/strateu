@@ -201,6 +201,9 @@ kernels, same buffers, same order, same stream — only the transport and the en
 | 512 ids, ctx 8192 | 63.2 ms (15.9 tok/s) | 56.9 ms (17.7 tok/s) | **−10.1 %** |
 | 8191 ids, ctx 12288 | 86.0 ms (11.6 tok/s) | 81.5 ms (12.6 tok/s) | **−7.5 %** |
 
+Adding `STRATA_KOLIBRI_DEC_ATTN_DP=1` (the device-position attention kernel below) to the same arm changes
+nothing measurable: 17.65 against 17.70 tok/s, two alternating pairs each.
+
 Three alternating pairs per workload, all six favouring the arm, spread inside an arm ≤0.05 % (short) and
 ≤0.4 % (long). Both workloads clear the acceptance rule (< 5 % on the short one, and no regression anywhere).
 Raw records: `/tmp/kolibri-dec2/{handoff,handoff-long}/`.
@@ -232,8 +235,18 @@ while the greedy ids stay identical — the exact failure mode that makes "same 
 
 So a bitwise whole-stack graph needs a device-position variant of the *single-pass* kernel (same body and order,
 `pos` from device memory, shared memory sized per position bucket) before any capture work can be gated. That
-is a kernel change with its own gate, and it is now the prerequisite written down for the next stage, not
-something this arm smuggled in.
+kernel now exists: `k_attn_dp` (`STRATA_KOLIBRI_DEC_ATTN_DP=1`, off by default) runs the same body, block size and
+shared-memory layout with the position read from device memory, and the dynamic shared memory is the bucket's
+capacity rather than `n_vis` itself. It is **bitwise** against the eager kernel at a 512-id prompt and a 8192
+context (9 records × 128 000 values, `max |a-b| 0.0`), on the reused-prefix path, and over six repeats, all
+through `decode_gate.sh`; it costs nothing measurable (17.70 tok/s handoff alone, 17.65 with it, two alternating
+pairs each).
+
+What still stands between that kernel and a capture arm is not numerics but stream discipline: the eager
+decode runs its layers on the legacy stream (`st = 0`) and the router on `g_st`, and a legacy stream cannot be
+captured at all. The arm therefore needs the decode moved onto one explicitly ordered stream, router included,
+before any segment is captured — the plan's own "legacy/default-stream side effects are not a synchronization
+contract" bullet, and a change that deserves its own correctness gate rather than being folded into this one.
 
 ## The actual Flash-Next recipe
 
