@@ -163,12 +163,16 @@ P4 left decode unchanged. Measured with `tools/kolibri/decode_bench.py` on card0
 --cpu-threads 8`, no expert slots, ctx 8192), 96 new tokens cost 62.1 ms/token (16.1 tok/s) and 85.4
 ms/token after an 8191-token prompt at ctx 12288 (11.7 tok/s); six identical runs spread 0.4 %.
 
-`STRATA_KOLIBRI_DEC_HANDOFF=1` (opt-in, off by default) cuts that to 56.9 ms/token (17.7 tok/s, −10.1 %)
-and 81.5 ms (12.6 tok/s, −7.5 %): it replaces the decode's two blocking per-layer device-to-host copies
-with one publication kernel plus a bounded host spin, and enqueues the shared expert while the host
-waits. `tools/kolibri/decode_gate.sh` shows it bit-identical to the plain engine at 16/511/512/513 ids
-and on the reused-prefix path, six repeats included, and both prefill gate profiles pass unchanged. The
-earlier `STRATA_KOLIBRI_DEC_XEXP` arm on its own measured 5.2 % and 4.2 %.
+Two opt-in arms (both off by default) now cut that. `STRATA_KOLIBRI_DEC_HANDOFF=1` replaces the decode's
+two blocking per-layer device-to-host copies with one publication kernel plus a bounded host spin and
+enqueues the shared expert while the host waits: 56.9 ms/token (17.7 tok/s, −10.1 %) and 81.5 ms
+(−7.5 %). `STRATA_KOLIBRI_DEC_STREAM=1` then moves the decode off the legacy default stream onto one
+explicit non-blocking stream: together they reach **49.3 ms/token (20.33 tok/s, −21.5 %)** and
+**73.1 ms (−15.1 %)** after 8191 ids, three alternating pairs each, every pair favouring the arm.
+`tools/kolibri/decode_gate.sh` shows the combination bit-identical to the plain engine at 16/511/512/513
+ids and on the reused-prefix path, six repeats included, and the plain path's own logits are byte-identical
+to the build before any arm existed. Both prefill gate profiles still pass. The earlier
+`STRATA_KOLIBRI_DEC_XEXP` arm on its own measured 5.2 % and 4.2 %.
 
 The earlier kernel trace (about 1 344 dispatches and 67.9 ms between forward markers) is a profiled
 diagnostic, not an unprofiled speed baseline, and the original wall-based slot comparisons and

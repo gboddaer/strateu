@@ -77,7 +77,9 @@ EOF
     run "$TMO" "/dev/null" "$OUT/base$n.err" -- $COMMON --tokens-file "$OUT/ids$n.txt" --ctx 2048 \
         --dump-full-logits "$OUT/base$n.bin"
     b=$?
-    run "$TMO" "/dev/null" "$OUT/arm$n.err" "$ARM" -- $COMMON --tokens-file "$OUT/ids$n.txt" --ctx 2048 \
+    # $ARM is deliberately unquoted: it holds one or more NAME=VALUE assignments ("A=1 B=1"), and word splitting
+    # is what hands them to env as separate arguments.
+    run "$TMO" "/dev/null" "$OUT/arm$n.err" $ARM -- $COMMON --tokens-file "$OUT/ids$n.txt" --ctx 2048 \
         --dump-full-logits "$OUT/arm$n.bin"
     a=$?
     if [ $b -ne 0 ] || [ $a -ne 0 ]; then

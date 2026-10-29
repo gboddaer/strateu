@@ -248,6 +248,48 @@ captured at all. The arm therefore needs the decode moved onto one explicitly or
 before any segment is captured — the plan's own "legacy/default-stream side effects are not a synchronization
 contract" bullet, and a change that deserves its own correctness gate rather than being folded into this one.
 
+### `STRATA_KOLIBRI_DEC_STREAM`: one explicit stream — and the two races it exposed
+
+`STRATA_KOLIBRI_DEC_STREAM=1` runs the decode on one explicitly created **non-blocking** stream instead of the
+legacy default stream, taking the router launch, the pool's result copy and the host reads with it. It was
+built as the prerequisite for capture (a legacy stream cannot be captured at all), and it turned out to be
+the largest single step so far:
+
+| Arm (512 ids, ctx 8192) | ms/token | tok/s | vs plain |
+|---|---:|---:|---:|
+| plain | 63.0 | 15.95 | — |
+| `DEC_HANDOFF` | 56.9 | 17.7 | −10.1 % |
+| `DEC_HANDOFF` + `DEC_STREAM` | **49.3** | **20.33** | **−21.5 %** |
+
+Long workload (8191 ids, ctx 12288): 86.1 → **73.1 ms/token** (11.6 → 13.7 tok/s), **−15.1 %**, three alternating
+pairs, every pair favouring the arm, spread inside an arm ≤ 0.4 %.
+
+Correctness: `decode_gate.sh` with both arms — bitwise at 16/511/512/513 ids, bitwise on the reused-prefix
+path, six repeats identical, both markers required in the arm and absent from the control. And the plain path
+is **bitwise unchanged**: the 9-record dump from this build is byte-identical to the one taken before any decode
+arm existed.
+
+Getting there needed two real fixes, both of which are the legacy stream's hidden contract:
+
+1. **`gemv()`'s quantised path hard-wired `g_st`.** Every dense gemv of a quantised weight (q/k/v, o_proj, the
+   router, all three shared-expert matrices) enqueued its q8_1 quantise and its mmvq on `g_st`, ignoring the
+   stream argument. That worked only because `g_st` is a *blocking* stream, so the legacy stream was implicitly
+   ordered against it both ways. On a non-blocking stream the layer's kernels and its gemvs ran unordered — every
+   logit moved. The fix keeps `g_st` for `st == 0` (the default path, unchanged) and uses the caller's stream
+   otherwise.
+2. **Two host reads used `cudaMemcpy`,** which targets the legacy stream. With the layer work on an explicit
+   stream they read whatever the legacy stream had, not what the layer just produced. They now use
+   `cudaMemcpyAsync(..., st)` + a stream sync when the arm is on.
+
+Neither bug could have been caught by comparing generated ids: the greedy ids agreed in one of the intermediate
+states while the logits were wrong. They were caught by the bitwise full-logit gate, which is why that gate is
+the contract for every arm here.
+
+**Usage note for the prefill gates:** run each profile in a fresh shell. `pf_gate.sh` *exports* the profile's
+`STRATA_*` settings, so running `KOLIBRI_GATE_PROFILE=mmq-gfx1201` and then `KOLIBRI_GATE_PROFILE=pool` in one
+shell leaves the second run on the first profile's MMQ path; that produced a spurious stage-4 failure here,
+which went away when the profile was run on its own.
+
 ## The actual Flash-Next recipe
 
 Start with these source paths and entry points, not Qwen3.6's driver:

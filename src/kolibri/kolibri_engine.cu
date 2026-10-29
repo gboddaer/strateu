@@ -1796,14 +1796,19 @@ void gemv(const Dense& w, const float* x, float* y, const int* ids, int n_sel, s
     const int n_in = (int) w.shape[0], n_out = (int) w.shape[1];
     const uint8_t* W = base ? base : w.d;
     const bool quant = w.type == T_Q8_0 || w.type == T_Q4_K || w.type == T_Q5_K || w.type == T_Q6_K;
+    // `st == 0` keeps the historical g_st submission, which is what the legacy-stream decode relies on: g_st is a
+    // blocking stream, so the legacy stream is implicitly ordered against it in both directions.  A caller that
+    // passes its OWN non-blocking stream (STRATA_KOLIBRI_DEC_STREAM) gets the quantise and the mmvq on that stream
+    // instead - otherwise every dense gemv would run on g_st and race the caller's other kernels.
+    const cudaStream_t qst = st != 0 ? st : g_st;
     if (quant) {
         const int cols = x_stride ? n_sel : 1;
-        strata::kernels::native_quantize_q8_1(x, g_q8, n_in, cols, g_st);
+        strata::kernels::native_quantize_q8_1(x, g_q8, n_in, cols, qst);
         const size_t qb = strata::kernels::native_q8_1_bytes(n_in, 1);
         for (int sel = 0; sel < n_sel; ++sel) {
             const uint8_t* we = W + (ids ? (size_t) g_ids_host[(size_t) sel] * eb : 0);
             strata::kernels::native_mmvq(w.type, we, (const char*) g_q8 + (x_stride ? (size_t) sel * qb : 0),
-                                         y + (size_t) sel * n_out, n_in, n_out, 1, g_st);
+                                         y + (size_t) sel * n_out, n_in, n_out, 1, qst);
         }
         KC(cudaGetLastError());
         return;
@@ -2168,6 +2173,30 @@ static inline bool dec_handoff_on() { return env_on("STRATA_KOLIBRI_DEC_HANDOFF"
 /// eager launch bakes `n_vis` into the dynamic shared-memory size, which a replayed graph cannot change.
 static inline bool dec_attn_dp_on() { return env_on("STRATA_KOLIBRI_DEC_ATTN_DP"); }
 
+/// STRATA_KOLIBRI_DEC_STREAM: run the decode on ONE explicitly created, non-blocking stream instead of the
+/// legacy default stream (the router's launch and the pool's result copy move with it).
+///
+/// Two reasons this is its own switch rather than a detail of an arm.  (1) A legacy stream cannot be captured at
+/// all, so capture needs this first and it must be provable on its own, with the eager kernels unchanged.  (2)
+/// Every launch on the legacy stream is implicitly ordered against every blocking stream in the process, which
+/// is a per-launch cost the token pays 1 344 times; an explicit stream pays it once, and that is measurable.
+/// The arithmetic is untouched: same kernels, same buffers, same order - only which queue they are submitted to.
+static inline bool dec_stream_on() { return env_on("STRATA_KOLIBRI_DEC_STREAM"); }
+
+/// The decode's own stream, created on first use.  Non-blocking, so it does not implicitly synchronise with the
+/// legacy stream; ordering against the prefill and the logits read is established by the end-of-token device
+/// synchronise and by the per-token position copy being on this same stream.
+cudaStream_t dec_stream() {
+    static cudaStream_t s = nullptr;
+    if (s == nullptr) {
+        if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess) {
+            std::fprintf(stderr, "kolibri: DEC_STREAM: cannot create the decode stream\n");
+            std::exit(1);
+        }
+    }
+    return s;
+}
+
 /// Process-lifetime mapped publication buffers, like g_q8.  The ring word is never reset: it only counts up, so
 /// a request reset cannot confuse the expectation (a reset that clears the ring without clearing the
 /// expectation is how the synthetic test's first version hung on a stale target).
@@ -2363,12 +2392,16 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
         k_rms<<<1, kThreads, 0, st>>>(s.x, e.f32.at(L(l, "ffn_norm.weight")), s.h, N, e.eps);
         gemv_dec(e.dense.at(L(l, "ffn_gate_inp.weight")), s.h, s.dec_h16, s.router, st);
         strata::kernels::native_router_sigmoid_logit_add(s.router, e.f32.at(L(l, "exp_probs_b.bias")), s.ids, s.wts, 1,
-                                                         g_st);
+                                                         dec_stream_on() ? st : g_st);
         const bool dph = dec_phases_on();
         std::chrono::steady_clock::time_point dpt{};
         if (dph) { KC(cudaStreamSynchronize(st)); dpt = std::chrono::steady_clock::now(); }
         if (!graph && !dec_handoff_on()) {   // the handoff arm reads the picks out of the published payload
             g_ids_host.resize((size_t) K);
+            if (dec_stream_on()) {   // the picks are on the decode stream; a plain cudaMemcpy would read the legacy one
+                KC(cudaMemcpyAsync(g_ids_host.data(), s.ids, K * sizeof(int), cudaMemcpyDeviceToHost, st));
+                KC(cudaStreamSynchronize(st));
+            } else
             KC(cudaMemcpy(g_ids_host.data(), s.ids, K * sizeof(int), cudaMemcpyDeviceToHost));
         }
         bool shexp_done = false;
@@ -2436,7 +2469,11 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                 if (e.counters) ++e.cnt.br_pool;
                 g_ids_host.assign(g_ids_host.size(), 0);   // restored below from the device ids
                 KC(cudaMemcpy(g_ids_host.data(), s.ids, K * sizeof(int), cudaMemcpyDeviceToHost));
-                KC(cudaMemcpy(s.h_host, s.h, N * 4, cudaMemcpyDeviceToHost));
+                if (dec_stream_on()) {   // same reason as the picks: an explicit stream needs an explicit wait
+                KC(cudaMemcpyAsync(s.h_host, s.h, N * 4, cudaMemcpyDeviceToHost, st));
+                KC(cudaStreamSynchronize(st));
+            } else
+            KC(cudaMemcpy(s.h_host, s.h, N * 4, cudaMemcpyDeviceToHost));
                 if (e.counters) { e.cnt.d2h_n += 2; e.cnt.d2h_bytes += K * sizeof(int) + (long long) N * 4; }
                 strata::kernels::cpu::native_quant_act(b.fmt, s.h_host, s.act);
                 std::memset(s.ey_h, 0, (size_t) K * N * 4);
@@ -2488,6 +2525,10 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                 if (e.counters) { ++e.cnt.d2h_n; e.cnt.d2h_bytes += (long long) N * 4 + (long long) K * 4; }
                 strata::kernels::cpu::native_quant_act(b.fmt, s.h_host, s.act);
             } else {
+            if (dec_stream_on()) {   // same reason as the picks: an explicit stream needs an explicit wait
+                KC(cudaMemcpyAsync(s.h_host, s.h, N * 4, cudaMemcpyDeviceToHost, st));
+                KC(cudaStreamSynchronize(st));
+            } else
             KC(cudaMemcpy(s.h_host, s.h, N * 4, cudaMemcpyDeviceToHost));
             if (e.counters) { ++e.cnt.d2h_n; e.cnt.d2h_bytes += (long long) N * 4; }   // was uncounted: the pool-only leg read as "no pool" from CNT
             strata::kernels::cpu::native_quant_act(b.fmt, s.h_host, s.act);
@@ -2516,7 +2557,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                        e.cnt.dec_pool_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(n - dpt).count();
                        dpt = n; }
             // K15/K18: async on the compute stream (pinned source); see the slots path above for why.
-            KC(cudaMemcpyAsync(s.ey, s.ey_h, (size_t) K * N * 4, cudaMemcpyHostToDevice, g_st));
+            KC(cudaMemcpyAsync(s.ey, s.ey_h, (size_t) K * N * 4, cudaMemcpyHostToDevice, dec_stream_on() ? st : g_st));
             if (e.counters) { ++e.cnt.h2d_n; e.cnt.h2d_bytes += (long long) K * N * 4; }   // was uncounted
             // K29: the resident rows are written AFTER the copy above (same stream), so they win over whatever the
             // pool left in s.ey_h for those rows.  No new kernel: gemm.f16 takes f16 weights and T = 1.
@@ -3737,20 +3778,27 @@ void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
             else layer_step(e, s, l, false, 0, nullptr);
         k_pos_add<<<1, 1, 0, g_st>>>(s.pos_d);
     } else {
+        // The embedding gather writes s.x, which the first layer reads: with the arm on it must be on the same
+        // stream as the layers, or a non-blocking decode stream would race the legacy-stream gather.
+        const cudaStream_t emb_st = dec_stream_on() ? dec_stream() : (cudaStream_t) 0;
         switch (emb.type) {
-        case T_Q8_0: k_row<T_Q8_0><<<4, 128>>>(emb.d, emb.row_bytes, tok, N, s.x); break;
-        case T_Q4_K: k_row<T_Q4_K><<<4, 128>>>(emb.d, emb.row_bytes, tok, N, s.x); break;
-        case T_Q6_K: k_row<T_Q6_K><<<4, 128>>>(emb.d, emb.row_bytes, tok, N, s.x); break;
-        case T_F16: k_row<T_F16><<<4, 128>>>(emb.d, emb.row_bytes, tok, N, s.x); break;
+        case T_Q8_0: k_row<T_Q8_0><<<4, 128, 0, emb_st>>>(emb.d, emb.row_bytes, tok, N, s.x); break;
+        case T_Q4_K: k_row<T_Q4_K><<<4, 128, 0, emb_st>>>(emb.d, emb.row_bytes, tok, N, s.x); break;
+        case T_Q6_K: k_row<T_Q6_K><<<4, 128, 0, emb_st>>>(emb.d, emb.row_bytes, tok, N, s.x); break;
+        case T_F16: k_row<T_F16><<<4, 128, 0, emb_st>>>(emb.d, emb.row_bytes, tok, N, s.x); break;
         default: std::fprintf(stderr, "strata-kolibri: token_embd type %d\n", emb.type); std::exit(1);
         }
         // The device-position attention reads s.pos from s.pos_d, so the host's position must be there before the
         // first layer runs.  One 4-byte copy per token, on the same stream the layers use.
-        if (dec_attn_dp_on()) KC(cudaMemcpy(s.pos_d, &s.pos, 4, cudaMemcpyHostToDevice));
-        for (int64_t l = 0; l < g.n_layers; ++l) layer_step(e, s, l, false, 0, layers_host);
+        if (dec_attn_dp_on()) {
+            if (dec_stream_on()) KC(cudaMemcpyAsync(s.pos_d, &s.pos, 4, cudaMemcpyHostToDevice, dec_stream()));
+            else KC(cudaMemcpy(s.pos_d, &s.pos, 4, cudaMemcpyHostToDevice));
+        }
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            layer_step(e, s, l, false, dec_stream_on() ? dec_stream() : 0, layers_host);
     }
-    k_rms<<<1, kThreads>>>(s.x, e.f32.at("output_norm.weight"), s.h, N, e.eps);
-    gemv_dec(e.dense.at("output.weight"), s.h, s.dec_h16, s.logits, 0);
+    k_rms<<<1, kThreads, 0, dec_stream_on() ? dec_stream() : 0>>>(s.x, e.f32.at("output_norm.weight"), s.h, N, e.eps);
+    gemv_dec(e.dense.at("output.weight"), s.h, s.dec_h16, s.logits, dec_stream_on() ? dec_stream() : 0);
     KC(cudaDeviceSynchronize());
     ++s.pos;
     if (hit_trace) {   // pos is 0-based after the increment: the first decoded token prints pos=1
@@ -5733,6 +5781,9 @@ int strata::kolibri::run(int argc, char** argv) {
     if (dec_attn_dp_on())
         std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_DEC_ATTN_DP active: decode attention is the single-pass "
                              "body with the position from device memory, shared memory sized per bucket\n");
+    if (dec_stream_on())
+        std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_DEC_STREAM active: the decode runs on one explicit "
+                             "non-blocking stream (router and pool result copy included)\n");
     if (serve_mode) {
         Scratch s;
         s.ctx = ctx;
