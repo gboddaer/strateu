@@ -242,6 +242,30 @@ for `--graphs` was withdrawn after checking the actual parser: no such option ex
 are selected internally only for a non-pool path. The mistaken guard and its test are both removed;
 the restored engine builds. Do not describe that discarded test as an engine defect.
 
+## Self-review (no subagent tool; delegation was not authorized)
+
+A separate pass over the final diff, after the last task line. What it confirms and what it defers:
+
+- `run_token_graph` resolves every layer's geometry key before launching, so a token is either fully in the
+  parent executable or fully on segments; no partial mix. Embedding and the logits head stay outside, and
+  `decode_aborted` suppresses logits for a discarded token.
+- Abort sets `control->abort`, then one token-boundary `cudaStreamSynchronize`; the wait kernel is the only
+  long-running GPU node and its budget is finite device ticks. On abort `hb.expect` adopts the observed
+  publication count so a discarded token does not also report a second, misleading mismatch.
+- Sequence reset moved to the token boundary in `forward()` and quiesces with `cudaDeviceSynchronize` only at
+  the rare identity boundary; that is not a per-layer timing change.
+- `prefix_fingerprint.inc` is env-gated, diagnostic-only, reads valid KV rows at an already-quiescent boundary,
+  and adds no decode synchronization or kernels.
+- Graph caches (`DecGraphArm`, `HandoffBuffers`) are process-lifetime and keyed by layer geometry; replacing a
+  loaded model inside one process is not supported and is documented rather than handled.
+- Deferred minor: the `DecGraphArm` parent executables are never explicitly destroyed before exit; the count is
+  bounded by distinct attention geometries, so this is cleanup rather than a growth path.
+- Deferred minor: `docs/KOLIBRI_DECODE.md`'s verification table keeps its historical 55-test row, marked as such,
+  next to the current 88-test row.
+
+A self-review by the author is weaker than a fresh reviewer. The goal's remaining verification gap is that no
+independent reviewer has run.
+
 ## Remaining work
 
 Reproduce/classify the six current CTest failures against baseline, separate capture creation from

@@ -494,7 +494,7 @@ Everything below was run on this box; nothing is inferred from a previous sessio
 
 | Check | Result |
 |---|---|
-| `tools/kolibri/test_decode_bench.py` + `test_check_decode.py` | 55 tests, all pass (no GPU) |
+| `tools/kolibri/test_decode_bench.py` + `test_check_decode.py` (historical row) | 55 tests passed at that time; the current decode/tool set is the 88 below |
 | Fresh full HIP build with STRATA_BUILD_TESTS=ON | PASS; optional CUDA-only test links fixed |
 | Fresh `ctest`, card0 | **188 tests: 171 passed, 11 skipped, 6 failed** |
 | Six failures, also rebuilt/reproduced at committed baseline 057d42a6 | `kolibri_load_test` (missing hard-coded model path), `vmm_test`, `ple_parity` (missing Qwen fixture), `platform_memory_test`, `conversation_copy_streams_test`, `isa_guard_check` |
