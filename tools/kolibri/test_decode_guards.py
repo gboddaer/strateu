@@ -25,3 +25,17 @@ def test_unsupported_arm_fails_before_model_read(arm, args, reason):
     assert result.returncode == 2
     assert arm in result.stderr and reason in result.stderr
     assert 'cannot open' not in result.stderr
+
+
+@pytest.mark.skipif(not BIN.exists(), reason='build strata-kolibri first')
+@pytest.mark.parametrize('budget', ['-1', '1000000001', '18446744073709551615', 'oops', '1junk', ''])
+def test_token_wait_budget_rejects_unbounded_or_malformed_values_before_model_read(budget):
+    env = {k: v for k, v in os.environ.items() if not k.startswith('STRATA_KOLIBRI_DEC_')}
+    env['HIP_VISIBLE_DEVICES'] = '0'
+    for flag in ('HANDOFF', 'STREAM', 'HANDOFF_GRAPH', 'TOKEN_GRAPH'):
+        env['STRATA_KOLIBRI_DEC_' + flag] = '1'
+    env['STRATA_KOLIBRI_DEC_WAIT_TICKS'] = budget
+    result = subprocess.run([str(BIN), '--model', '/no-such-kolibri-test-model.gguf', '--cpu-threads', '8'],
+                            env=env, text=True, capture_output=True, timeout=10)
+    assert result.returncode == 2
+    assert 'WAIT_TICKS' in result.stderr and 'cannot open' not in result.stderr

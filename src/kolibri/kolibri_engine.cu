@@ -16,6 +16,7 @@
 // table - the GPU is the expert cache, the model is bigger than any PC's VRAM (Q4_K_M: 42.6 GiB of experts,
 // 3.5 GiB of dense).  --load-only runs just the load and reports.
 #include "strata/kolibri/engine.hpp"
+#include "strata/kolibri/decode_wait.hpp"
 #include "pf_combine.hpp"   // G1: the prefill MoE combiner (src/kolibri/pf_combine.cu)
 
 #include "strata/artifact/gguf_reader.hpp"
@@ -34,6 +35,8 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include <atomic>
+#include <charconv>
+#include <new>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -2220,10 +2223,37 @@ static inline bool dec_stream_on() { return env_on("STRATA_KOLIBRI_DEC_STREAM");
 /// Requires STRATA_KOLIBRI_DEC_STREAM (a legacy stream cannot be captured) and STRATA_KOLIBRI_DEC_HANDOFF (the
 /// publication is what the captured pre segment ends with).
 static inline bool dec_graph_on() { return env_on("STRATA_KOLIBRI_DEC_HANDOFF_GRAPH"); }
+static inline bool dec_token_graph_on() { return env_on("STRATA_KOLIBRI_DEC_TOKEN_GRAPH"); }
+static uint64_t dec_wait_ticks() {
+    static const uint64_t ticks = []() -> uint64_t {
+        const char* text = std::getenv("STRATA_KOLIBRI_DEC_WAIT_TICKS");
+        if (!text) return 1000000000ULL;
+        uint64_t value = 0;
+        const char* end = text + std::strlen(text);
+        const auto result = std::from_chars(text, end, value);
+        if (result.ec != std::errc{} || result.ptr != end || value > 1000000000ULL) {
+            std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_DEC_WAIT_TICKS must be an integer in [0,1000000000]\n");
+            std::exit(2);
+        }
+        return value;
+    }();
+    return ticks;
+}
+static thread_local std::atomic<bool>* decode_cancel = nullptr;
+static thread_local bool decode_aborted = false;
+
+struct DecodeCancelScope {
+    std::atomic<bool>* previous;
+    explicit DecodeCancelScope(std::atomic<bool>* flag) : previous(decode_cancel) { decode_cancel = flag; }
+    ~DecodeCancelScope() { decode_cancel = previous; }
+};
 
 struct DecGraphArm {
     std::vector<std::map<int, cudaGraphExec_t>> pre;   // [layer][geometry key] -> captured pre segment
     std::vector<cudaGraphExec_t> post;                // [layer] -> captured post segment
+    std::vector<std::map<int, cudaGraph_t>> pre_graph;
+    std::vector<cudaGraph_t> post_graph;
+    std::map<std::vector<int>, cudaGraphExec_t> tokens;
     long long captures = 0;
 };
 
@@ -2232,6 +2262,8 @@ static DecGraphArm& dec_graph_arm(int64_t n_layers) {
     if (a.pre.empty()) {
         a.pre.resize((size_t) n_layers);
         a.post.assign((size_t) n_layers, nullptr);
+        a.pre_graph.resize((size_t) n_layers);
+        a.post_graph.assign((size_t) n_layers, nullptr);
     }
     return a;
 }
@@ -2239,7 +2271,8 @@ static DecGraphArm& dec_graph_arm(int64_t n_layers) {
 /// Capture `body` on `stream` and instantiate it.  Any failure is fatal and named: a half-captured graph that was
 /// silently ignored would make the arm look active while it ran the eager path.
 template <class F>
-static cudaGraphExec_t dec_capture_graph(F body, cudaStream_t stream, const char* what, int64_t layer) {
+static cudaGraphExec_t dec_capture_graph(F body, cudaStream_t stream, const char* what, int64_t layer,
+                                         cudaGraph_t* retained = nullptr) {
     cudaGraph_t gr = nullptr;
     cudaGraphExec_t ex = nullptr;
     if (cudaStreamSynchronize(stream) != cudaSuccess) {   // capture starts from a quiescent point
@@ -2261,7 +2294,8 @@ static cudaGraphExec_t dec_capture_graph(F body, cudaStream_t stream, const char
         std::fprintf(stderr, "kolibri: DEC_GRAPH: %s: instantiate failed at layer %lld\n", what, (long long) layer);
         std::exit(1);
     }
-    cudaGraphDestroy(gr);
+    if (retained) *retained = gr;
+    else cudaGraphDestroy(gr);
     return ex;
 }
 
@@ -2288,6 +2322,10 @@ struct HandoffBuffers {
     float* w = nullptr;
     float* y = nullptr;        // mapped CPU result, device alias for the compute-queue copy
     float* h_y = nullptr;
+    float* host_x = nullptr;
+    int32_t* host_ids = nullptr;
+    strata::kolibri::DecodeWaitControl* control = nullptr;
+    strata::kolibri::DecodeWaitControl* host_control = nullptr;
     uint32_t* seq = nullptr;
     uint32_t* h_seq = nullptr;  // the host's own view of the same word
     uint32_t expect = 0;
@@ -2320,7 +2358,12 @@ static HandoffBuffers* handoff_buffers(int64_t n, int64_t k) {
         std::fprintf(stderr, "kolibri: DEC_HANDOFF: mapped host memory has no device alias on this stack\n");
         std::exit(1);
     }
+    ::new ((void*) seq) strata::kolibri::DecodeWaitControl{};
     b.h_seq = seq;
+    b.host_x = hx;
+    b.host_ids = ids;
+    b.control = reinterpret_cast<strata::kolibri::DecodeWaitControl*>(b.seq);
+    b.host_control = reinterpret_cast<strata::kolibri::DecodeWaitControl*>(seq);
     return &b;
 }
 
@@ -2644,7 +2687,8 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                         // Capture must not count as a publication: pre_body(true) ends with the publish, and during
                         // capture those launches are recorded, not executed.  The ring is incremented by the REPLAY.
                         const bool saved = pre_published;
-                        slot = dec_capture_graph([&] { pre_body(true); }, st, "pre", l);
+                        slot = dec_capture_graph([&] { pre_body(true); }, st, "pre", l,
+                                                 &dga.pre_graph[(size_t) l][geometry_key]);
                         pre_published = saved;
                         ++dga.captures;
                     }
@@ -2670,9 +2714,9 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                     std::fflush(stderr);
                     std::exit(1);
                 }
-                std::memcpy(s.h_host, hb.hx, (size_t) N * 4);
+                std::memcpy(s.h_host, hb.host_x, (size_t) N * 4);
                 g_ids_host.resize((size_t) K);
-                for (int k = 0; k < K; ++k) g_ids_host[(size_t) k] = hb.ids[(size_t) k];
+                for (int k = 0; k < K; ++k) g_ids_host[(size_t) k] = hb.host_ids[(size_t) k];
                 if (e.counters) { ++e.cnt.d2h_n; e.cnt.d2h_bytes += (long long) N * 4 + (long long) K * 4; }
                 strata::kernels::cpu::native_quant_act(b.fmt, s.h_host, s.act);
             } else {
@@ -2721,7 +2765,8 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                 // stream order is the whole contract, and a CPU failure simply never launches it.
                 DecGraphArm& dga = dec_graph_arm((int64_t) e.blobs.size());
                 if (dga.post[(size_t) l] == nullptr)
-                    dga.post[(size_t) l] = dec_capture_graph([&] { post_body(); }, st, "post", l);
+                    dga.post[(size_t) l] = dec_capture_graph([&] { post_body(); }, st, "post", l,
+                                                           &dga.post_graph[(size_t) l]);
                 KC(cudaGraphLaunch(dga.post[(size_t) l], st));
                 post_done = true;
             }
@@ -3916,7 +3961,11 @@ static const int grp_max = [] {
     KC(cudaDeviceSynchronize());
 }
 
+#include "token_graph.inc"
+#include "prefix_fingerprint.inc"
+
 void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
+    decode_aborted = false;
     if (e.counters) ++e.cnt.tok;   // every processed token (prompt + decode): the per-token normaliser
     // **0.1 DECODE INSTRUMENT** (dynamic-expert-cache plan, step 0.1).  ONE stderr line per decoded token with that
     // token's own routed-pick split, so the hit-rate-vs-token curve costs one printf and no new counter: the two
@@ -3928,6 +3977,18 @@ void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
     const int N = (int) g.n_embd, K = (int) e.top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
     const int H = (int) g.n_head, HKV = (int) g.n_head_kv, D = (int) g.head_dim;
     const int B = 256;
+    // Reserve a whole token's nonzero publication identities BEFORE cold segmented execution too.
+    // Checking only inside run_token_graph misses rollover during mirror/bucket warmup.
+    if (dec_handoff_on()) {
+        HandoffBuffers& hb = *handoff_buffers(N, K);
+        if (hb.expect > UINT32_MAX - (uint32_t) g.n_layers) {
+            KC(cudaDeviceSynchronize());  // rare token-boundary quiescence before descriptor reuse
+            hb.expect = 0;
+            std::atomic_ref<uint32_t>(hb.host_control->ready).store(0, std::memory_order_release);
+            std::atomic_ref<uint32_t>(hb.host_control->acknowledged).store(0, std::memory_order_release);
+            std::atomic_ref<uint32_t>(hb.host_control->acknowledged_generation).store(0, std::memory_order_release);
+        }
+    }
     const Dense& emb = e.dense.at("token_embd.weight");
     if (layers_host && s.layer_trace_d == nullptr) s.layer_trace_d = dalloc((size_t) g.n_layers * N);
         if (e.graphs > 0 && layers_host == nullptr) {
@@ -3960,8 +4021,12 @@ void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
             if (dec_stream_on()) KC(cudaMemcpyAsync(s.pos_d, &s.pos, 4, cudaMemcpyHostToDevice, dec_stream()));
             else KC(cudaMemcpy(s.pos_d, &s.pos, 4, cudaMemcpyHostToDevice));
         }
-        for (int64_t l = 0; l < g.n_layers; ++l)
-            layer_step(e, s, l, false, dec_stream_on() ? dec_stream() : 0, layers_host);
+        const bool token_ran = dec_token_graph_on() && layers_host == nullptr &&
+                               run_token_graph(e, s, dec_stream());
+        if (decode_aborted) return;
+        if (!token_ran)
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                layer_step(e, s, l, false, dec_stream_on() ? dec_stream() : 0, layers_host);
     }
     k_rms<<<1, kThreads, 0, dec_stream_on() ? dec_stream() : 0>>>(s.x, e.f32.at("output_norm.weight"), s.h, N, e.eps);
     gemv_dec(e.dense.at("output.weight"), s.h, s.dec_h16, s.logits, dec_stream_on() ? dec_stream() : 0);
@@ -5099,6 +5164,7 @@ int serve(Engine& e, Scratch& s) {
     std::deque<std::string> lines;
     bool eof = false;
     std::atomic<bool> stop{false};
+    DecodeCancelScope cancel_scope(&stop);
     std::thread reader([&] {
         std::string l;
         while (std::getline(std::cin, l)) {
@@ -5352,6 +5418,12 @@ int serve(Engine& e, Scratch& s) {
         int32_t tok = ids.back();   // the last prompt token: the first decode step runs it
         for (;;) {
             forward(e, s, tok, nullptr);
+            if (decode_aborted) {
+                reset_state(e, s);
+                live.clear();
+                finish = "cancel";
+                break;
+            }
             KC(cudaMemcpy(lg.data(), s.logits, lg.size() * 4, cudaMemcpyDeviceToHost));
             if (produced == 0 && reuse_gate_dump_path()) {
                 // Measurement-only. The first decode step's logits ARE the logits for the last prompt position,
@@ -5694,6 +5766,18 @@ int strata::kolibri::run(int argc, char** argv) {
         std::fprintf(stderr, "strata-kolibri: the Kolibri 1 engine path (plan T7); --model GGUF [--load-only] for now\n");
         return 2;
     }
+    if (dec_token_graph_on()) (void) dec_wait_ticks();   // validate bounds before GPU/model work
+    if (dec_token_graph_on() &&
+        (!dec_graph_on() || !dec_handoff_on() || !dec_stream_on() ||
+         !env_on_default_on("STRATA_KOLIBRI_DEC_GRAPH_PRE") ||
+         !env_on_default_on("STRATA_KOLIBRI_DEC_GRAPH_POST") ||
+         !env_on_default_on("STRATA_KOLIBRI_DEC_GRAPH_SHARED") || !dump_layers.empty())) {
+        std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_DEC_TOKEN_GRAPH requires HANDOFF, STREAM, HANDOFF_GRAPH, "
+                             "all PRE/POST/SHARED segments and no --dump-layers\n");
+        return 2;
+    }
+    if (dec_token_graph_on())
+        std::fprintf(stderr, "kolibri: DEC_TOKEN_GRAPH requested: cold mirrors and new buckets warm through segments\n");
     if (dec_handoff_on() || dec_stream_on()) {
         const char* arm = dec_handoff_on() ? "STRATA_KOLIBRI_DEC_HANDOFF" : "STRATA_KOLIBRI_DEC_STREAM";
         const char* why = nullptr;
@@ -6112,6 +6196,7 @@ int strata::kolibri::run(int argc, char** argv) {
     slots_reselect(e, " [after prompt]", e.hot_swaps_final);   // the prompt is read: the one large round (above)
     hot_forget_prompt(e);
     if (e.graphs > 0) KC(cudaMemcpy(s.pos_d, &s.pos, 4, cudaMemcpyHostToDevice));
+    prefix_fingerprint(e, s);
     // the last prompt token and every step after it: run, argmax, feed back (a --force sequence replaces the
     // greedy picks - kl.py's teacher-forced KL path, kolibriref's semantics)
     const int n_steps = (int) forced.empty() ? n_gen : (int) forced.size() + 1;

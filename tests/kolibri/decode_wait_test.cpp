@@ -4,6 +4,9 @@
 #include <chrono>
 #include <cstdio>
 #include <thread>
+#include <vector>
+#include <stdexcept>
+#include "strata/kernels/elementwise.hpp"
 
 using namespace strata::kolibri;
 #define CHECK(call) do { auto e = (call); if (e != cudaSuccess) { \
@@ -13,7 +16,10 @@ static void store(uint32_t& dst, uint32_t value) {
     std::atomic_ref<uint32_t>(dst).store(value, std::memory_order_release);
 }
 
+#include "decode_chain_test.inc"
+
 int main() {
+    if (const int result = chain_test()) return result;
     DecodeWaitControl *host = nullptr, *device = nullptr;
     CHECK(cudaHostAlloc(reinterpret_cast<void**>(&host), sizeof(*host), cudaHostAllocMapped));
     *host = DecodeWaitControl{};

@@ -1017,10 +1017,20 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # compiles pf_combine.cu on its own rather than linking strata_kolibri, because the test must not need any
   # engine internals (no GGUF, no pool) - only the kernel and its launcher.
   if(STRATA_BUILD_TESTS)
+    # Real-engine rollover injection lives in a test TU, not in a production runtime knob.
+    if(STRATA_ENABLE_HIP)
+      set_source_files_properties(tests/kolibri/decode_rollover.cu PROPERTIES LANGUAGE HIP)
+    endif()
+    add_executable(kolibri_decode_rollover tests/kolibri/decode_rollover.cu
+                   src/kolibri/pf_combine.cu src/kolibri/decode_wait.cu)
+    target_include_directories(kolibri_decode_rollover PRIVATE $<TARGET_PROPERTY:strata_kolibri,INCLUDE_DIRECTORIES>)
+    target_compile_definitions(kolibri_decode_rollover PRIVATE $<TARGET_PROPERTY:strata_kolibri,COMPILE_DEFINITIONS>)
+    target_compile_options(kolibri_decode_rollover PRIVATE $<TARGET_PROPERTY:strata_kolibri,COMPILE_OPTIONS>)
+    target_link_libraries(kolibri_decode_rollover PRIVATE $<TARGET_PROPERTY:strata_kolibri,LINK_LIBRARIES>)
     add_executable(kolibri_decode_wait_test tests/kolibri/decode_wait_test.cpp src/kolibri/decode_wait.cu)
     target_include_directories(kolibri_decode_wait_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                ${_strata_gpu_include_directories})
-    target_link_libraries(kolibri_decode_wait_test PRIVATE strata_warnings ${_strata_gpu_runtime_target})
+    target_link_libraries(kolibri_decode_wait_test PRIVATE strata_warnings strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME kolibri_decode_wait_test COMMAND kolibri_decode_wait_test)
     set_tests_properties(kolibri_decode_wait_test PROPERTIES TIMEOUT 20 ENVIRONMENT "HIP_VISIBLE_DEVICES=0")
     add_executable(pf_combine_test tests/kolibri/pf_combine_test.cpp src/kolibri/pf_combine.cu)
@@ -1036,7 +1046,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(q4k_grouped_vram_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
                                ${_strata_gpu_include_directories})
     target_link_libraries(q4k_grouped_vram_parity PRIVATE strata_kernels strata_prefill strata_mmq
-                          strata_mmq_w4a4 strata_kq strata_warnings ${_strata_gpu_runtime_target})
+                          $<$<TARGET_EXISTS:strata_mmq_w4a4>:strata_mmq_w4a4>
+                          $<$<TARGET_EXISTS:strata_kq>:strata_kq> strata_warnings ${_strata_gpu_runtime_target})
     add_test(NAME q4k_grouped_vram_parity COMMAND q4k_grouped_vram_parity)
   endif()
   # the reference forward pass (plan T6): plain kernels + Strata native MMVQ/router, no graphs, no cache; the
