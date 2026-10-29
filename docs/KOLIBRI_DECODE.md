@@ -188,6 +188,53 @@ carries a `__threadfence_system()` after the store on HIP). Two claims are now o
 results in different graphs, so the arm must measure its own loop rather than inherit either. What must not
 happen is a per-layer stream sync presented as a fix; that would serialise the very overlap being bought.
 
+### `STRATA_KOLIBRI_DEC_HANDOFF`: the publication handoff
+
+The eager decode blocks twice per layer on device-to-host copies: the router's picks, then the normalized FFN
+input. `STRATA_KOLIBRI_DEC_HANDOFF=1` replaces both with ONE `doorbell_publish` kernel on the layer stream and a
+bounded host spin on the ring, then hands the CPU the same bytes; the shared expert is enqueued between the
+publication and the spin, so the GPU's independent half runs while the host waits and then computes. Same
+kernels, same buffers, same order, same stream — only the transport and the enqueue point move.
+
+| Workload | Plain median | Handoff median | Change |
+|---|---:|---:|---:|
+| 512 ids, ctx 8192 | 63.2 ms (15.9 tok/s) | 56.9 ms (17.7 tok/s) | **−10.1 %** |
+| 8191 ids, ctx 12288 | 86.0 ms (11.6 tok/s) | 81.5 ms (12.6 tok/s) | **−7.5 %** |
+
+Three alternating pairs per workload, all six favouring the arm, spread inside an arm ≤0.05 % (short) and
+≤0.4 % (long). Both workloads clear the acceptance rule (< 5 % on the short one, and no regression anywhere).
+Raw records: `/tmp/kolibri-dec2/{handoff,handoff-long}/`.
+
+Correctness, `tools/kolibri/decode_gate.sh` (one command, `DECODE GATE PASS`):
+
+- **bitwise full logits** against the plain engine on aligned forced histories at 16, 511, 512 and 513 ids
+  (the 256-token chunk rule either side of its boundary), 9 records × 128 000 values each, `max |a-b| 0.0`;
+- the **reused-prefix** path in serve mode (a cold 512-id request, then one extending it by 64) bitwise, headers
+  included;
+- **six repeats** of the arm bit-identical, with the arm's activation marker required in every run and
+  forbidden in every baseline run;
+- unsupported combinations are refused by name at startup (no pool, non-zero `--expert-slots`, `--grouped`, an
+  fp16 expert cache, or a layer whose experts cannot run in the pool), and a publication that misses its
+  deadline prints the layer and the ring and exits instead of computing on a stale payload.
+
+Both prefill gate profiles were re-run with the arm at its default (off) and passed unchanged: `pool` and
+`mmq-gfx1201`, including `PF_HASH`, the plain oracle and the reuse stage.
+
+### Why capture is not part of this arm
+
+The capturable attention kernel (`k_attn_p`) calls the shared body with `two_pass = true`, because the
+single-pass path's launch bakes `n_vis` into the dynamic shared-memory size and cannot be replayed across
+positions (comment at `src/kolibri/kolibri_engine.cu:1717`). For this model at these contexts the eager decode
+always takes the single-pass path (`g_two_pass_max` is 11 000), so a captured graph would silently change the
+arithmetic. That is not a deduction to leave implicit: `--attn-2pass-max 0` forces the two-pass branch, and the
+full logits then differ at **record 0, index 0** (`718d8cc0` against `929486c0`, `tools/kolibri/check_decode.py`),
+while the greedy ids stay identical — the exact failure mode that makes "same tokens" a worthless check.
+
+So a bitwise whole-stack graph needs a device-position variant of the *single-pass* kernel (same body and order,
+`pos` from device memory, shared memory sized per position bucket) before any capture work can be gated. That
+is a kernel change with its own gate, and it is now the prerequisite written down for the next stage, not
+something this arm smuggled in.
+
 ## The actual Flash-Next recipe
 
 Start with these source paths and entry points, not Qwen3.6's driver:

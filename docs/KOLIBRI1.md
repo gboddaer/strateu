@@ -161,17 +161,20 @@ All of it, with the commands and the per-arm tables, is in [AMD_R9700_PORT.md](A
 
 P4 left decode unchanged. Measured with `tools/kolibri/decode_bench.py` on card0 (`--serve --prefill
 --cpu-threads 8`, no expert slots, ctx 8192), 96 new tokens cost 62.1 ms/token (16.1 tok/s) and 85.4
-ms/token after an 8191-token prompt at ctx 12288 (11.7 tok/s); six identical runs spread 0.4 %. The
-existing `STRATA_KOLIBRI_DEC_XEXP` arm, which enqueues the shared expert before the CPU pool drain,
-measured 5.2 % faster at the short prompt and 4.2 % faster at 8K; it is still off by default.
+ms/token after an 8191-token prompt at ctx 12288 (11.7 tok/s); six identical runs spread 0.4 %.
+
+`STRATA_KOLIBRI_DEC_HANDOFF=1` (opt-in, off by default) cuts that to 56.9 ms/token (17.7 tok/s, −10.1 %)
+and 81.5 ms (12.6 tok/s, −7.5 %): it replaces the decode's two blocking per-layer device-to-host copies
+with one publication kernel plus a bounded host spin, and enqueues the shared expert while the host
+waits. `tools/kolibri/decode_gate.sh` shows it bit-identical to the plain engine at 16/511/512/513 ids
+and on the reused-prefix path, six repeats included, and both prefill gate profiles pass unchanged. The
+earlier `STRATA_KOLIBRI_DEC_XEXP` arm on its own measured 5.2 % and 4.2 %.
 
 The earlier kernel trace (about 1 344 dispatches and 67.9 ms between forward markers) is a profiled
 diagnostic, not an unprofiled speed baseline, and the original wall-based slot comparisons and
-30–38 tok/s projections are withdrawn. [KOLIBRI_DECODE.md](KOLIBRI_DECODE.md) has the measurements and
-the reassessment; it follows the actual Flash-Next engine's `session_loop` and `session_run_token`,
-where CPU misses participate in a captured graph through mapped publication and acknowledgements.
-The next proposed step is to validate that scheduling protocol while retaining Kolibri's CPU
-arithmetic, then measure it before choosing a separate residency change.
+30–38 tok/s projections are withdrawn. [KOLIBRI_DECODE.md](KOLIBRI_DECODE.md) has the measurements, the
+reassessment, and why a captured graph is not yet part of the arm: the capturable attention path forces
+the two-pass arithmetic, and the full logits then differ at record 0 while the greedy ids still agree.
 
 ## Validation
 

@@ -25,6 +25,7 @@
 #include "strata/kernels/kolibri_window.hpp"
 #include "strata/kernels/kolibri_hot_policy.hpp"   // hot_due / hot_round: the residency round's arithmetic (host-only)
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/elementwise.hpp"   // doorbell_publish: the decode handoff's publication node
 #if defined(STRATA_KOLIBRI_MMQ)
 #include "strata/prefill/moe_mmq.hpp"   // P4: the prompt path's per-group Q4_K product (parity-gated, ledger §P4)
 #endif
@@ -2117,6 +2118,91 @@ static inline bool dec_res_on() { return env_on("STRATA_KOLIBRI_DEC_RES"); }
 // expert WRITES the f16 activation buffer the routed path reads; at decode it only reads dec_h16.)
 static inline bool dec_xexp_on() { return env_on("STRATA_KOLIBRI_DEC_XEXP"); }
 
+// ------------------------------------------------------------------------------------------------------------------
+// STRATA_KOLIBRI_DEC_HANDOFF: the decode's publication handoff (docs/KOLIBRI_DECODE.md, plan Task 3).
+//
+// The eager decode blocks twice per layer on device-to-host copies: the router's picks and the normalized
+// FFN input.  Each blocking copy is a driver round trip in the middle of the layer, and the host cannot start
+// the pool until the second one returns.  This arm publishes the same bytes with ONE kernel on the layer
+// stream (`doorbell_publish`: payload + ring) and waits for the ring on the host with a bounded spin.
+//
+// Why it is bitwise by construction: the same kernels read and write the same buffers in the same order on the
+// same stream.  Only the TRANSPORT of two buffers to the host changes (a kernel's stores instead of a copy
+// engine's), and the host then reads those bytes.  The shared expert is enqueued between the publication and
+// the spin, which is the STRATA_KOLIBRI_DEC_XEXP change (already measured bitwise) moved one step earlier, so
+// the GPU's independent half runs while the host is still waiting for the payload and then computing.
+//
+// What it is NOT: a captured graph.  See docs/KOLIBRI_DECODE.md - the capturable attention variant forces the
+// two-pass arithmetic and therefore changes the numbers (measured), so capture is a separate design, not a
+// scheduling change this arm may smuggle in.
+// ------------------------------------------------------------------------------------------------------------------
+static inline bool dec_handoff_on() { return env_on("STRATA_KOLIBRI_DEC_HANDOFF"); }
+
+/// Process-lifetime mapped publication buffers, like g_q8.  The ring word is never reset: it only counts up, so
+/// a request reset cannot confuse the expectation (a reset that clears the ring without clearing the
+/// expectation is how the synthetic test's first version hung on a stale target).
+struct HandoffBuffers {
+    float* hx = nullptr;        // device aliases of mapped host memory
+    int32_t* ids = nullptr;
+    float* w = nullptr;
+    uint32_t* seq = nullptr;
+    uint32_t* h_seq = nullptr;  // the host's own view of the same word
+    uint32_t expect = 0;
+};
+
+static HandoffBuffers* handoff_buffers(int64_t n, int64_t k) {
+    static HandoffBuffers b;
+    if (b.hx != nullptr) return &b;
+    float* hx = nullptr;
+    int32_t* ids = nullptr;
+    float* w = nullptr;
+    uint32_t* seq = nullptr;
+    auto mapped = [](void** h, size_t bytes) {
+        if (cudaHostAlloc(h, bytes, cudaHostAllocMapped) != cudaSuccess) {
+            std::fprintf(stderr, "kolibri: DEC_HANDOFF: cannot allocate %zu bytes of mapped host memory\n", bytes);
+            std::exit(1);
+        }
+        std::memset(*h, 0, bytes);
+    };
+    mapped((void**) &hx, (size_t) n * 4);
+    mapped((void**) &ids, (size_t) k * 4);
+    mapped((void**) &w, (size_t) k * 4);
+    mapped((void**) &seq, 64);   // the sequence word plus room for the documented tag/checksum slots
+    if (cudaHostGetDevicePointer((void**) &b.hx, hx, 0) != cudaSuccess ||
+        cudaHostGetDevicePointer((void**) &b.ids, ids, 0) != cudaSuccess ||
+        cudaHostGetDevicePointer((void**) &b.w, w, 0) != cudaSuccess ||
+        cudaHostGetDevicePointer((void**) &b.seq, seq, 0) != cudaSuccess) {
+        std::fprintf(stderr, "kolibri: DEC_HANDOFF: mapped host memory has no device alias on this stack\n");
+        std::exit(1);
+    }
+    b.h_seq = seq;
+    return &b;
+}
+
+/// The handoff's deadline, in milliseconds (STRATA_KOLIBRI_DEC_HANDOFF_TIMEOUT_MS, default 5000).  A deadline that
+/// a stalled publication cannot exceed is the difference between a diagnosable failure and a hung request.
+static inline int dec_handoff_timeout_ms() {
+    static const int v = [] {
+        const char* s = std::getenv("STRATA_KOLIBRI_DEC_HANDOFF_TIMEOUT_MS");
+        const int n = s != nullptr ? std::atoi(s) : 5000;
+        return n > 0 ? n : 5000;
+    }();
+    return v;
+}
+
+/// The handoff's bounded host wait: spin on the mapped sequence word, without calling the driver, under a hard
+/// deadline.  `false` means the deadline passed, and the caller must not use the payload.
+static bool handoff_wait(const uint32_t* h_seq, uint32_t want, int timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    const volatile uint32_t* seq = h_seq;
+    while (*seq < want) {
+        if (std::chrono::steady_clock::now() > deadline) return false;
+        std::this_thread::yield();
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);   // the payload is read after the ring (elementwise.cu)
+    return true;
+}
+
 /// K29: seed the decode's fp16 cache with each layer's HOT experts.  Without this the slots hold only the last prefill
 /// chunk's RES_TOP promotions, which measured 27% of decode picks; the prompt's own routing says which 24 per layer
 /// matter (the coverage probe measures 45.0% for a top-24 set).  ~1200 promotions, ~2.2 GB over PCIe, once per request.
@@ -2246,7 +2332,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
         const bool dph = dec_phases_on();
         std::chrono::steady_clock::time_point dpt{};
         if (dph) { KC(cudaStreamSynchronize(st)); dpt = std::chrono::steady_clock::now(); }
-        if (!graph) {
+        if (!graph && !dec_handoff_on()) {   // the handoff arm reads the picks out of the published payload
             g_ids_host.resize((size_t) K);
             KC(cudaMemcpy(g_ids_host.data(), s.ids, K * sizeof(int), cudaMemcpyDeviceToHost));
         }
@@ -2346,10 +2432,32 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
             if (dph) { KC(cudaStreamSynchronize(st)); const auto n = std::chrono::steady_clock::now();
                        e.cnt.dec_d2h_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(n - dpt).count();
                        dpt = n; }
+            if (dec_handoff_on()) {
+                // ONE publication node for the activation, the picks and the weights, then a bounded host spin.
+                // Nothing about the arithmetic changes: the CPU is handed the same bytes the blocking copies
+                // would have handed it, and the same kernels consume them afterwards.
+                HandoffBuffers& hb = *handoff_buffers(N, K);
+                strata::kernels::doorbell_publish(s.h, s.ids, s.wts, N, K, hb.hx, hb.ids, hb.w, hb.seq, st);
+                run_shexp();   // the GPU's independent half runs while the host waits and then computes
+                const uint32_t want = ++hb.expect;
+                if (!handoff_wait(hb.h_seq, want, dec_handoff_timeout_ms())) {
+                    std::fprintf(stderr, "kolibri: DEC_HANDOFF: layer %lld: no publication within %d ms (ring %u); "
+                                         "refusing to compute on a stale payload\n",
+                                 (long long) l, dec_handoff_timeout_ms(), want);
+                    std::fflush(stderr);
+                    std::exit(1);
+                }
+                std::memcpy(s.h_host, hb.hx, (size_t) N * 4);
+                g_ids_host.resize((size_t) K);
+                for (int k = 0; k < K; ++k) g_ids_host[(size_t) k] = hb.ids[(size_t) k];
+                if (e.counters) { ++e.cnt.d2h_n; e.cnt.d2h_bytes += (long long) N * 4 + (long long) K * 4; }
+                strata::kernels::cpu::native_quant_act(b.fmt, s.h_host, s.act);
+            } else {
             KC(cudaMemcpy(s.h_host, s.h, N * 4, cudaMemcpyDeviceToHost));
             if (e.counters) { ++e.cnt.d2h_n; e.cnt.d2h_bytes += (long long) N * 4; }   // was uncounted: the pool-only leg read as "no pool" from CNT
             strata::kernels::cpu::native_quant_act(b.fmt, s.h_host, s.act);
             if (dec_xexp_on()) run_shexp();   // K30: the GPU works during the drain below
+            }
             std::vector<int> sels((size_t) K);
             for (int k = 0; k < K; ++k) sels[(size_t) k] = k;
             // K29: resident picks run on the GPU from the fp16 cache; only the misses go to the pool.
@@ -5560,6 +5668,30 @@ int strata::kolibri::run(int argc, char** argv) {
         return 0;
     }
     if (load_only) return 0;
+    // The handoff arm is a scheduling change, so it is only allowed where the arithmetic is the plain pool's:
+    // the pool feeds the routed experts, nothing else serves a pick, and no slot or fp16 cache moves bytes.  Any
+    // other combination is refused here, by name, instead of silently degrading into a different arm.
+    if (dec_handoff_on()) {
+        const char* why = nullptr;
+        if (cpu_threads <= 0) why = "--cpu-threads is required (the CPU pool computes the routed experts)";
+        else if (slots != 0) why = "--expert-slots must be 0 (resident slots move where experts are computed)";
+        else if (grouped != 0) why = "--grouped must be off (it serves picks on the GPU)";
+        else if (expert_f16_n() > 0 || dec_res_on()) why = "the fp16 expert cache must be off (it serves picks on the GPU)";
+        else {
+            for (size_t li = 0; li < e.blobs.size(); ++li)
+                if (!e.blobs[li].pool_ok) { why = "a layer's experts cannot run in the CPU pool"; break; }
+        }
+        if (why != nullptr) {
+            std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_DEC_HANDOFF is set but not supported: %s.\n"
+                                 "The arm is a scheduling change over the plain CPU-pool decode; see "
+                                 "docs/KOLIBRI_DECODE.md.\n", why);
+            std::fflush(stderr);
+            return 2;
+        }
+        std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_DEC_HANDOFF active: the layer publishes its FFN input, picks "
+                             "and weights in one kernel and the host waits on the ring (bounded at %d ms)\n",
+                     dec_handoff_timeout_ms());
+    }
     if (serve_mode) {
         Scratch s;
         s.ctx = ctx;

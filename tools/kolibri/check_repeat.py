@@ -10,6 +10,7 @@ import argparse
 import array
 import math
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -20,6 +21,9 @@ def main():
     p.add_argument('--runs', type=int, default=6)
     p.add_argument('--out', type=Path, required=True)
     p.add_argument('--require-mmq', action='store_true', help='fail if the engine falls back instead of activating MMQ')
+    p.add_argument('--require-marker', default=None,
+                   help='regex that must appear in every run\'s stdout+stderr, so an arm that is switched on but '
+                        'inert cannot pass as six identical runs')
     p.add_argument('command', nargs=argparse.REMAINDER)
     a = p.parse_args()
     cmd = a.command[1:] if a.command[:1] == ['--'] else a.command
@@ -42,6 +46,11 @@ def main():
         if a.require_mmq and 'MMQ active (direct shared-expert tuning verified)' not in stem.with_suffix('.err').read_text():
             print(f'FAIL run {i}: MMQ did not activate', flush=True)
             return 1
+        if a.require_marker is not None:
+            both = stem.with_suffix('.err').read_text() + stem.with_suffix('.out').read_text()
+            if re.search(a.require_marker, both) is None:
+                print(f'FAIL run {i}: the marker {a.require_marker!r} never appeared; the arm was not active', flush=True)
+                return 1
         raw = logits.read_bytes()
         floats = array.array('f')
         floats.frombytes(raw)
