@@ -157,6 +157,15 @@ short of work per launch.
 
 All of it, with the commands and the per-arm tables, is in [AMD_R9700_PORT.md](AMD_R9700_PORT.md) §T1-T14.
 
+## Decode
+
+Decode did not change with P4, and it is where the R9700 disappoints: one token costs 67.4 ms (14.7 tok/s)
+of which the GPU is busy 24.3 ms, **25.4 ms is one host round trip per layer**, and 17.7 ms is dispatch
+overhead across 1 344 launches. The 714.2 MB of expert bytes per token come from system RAM at the host's
+measured ceiling of 32.3 GB/s, and the per-layer dependency means that leg cannot be overlapped with the
+GPU's own work for a single token. [KOLIBRI_DECODE.md](KOLIBRI_DECODE.md) has the trace, the host ceiling
+sweep, the Flash-Next recipe, the two arms that cut bytes and were slower anyway, and the ranking.
+
 ## Validation
 
 Checked against the patched llama.cpp (`~/llama.cpp`, upstream + the conversion's 4-commit kolibri1 series) by
