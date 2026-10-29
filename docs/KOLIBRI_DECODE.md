@@ -285,10 +285,11 @@ Neither bug could have been caught by comparing generated ids: the greedy ids ag
 states while the logits were wrong. They were caught by the bitwise full-logit gate, which is why that gate is
 the contract for every arm here.
 
-**Usage note for the prefill gates:** run each profile in a fresh shell. `pf_gate.sh` *exports* the profile's
-`STRATA_*` settings, so running `KOLIBRI_GATE_PROFILE=mmq-gfx1201` and then `KOLIBRI_GATE_PROFILE=pool` in one
-shell leaves the second run on the first profile's MMQ path; that produced a spurious stage-4 failure here,
-which went away when the profile was run on its own.
+**Prefill-gate limitation:** one pool-profile run failed the cancelled-request stage; a subsequent isolated
+reuse run and a fresh pool-profile run passed. The earlier claim that a child `bash pf_gate.sh` exported
+settings back into its parent shell was incorrect: child exports cannot do that. The cause of the transient
+failure was not established, so retain the failure alongside the successful reruns rather than calling it
+explained or spurious.
 
 ## The actual Flash-Next recipe
 
@@ -418,6 +419,26 @@ No drafter, MTP, speculation, or extra sequence is required for the scheduling w
 - Numerical changes and a default change require a separate decision after actual measurements.
   An optimization is rejected if correctness fails, regardless of speed.
 
+## Segmented-graph experiment: rejected
+
+The uncommitted segmented-graph arm passed the short full-logit/reuse/repeat gate, but its initial speed
+comparison against plain eager execution credited it with gains from handoff and stream changes. The direct
+comparison keeps `DEC_HANDOFF=1` and `DEC_STREAM=1` in **both** arms and toggles only graph capture:
+
+| Three alternating pairs, 512 prompt ids, ctx 8192, 96 new tokens | Median request decode time | Per token |
+|---|---:|---:|
+| Handoff + explicit stream | 4657.7 ms | 48.52 ms; 20.61 tok/s |
+| Same + segmented graphs | 4728.8 ms | 49.26 ms; 20.30 tok/s |
+
+All three pairs lost: graphs increased median request decode time **1.5%**. Steady T-to-T medians were
+48.7 versus 49.1 ms. These are unprofiled `DONE` timings, excluding model load and prefill; capture creation
+within decode is included. Raw logs, environment and JSON are in `/tmp/kolibri-dec2/graph-v-stream/`.
+
+**Ruling:** stop the graph stage under the goal's failed-performance-gate rule. Save the experimental patch
+and source in `/tmp/kolibri-dec2/rejected-segments/`, restore the committed engine source, and do not start
+whole-stack waits/capture. No graph code was committed and no default changed. This does not measure a
+whole-stack graph or prove it cannot improve; investigating that is a separate decision.
+
 ## Verification record (2026-10-29, card0, ROCm 7.2.2, gfx1201)
 
 Everything below was run on this box; nothing is inferred from a previous session.
@@ -441,10 +462,11 @@ and every run set `HIP_VISIBLE_DEVICES=0`.
 
 The T4/R9700 gap is not yet an apples-to-apples GPU comparison. The hosts, active expert work,
 harnesses, visible positions and profiling state differ. No T4 GPU or other local GPU was used in this
-review, and no new GPU tests or performance runs were made. Source findings above are static analysis;
-the GGUF type inventory came from reading only metadata.
+comparison. The reassessment began as static analysis; subsequent implementation runs and their limits are
+recorded above. The GGUF type inventory came from reading only metadata.
 
 The corrected plan is [the decode plan](plans/2026-10-29-kolibri-decode-experts-vram.md). Its filename is
 retained for existing links; its first implementation target is now host-assisted scheduling, not VRAM
-placement. There is no supported 30–38 tok/s forecast. Measure the first scheduling arm before choosing
-the next optimization.
+placement. There is no supported 30–38 tok/s forecast. Execution is paused after the segmented-graph
+performance rejection. The full goal is **not complete**: whole-stack abort/wait safety, long-context aligned
+logit coverage, comprehensive lifecycle/failure tests and independent final review remain unverified.

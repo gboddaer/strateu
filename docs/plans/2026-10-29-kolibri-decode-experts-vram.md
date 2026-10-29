@@ -2,7 +2,8 @@
 
 > **For agentic workers:** Use `superpowers:executing-plans` for native execution, or
 > `superpowers:subagent-driven-development` only if the operator explicitly chooses delegation.
-> This is a revised plan for review, not authorization to implement or change a default.
+> Implementation was authorized through goal `mvticbbf-mb0flp`. Defaults remain unchanged.
+> The segmented-graph experiment failed its direct performance comparison; execution is paused below.
 
 **Goal:** Improve exact single-stream decode on the R9700 without a drafter. First transfer
 Flash-Next's host-assisted scheduling while preserving Kolibri's CPU expert arithmetic. Measure the
@@ -28,16 +29,27 @@ The historical filename is retained so existing links continue to work; this no 
 - **Task 2 — done** (`41b2a91b`): `tests/hip/kolibri_decode_handoff.cpp` proves the per-layer
   publish/wait/answer protocol with a payload that changes on every replay, plus reset, 30/30 ring visibility
   with the graph still running, and a bounded no-ring failure. Negative control run (exit 12 in 5.1 s).
-- **Task 3 — done, as a publication handoff rather than captured segments** (`eb752473`):
+- **Task 3 — partial, not the contracted captured-segment deliverable** (`eb752473`):
   `STRATA_KOLIBRI_DEC_HANDOFF=1` measured −10.1 % (512 ids) and −7.5 % (8191 ids), bitwise against the plain
   engine through `tools/kolibri/decode_gate.sh` at 16/511/512/513 ids and on the reused-prefix path, six
   repeats, both prefill profiles unchanged. Capture was **not** part of it: see the next item.
-- **Task 4 — prerequisite delivered, capture not built** (`0ca15a37`): `k_attn_dp`
-  (`STRATA_KOLIBRI_DEC_ATTN_DP=1`) is the bitwise device-position *single-pass* kernel a capture needs, gated
-  bitwise on the same cases and costing nothing measurable. What remains before a capture arm can be gated:
-  move the eager decode off the legacy stream (`st = 0`) and the router off `g_st` onto one explicitly
-  ordered stream - a legacy stream cannot be captured at all - then capture the per-layer segments keyed by
-  `n_vis` bucket, and only after that consider the whole-stack graph with its acknowledgement/abort path.
+- **Capture prerequisites delivered**: device-position attention (`0ca15a37`) and the explicit-stream arm
+  (`072e99c9`). The handoff-plus-stream arm remains opt-in. Earlier goal task-completion labels do not
+  establish that the full original acceptance contract was met.
+- **Segmented graphs tested, rejected and removed from the working source**: three alternating direct pairs
+  at 512 prompt ids / ctx 8192 / 96 generated tokens gave 4657.7 ms/request for handoff-plus-stream versus
+  4728.8 ms/request with segmented graphs: **1.5% slower**, every pair losing. The earlier comparison against
+  plain eager execution was insufficient because it credited graphs with gains already supplied by the other
+  arms. Raw records: `/tmp/kolibri-dec2/graph-v-stream/`; rejected patch/source:
+  `/tmp/kolibri-dec2/rejected-segments/`. No graph code was committed.
+- **Task 4 — not implemented**: whole-stack capture and its abort-aware wait tests were not started. Under
+  the goal's failed-stage rule, stop here rather than force the next stage through. A different graph design
+  or longer amortization study needs an explicit follow-up decision; this result does not prove that every
+  possible whole-stack graph would be slower.
+- **Final verification incomplete**: recorded gates cover the cases listed in the ledger, not every promised
+  acceptance case. In particular, long-context aligned full-logit checks for the new arms, comprehensive
+  cancel/allocation-failure coverage, cross-backend compilation and an independent final review are not
+  established. Do not promote a default or mark the entire goal complete from these measurements.
 
 ## Global constraints
 
