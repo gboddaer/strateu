@@ -1004,7 +1004,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # Kolibri 1 (kolibri1): an engine path of its own (src/kolibri), the same family-switch pattern as qwen35
   # (plan docs/superpowers/plans/2026-10-16-kolibri1.md).  Q6_K experts (the Q4_K_M files' mixed Q4_K/Q6_K
   # down projections) need STRATA_Q6K_EXPERTS; setup builds with it on.
-  add_library(strata_kolibri STATIC src/kolibri/kolibri_engine.cu src/kolibri/pf_combine.cu)
+  if(STRATA_ENABLE_HIP)
+    set_source_files_properties(src/kolibri/decode_wait.cu PROPERTIES LANGUAGE HIP)
+  endif()
+  add_library(strata_kolibri STATIC src/kolibri/kolibri_engine.cu src/kolibri/pf_combine.cu src/kolibri/decode_wait.cu)
   target_include_directories(strata_kolibri PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata_kolibri PRIVATE strata_prefill strata_kernels strata_warnings ${_strata_gpu_runtime_target})
   add_executable(strata-kolibri src/kolibri/kolibri_main.cpp)
@@ -1014,6 +1017,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # compiles pf_combine.cu on its own rather than linking strata_kolibri, because the test must not need any
   # engine internals (no GGUF, no pool) - only the kernel and its launcher.
   if(STRATA_BUILD_TESTS)
+    add_executable(kolibri_decode_wait_test tests/kolibri/decode_wait_test.cpp src/kolibri/decode_wait.cu)
+    target_include_directories(kolibri_decode_wait_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                               ${_strata_gpu_include_directories})
+    target_link_libraries(kolibri_decode_wait_test PRIVATE strata_warnings ${_strata_gpu_runtime_target})
+    add_test(NAME kolibri_decode_wait_test COMMAND kolibri_decode_wait_test)
+    set_tests_properties(kolibri_decode_wait_test PROPERTIES TIMEOUT 20 ENVIRONMENT "HIP_VISIBLE_DEVICES=0")
     add_executable(pf_combine_test tests/kolibri/pf_combine_test.cpp src/kolibri/pf_combine.cu)
     target_include_directories(pf_combine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/kolibri
                                  ${_strata_gpu_include_directories})
