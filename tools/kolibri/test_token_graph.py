@@ -13,6 +13,10 @@ import check_decode
 ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.skipif(os.environ.get('KOLIBRI_GPU_TEST') != '1', reason='explicit real-model GPU test')
 
+# The decode arms are ON by default, so a control run must switch them off explicitly; an unset environment is the
+# candidate, not the baseline.
+PLAIN = {f'STRATA_KOLIBRI_DEC_{name}': '0' for name in ('HANDOFF', 'STREAM', 'HANDOFF_GRAPH', 'TOKEN_GRAPH')}
+
 
 @pytest.fixture(autouse=True)
 def deterministic_prefill(monkeypatch):
@@ -33,7 +37,7 @@ def test_whole_stack_actually_replays_and_matches_full_logits(tmp_path, rollover
            '--tokens-file', str(prompt), '--force', '286,3515,310,262,14292,1343,1444,46',
            '--ctx', '2048', '--prefill', '--cpu-threads', '8']
     for arm in ('base', 'token'):
-        flags = {} if arm == 'base' else {name: '1' for name in (
+        flags = dict(PLAIN) if arm == 'base' else {name: '1' for name in (
             'STRATA_KOLIBRI_DEC_HANDOFF', 'STRATA_KOLIBRI_DEC_STREAM',
             'STRATA_KOLIBRI_DEC_HANDOFF_GRAPH', 'STRATA_KOLIBRI_DEC_TOKEN_GRAPH')}
         run_cmd = list(cmd)
@@ -68,7 +72,7 @@ def test_whole_stack_failure_paths_never_emit_an_invalid_record(tmp_path, failur
     baseline = tmp_path / 'baseline.bin'
     if failure != 'mapped':
         result = subprocess.run([str(ROOT / 'build-mmq/strata-kolibri'), *common,
-                                 '--dump-full-logits', str(baseline)], cwd=ROOT, env=env,
+                                 '--dump-full-logits', str(baseline)], cwd=ROOT, env=env | PLAIN,
                                 capture_output=True, text=True, timeout=120)
         assert result.returncode == 0, result.stderr
     for flag in ('HANDOFF', 'STREAM', 'HANDOFF_GRAPH', 'TOKEN_GRAPH'):

@@ -25,8 +25,11 @@
 #
 # Environment:
 #   KOLIBRI_BIN / KOLIBRI_MODEL / KOLIBRI_PYTHON   the engine, the GGUF, the interpreter (with numpy not needed)
-#   KOLIBRI_DEC_ARM        default "STRATA_KOLIBRI_DEC_HANDOFF=1"
-#   KOLIBRI_DEC_MARKER     default "DEC_HANDOFF active"
+#   KOLIBRI_DEC_ARM        default "" = the engine's default decode path.  The arms are ON by default, so the
+#                          candidate needs no environment; pass assignments here to test another arm.
+#   KOLIBRI_DEC_CONTROL    default the four arms explicitly OFF, so the control is the plain path.  Without this
+#                          a default-on arm would be compared with itself and the marker check would fail.
+#   KOLIBRI_DEC_MARKER     default "DEC_TOKEN_GRAPH replay active"
 #   KOLIBRI_DEC_GATE_OUT   default /tmp/kolibri-decode-gate
 #   KOLIBRI_DEC_GATE_REPEATS default 6
 #   KOLIBRI_DEC_GATE_TIMEOUT default 900 (seconds per engine run)
@@ -35,8 +38,9 @@ set -u
 BIN=${KOLIBRI_BIN:-build-mmq/strata-kolibri}
 M=${KOLIBRI_MODEL:-/fast/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf}
 PY=${KOLIBRI_PYTHON:-python3}
-ARM=${KOLIBRI_DEC_ARM:-STRATA_KOLIBRI_DEC_HANDOFF=1}
-MARKER=${KOLIBRI_DEC_MARKER:-DEC_HANDOFF active}
+ARM=${KOLIBRI_DEC_ARM-}
+CONTROL=${KOLIBRI_DEC_CONTROL-STRATA_KOLIBRI_DEC_HANDOFF=0 STRATA_KOLIBRI_DEC_STREAM=0 STRATA_KOLIBRI_DEC_HANDOFF_GRAPH=0 STRATA_KOLIBRI_DEC_TOKEN_GRAPH=0}
+MARKER=${KOLIBRI_DEC_MARKER:-DEC_TOKEN_GRAPH replay active}
 OUT=${KOLIBRI_DEC_GATE_OUT:-/tmp/kolibri-decode-gate}
 REPEATS=${KOLIBRI_DEC_GATE_REPEATS:-6}
 TMO=${KOLIBRI_DEC_GATE_TIMEOUT:-900}
@@ -82,7 +86,7 @@ if len(ids) * (2 if n > 512 else 1) < n:
 open(sys.argv[2], 'w').write(','.join((ids + ids)[:n]))
 EOF
     rm -f "$OUT/base$n.bin" "$OUT/arm$n.bin"
-    run "$TMO" "/dev/null" "$OUT/base$n.err" -- "${COMMON[@]}" --tokens-file "$OUT/ids$n.txt" --ctx 2048 \
+    run "$TMO" "/dev/null" "$OUT/base$n.err" $CONTROL -- "${COMMON[@]}" --tokens-file "$OUT/ids$n.txt" --ctx 2048 \
         --dump-full-logits "$OUT/base$n.bin"
     b=$?
     # $ARM is deliberately unquoted: it holds one or more NAME=VALUE assignments ("A=1 B=1"), and word splitting
@@ -132,7 +136,7 @@ reuse_case() {   # reuse_case <arm-env-or-empty> <out.bin> <err> <log>
 }
 if [ -f tools/kolibri/decode_gate_serve.py ]; then
     rm -f "$OUT/reuse-base.bin" "$OUT/reuse-arm.bin"
-    reuse_case "" "$OUT/reuse-base.bin" "$OUT/reuse-base.err" "$OUT/reuse-base.log"
+    reuse_case "$CONTROL" "$OUT/reuse-base.bin" "$OUT/reuse-base.err" "$OUT/reuse-base.log"
     b=$?
     reuse_case "$ARM" "$OUT/reuse-arm.bin" "$OUT/reuse-arm.err" "$OUT/reuse-arm.log"
     a=$?

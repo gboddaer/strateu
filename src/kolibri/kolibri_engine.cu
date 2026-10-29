@@ -2197,7 +2197,7 @@ static inline bool dec_xexp_on() { return env_on("STRATA_KOLIBRI_DEC_XEXP"); }
 // two-pass arithmetic and therefore changes the numbers (measured), so capture is a separate design, not a
 // scheduling change this arm may smuggle in.
 // ------------------------------------------------------------------------------------------------------------------
-static inline bool dec_handoff_on() { return env_on("STRATA_KOLIBRI_DEC_HANDOFF"); }
+static inline bool dec_handoff_on();   // resolved by dec_arms_resolve() during startup
 
 /// STRATA_KOLIBRI_DEC_ATTN_DP: run the decode's attention from `k_attn_dp` (single-pass body, position from
 /// device memory, shared memory sized per position bucket) instead of `k_attn` (position by value).  Same
@@ -2213,7 +2213,7 @@ static inline bool dec_attn_dp_on() { return env_on("STRATA_KOLIBRI_DEC_ATTN_DP"
 /// Every launch on the legacy stream is implicitly ordered against every blocking stream in the process, which
 /// is a per-launch cost the token pays 1 344 times; an explicit stream pays it once, and that is measurable.
 /// The arithmetic is untouched: same kernels, same buffers, same order - only which queue they are submitted to.
-static inline bool dec_stream_on() { return env_on("STRATA_KOLIBRI_DEC_STREAM"); }
+static inline bool dec_stream_on();    // resolved by dec_arms_resolve() during startup
 
 /// STRATA_KOLIBRI_DEC_HANDOFF_GRAPH: per-layer graph segments.  The GPU's half of a layer before the CPU pool
 /// (attention through the router and the publication) and the half after it (the MoE sum and the residual) are
@@ -2222,8 +2222,71 @@ static inline bool dec_stream_on() { return env_on("STRATA_KOLIBRI_DEC_STREAM");
 /// capture, and no device acknowledgement is needed because the HOST enqueues the post segment after its own work.
 /// Requires STRATA_KOLIBRI_DEC_STREAM (a legacy stream cannot be captured) and STRATA_KOLIBRI_DEC_HANDOFF (the
 /// publication is what the captured pre segment ends with).
-static inline bool dec_graph_on() { return env_on("STRATA_KOLIBRI_DEC_HANDOFF_GRAPH"); }
-static inline bool dec_token_graph_on() { return env_on("STRATA_KOLIBRI_DEC_TOKEN_GRAPH"); }
+// ------------------------------------------------------------------------------------------------------------------
+// The four decode scheduling arms are ON BY DEFAULT where the engine supports them, and each keeps an explicit
+// off switch.  A request is three-valued: unset = automatic, "0" = off, anything else = on and STRICT.
+//
+// Automatic mode must never turn an unsupported configuration into a startup failure: the Terminal's tuner passes
+// `--expert-slots auto`, and a user who never asked for these arms should get the plain decode plus one line
+// naming why, not exit 2.  An explicit request is different: there a silent fallback would let someone believe a
+// measured path ran when it did not, so it is refused by name before any model I/O.
+struct DecArms {
+    bool handoff = false, stream = false, graph = false, token = false;
+};
+static DecArms g_dec_arms;
+static inline bool dec_handoff_on() { return g_dec_arms.handoff; }
+static inline bool dec_stream_on() { return g_dec_arms.stream; }
+static inline bool dec_graph_on() { return g_dec_arms.graph; }
+static inline bool dec_token_graph_on() { return g_dec_arms.token; }
+
+// 0 = off, 1 = unset (automatic), 2 = on and strict.
+static inline int dec_arm_request(const char* name) {
+    const char* v = std::getenv(name);
+    if (v == nullptr) return 1;
+    return (v[0] != 0 && std::atoi(v) != 0) ? 2 : 0;
+}
+
+/// Resolve the arms from their requests and an eligibility verdict.  `why` == nullptr means eligible; otherwise it
+/// names the unsupported configuration.  Returns false only when an EXPLICIT request must be refused, having
+/// printed each such arm and the reason; true means the arm state is settled for this run.
+static bool dec_arms_resolve(const char* why) {
+    static const char* const names[4] = {"STRATA_KOLIBRI_DEC_HANDOFF", "STRATA_KOLIBRI_DEC_STREAM",
+                                         "STRATA_KOLIBRI_DEC_HANDOFF_GRAPH", "STRATA_KOLIBRI_DEC_TOKEN_GRAPH"};
+    bool* const on[4] = {&g_dec_arms.handoff, &g_dec_arms.stream, &g_dec_arms.graph, &g_dec_arms.token};
+    bool rejected = false;
+    for (int i = 0; i < 4; ++i) {
+        const int request = dec_arm_request(names[i]);
+        if (why == nullptr) {
+            *on[i] = request != 0;
+        } else {
+            *on[i] = false;
+            if (request == 2) {
+                std::fprintf(stderr, "kolibri: %s is set but not supported: %s\n", names[i], why);
+                rejected = true;
+            }
+        }
+    }
+    if (rejected) return false;
+    if (why != nullptr) {
+        std::fprintf(stderr, "kolibri: decode acceleration off (%s); running the plain decode path\n", why);
+        return true;
+    }
+    // The whole-token graph joins the other three arms and all three segments; an automatic request that cannot
+    // be joined stays off, an explicit one is named.
+    const bool joined = g_dec_arms.handoff && g_dec_arms.stream && g_dec_arms.graph &&
+                        env_on_default_on("STRATA_KOLIBRI_DEC_GRAPH_PRE") &&
+                        env_on_default_on("STRATA_KOLIBRI_DEC_GRAPH_POST") &&
+                        env_on_default_on("STRATA_KOLIBRI_DEC_GRAPH_SHARED");
+    if (g_dec_arms.token && !joined) {
+        if (dec_arm_request("STRATA_KOLIBRI_DEC_TOKEN_GRAPH") == 2) {
+            std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_DEC_TOKEN_GRAPH requires HANDOFF, STREAM, HANDOFF_GRAPH, "
+                                 "all PRE/POST/SHARED segments and no --dump-layers\n");
+            return false;
+        }
+        g_dec_arms.token = false;
+    }
+    return true;
+}
 static uint64_t dec_wait_ticks() {
     static const uint64_t ticks = []() -> uint64_t {
         const char* text = std::getenv("STRATA_KOLIBRI_DEC_WAIT_TICKS");
@@ -2239,6 +2302,9 @@ static uint64_t dec_wait_ticks() {
     }();
     return ticks;
 }
+// A malformed budget is a typo, not an arm setting: refuse it whether or not the arm resolves on, so a bounded-wait
+// test cannot silently run with a different bound.
+static void dec_wait_budget_check() { (void) dec_wait_ticks(); }
 static thread_local std::atomic<bool>* decode_cancel = nullptr;
 static thread_local bool decode_aborted = false;
 
@@ -5766,30 +5832,16 @@ int strata::kolibri::run(int argc, char** argv) {
         std::fprintf(stderr, "strata-kolibri: the Kolibri 1 engine path (plan T7); --model GGUF [--load-only] for now\n");
         return 2;
     }
-    if (dec_token_graph_on()) (void) dec_wait_ticks();   // validate bounds before GPU/model work
-    if (dec_token_graph_on() &&
-        (!dec_graph_on() || !dec_handoff_on() || !dec_stream_on() ||
-         !env_on_default_on("STRATA_KOLIBRI_DEC_GRAPH_PRE") ||
-         !env_on_default_on("STRATA_KOLIBRI_DEC_GRAPH_POST") ||
-         !env_on_default_on("STRATA_KOLIBRI_DEC_GRAPH_SHARED") || !dump_layers.empty())) {
-        std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_DEC_TOKEN_GRAPH requires HANDOFF, STREAM, HANDOFF_GRAPH, "
-                             "all PRE/POST/SHARED segments and no --dump-layers\n");
-        return 2;
-    }
-    if (dec_token_graph_on())
-        std::fprintf(stderr, "kolibri: DEC_TOKEN_GRAPH requested: cold mirrors and new buckets warm through segments\n");
-    if (dec_handoff_on() || dec_stream_on()) {
-        const char* arm = dec_handoff_on() ? "STRATA_KOLIBRI_DEC_HANDOFF" : "STRATA_KOLIBRI_DEC_STREAM";
-        const char* why = nullptr;
-        if (cpu_threads <= 0) why = "--cpu-threads must select the CPU pool";
-        else if (grouped != 0) why = "--grouped is incompatible with this CPU-pool arm";
-        else if (slots != 0) why = "--expert-slots must be zero";
-        else if (expert_f16_n() > 0 || dec_res_on()) why = "the fp16 expert cache must be off";
-        if (why) {
-            std::fprintf(stderr, "kolibri: %s is set but not supported: %s\n", arm, why);
-            return 2;   // reject before model I/O or GPU allocation
-        }
-    }
+    dec_wait_budget_check();   // a malformed budget is a typo, whatever the arm state: refuse it before I/O
+    const char* dec_why = nullptr;
+    if (!dump_layers.empty()) dec_why = "--dump-layers is a diagnostic path that cannot be captured";
+    else if (cpu_threads <= 0) dec_why = "--cpu-threads must select the CPU pool";
+    else if (grouped != 0) dec_why = "--grouped serves picks on the GPU";
+    else if (slots != 0) dec_why = "--expert-slots must be zero";
+    else if (expert_f16_n() > 0 || dec_res_on()) dec_why = "the fp16 expert cache must be off";
+    if (!dec_arms_resolve(dec_why)) return 2;   // an explicit request that cannot be honoured
+    if (dec_token_graph_on() && dec_arm_request("STRATA_KOLIBRI_DEC_TOKEN_GRAPH") == 2)
+        std::fprintf(stderr, "kolibri: DEC_TOKEN_GRAPH: cold mirrors and new buckets warm through segments\n");
     Engine e;
     std::string err;
     KC(cudaStreamCreate(&g_st));
@@ -6018,32 +6070,24 @@ int strata::kolibri::run(int argc, char** argv) {
         return 0;
     }
     if (load_only) return 0;
-    // The handoff arm is a scheduling change, so it is only allowed where the arithmetic is the plain pool's:
-    // the pool feeds the routed experts, nothing else serves a pick, and no slot or fp16 cache moves bytes.  Any
-    // other combination is refused here, by name, instead of silently degrading into a different arm.
-    if (dec_handoff_on() || dec_stream_on()) {
-        const char* arm = dec_handoff_on() ? "STRATA_KOLIBRI_DEC_HANDOFF" : "STRATA_KOLIBRI_DEC_STREAM";
+    // The arms are a scheduling change, so they are only allowed where the arithmetic is the plain pool's: the pool
+    // feeds the routed experts, nothing else serves a pick, and no slot or fp16 cache moves bytes.  The flags were
+    // checked before loading; this is the one verdict that needs the loaded layer table.
+    if (dec_handoff_on()) {
         const char* why = nullptr;
-        if (cpu_threads <= 0) why = "--cpu-threads is required (the CPU pool computes the routed experts)";
-        else if (slots != 0) why = "--expert-slots must be 0 (resident slots move where experts are computed)";
-        else if (grouped != 0) why = "--grouped must be off (it serves picks on the GPU)";
-        else if (expert_f16_n() > 0 || dec_res_on()) why = "the fp16 expert cache must be off (it serves picks on the GPU)";
-        else {
-            for (size_t li = 0; li < e.blobs.size(); ++li)
-                if (!e.blobs[li].pool_ok) { why = "a layer's experts cannot run in the CPU pool"; break; }
-        }
-        if (why != nullptr) {
-            std::fprintf(stderr, "kolibri: %s is set but not supported: %s.\n"
-                                 "The arm is a scheduling change over the plain CPU-pool decode; see "
-                                 "docs/KOLIBRI_DECODE.md.\n", arm, why);
+        for (size_t li = 0; li < e.blobs.size(); ++li)
+            if (!e.blobs[li].pool_ok) { why = "a layer's experts cannot run in the CPU pool"; break; }
+        if (why != nullptr && !dec_arms_resolve(why)) {
+            std::fprintf(stderr, "kolibri: the arms are a scheduling change over the plain CPU-pool decode; see "
+                                 "docs/KOLIBRI_DECODE.md\n");
             std::fflush(stderr);
             return 2;
         }
-        if (dec_handoff_on())
+    }
+    if (dec_handoff_on())
         std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_DEC_HANDOFF active: the layer publishes its FFN input, picks "
                              "and weights in one kernel and the host waits on the ring (bounded at %d ms)\n",
                      dec_handoff_timeout_ms());
-    }
     if (dec_attn_dp_on())
         std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_DEC_ATTN_DP active: decode attention is the single-pass "
                              "body with the position from device memory, shared memory sized per bucket\n");
@@ -6051,18 +6095,24 @@ int strata::kolibri::run(int argc, char** argv) {
         std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_DEC_STREAM active: the decode runs on one explicit "
                              "non-blocking stream (router and pool result copy included)\n");
     if (dec_graph_on()) {
+        // Diagnostics that do host I/O or synchronise inside a layer cannot be captured.  An explicit request for
+        // capture is refused; an automatic one steps down to the eager layer path and says why.
         const char* why = nullptr;
-        if (!dec_handoff_on()) why = "STRATA_KOLIBRI_DEC_HANDOFF is required (the captured pre segment ends with the publication)";
-        else if (!dec_stream_on()) why = "STRATA_KOLIBRI_DEC_STREAM is required (a legacy stream cannot be captured)";
-        else if (reuse_gate_kv_path() != nullptr) why = "STRATA_KOLIBRI_KV_DUMP does host I/O inside the layer";
+        if (reuse_gate_kv_path() != nullptr) why = "STRATA_KOLIBRI_KV_DUMP does host I/O inside the layer";
         else if (dec_phases_on()) why = "STRATA_KOLIBRI_DEC_PHASES synchronises inside the layer";
-        if (why != nullptr) {
+        if (why != nullptr && dec_arm_request("STRATA_KOLIBRI_DEC_HANDOFF_GRAPH") == 2) {
             std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_DEC_HANDOFF_GRAPH is set but not supported: %s.\n", why);
             std::fflush(stderr);
             return 2;
         }
-        std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_DEC_HANDOFF_GRAPH active: per-layer pre/post graph segments, "
-                             "CPU pool unchanged\n");
+        if (why != nullptr) {
+            g_dec_arms.graph = false;
+            g_dec_arms.token = false;
+            std::fprintf(stderr, "kolibri: per-layer capture skipped (%s); the decode runs the eager layer path\n", why);
+        } else {
+            std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_DEC_HANDOFF_GRAPH active: per-layer pre/post graph segments, "
+                                 "CPU pool unchanged\n");
+        }
     }
     if (serve_mode) {
         Scratch s;

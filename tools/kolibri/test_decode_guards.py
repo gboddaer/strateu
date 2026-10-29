@@ -39,3 +39,45 @@ def test_token_wait_budget_rejects_unbounded_or_malformed_values_before_model_re
                             env=env, text=True, capture_output=True, timeout=10)
     assert result.returncode == 2
     assert 'WAIT_TICKS' in result.stderr and 'cannot open' not in result.stderr
+
+
+ARMS = ('STRATA_KOLIBRI_DEC_HANDOFF', 'STRATA_KOLIBRI_DEC_STREAM',
+        'STRATA_KOLIBRI_DEC_HANDOFF_GRAPH', 'STRATA_KOLIBRI_DEC_TOKEN_GRAPH')
+
+
+def _clean_env():
+    return {k: v for k, v in os.environ.items() if not k.startswith('STRATA_KOLIBRI_DEC_')}
+
+
+def test_unsupported_config_with_no_request_runs_the_plain_path_instead_of_failing():
+    # The Terminal's tuner passes --expert-slots auto.  A user who never asked for the decode arms must get the
+    # plain decode plus one line naming why, not exit 2 before the model is even opened.
+    env = _clean_env()
+    env['HIP_VISIBLE_DEVICES'] = '0'
+    result = subprocess.run([str(BIN), '--model', '/no-such-kolibri-test-model.gguf',
+                             '--cpu-threads', '8', '--expert-slots', '1'],
+                            env=env, text=True, capture_output=True, timeout=10)
+    assert result.returncode == 1, result.stderr
+    assert 'decode acceleration off' in result.stderr
+    assert '--expert-slots' in result.stderr
+    assert 'cannot open' in result.stderr   # it reached model I/O: the arms stepped aside, they did not abort
+
+
+def test_explicit_zero_restores_the_plain_path_silently():
+    env = _clean_env()
+    env.update({name: '0' for name in ARMS})
+    env['HIP_VISIBLE_DEVICES'] = '0'
+    result = subprocess.run([str(BIN), '--model', '/no-such-kolibri-test-model.gguf', '--cpu-threads', '8'],
+                            env=env, text=True, capture_output=True, timeout=10)
+    assert result.returncode == 1, result.stderr
+    assert 'decode acceleration off' not in result.stderr
+    assert ' active:' not in result.stderr
+
+
+def test_malformed_wait_budget_is_refused_even_without_a_request():
+    env = _clean_env()
+    env.update(HIP_VISIBLE_DEVICES='0', STRATA_KOLIBRI_DEC_WAIT_TICKS='12abc')
+    result = subprocess.run([str(BIN), '--model', '/no-such-kolibri-test-model.gguf', '--cpu-threads', '8'],
+                            env=env, text=True, capture_output=True, timeout=10)
+    assert result.returncode == 2
+    assert 'WAIT_TICKS' in result.stderr and 'cannot open' not in result.stderr
