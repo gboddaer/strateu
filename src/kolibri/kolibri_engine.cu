@@ -1719,6 +1719,30 @@ __global__ void k_attn_p(const float* q, const __half* kc, const __half* vc, flo
     k_attn_body(q, kc, vc, out, H, HKV, D, *pos_p, swa, ctx, scale, sliding, true);
 }
 
+/// STRATA_KOLIBRI_DEC_ATTN_DP: the SINGLE-PASS decode kernel with the position from device memory.
+///
+/// `k_attn_p` above cannot be used for a bitwise arm: it forces the two-pass body, and the two-pass rescaling
+/// order changes the numbers (measured - the full logits differ at record 0 while the greedy ids agree).  This
+/// variant keeps the eager body exactly: same branch, same block size, same shared-memory layout, same order of
+/// every product.  The only differences are where `pos` comes from (one load at kernel entry) and who sizes the
+/// dynamic shared memory: the caller passes the CAPACITY of its position bucket, and the body only reads up to
+/// n_vis entries, so every position inside the bucket computes exactly what the eager launch computes.
+__global__ void k_attn_dp(const float* q, const __half* kc, const __half* vc, float* out, int H, int HKV, int D,
+                         const int* pos_p, int64_t swa, int ctx, float scale, bool sliding, int two_pass_max,
+                         const __half* ktc, const __half* vtc) {
+    k_attn_body(q, kc, vc, out, H, HKV, D, *pos_p, swa, ctx, scale, sliding, false, 0, two_pass_max, ktc, vtc);
+}
+
+/// The dynamic shared-memory capacity for a device-position attention launch: the next power of two at or above
+/// `n_vis`, never above the two-pass threshold (past it the body would take the two-pass branch, whose launch
+/// geometry a captured graph cannot change).  Rounding UP is safe because the body reads only the first `n_vis`
+/// entries of that buffer.
+static inline int attn_dp_bucket(int n_vis, int two_pass_max) {
+    int b = 512;
+    while (b < n_vis && b < two_pass_max) b <<= 1;
+    return b < n_vis ? two_pass_max : b;
+}
+
 
 __half* halloc(size_t n) {
     __half* p = nullptr;
@@ -2138,6 +2162,12 @@ static inline bool dec_xexp_on() { return env_on("STRATA_KOLIBRI_DEC_XEXP"); }
 // ------------------------------------------------------------------------------------------------------------------
 static inline bool dec_handoff_on() { return env_on("STRATA_KOLIBRI_DEC_HANDOFF"); }
 
+/// STRATA_KOLIBRI_DEC_ATTN_DP: run the decode's attention from `k_attn_dp` (single-pass body, position from
+/// device memory, shared memory sized per position bucket) instead of `k_attn` (position by value).  Same
+/// arithmetic - see the kernel's comment - and it is the prerequisite for capturing a bitwise attention: the
+/// eager launch bakes `n_vis` into the dynamic shared-memory size, which a replayed graph cannot change.
+static inline bool dec_attn_dp_on() { return env_on("STRATA_KOLIBRI_DEC_ATTN_DP"); }
+
 /// Process-lifetime mapped publication buffers, like g_q8.  The ring word is never reset: it only counts up, so
 /// a request reset cannot confuse the expectation (a reset that clears the ring without clearing the
 /// expectation is how the synthetic test's first version hung on a stale target).
@@ -2304,6 +2334,11 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                 ktc = s.kt[(size_t) l];
                 vtc = s.vt[(size_t) l];
             }
+            if (dec_attn_dp_on() && n_vis <= g_two_pass_max)
+                k_attn_dp<<<H, kThreads, (size_t) attn_dp_bucket(n_vis, g_two_pass_max) * sizeof(float), st>>>(
+                    s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos_d, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding,
+                    g_two_pass_max, ktc, vtc);
+            else
             k_attn<<<H, n_vis <= g_two_pass_max ? kThreads : 512, n_vis <= g_two_pass_max ? (size_t) n_vis * sizeof(float) : (size_t) 4096 * sizeof(float), st>>>(
                 s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding, 0, g_two_pass_max, ktc, vtc);
         }
@@ -3709,6 +3744,9 @@ void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
         case T_F16: k_row<T_F16><<<4, 128>>>(emb.d, emb.row_bytes, tok, N, s.x); break;
         default: std::fprintf(stderr, "strata-kolibri: token_embd type %d\n", emb.type); std::exit(1);
         }
+        // The device-position attention reads s.pos from s.pos_d, so the host's position must be there before the
+        // first layer runs.  One 4-byte copy per token, on the same stream the layers use.
+        if (dec_attn_dp_on()) KC(cudaMemcpy(s.pos_d, &s.pos, 4, cudaMemcpyHostToDevice));
         for (int64_t l = 0; l < g.n_layers; ++l) layer_step(e, s, l, false, 0, layers_host);
     }
     k_rms<<<1, kThreads>>>(s.x, e.f32.at("output_norm.weight"), s.h, N, e.eps);
@@ -5692,6 +5730,9 @@ int strata::kolibri::run(int argc, char** argv) {
                              "and weights in one kernel and the host waits on the ring (bounded at %d ms)\n",
                      dec_handoff_timeout_ms());
     }
+    if (dec_attn_dp_on())
+        std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_DEC_ATTN_DP active: decode attention is the single-pass "
+                             "body with the position from device memory, shared memory sized per bucket\n");
     if (serve_mode) {
         Scratch s;
         s.ctx = ctx;
