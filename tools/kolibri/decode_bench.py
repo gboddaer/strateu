@@ -380,7 +380,7 @@ def _tail(lines, n=12) -> str:
 
 
 def run_request(cmd, *, tokens: str, n: int, timeout_s: float, require_marker: str | None = None,
-                label: str = "run", log_dir=None, env=None) -> RunResult:
+                label: str = "run", log_dir=None, env=None, observe_marker: str | None = None) -> RunResult:
     """One serve request against an already-configured engine argv.  Everything is bounded."""
     if timeout_s <= 0:
         raise BenchError("timeout_s must be positive")
@@ -406,7 +406,8 @@ def run_request(cmd, *, tokens: str, n: int, timeout_s: float, require_marker: s
     done_holder, info_holder, marker_holder = {}, {}, {"seen": False}
     ready, finished, eof = threading.Event(), threading.Event(), threading.Event()
     t_gen_sent = {"t": None}
-    pattern = re.compile(require_marker) if require_marker else None
+    marker = require_marker or observe_marker
+    pattern = re.compile(marker) if marker else None
 
     def scan(line: str) -> None:
         if pattern is not None and pattern.search(line):
@@ -505,7 +506,7 @@ def run_request(cmd, *, tokens: str, n: int, timeout_s: float, require_marker: s
         raise BenchError(f"{label}: asked for {n} token(s), engine produced {done['produced']}")
     if len(tokens_ns) != done["produced"]:
         raise BenchError(f"{label}: {len(tokens_ns)} T line(s) for {done['produced']} produced token(s)")
-    if pattern is not None and not marker_holder["seen"]:
+    if require_marker is not None and not marker_holder["seen"]:
         raise BenchError(f"{label}: the candidate marker {require_marker!r} never appeared; the arm is "
                          f"not proven active, so this run cannot be scored")
 
@@ -530,6 +531,7 @@ def run_pairs(cmd, *, tokens, n, pairs, timeout_s, candidate_env=None, require_m
         label = f"{label_prefix}{idx}-{arm}"
         r = run_request(cmd, tokens=tokens, n=n, timeout_s=timeout_s,
                         require_marker=require_marker if arm == "candidate" else None,
+                        observe_marker=require_marker if arm == "baseline" else None,
                         label=label, log_dir=log_dir, env=base_env if arm == "baseline" else cand_env)
         if arm == "baseline" and require_marker and r.marker_seen:
             raise BenchError(f"{label}: the baseline run also carries the candidate marker "
@@ -655,9 +657,9 @@ def main(argv=None) -> int:
                         label_prefix=f"{label}-pair")
         s = res["summary"]
         print(f"{label}: prompt {expect} id(s), ctx {ctx}, {a.n} new token(s), threads {a.threads}")
-        print(f"  baseline  median {s['baseline_median_ms']:.1f} ms/token over {s['pairs']} run(s): "
+        print(f"  baseline  median {s['baseline_median_ms']:.1f} ms/request over {s['pairs']} run(s): "
               + ", ".join(f"{v:.1f}" for v in s["baseline_ms"]))
-        print(f"  candidate median {s['candidate_median_ms']:.1f} ms/token over {s['pairs']} run(s): "
+        print(f"  candidate median {s['candidate_median_ms']:.1f} ms/request over {s['pairs']} run(s): "
               + ", ".join(f"{v:.1f}" for v in s["candidate_ms"]))
         print(f"  reduction {s['reduction'] * 100:+.1f}%  (order: {' '.join(res['order'])})")
         for arm in ("baseline", "candidate"):

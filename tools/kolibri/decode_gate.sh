@@ -42,7 +42,15 @@ REPEATS=${KOLIBRI_DEC_GATE_REPEATS:-6}
 TMO=${KOLIBRI_DEC_GATE_TIMEOUT:-900}
 IDS=tools/kolibri/oracle_ids512.txt
 FORCE=${KOLIBRI_DEC_FORCE:-286,3515,310,262,14292,1343,1444,46}
-COMMON="--model $M --force $FORCE --n 8 --prefill --cpu-threads 8"
+# Expected geometry is independent of dump length. Kolibri-1 has 128000 logits per step.
+VOCAB=${KOLIBRI_DEC_VOCAB:-128000}
+RECORDS=$("$PY" - "$FORCE" <<'EOF'
+import sys
+forced = [int(x) for x in sys.argv[1].split(',') if x.strip()]
+print(len(forced) + 1)
+EOF
+) || exit 2
+COMMON=(--model "$M" --force "$FORCE" --n 8 --prefill --cpu-threads 8)
 
 cmd=${1:-check}
 if [ "$cmd" != "check" ]; then
@@ -74,12 +82,12 @@ if len(ids) * (2 if n > 512 else 1) < n:
 open(sys.argv[2], 'w').write(','.join((ids + ids)[:n]))
 EOF
     rm -f "$OUT/base$n.bin" "$OUT/arm$n.bin"
-    run "$TMO" "/dev/null" "$OUT/base$n.err" -- $COMMON --tokens-file "$OUT/ids$n.txt" --ctx 2048 \
+    run "$TMO" "/dev/null" "$OUT/base$n.err" -- "${COMMON[@]}" --tokens-file "$OUT/ids$n.txt" --ctx 2048 \
         --dump-full-logits "$OUT/base$n.bin"
     b=$?
     # $ARM is deliberately unquoted: it holds one or more NAME=VALUE assignments ("A=1 B=1"), and word splitting
     # is what hands them to env as separate arguments.
-    run "$TMO" "/dev/null" "$OUT/arm$n.err" $ARM -- $COMMON --tokens-file "$OUT/ids$n.txt" --ctx 2048 \
+    run "$TMO" "/dev/null" "$OUT/arm$n.err" $ARM -- "${COMMON[@]}" --tokens-file "$OUT/ids$n.txt" --ctx 2048 \
         --dump-full-logits "$OUT/arm$n.bin"
     a=$?
     if [ $b -ne 0 ] || [ $a -ne 0 ]; then
@@ -97,14 +105,14 @@ EOF
         rc=1
         continue
     fi
-    vocab=$(( $(stat -c %s "$OUT/base$n.bin") / (4 * 9) ))
+    vocab=$VOCAB
     if [ "$(stat -c %s "$OUT/arm$n.bin")" != "$(stat -c %s "$OUT/base$n.bin")" ]; then
         echo "  1.$n  FAIL  dump sizes differ ($(stat -c %s "$OUT/base$n.bin") vs $(stat -c %s "$OUT/arm$n.bin"))"
         rc=1
         continue
     fi
     if "$PY" tools/kolibri/check_decode.py --baseline "$OUT/base$n.bin" --candidate "$OUT/arm$n.bin" \
-            --vocab "$vocab" --records 9 >"$OUT/check$n.txt" 2>&1; then
+            --vocab "$vocab" --records "$RECORDS" >"$OUT/check$n.txt" 2>&1; then
         echo "  1.$n  PASS  $(cat "$OUT/check$n.txt")"
     else
         echo "  1.$n  FAIL  $(cat "$OUT/check$n.txt")"
@@ -133,21 +141,24 @@ if [ -f tools/kolibri/decode_gate_serve.py ]; then
         echo "  2.reuse FAIL  marker missing from the arm's log, or present in the plain run's"
         rc=1
     else
-        if cmp -s "$OUT/reuse-base.bin" "$OUT/reuse-arm.bin"; then
+        if "$PY" tools/kolibri/check_decode.py --serve-records \
+                --baseline "$OUT/reuse-base.bin" --candidate "$OUT/reuse-arm.bin" \
+                --vocab "$VOCAB" --records 2 >"$OUT/reuse-check.txt" 2>&1; then
             echo "  2.reuse PASS  2 request record(s) (cold 512 ids, then +64) bitwise identical, headers included"
         else
             echo "  2.reuse FAIL  the reused-prefix records differ"
-            cmp "$OUT/reuse-base.bin" "$OUT/reuse-arm.bin" 2>&1 | sed 's/^/     /'
+            tail -3 "$OUT/reuse-check.txt"
             rc=1
         fi
     fi
 else
-    echo "  2.reuse SKIP  tools/kolibri/decode_gate_serve.py is missing"
+    echo "  2.reuse FAIL  tools/kolibri/decode_gate_serve.py is missing"
+    rc=1
 fi
 
 # ---- 3. six repeats of the arm, with the marker required in every run ----
 if env $ARM "$PY" tools/kolibri/check_repeat.py --runs "$REPEATS" --out "$OUT/repeat" \
-        --require-marker "$MARKER" -- "$BIN" $COMMON --tokens-file "$IDS" --ctx 2048 \
+        --require-marker "$MARKER" -- "$BIN" "${COMMON[@]}" --tokens-file "$IDS" --ctx 2048 \
         >"$OUT/repeat.txt" 2>&1; then
     echo "  3.repeat PASS  $(tail -1 "$OUT/repeat.txt")"
 else

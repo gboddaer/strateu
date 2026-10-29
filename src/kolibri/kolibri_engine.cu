@@ -1740,7 +1740,7 @@ __global__ void k_attn_dp(const float* q, const __half* kc, const __half* vc, fl
 static inline int attn_dp_bucket(int n_vis, int two_pass_max) {
     int b = 512;
     while (b < n_vis && b < two_pass_max) b <<= 1;
-    return b < n_vis ? two_pass_max : b;
+    return b > two_pass_max ? two_pass_max : b;
 }
 
 

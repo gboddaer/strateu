@@ -69,6 +69,32 @@ def compare(baseline, candidate, vocab, records, require_finite=True):
     return {"records": records, "values": len(a), "max_abs_diff": worst, "max_at": worst_at}
 
 
+def compare_serve(baseline, candidate, vocab, records):
+    """Compare headered [reuse, fresh, vocab]+float32 records; reject empty/truncated matched files."""
+    if vocab <= 0 or records <= 0:
+        raise Mismatch("vocab and record count must be positive")
+    stride = 12 + 4 * vocab
+    payloads = []
+    for path in (baseline, candidate):
+        raw = path.read_bytes()
+        if len(raw) != stride * records:
+            raise Mismatch(f"{path.name}: size {len(raw)}, expected {stride * records}")
+        for rec in range(records):
+            start = rec * stride
+            reused, fresh, nv = struct.unpack_from('<iii', raw, start)
+            if nv != vocab:
+                raise Mismatch(f"{path.name}: record {rec} vocab {nv}, expected {vocab}")
+            if reused < 0 or fresh < 0:
+                raise Mismatch(f"{path.name}: invalid request header at record {rec}")
+            for idx, (value,) in enumerate(struct.iter_unpack('<f', raw[start + 12:start + stride])):
+                if not math.isfinite(value):
+                    raise Mismatch(f"{path.name}: record {rec} index {idx} is not finite")
+        payloads.append(raw)
+    if payloads[0] != payloads[1]:
+        raise Mismatch("headered serve records differ bitwise")
+    return {'records': records, 'values': records * vocab, 'max_abs_diff': 0.0}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -76,14 +102,18 @@ def main(argv=None):
     ap.add_argument("--candidate", required=True)
     ap.add_argument("--vocab", type=int, required=True, help="float32 values per record (the model's n_vocab)")
     ap.add_argument("--records", type=int, required=True, help="records the caller expects in BOTH files")
+    ap.add_argument("--serve-records", action="store_true", help="compare headered serve dump records")
     ap.add_argument("--allow-non-finite", action="store_true",
                     help="skip the finiteness gate (never use this for a correctness verdict)")
     a = ap.parse_args(argv)
     from pathlib import Path
     try:
-        r = compare(Path(a.baseline), Path(a.candidate), a.vocab, a.records,
-                    require_finite=not a.allow_non_finite)
-    except Mismatch as e:
+        if a.serve_records:
+            r = compare_serve(Path(a.baseline), Path(a.candidate), a.vocab, a.records)
+        else:
+            r = compare(Path(a.baseline), Path(a.candidate), a.vocab, a.records,
+                        require_finite=not a.allow_non_finite)
+    except (Mismatch, OSError) as e:
         print(f"FAIL {e}", flush=True)
         return 1
     print(f"PASS {r['records']} record(s) x {a.vocab} value(s) bitwise identical; "

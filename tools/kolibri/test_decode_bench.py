@@ -465,6 +465,20 @@ def test_pair_run_rejects_a_candidate_that_is_silently_inactive(tmp_path):
         )
 
 
+def test_pair_run_rejects_candidate_marker_in_baseline(tmp_path):
+    script = fake_child(tmp_path, GOOD_CHILD)
+    with pytest.raises(db.BenchError, match="baseline.*candidate marker"):
+        db.run_pairs(engine_cmd(script), tokens="1,2,3", n=8, pairs=1, timeout_s=10,
+                     candidate_env={"CANDIDATE": "1"}, require_marker="MARKER-ACTIVE")
+
+
+def test_request_can_observe_marker_without_requiring_it(tmp_path):
+    script = fake_child(tmp_path, GOOD_CHILD.replace("MARKER-ACTIVE", "OTHER-MARKER"))
+    result = db.run_request(engine_cmd(script), tokens="1,2,3", n=8, timeout_s=10,
+                            observe_marker="MARKER-ACTIVE")
+    assert not result.marker_seen
+
+
 def test_fixture_length_is_asserted(tmp_path):
     ids_file = tmp_path / "ids.txt"
     ids_file.write_text(",".join(str(i) for i in range(10)))

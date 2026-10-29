@@ -1,71 +1,122 @@
 #!/usr/bin/env python3
-"""Drive one serve process through a cold request and one that EXTENDS the held prefix.
+"""Bounded cold/extended-prefix serve requests for decode_gate.sh.
 
-The decode gate (tools/kolibri/decode_gate.sh) needs the reused-prefix path compared between two arms, and
-that path only exists in serve mode: a second request whose ids extend the ids the engine already holds
-skips the prefix.  The engine's STRATA_KOLIBRI_LOGITS_DUMP writes one record per request at its first decode
-step, header included, so the two arms' files are comparable byte for byte.
-
-Everything is bounded: a request that never reports DONE fails the run instead of hanging the gate.
-
-    decode_gate_serve.py <engine> <model> <ids-file>
+The engine runs in its own process group. A reader thread drains stdout into a deadline-aware queue;
+stderr is inherited so activation markers remain in the gate's log. No blocking readline runs on the
+supervisor thread, and successful DONE records do not hide a later engine failure.
 """
+import os
+from pathlib import Path
+import queue
+import signal
 import subprocess
 import sys
+import threading
 import time
 
-TIMEOUT_S = float(__import__("os").environ.get("KOLIBRI_DEC_GATE_TIMEOUT", "900"))
+from decode_bench import BenchError, parse_done
+
+TIMEOUT_S = float(os.environ.get("KOLIBRI_DEC_GATE_TIMEOUT", "900"))
+
+
+def drive(engine, model, ids, timeout_s):
+    deadline = time.monotonic() + timeout_s
+    proc = subprocess.Popen(
+        [engine, "--model", model, "--serve", "--ctx", "1024", "--prefill", "--cpu-threads", "8"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1, start_new_session=True)
+    lines = queue.Queue()
+
+    def read():
+        try:
+            for line in proc.stdout:
+                lines.put(line.strip())
+        finally:
+            lines.put(None)
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+
+    def next_line():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise BenchError("serve deadline exceeded")
+        try:
+            line = lines.get(timeout=remaining)
+        except queue.Empty:
+            raise BenchError("serve deadline exceeded") from None
+        if line is None:
+            raise BenchError("engine closed stdout before request completed")
+        return line
+
+    try:
+        while True:
+            line = next_line()
+            if line.startswith("READY "):
+                break
+            if line.startswith("ERR"):
+                raise BenchError(line)
+        for label, tokens in (("cold", ids), ("extend", ids + ids[:64])):
+            proc.stdin.write("GEN 4 " + ",".join(tokens) + "\n")
+            proc.stdin.flush()
+            produced = 0
+            while True:
+                line = next_line()
+                if line.startswith("T "):
+                    int(line.split()[1])
+                    produced += 1
+                elif line.startswith("DONE "):
+                    done = parse_done(line)
+                    if done['produced'] != 4 or produced != 4 or done['finish'] != 'length':
+                        raise BenchError(f"{label}: incomplete generation: {line}")
+                    if done['prompt_ids'] != len(tokens):
+                        raise BenchError(f"{label}: unexpected prompt length: {line}")
+                    if label == 'cold' and done['reused'] != 0:
+                        raise BenchError("cold request unexpectedly reused a prefix")
+                    if label == 'extend' and not 0 < done['reused'] <= len(ids):
+                        raise BenchError("extended request did not exercise valid prefix reuse")
+                    print(f"{label}: {line}", flush=True)
+                    break
+                elif line.startswith("ERR"):
+                    raise BenchError(line)
+        proc.stdin.close()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise BenchError("serve deadline exceeded before exit")
+        try:
+            rc = proc.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            raise BenchError("serve deadline exceeded waiting for exit") from None
+        if rc:
+            raise BenchError(f"engine exit status {rc} after DONE")
+    finally:
+        # Kill only the group we created, including descendants whose parent may already have exited.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait(timeout=5)
+        reader.join(timeout=1)
+        proc.stdout.close()
+        if not proc.stdin.closed:
+            proc.stdin.close()
 
 
 def main(argv):
     if len(argv) != 4:
-        print(__doc__, file=sys.stderr)
+        print("usage: decode_gate_serve.py <engine> <model> <ids-file>", file=sys.stderr)
         return 2
-    engine, model, ids_file = argv[1:]
-    ids = [t for t in open(ids_file).read().strip().split(",") if t]
-    if len(ids) < 512:
-        print(f"decode_gate_serve: {ids_file} holds {len(ids)} id(s), need at least 512", file=sys.stderr)
-        return 2
-
-    p = subprocess.Popen(
-        [engine, "--model", model, "--serve", "--ctx", "1024", "--prefill", "--cpu-threads", "8"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1, start_new_session=True)
-    deadline = time.monotonic() + TIMEOUT_S
-
-    def line():
-        while time.monotonic() < deadline:
-            out = p.stdout.readline()
-            if out == "":
-                return None
-            out = out.strip()
-            if out.startswith(("READY", "T ", "PP ", "INFO", "RESUME", "kolibri:")):
-                if out.startswith("READY"):
-                    return out
-                continue
-            return out
-        return None
-
     try:
-        ready = line()
-        if ready is None or not ready.startswith("READY"):
-            print(f"decode_gate_serve: no READY (got {ready!r})", file=sys.stderr)
-            return 1
-        for label, toks in (("cold", ids), ("extend", ids + ids[:64])):
-            p.stdin.write("GEN 4 " + ",".join(toks) + "\n")
-            p.stdin.flush()
-            got = line()
-            if got is None or not got.startswith("DONE"):
-                print(f"decode_gate_serve: {label}: expected DONE, got {got!r}", file=sys.stderr)
-                return 1
-            print(f"{label}: {got}")
-        p.stdin.close()
-        p.wait(timeout=120)
-        return 0
-    finally:
-        if p.poll() is None:
-            p.kill()
-            p.wait(timeout=60)
+        ids = Path(argv[3]).read_text().strip().split(',')
+        if len(ids) != 512:
+            raise BenchError(f"expected 512 prompt ids, got {len(ids)}")
+        for token in ids:
+            int(token)
+        drive(argv[1], argv[2], ids, TIMEOUT_S)
+    except (BenchError, OSError, ValueError) as exc:
+        print(f"decode_gate_serve: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     sys.exit(main(sys.argv))
