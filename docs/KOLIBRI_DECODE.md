@@ -61,6 +61,27 @@ Parity on that same final binary at the KV-wrap boundary: two plain and two whol
 `93274a15a769b28b4e4ea57e5ae5289fd624d01a172f9872aaa4ac27f1105c88`, and all four cross-comparisons were
 bitwise. Artifacts: `/tmp/kolibri-dec2/final-8191-parity/`.
 
+### Where a token goes (default path, unprofiled wall clocks)
+
+`STRATA_KOLIBRI_DEC_TOKEN_TIMING=1` prints one line per token with this split and adds no synchronisation of its
+own; medians over steady tokens, same configuration as the table above:
+
+| Leg | 512 ids | 8191 ids |
+|---|---:|---:|
+| host waiting for the GPU to publish each layer | 16.0 ms | 29.4 ms |
+| host payload work, CPU experts and acknowledgement | 23.9 ms | 24.0 ms |
+| graph launch | 0.68 ms | 0.61 ms |
+| token-boundary sync | 0.05 ms | 0.05 ms |
+| **token** | **41.0 ms** | **54.7 ms** |
+
+The CPU expert leg is the largest single item and is flat with context; the GPU leg grows by ~13 ms between 512
+and 8191 ids, which is attention. Driver and launch work is 0.7 ms, **1.7 % of a token**.
+
+Two overhead changes were tried and **rejected on measurement**: `cudaGraphUpload` before the first launch
+(0.68 → 0.69 ms, no help) and a stream-scoped sync plus a queued logits read in place of the device-wide sync
+(0.13 % and 0.08 % "gains", inside the noise, with one short pair slower). Both are reverted, so the code keeps
+the simpler form; artifacts `/tmp/kolibri-dec2/{default-hip-api,dec-split-*,overhead-*,tail-ab}/`.
+
 Correctness covers the full short/chunk/reuse/six-repeat gate, the 8192 and 11000 attention
 transitions, sequence/generation rollover during cold warmup, missing publication/ACK, STOP and cold
 recovery, mapped/parent allocation failure and a CPU producer exception. Failed steps emit no logit

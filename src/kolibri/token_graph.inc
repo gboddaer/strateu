@@ -7,6 +7,16 @@ static bool run_token_graph(const Engine& e, Scratch& s, cudaStream_t stream) {
     using strata::kolibri::enqueue_decode_wait;
     const int N = (int) e.g.n_embd, K = (int) e.top_k;
     const size_t layers = e.blobs.size();
+    // Measurement only (no behaviour change): split the token into the host's wait for the GPU, its own payload
+    // work plus the CPU experts, the launch call, and the token-boundary sync.  Wall clocks only, so this does not
+    // perturb the run the way a driver trace does.
+    const bool timing = env_on("STRATA_KOLIBRI_DEC_TOKEN_TIMING");
+    using Clock = std::chrono::steady_clock;
+    const auto tc0 = Clock::now();
+    double ms_wait = 0, ms_host = 0, ms_launch = 0, ms_sync = 0;
+    auto since = [](Clock::time_point a) {
+        return std::chrono::duration<double, std::milli>(Clock::now() - a).count();
+    };
     DecGraphArm& cache = dec_graph_arm((int64_t) layers);
     std::vector<int> keys;
     keys.reserve(layers);
@@ -77,7 +87,9 @@ static bool run_token_graph(const Engine& e, Scratch& s, cudaStream_t stream) {
     std::vector<int> selections((size_t) K);
     for (int k = 0; k < K; ++k) selections[(size_t) k] = k;
     g_ids_host.resize((size_t) K);
+    const auto tl0 = Clock::now();
     KC(cudaGraphLaunch(executable, stream));
+    ms_launch = since(tl0);
     static bool announced = false;
     if (!announced) {
         std::fprintf(stderr, "kolibri: DEC_TOKEN_GRAPH replay active: %zu layers, CPU experts retained\n", layers);
@@ -88,6 +100,7 @@ static bool run_token_graph(const Engine& e, Scratch& s, cudaStream_t stream) {
     try {
         for (size_t l = 0; l < layers; ++l) {
             const uint32_t want = ++hb.expect;
+            const auto tw0 = Clock::now();
             const auto deadline = std::chrono::steady_clock::now() +
                                   std::chrono::milliseconds(dec_handoff_timeout_ms());
             while (load(control->ready) < want) {
@@ -97,6 +110,7 @@ static bool run_token_graph(const Engine& e, Scratch& s, cudaStream_t stream) {
                 }
                 std::this_thread::yield();
             }
+            ms_wait += since(tw0);
             if (aborted || cancelled() || load(control->abort) || load(control->ready) != want) {
                 aborted = true;
                 user_cancel = cancelled();
@@ -107,6 +121,7 @@ static bool run_token_graph(const Engine& e, Scratch& s, cudaStream_t stream) {
                              (long long) s.pos, generation, want);
                 std::fflush(stderr);
             }
+            const auto th0 = Clock::now();
             std::memcpy(s.h_host, hb.host_x, (size_t) N * 4);
             for (int k = 0; k < K; ++k) g_ids_host[(size_t) k] = hb.host_ids[(size_t) k];
             strata::kernels::cpu::native_quant_act(e.blobs[l].fmt, s.h_host, s.act);
@@ -119,6 +134,7 @@ static bool run_token_graph(const Engine& e, Scratch& s, cudaStream_t stream) {
             std::memcpy(hb.h_y, s.ey_h, (size_t) K * N * 4);
             store(control->acknowledged_generation, generation);
             store(control->acknowledged, want);  // result bytes precede this publication
+            ms_host += since(th0);
             if (e.counters) {
                 ++e.cnt.br_pool;
                 ++e.cnt.d2h_n;
@@ -133,7 +149,9 @@ static bool run_token_graph(const Engine& e, Scratch& s, cudaStream_t stream) {
         throw;  // producer failure cannot leave a graph waiting on freed storage
     }
     if (aborted) store(control->abort, 1);
+    const auto ts0 = Clock::now();
     KC(cudaStreamSynchronize(stream));  // token boundary, never a per-layer drain
+    ms_sync = since(ts0);
     if (aborted) hb.expect = load(control->ready);  // cancelled graphs still drain their later publish nodes
     if (aborted || load(control->status) != DecodeWaitOk || load(control->ready) != hb.expect) {
         if (user_cancel) {
@@ -144,6 +162,11 @@ static bool run_token_graph(const Engine& e, Scratch& s, cudaStream_t stream) {
         std::fprintf(stderr, "kolibri: DEC_TOKEN_GRAPH failed (status %u, ready %u, expected %u); no token emitted\n",
                      load(control->status), load(control->ready), hb.expect);
         std::exit(1);
+    }
+    if (timing) {
+        std::fprintf(stderr, "DEC_TIMING pos=%lld total=%.2f wait=%.2f host=%.2f launch=%.2f sync=%.2f ms\n",
+                     (long long) s.pos, since(tc0), ms_wait, ms_host, ms_launch, ms_sync);
+        std::fflush(stderr);
     }
     return true;
 }

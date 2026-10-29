@@ -293,6 +293,35 @@ A separate pass over the final diff, after the last task line. What it confirms 
 A self-review by the author is weaker than a fresh reviewer. The goal's remaining verification gap is that no
 independent reviewer has run.
 
+## Where a token goes, and the overhead that was rejected
+
+`STRATA_KOLIBRI_DEC_TOKEN_TIMING=1` splits each token with wall clocks only (no driver trace, no extra
+synchronisation):
+
+| Leg (median, steady tokens) | 512 ids | 8191 ids |
+|---|---:|---:|
+| host waiting for the GPU to publish | 16.04 ms | 29.44 ms |
+| host payload work + CPU experts + acknowledgement | 23.94 ms | 24.03 ms |
+| graph launch | 0.68 ms | 0.61 ms |
+| token-boundary sync | 0.05 ms | 0.06 ms |
+| **token** | **41.0 ms** | **54.7 ms** |
+
+The earlier arithmetic estimate — the 717 MB/token of expert blobs streamed at 27–32 GB/s — is confirmed at
+23.9 ms, and it does not grow with context. The GPU leg grows ~13.4 ms between 512 and 8191 ids, which is
+attention. Summed, the driver/launch/sync legs are 0.7 ms of 41 ms.
+
+Two attempts to cut that 0.7 ms were measured and **rejected**:
+
+- `cudaGraphUpload` on the parent executable after instantiation: launch 0.68 → 0.69 ms short and 0.61 → 0.68 ms
+  long, i.e. no help. Reverted.
+- Stream-scoped sync plus a queued logits read instead of the device-wide sync and blocking copy: three
+  rotating-order pairs gave 4044.3 → 4039.1 ms/request short (0.13 %) and 5375.4 → 5370.9 ms long (0.08 %), inside
+  the 0.4 % noise floor, with one short pair slower. Reverted rather than kept as an unmeasured default.
+
+Artifacts: `/tmp/kolibri-dec2/{default-hip-api,dec-split-short,dec-split-long,overhead-short,overhead-long,tail-ab}/`.
+A driver trace was also taken and discarded: it is dominated by the 43 GB pinned allocation at load and by the
+instrument's own serialisation, so dividing it by a token count says nothing about the decode.
+
 ## Status: complete, with stated limits
 
 All five tracked tasks are done and every contractual gate above has a recorded, inspectable artifact.
