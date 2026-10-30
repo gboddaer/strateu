@@ -15,7 +15,7 @@
 #include "ggml-cpu.h"
 
 using namespace strata::kernels::cpu;
-static constexpr int QK_K = 256, QK8 = 256;
+static constexpr int QK_K = 256;
 
 static uint16_t f2h(float f) {
     uint32_t x; std::memcpy(&x, &f, 4);
@@ -56,7 +56,7 @@ static void make_q4k(uint8_t* b) {
 //        s[2j]   * sum of the 4 values at 64j + 4k
 //      + s[2j+1] * sum of the 4 values at 64j + 32 + 4k
 //   acc[k] = fma(d, (float)sumi[k], acc[k])                        per block, d = x.d * y.d
-//   am[i]  = fma(dmin, (float)(mn[2i]*(B[4i]+B[4i+1]) + mn[2i+1]*(B[4i+2]+B[4i+3])), am[i])
+//   am[i]  = fma(-x.dmin*y.d, (float)(mn[2i]*(B[4i]+B[4i+1]) + mn[2i+1]*(B[4i+2]+B[4i+3])), am[i])
 //   result = hsum_float_8(acc) + ((am0+am2) + (am1+am3))
 // with hsum_float_8(x) = ((x0+x4)+(x2+x6)) + ((x1+x5)+(x3+x7)).
 __global__ void k_q4k_dot(const uint8_t* __restrict__ w, const uint8_t* __restrict__ a, int nb, float* out, int rows,
@@ -96,7 +96,7 @@ __global__ void k_q4k_dot(const uint8_t* __restrict__ w, const uint8_t* __restri
                 }
             }
         }
-        const float d = xd * yd, dmin = xdmin * yd;
+        const float d = xd * yd, dmin = -yd * xdmin;
         for (int k = 0; k < 8; ++k) {
             if (mode & 1) acc[k] = __fmaf_rn(d, (float)sumi[k], acc[k]);
             else          acc[k] = __fadd_rn(acc[k], __fmul_rn(d, (float)sumi[k]));
@@ -117,13 +117,15 @@ __global__ void k_q4k_dot(const uint8_t* __restrict__ w, const uint8_t* __restri
 extern "C" void ggml_vec_dot_q4_K_q8_K_generic(int n, float* s, size_t bs, const void* vx, size_t bx,
                                                const void* vy, size_t by, int nrc);
 
-int main() {
+int main(int argc, char** argv) {
     ggml_cpu_init();
     const ggml_type_traits_cpu* t8 = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
     if (!t8 || !t8->from_float) { std::printf("no Q8_K quantiser in this ggml\n"); return 2; }
-    const size_t act_bytes = 10 * 292;          // 2560 values as Q8_K: 10 blocks of 292 B
-    const size_t gu_row = 10 * 144;             // 2560 values as Q4_K: 10 blocks of 144 B
-    const int rows = 512, n = 2560, nt = 4, nb = n / QK_K;
+    const int nb = argc > 1 ? std::stoi(argv[1]) : 10;
+    if (nb < 1 || nb > 64) return 2;
+    const size_t act_bytes = size_t(nb) * 292;
+    const size_t gu_row = size_t(nb) * 144;
+    const int rows = 512, n = nb * QK_K, nt = 4;
     std::printf("geometry: gu_row %zu act_bytes %zu\n", gu_row, act_bytes); std::fflush(stdout);
 
     std::vector<uint8_t> w(size_t(rows) * nb * 144);
@@ -153,10 +155,6 @@ int main() {
         for (int r = 0; r < rows; ++r)
             ggml_vec_dot_q4_K_q8_K_generic(n, &gen[size_t(t) * rows + r], 0, w.data() + (size_t) r * gu_row, 0,
                                            actp[t], 0, 1);
-    long long gm = 0, gt = 0; double gw = 0;
-    for (size_t i = 0; i < gen.size(); ++i) { ++gt; if (std::memcmp(&gen[i], &outp[0][0], 0) == 0) {} }
-    for (int t = 0; t < nt; ++t)
-        for (int r = 0; r < rows; ++r) { ++gt; if (false) {} (void)r; (void)t; }
     std::printf("generic ref computed (%lld values); comparing Strata AVX2 against generic next\n", (long long)gen.size());
     long long avx_vs_gen = 0;
     for (size_t i = 0; i < gen.size(); ++i) if (std::memcmp(&gen[i], &ref[i], 4) == 0) ++avx_vs_gen;
@@ -169,33 +167,35 @@ int main() {
     std::vector<float> got; got.resize((size_t)rows);
 
     double gpu_ms_best = 1e9;
+    bool exact = false;
     for (int mode = 0; mode < 4; ++mode) {
-        long long m2 = 0, tot2 = 0; double w2 = 0, gpu_ms = 0;
+        long long m2 = 0, tot2 = 0, mgen = 0; double w2 = 0, gpu_ms = 0;
         for (int t = 0; t < nt; ++t) {
             cudaMemcpy(da, act.data() + size_t(t) * act_bytes, act_bytes, cudaMemcpyHostToDevice);
             cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
             cudaEventRecord(e0);
             k_q4k_dot<<<(rows + 127) / 128, 128>>>(dw, da, nb, dout, rows, mode);
-            cudaEventRecord(e1); cudaEventSynchronize(e1);
+            cudaEventRecord(e1);
+            if (cudaEventSynchronize(e1) != cudaSuccess || cudaGetLastError() != cudaSuccess) return 2;
             float ms = 0; cudaEventElapsedTime(&ms, e0, e1); gpu_ms += ms;
             cudaMemcpy(got.data(), dout, size_t(rows) * 4, cudaMemcpyDeviceToHost);
             for (int r = 0; r < rows; ++r) {
                 ++tot2;
+                if (std::memcmp(&got[r], &gen[size_t(t) * rows + r], 4) == 0) ++mgen;
                 if (std::memcmp(&got[r], &outp[t][r], 4) == 0) ++m2;
                 else { const double d = std::fabs(double(got[r]) - double(outp[t][r])); if (d > w2) w2 = d; }
             }
         }
         gpu_ms /= nt;
         if (gpu_ms < gpu_ms_best) gpu_ms_best = gpu_ms;
-        long long mgen = 0;
-        for (int t = 0; t < nt; ++t)
-            for (int r = 0; r < rows; ++r)
-                if (std::memcmp(&got[r], &gen[size_t(t) * rows + r], 4) == 0) ++mgen;
+        if (mode == 3) exact = m2 == tot2;
+        std::printf("worst |dlogit|: %.9g\n", w2);
         std::printf("mode %d (%s/%s): vs Strata AVX2 %lld/%lld match (%.2f%%) | vs ggml generic %lld/%d match (%.2f%%) | GPU %.3f ms/launch\n",
                     mode, (mode & 1) ? "fma" : "mul", (mode & 2) ? "fma" : "mul", m2, tot2,
                     100.0 * m2 / tot2, mgen, rows * nt, 100.0 * mgen / (rows * nt), gpu_ms);
     }
     std::printf("time: CPU kq256_rows %.2f ms for %d rows x %d token(s) (%.1f GFLOP/s, one thread); GPU best %.3f ms/launch\n",
                 cpu_ms, rows, nt, 2.0 * rows * nt * n * 0 + 2.0 * rows * n / (cpu_ms / 1000) / 1e9 / nt * nt, gpu_ms_best);
-    return 0;
+    std::printf("FMA/FMA exactness: %s\n", exact ? "PASS" : "FAIL");
+    return exact ? 0 : 1;
 }

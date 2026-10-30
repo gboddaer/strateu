@@ -345,7 +345,34 @@ allocated on the far node, half the workers read it across the interconnect at r
 Both keep the arithmetic identical, so neither needs qualification — the bit-identity was already proven for the
 `numactl` configuration (9 x 128,000 logits, max |a-b| = 0).
 
-## Phase 2 — preregistration for the two numerical levers (awaiting the operator's approval; NO results collected)
+## A1 one-block oracle — root cause isolated and probe repaired
+
+The operator's latest direction is **one-block oracle for A1, then Phase 2a**. Phase 2b stays parked;
+this does not authorise an in-engine A1 rollout or change a default.
+
+`probe/q4k_oneblock.cpp` instruments the **actual** `kq_avx2.cpp` FMA boundaries (intrinsic wrappers,
+not a rewritten AVX2 implementation). Across 4,096 seeded blocks, all eight `sumi` lanes and four
+minimum-product lanes agree with the scalar mapping. The structural error was simply the missing
+minus sign: CPU uses `dmin = -y.d * xdmin`, the CUDA attempt used `+y.d * xdmin`.
+The corrected scalar reduction matches all 4,096 output bit patterns; the old sign matches zero.
+
+The CUDA regression check failed before the fix (0/2,048 one-block outputs, exit 1). After the
+one-line sign fix, FMA/FMA matches **2,048/2,048** outputs at each of **1, 2, 10 and 32 blocks**
+(256/512/2,560/8,192 columns), worst error zero. This establishes the tested dot-product probe,
+**not full engine logits, all possible inputs, throughput, or a completed GPU port**.
+The generic comparison also had a harness bug: it compared only the last token's GPU output
+against all tokens. It now compares the corresponding token, and exactness failure returns nonzero.
+
+Reproduce with `bash probe/run_q4k_oracle.sh`. Raw red/green outputs, host lane dump, binaries,
+build log and hashes: `/data4/kolibri-perf0/a1-oracle/`. CUDA sm_75 and host AVX2 tested;
+HIP/SYCL not tested (toolchains unavailable). No engine arithmetic changed in this step.
+
+**Correction to Phase 3f:** `stream_floor.cu` queues copies and consuming kernels on a *single stream*;
+they are serial, not overlapped. The 2.937/3.239 s timings are real copy/copy-plus-read measurements,
+but do not prove a compute-overlapped or in-engine floor. A real expert-compute streaming pipeline
+still needs its own timing. Earlier wording claiming overlap/reachability was too strong.
+
+## Phase 2 — approved preregistration (Phase 2a next; Phase 2b parked)
 
 Written **before** any measurement of either lever, as the goal's G2 gate requires. Nothing below has been run.
 
