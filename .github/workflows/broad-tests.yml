@@ -17,7 +17,9 @@ jobs:
   broad:
     name: ${{ matrix.suite }} / ${{ matrix.os }} / Python 3.11
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # The Windows runners are far slower than Linux at spawning processes and walking files,
+    # so the budget is per-OS shape, not one number for all (an expiry shows as "cancelled").
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -64,7 +66,8 @@ jobs:
   desktop:
     name: Desktop / ${{ matrix.os }} / Rust 1.90
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # The Windows suite takes the longest of the three (spawns and file trees cost more there).
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
