@@ -608,6 +608,35 @@ Reproduce: `bash probe/run_q4k_oracle.sh` (the CUDA half is skipped with `SKIP_C
 the sign convention that cost the earlier attempt. It does **not** establish anything about the engine: no kernel in
 `src/kolibri` uses this order yet, so there is still no engine-level bitwise result and no speed measurement.
 
+### A1 kernels — both expert products are bit-identical on the GPU
+
+`src/kolibri/kq_a1.cuh` holds the two kernels; `probe/q4k_parity.cu` and `probe/q6k_parity.cu` test them against the
+functions the CPU pool actually calls. One warp covers four rows and eight lanes own the eight integer lanes of the
+dot, so every lane accumulates in the scalar order and no cross-lane reduction reorders anything.
+
+| product | reference | nb = 1, 2, 10, 32 | worst difference |
+|---|---|---|---|
+| Q4_K gate/up | `kq256_rows` -> Strata's AVX2 `q4k_dot` | **2,048/2,048 each** | **0** |
+| Q6_K down | `ggml_vec_dot_q6_K_q8_K` (the pool's trait) | **2,048/2,048 each** | **0** |
+
+Shape guards are exercised too: null pointers, `nb` of zero or beyond 1,024, and out-of-range rows all return a
+refusal, and a valid geometry returns none.
+
+Three defects were found and fixed on the way, each invisible without a bit-level comparison:
+
+1. **The scale of a 32-value Q6_K chunk is a pair, not one value.** `get_scale_shuffle` expands an index into the
+   sub-block pair `(2n, 2n+1)`, so the first 16 values use `scales[8j+2c]` and the second 16 `scales[8j+2c+1]`.
+   Using one scale for all 32 gave 0 % agreement and errors in the thousands.
+2. **Each 128-value group consumes 64 `ql` bytes**, not 32; the second group's base was wrong.
+3. **The Q6_K reference needs `ggml_cpu_init()` first**, otherwise the type traits are uninitialised and every
+   reference value comes back 0 — which reads as a total mismatch and sends you hunting in the wrong place.
+
+Raw output: `a1-oracle/multiblock.txt`, `a1-oracle/q6k-nb*.txt`. Reproduce: `bash probe/run_q4k_oracle.sh`.
+
+**Scope of the claim.** This is bit-exactness of the two dot products against the functions the pool calls, measured
+on random blocks with signed scales, both signs of `dmin`, and all six-bit encodings. Nothing in the engine uses them
+yet: no engine-level bitwise result exists and no speed has been measured.
+
 ### What would make me stop early
 
 If 2a shows no gain at 8k-110k, or 2b's byte saving does not move prefill or decode measurably, the lever is dropped as

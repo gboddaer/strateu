@@ -23,6 +23,7 @@ namespace strata::kolibri::a1 {
 constexpr int kQK = 256;          // values per super-block
 constexpr int kQ4KBlock = 144;    // bytes: d, dmin, 12 scale bytes, 128 nibbles
 constexpr int kQ8KBlock = 292;    // bytes: d(float), 256 int8, 16 int16 sums
+constexpr int kQ6KBlock = 210;    // bytes: ql[128], qh[64], scales[16] int8, d (fp16)
 constexpr int kLanesPerRow = 8;   // one thread per integer lane
 constexpr int kRowsPerWarp = 4;   // 32 / 8
 
@@ -34,6 +35,11 @@ inline const char* unsupported(int nb, int64_t rows, const void* w, const void* 
     if (rows < 1) return "rows must be positive";
     if (rows > (int64_t)1 << 20) return "rows beyond 1048576 are not supported";
     return nullptr;
+}
+
+/// The down projection is Q6_K on half of Kolibri's layers: same guards, different block size.
+inline const char* unsupported_q6k(int nb, int64_t rows, const void* w, const void* act) {
+    return unsupported(nb, rows, w, act);
 }
 
 __device__ __forceinline__ float tree8(const float* a) {
@@ -104,6 +110,66 @@ __global__ void kq_a1_dot_rows(const uint8_t* __restrict__ w, const uint8_t* __r
     for (int j = 0; j < 8; ++j) a[j] = __shfl_sync(0xffffffffu, acc, j, kLanesPerRow);
     for (int j = 0; j < 4; ++j) m[j] = __shfl_sync(0xffffffffu, am, j, kLanesPerRow);
     if (k == 0) out[row] = __fadd_rn(tree8(a), (m[0] + m[2]) + (m[1] + m[3]));
+}
+
+/// Q6_K x Q8_K, reproducing ggml's AVX2 branch (quants.c: ggml_vec_dot_q6_K_q8_K) exactly.
+///
+/// Two details make this different from the Q4_K order above.  There is no minimum term: the six-bit weights
+/// are offset by 32 and the offset is removed as an integer sum, `sumi -= 32 * (scales * bsums)`.  And that
+/// subtraction is applied per lane from the sub-block PAIR 2k, 2k+1 - a distribution that does not follow the
+/// values each lane actually holds.  The integer total is identical either way, but the float accumulation is
+/// per lane, so the distribution decides the rounding.  Reproducing it is the whole point of this file.
+__global__ void kq_a1_dot_rows_q6k(const uint8_t* __restrict__ w, const uint8_t* __restrict__ act, int nb, int rows,
+                                   float* __restrict__ out) {
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = warp * kRowsPerWarp + (lane >> 3);
+    const int k = lane & (kLanesPerRow - 1);
+    if (row >= rows) return;
+
+    const uint8_t* xrow = w + (size_t) row * nb * kQ6KBlock;
+    float acc = 0.f;
+    for (int i = 0; i < nb; ++i) {
+        const uint8_t* xb = xrow + (size_t) i * kQ6KBlock;
+        const uint8_t* ql = xb;              // 128 bytes of paired 4-bit halves
+        const uint8_t* qh = xb + 128;        // 64 bytes of the two high bits
+        const int8_t* sc = (const int8_t*) (xb + 192);
+        uint16_t hd;
+        __builtin_memcpy(&hd, xb + 208, 2);  // the super-block scale is at the END of a Q6_K block
+        const float xd = __half2float(*(__half*) &hd);
+
+        const uint8_t* yb = act + (size_t) i * kQ8KBlock;
+        const float yd = *(const float*) yb;
+        const int8_t* yq = (const int8_t*) (yb + 4);
+        const int16_t* ysums = (const int16_t*) (yb + 4 + kQK);
+
+        int raw = 0;
+        for (int j = 0; j < 2; ++j) {
+            for (int c = 0; c < 4; ++c) {
+                // A 32-value chunk carries TWO scales: ggml's get_scale_shuffle expands each index into the pair
+                // (2n, 2n+1) of the 16-value sub-blocks, so the first 16 values use scales[8j+2c] and the second
+                // 16 use scales[8j+2c+1]. Lane k holds values 4k..4k+3, so lanes 0-3 take the first, 4-7 the second.
+                const int s = int(sc[8 * j + 2 * c + (k >> 2)]);
+                const int byte_base = 64 * j + (c & 1) * 32;   // each 128-group consumes 64 ql bytes
+                int v4 = 0;
+                for (int t = 0; t < 4; ++t) {
+                    const int l = 4 * k + t;
+                    const int b = ql[byte_base + l];
+                    const int low = (c < 2) ? (b & 0xF) : ((b >> 4) & 0xF);
+                    const int high = ((qh[32 * j + l] >> (2 * c)) & 3) << 4;
+                    v4 += (low | high) * int(yq[128 * j + 32 * c + l]);
+                }
+                raw += s * v4;
+            }
+        }
+        // the offset removal, distributed exactly as ggml's AVX2 kernel distributes it
+        const int corr = 32 * (int(ysums[2 * k]) * int(sc[2 * k]) + int(ysums[2 * k + 1]) * int(sc[2 * k + 1]));
+        acc = __fmaf_rn(xd * yd, float(raw - corr), acc);
+    }
+
+    float a[8];
+    for (int j = 0; j < 8; ++j) a[j] = __shfl_sync(0xffffffffu, acc, j, kLanesPerRow);
+    if (k == 0) out[row] = tree8(a);
 }
 
 }  // namespace strata::kolibri::a1

@@ -24,6 +24,11 @@ if [ "${SKIP_CUDA:-0}" != "1" ]; then
         "$LIB/libstrata_kernels_cpu.a" "$LIB/ggml/src/libggml-cpu.a" "$LIB/ggml/src/libggml-base.a" \
         -lpthread -ldl
     for nb in 1 2 10 32; do "$OUT/q4k_parity" "$nb" | tee "$OUT/green-nb${nb}.txt"; done
+    /usr/local/cuda/bin/nvcc -O3 -arch=sm_75 -std=c++17 -I include -I "$GGML/include" \
+        -o "$OUT/q6k_parity" probe/q6k_parity.cu \
+        "$LIB/ggml/src/libggml-cpu.a" "$LIB/ggml/src/libggml-base.a" "$LIB/libstrata_kernels_cpu.a" \
+        -lpthread -ldl
+    for nb in 1 2 10 32; do "$OUT/q6k_parity" "$nb" | tee "$OUT/q6k-nb${nb}.txt"; done
 fi
 
 sha256sum "$OUT/q4k_multiblock" "$OUT/q4k_oneblock" "$LIB/libstrata_kernels_cpu.a" > "$OUT/SHA256SUMS"
