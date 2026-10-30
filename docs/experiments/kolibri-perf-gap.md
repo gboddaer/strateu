@@ -374,7 +374,8 @@ still needs its own timing. Earlier wording claiming overlap/reachability was to
 
 ## Phase 2 — approved preregistration (Phase 2a next; Phase 2b parked)
 
-Written **before** any measurement of either lever, as the goal's G2 gate requires. Nothing below has been run.
+The protocol below was written **before** any measurement of either lever, as the goal's G2 gate requires.
+Later execution is recorded separately; the corpus and limits have not been changed.
 
 ### What is proposed
 
@@ -424,8 +425,8 @@ each arm. Non-finite values, stale outputs or unexplained same-arm variability r
 | **A** | **benchmark first**, then **A1** if the floor is reachable | the chunk-scale streaming benchmark runs before any port work; if it shows the 2.93 s streaming floor is reachable, the port is built to A1 (emulate the AVX2 summation order exactly — bit-identical, no numerical qualification). If the floor is not reachable, A stops |
 | **memory binding** | **launcher prefix** (`setup.py` writes the node, `serve/server.py` applies `numactl --cpunodebind/--membind`) | this is the decode half of the free win (24.02 → 12.93 ms/token measured). It must fall back cleanly when `numactl` is absent or the machine has one node, and it changes no arithmetic |
 
-No measurement, implementation or result exists against these approvals yet: they are recorded here first, as the
-accuracy policy requires.
+At this approval checkpoint no implementation or result existed against these approvals: they were recorded first,
+as the accuracy policy requires.
 
 ### Phase 2a execution notes (before candidate end-to-end results)
 
@@ -442,7 +443,10 @@ FP16 K/V workspace restores a layer before its attention preparation, then only 
 packed and rounded back into that workspace. This genuinely reduces durable cache bytes but
 adds unpack traffic and staging allocation. Speed results describe this staging implementation,
 **not a ceiling for fused/direct int8 attention**. No claim of halved attention traffic is valid
-for this arm. Reject incompatible pipelining/graph/mirror combinations rather than silently running
+for this arm. The staging also changes where attention reads its FP16 operands (GPU workspace
+rather than the control's mapped host cache). Any gain therefore belongs to the whole staged
+arm; it cannot be attributed to reduced precision alone. A same-placement FP16 staging control
+would be needed to separate that accuracy-safe placement effect from compression. Reject incompatible pipelining/graph/mirror combinations rather than silently running
 a different arm. Existing f16 code remains the exact gate-off path.
 
 The fixed six histories, nine records, two runs, independent reference, calibration-first rule,
@@ -475,6 +479,13 @@ mandatory state checks use short-lived stdio engine processes only.
 * State checks add a genuine warm-prefix/cold comparison (including generated history),
   require a positive reported reuse count, and check cancellation's actual reason.
   The older state helper's simple extension alone did not prove that reuse occurred.
+
+An unprofiled timing sweep is queued **after** qualification and state checks, never concurrently
+with another GPU job. `phase2a_speed.py` uses two cold requests at 512, 8,191 and 11,000 ids,
+32 greedy decode steps, fixed context capacity 14,336, the same binary/worker/NUMA configuration
+for both arms, and the stdio `DONE` prompt/decode timers. These generated speed histories are
+not the forced histories used for numerical qualification; their ids/counts are recorded and
+no cross-arm KL is computed on them. Load-to-READY and sampled VRAM high-water are separate.
 
 ### What would make me stop early
 
