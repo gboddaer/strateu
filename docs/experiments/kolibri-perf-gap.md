@@ -149,6 +149,38 @@ correct. Options: reproduce the CPU value exactly (hard), or measure the diverge
 thing the probe must measure, before any kernel work: compare CPU `std::exp` and CUDA `expf` over the full
 single-precision range, count exact matches, and report.**
 
+### Phase 3c — the linked probe: infrastructure works, bit-exact parity not yet achieved
+
+`probe/q4k_parity.cu` links the **real** pool kernels (`libstrata_kernels_cpu.a` + ggml-cpu) and puts a CUDA
+emulation of `q4k_dot` beside `kq256_rows(12, …)` on generated-valid Q4_K blocks and Q8_K activations produced by
+ggml's own quantiser, 512 rows x 4 tokens (one expert's gate *or* up):
+
+```
+bitwise: 0 of 2048 match (0.00 %), worst |diff| 499.4 at row 220
+time: CPU kq256_rows 0.29-0.31 ms for 512 rows x 4 tokens (36 GFLOP/s, ONE thread); GPU 0.89-1.06 ms
+```
+
+**What is established:** the probe infrastructure works end to end (the real AVX2 kernel is callable and timed, the
+CUDA kernel runs, comparands are aligned). **What is not:** the port is not bit-exact. Two concrete mapping errors were
+found and fixed on the way (the Q4_K nibble layout: one byte per value, low nibble for values 0-31 of a 64-value group
+and high for 32-63; and a heap-corrupting brace-initialised buffer in the probe itself), and the residual difference
+dropped from 1251 to 499 — so the structure is closer, but the 6-bit scale-to-lane mapping and/or the `acc_m` term are
+still wrong.
+
+**The methodological lesson, recorded because it changes how the next step is done:** reverse-engineering the AVX2
+kernel's `_mm256_shuffle_epi8` scale broadcast by trial and error is slow and unverifiable. The right reference is
+**ggml's scalar `ggml_vec_dot_q4_K_q8_K`** (in the fetched ggml-cpu source), whose value-to-scale mapping is written
+out explicitly; `q4k_dot` was authored to match it ("ggml_vec_dot_q4_K_q8_K, __AVX2__"), so implementing the scalar
+semantics in CUDA and then checking it against the AVX2 kernel is a two-step verification instead of a guessing game.
+That is the next step.
+
+**Speed signals so far, with their limits:** the CPU AVX2 kernel does **36 GFLOP/s on ONE thread** for these dots;
+the engine's measured pool roof is 226 GFLOP/s (the 13-worker configuration reached 194). The naive GPU kernel (one
+thread per row, 10 blocks serial, per-token launch) is **3x slower** than a single CPU thread — which says nothing
+about the GPU's ceiling, only that this kernel is unvectorised. A real candidate needs dp4a/mma and one launch for the
+whole group; whether *that* can beat 194 GFLOP/s while streaming 281 MB per chunk-layer is the open question that
+decides A, and it is not answered yet.
+
 ### Phase 3b — the expf/SwiGLU probe: A survives, but not the way it was written
 
 `probe/exp_parity.cu` (nvcc -O3 -arch=sm_75, no fast-math), 40 million samples, gate values uniform in [-40, 5] plus a
