@@ -78,7 +78,10 @@ test('directory API protects loaded models, active requests and downloads, then 
  const original=join(home,'models'),keep=join(original,'keep.txt');writeFileSync(keep,'preserve');
  writeFileSync(join(home,'data','state.json'),JSON.stringify({installed:{'qwen38-q4_k_m':{simulated:true}},loaded:'qwen38-q4_k_m',setup:{complete:true,flowVersion:2,step:4}}));
  const port=await freePort(),base=`http://127.0.0.1:${port}`;
- const host=spawn(process.execPath,['server/index.mjs'],{cwd,env:{...process.env,STRATA_HOME:home,STRATA_MODELS_DIR:join(home,'models'),STRATA_REAL_ENGINE:'0',STRATA_FORCE_DEMO:'1',STRATA_PORT:String(port),STRATA_BIND:'127.0.0.1'},stdio:'ignore'});
+ const host=spawn(process.execPath,['server/index.mjs'],{cwd,env:{...process.env,STRATA_HOME:home,STRATA_MODELS_DIR:join(home,'models'),STRATA_REAL_ENGINE:'0',STRATA_FORCE_DEMO:'1',STRATA_PORT:String(port),STRATA_BIND:'127.0.0.1',// Pinned CPU-only hardware: the boot restore of the persisted load must not depend on how much
+// memory happens to be free on the machine running the test (a loaded runner reports so little free
+// RAM that nothing fits, the restore is skipped, and the folder change is wrongly allowed).
+STRATA_TEST_HARDWARE:'{"totalGb":64,"freeGb":48,"gpus":[]}'},stdio:'ignore'});
  async function call(path,body){const response=await fetch(base+path,{method:body===undefined?'GET':'POST',headers:{'content-type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});return {status:response.status,body:await response.json()};}
  try {
   let ready=false;for(let i=0;i<100;i++){try{ready=(await call('/api/runtime')).status===200;if(ready)break;}catch{}await pause(100);}assert.ok(ready);
