@@ -47,6 +47,7 @@
 #include <cublas_v2.h>
 #include "strata/prefill/gemm.hpp"
 #include <cuda_fp16.h>
+#include "kv_int8.cuh"
 
 #include <algorithm>
 #include <atomic>
@@ -1942,6 +1943,10 @@ struct Scratch {
     __half* dec_att16 = nullptr;
     int* ids;
     std::vector<__half*> kc, vc;   // S3: FP16 KV -- half the bytes/token and half the prefill traffic
+    // Experimental Phase 2a: packed durable KV plus ONE shared FP16 attention workspace.
+    bool kv_int8 = false;
+    std::vector<strata::kolibri::experimental::Kv8Block*> k8, v8;
+    __half *kv8_stage_k = nullptr, *kv8_stage_v = nullptr;
     std::vector<__half*> kt;       // K27: the transposed K mirror for the sliding layers (STRATA_KOLIBRI_ATTN_KT)
     std::vector<__half*> vt;       // K27: and the transposed V mirror (the PV pass reads V the same way)
     std::vector<int64_t> kt_rows;  // K27: each mirror's row stride (min(rows, two_pass_max))
@@ -2510,6 +2515,25 @@ static void seed_hot(Engine& e, Scratch& s) {
     KC(cudaStreamSynchronize(g_st));
 }
 
+// Restore only prior reachable rows. Newly prepared rows are packed once and rounded back
+// before attention, never recursively re-quantizing an old cache row.
+void kv8_restore_layer(const Engine& e, Scratch& s, int64_t l, int64_t pos, cudaStream_t st) {
+    if (!s.kv_int8 || pos == 0) return;
+    const int rows = strata::core::is_swa_layer(e.g,l) ? e.g.n_swa : s.ctx;
+    const int visible = (int) std::min<int64_t>(pos, rows);
+    const int blocks = e.g.n_head_kv * visible * (e.g.head_dim/64);
+    strata::kolibri::experimental::kv8_restore<<<blocks,64,0,st>>>(s.k8[l],s.kc[l],e.g.head_dim,rows,visible);
+    strata::kolibri::experimental::kv8_restore<<<blocks,64,0,st>>>(s.v8[l],s.vc[l],e.g.head_dim,rows,visible);
+}
+void kv8_pack_layer(const Engine& e, Scratch& s, int64_t l, int64_t pos, int count, cudaStream_t st) {
+    if (!s.kv_int8) return;
+    const bool sliding = strata::core::is_swa_layer(e.g,l);
+    const int rows = sliding ? e.g.n_swa : s.ctx;
+    const int blocks = e.g.n_head_kv * count * (e.g.head_dim/64);
+    strata::kolibri::experimental::kv8_pack<<<blocks,64,0,st>>>(s.kc[l],s.k8[l],e.g.n_head_kv,e.g.head_dim,rows,pos,count,sliding,s.kc[l]);
+    strata::kolibri::experimental::kv8_pack<<<blocks,64,0,st>>>(s.vc[l],s.v8[l],e.g.n_head_kv,e.g.head_dim,rows,pos,count,sliding,s.vc[l]);
+}
+
 void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t st, float* layers_host) {
     const auto& g = e.g;
     const int N = (int) g.n_embd, K = (int) e.top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
@@ -2557,6 +2581,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
         gemv_dec(e.dense.at(L(l, "attn_q.weight")), s.h, s.dec_h16, s.q, st);
         gemv_dec(e.dense.at(L(l, "attn_k.weight")), s.h, s.dec_h16, s.k, st);
         gemv_dec(e.dense.at(L(l, "attn_v.weight")), s.h, s.dec_h16, s.v, st);
+        kv8_restore_layer(e, s, l, s.pos, st);
         if (graph || steady || dec_attn_dp_on())
             k_attn_prep_p<<<H + HKV, kThreads, 0, st>>>(s.q, s.k, s.v, e.f32.at(L(l, "attn_q_norm.weight")),
                                            e.f32.at(L(l, "attn_k_norm.weight")), s.q, s.kc[l], s.vc[l], H, D, s.pos_d,
@@ -2565,6 +2590,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
             k_attn_prep<<<H + HKV, kThreads, 0, st>>>(s.q, s.k, s.v, e.f32.at(L(l, "attn_q_norm.weight")),
                                            e.f32.at(L(l, "attn_k_norm.weight")), s.q, s.kc[l], s.vc[l], H, D, s.pos,
                                            g.n_swa, s.ctx, e.rope_base, e.eps, sliding);
+        kv8_pack_layer(e, s, l, s.pos, 1, st);
         if (graph)
             k_attn_p<<<H, 512, (size_t) 4096 * sizeof(float), st>>>(
                 s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos_d, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding);
@@ -3030,10 +3056,12 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
             else e.gemm.native((const uint16_t*) A.x16, wv.type, wv.d, A.v_m, Tc, HKV * D, N);
         }
         pp_mark(e.cnt.pf_dense_ns);
+        kv8_restore_layer(e, s, l, p0c, g_st);
         k_attn_prep_multi<<<dim3(H + HKV, Tc), kThreads>>>(A.q_m, A.k_m, A.v_m, e.f32.at(L(l, "attn_q_norm.weight")),
                                                           e.f32.at(L(l, "attn_k_norm.weight")), A.q_m, s.kc[l],
                                                           s.vc[l], H, HKV, D, p0c, g.n_swa, s.ctx, e.rope_base,
                                                           e.eps, sliding);
+        kv8_pack_layer(e, s, l, p0c, Tc, g_st);
         // the chunk reads positions 0..p0c+Tc-1 (full) or the ring's last n_vis (sliding)
         const int P = sliding ? (int) std::min<int64_t>(p0c + Tc, g.n_swa) : (int) (p0c + Tc);
         const int64_t first = sliding ? p0c + Tc - P : 0;
@@ -4422,11 +4450,39 @@ void init_scratch(const Engine& e, Scratch& s) {
     // and nothing else.  Cost: 709.5 MiB of the ~4.5 GiB free.  The sliding layers keep their host ring (513 rows,
     // 26 MB in total).  STRATA_KOLIBRI_KV_DEV=1, default off until measured.
     const bool kv_dev = env_on("STRATA_KOLIBRI_KV_DEV");
+    s.kv_int8 = env_on("STRATA_KOLIBRI_KV_INT8");
+    if (s.kv_int8) {
+        if (g.head_dim % 64 || pf_pipe_on() || attn_kt_on() || dec_graph_on() || e.grouped > 0 ||
+            env_on("STRATA_KOLIBRI_DEC_TOKEN_GRAPH")) {
+            std::fprintf(stderr, "strata-kolibri: experimental KV_INT8 refuses pipelining, mirrors, graphs, grouped decode or head_dim not divisible by 64\n");
+            std::exit(2);
+        }
+        const size_t cap = (size_t) g.n_head_kv * std::max<int64_t>(s.ctx,g.n_swa) * g.head_dim;
+        KC(cudaMalloc((void**)&s.kv8_stage_k,cap*2));
+        KC(cudaMalloc((void**)&s.kv8_stage_v,cap*2));
+        std::fprintf(stderr,"kolibri: experimental KV_INT8 staged, 66 bytes/64 values; staging=%zu bytes; durable placement=%s (sliding stays host)\n",
+                     cap*4,kv_dev?"device":"host");
+    }
+    size_t kv_durable_bytes = 0;
     for (int64_t l = 0; l < g.n_layers; ++l) {
         const bool sliding = strata::core::is_swa_layer(g, l);
         const int64_t rows = sliding ? g.n_swa : s.ctx;
         const size_t elems = (size_t) g.n_head_kv * (size_t) rows * (size_t) g.head_dim;   // halves
-        if (kv_dev && !sliding) {
+        kv_durable_bytes += elems * (s.kv_int8 ? 66 : 128) / 32;
+        if (s.kv_int8) {
+            using strata::kolibri::experimental::Kv8Block;
+            Kv8Block *pk=nullptr, *pv=nullptr;
+            const size_t bytes=elems/64*sizeof(Kv8Block);
+            if (kv_dev && !sliding) {
+                KC(cudaMalloc((void**)&pk,bytes)); KC(cudaMalloc((void**)&pv,bytes));
+            } else {
+                KC(cudaHostAlloc((void**)&pk,bytes,cudaHostAllocDefault));
+                KC(cudaHostAlloc((void**)&pv,bytes,cudaHostAllocDefault));
+            }
+            KC(cudaMemset(pk,0,bytes)); KC(cudaMemset(pv,0,bytes));
+            s.k8.push_back(pk); s.v8.push_back(pv);
+            s.kc.push_back(s.kv8_stage_k); s.vc.push_back(s.kv8_stage_v);
+        } else if (kv_dev && !sliding) {
             void* pk = nullptr;
             void* pv = nullptr;
             KC(cudaMalloc(&pk, elems * 2));
@@ -4458,6 +4514,7 @@ void init_scratch(const Engine& e, Scratch& s) {
             s.vt.push_back(nullptr);
         }
     }
+    if (s.kv_int8) std::fprintf(stderr,"kolibri: KV_INT8 durable K+V allocation=%zu bytes\n",kv_durable_bytes);
 }
 
 /// Per-layer CUDA graphs (--grouped + graphs): a grouped layer's decode step is fully device-side (position and
@@ -4510,6 +4567,12 @@ void reset_state(Engine& e, Scratch& s) {
         const bool sliding = strata::core::is_swa_layer(e.g, (int64_t) l);
         const int64_t rows = sliding ? e.g.n_swa : s.ctx;
         const int64_t clear_rows = sliding ? rows : std::min<int64_t>(rows, used);
+        if (s.kv_int8) {
+            // Packed caches retain their per-head stride; clear all so reset cannot expose stale codes/scales.
+            const size_t packed_bytes=(size_t)e.g.n_head_kv*rows*e.g.head_dim/64*sizeof(strata::kolibri::experimental::Kv8Block);
+            KC(cudaMemset(s.k8[l],0,packed_bytes)); KC(cudaMemset(s.v8[l],0,packed_bytes));
+            continue;
+        }
         const size_t bytes = (size_t) e.g.n_head_kv * clear_rows * e.g.head_dim * 2;   // FP16 KV (S3)
         KC(cudaMemset(s.kc[l], 0, bytes));
         KC(cudaMemset(s.vc[l], 0, bytes));

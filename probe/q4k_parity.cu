@@ -37,10 +37,10 @@ static uint32_t rnd() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return ui
 static void make_q4k(uint8_t* b) {
     for (int i = 0; i < 144; ++i) b[i] = uint8_t(rnd());
     const float d = 0.004f + float(rnd() % 1000) * 2e-5f;
-    const float dmin = -(0.004f + float(rnd() % 1000) * 2e-5f);
+    const float dmin = (rnd() & 1 ? -1.f : 1.f) * (0.004f + float(rnd() % 1000) * 2e-5f);
     const uint16_t hd = f2h(d), hm = f2h(dmin);
     std::memcpy(b, &hd, 2); std::memcpy(b + 2, &hm, 2);
-    for (int s = 0; s < 12; ++s) b[4 + s] = uint8_t(rnd() & 0x3f);
+    // Keep all bits of the random packed scales: high bits carry scales/mins 4..7.
 }
 
 // ggml's scalar q4_K x q8_K semantics (quants.c: ggml_vec_dot_q4_K_q8_K_generic), reproduced exactly:

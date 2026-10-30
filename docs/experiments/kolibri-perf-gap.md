@@ -427,6 +427,55 @@ each arm. Non-finite values, stale outputs or unexplained same-arm variability r
 No measurement, implementation or result exists against these approvals yet: they are recorded here first, as the
 accuracy policy requires.
 
+### Phase 2a execution notes (before candidate end-to-end results)
+
+Ruling: exercise **int8 only** first (not optional k8v4). The durable format is 64 signed codes
+in [-127,127] plus an FP16 scale (66 bytes versus 128). Scale is max(abs(f16 inputs))/127,
+rounded to FP16; codes use round-to-nearest-even and the *rounded* scale. A nonzero block
+whose scale underflows uses the smallest positive FP16 subnormal; zero blocks have zero codes
+and scale. Decode/attention consumes FP16-rounded reconstructions so that the existing attention
+arithmetic is otherwise unchanged. This is an experimental, default-off numerical change.
+
+Ruling: first implement a **staged compressed cache** behind `STRATA_KOLIBRI_KV_INT8=1`.
+Per-layer durable packed K/V has the same host/device placement as the f16 control; one shared
+FP16 K/V workspace restores a layer before its attention preparation, then only new rows are
+packed and rounded back into that workspace. This genuinely reduces durable cache bytes but
+adds unpack traffic and staging allocation. Speed results describe this staging implementation,
+**not a ceiling for fused/direct int8 attention**. No claim of halved attention traffic is valid
+for this arm. Reject incompatible pipelining/graph/mirror combinations rather than silently running
+a different arm. Existing f16 code remains the exact gate-off path.
+
+The fixed six histories, nine records, two runs, independent reference, calibration-first rule,
+limits and state checks above remain unchanged. Preserve pinned old references read-only; collect
+new same-day f16 controls in this worktree/build. If numerical limits fail, no promotion or task-quality
+pass is inferred; task-quality qualification still needs its own approved statistical design.
+
+### Phase 2a build and validation checkpoint
+
+Separate build: `/data2/develop/perf-gap/build-perf-cuda`, Release, CUDA sm_75,
+`STRATA_NATIVE_EXPERTS=ON`, `STRATA_Q6K_EXPERTS=ON`, `STRATA_MMQ_KQUANTS=ON`.
+Build/configuration logs and all new runs: `/data4/kolibri-perf0/phase2a/`.
+No files in the FP16 evidence tree are written. The network server is not started;
+mandatory state checks use short-lived stdio engine processes only.
+
+* The CUDA format test was red with empty kernels (959 mismatches), then green with
+  the implementation. The registered `kolibri_kv_int8_test` passes on the T4.
+  It checks wrap, partial per-head restore, zeros, underflow scale, repeat unpack,
+  and pack/roundtrip agreement. CUDA engine build passes; HIP/SYCL not run (unavailable).
+* Focused Python checks: **68 passed**, one plugin deprecation warning (matrix environment,
+  comparison gates, KL/layer/qualification tools, worker-count/launcher rules).
+* Bare repository-wide `python -m pytest`: **collection failed, 33 errors**. Missing
+  `regex`, `safetensors`, `textual`, and `libtqenc.so`, plus standalone script collection
+  failures. Full names and traces are preserved in `phase2a/pytest.log`; this is **not**
+  a passing repository-wide suite. No claim of a green full suite is made.
+* `phase2a_run.py` collects two same-day controls for every history before candidates.
+  It refuses candidate measurement if gate-off logits differ from the preserved control,
+  if repetition differs, or calibration is incomplete. Cached independent-reference
+  dumps are read-only, with their hashes and original commands in the manifest.
+* State checks add a genuine warm-prefix/cold comparison (including generated history),
+  require a positive reported reuse count, and check cancellation's actual reason.
+  The older state helper's simple extension alone did not prove that reuse occurred.
+
 ### What would make me stop early
 
 If 2a shows no gain at 8k-110k, or 2b's byte saving does not move prefill or decode measurably, the lever is dropped as
