@@ -510,9 +510,104 @@ Artifacts: `/data4/kolibri-f16-evidence/f16-t4/` — `toy.txt`, `model-shapes.tx
 `trace/` (both arms' `.err` with the F16TRACE lines, the normalized traces, the differing records, the slot-probe
 run and its bitwise comparison).
 
-### Tasks 5–8
+### Task 5 — fix demonstrated defects, prove non-regression
 
-Not run yet. Each will be filled in with its commands, exit statuses, raw artifacts and a status word.
+**No defect was demonstrated, so no arithmetic changed.** Task 4 measured the FP16 expert GEMM inside an fp32
+accumulation bound on the model's own expert shapes, found the cache gives each resident of a chunk its own slot,
+and explained the divergence through measured components (rounding → router flips → amplification) rather than a
+wiring fault. Writing a "fix" for an undemonstrated cause would be the change this plan forbids, so the only code
+this task's evidence covers is the default-off trace added in Task 4. Under the accuracy policy, fixing nothing does
+**not** qualify the changed arithmetic, and nothing here does.
+
+**The cross-revision proof, which is the part that must hold.** The new build (`0bc772bf…`, `c1efc4a6` plus the
+trace) against the preserved `5bbe6c4e` control (`74b0e257…`), identical forced histories, cache off
+(`EXPERT_F16=0`, `PF_PARTIAL=0`, the four decode arms off), `--prefill --cpu-threads 8`:
+
+| prompt length | ctx | control | new | result |
+|---:|---:|---|---|---|
+| 16 | 2048 | exit 0, 4,608,000 B | exit 0, 4,608,000 B | **PASS** 9 x 128,000 bitwise identical, max abs 0.0 |
+| 511 | 2048 | exit 0 | exit 0 | **PASS** bitwise |
+| 512 | 2048 | exit 0 | exit 0 | **PASS** bitwise |
+| 513 | 2048 | exit 0 | exit 0 | **PASS** bitwise |
+| 8,191 (KV wrap) | 12,288 | exit 0 | exit 0 | **PASS** bitwise |
+| ~11,000 (attention transition) | 14,336 | exit 0 | exit 0 | **PASS** bitwise |
+
+All twelve runs exited 0 with a complete 4,608,000-byte dump; every comparison is 9 records x 128,000 values with
+`max |a-b| 0.0`. The 8,191 and 11,000 runs use the retained fixtures (`ids8191.txt`, `ids11000.txt`) and the recipe
+recovered in Task 0. This is the check the plan calls for and the one an arms-only comparison cannot replace.
+
+**`tools/kolibri/decode_gate.sh check`** with the new build and the cache off, `STRATA_GEMM_DETERMINISTIC=1`:
+
+```
+  1.16  PASS  PASS 9 record(s) x 128000 value(s) bitwise identical; max |a-b| 0.0
+  1.511 PASS  PASS ... 1.512 PASS  PASS ... 1.513 PASS  PASS ...
+  2.reuse PASS  2 request record(s) (cold 512 ids, then +64) bitwise identical, headers included
+  3.repeat PASS  REPEAT PASS
+DECODE GATE PASS
+```
+
+**Affected tests** (`ctest -R 'kolibri|dequant|f16_expert|q4k|gemm_dequant'`, exit 0):
+
+| test | result |
+|---|---|
+| `kolibri_load_test`, `kolibri_window_test`, `kolibri_hot_policy_test` | passed |
+| `kolibri_decode_wait_test` | passed |
+| `q4k_grouped_vram_parity`, `f16_expert_gemm_parity` | passed |
+| `dequant_s2_parity`, `dequant_wide_parity`, `gemm_dequant_side_parity`, `dequant_q5_1_test`, `ple_iq4nl_dequant_test` | passed |
+| `kolibri_dequant_f16_selftest` | passed |
+| `kolibri_router_parity`, `kolibri_pf_partial_guard_test`, `kolibri_pf_partial_guard_explicit_zero_test`, `kolibri_cpu_threads_floor_test` | passed |
+| `kolibri_res_top_zero_test` | **skipped** by its own design |
+
+16 passed, 0 failed, 1 skipped. `pytest tools/kolibri/test_klcmp.py tools/kolibri/test_layer_delta.py` → 37 passed;
+`tools/kolibri/test_build_portability.py` → 2 passed.
+
+**Backends.** CUDA (`sm_75`) built and executed: passed as above. **HIP: not run** — no `hipcc` on this host.
+**SYCL: not run** — no `icpx` on this host. The touched files are the CUDA-only test registration, a host `.cpp`
+test, `tests/kolibri/*.cu` for the same runtime via `_strata_gpu_runtime_target`, and two default-off `fprintf`
+blocks in `kolibri_engine.cu`; that is a compilation claim for HIP/SYCL, not a tested one. The **full 210-test ctest
+suite was not run** in this task; only the affected subset above.
+
+Artifacts: `/data4/kolibri-f16-evidence/f16-t5/` — `cross/` (all twelve runs with `.env`, `.err`, `.out`, dumps,
+`compare.txt`, `binaries.txt`), `gate/` and `gate-output.txt`, `ctest-affected.txt`.
+
+### Task 6 — proposed qualification protocol, awaiting approval (no results collected)
+
+**Nothing has been measured for qualification yet, and this section is written before any is.** The numbers quoted
+anywhere above are diagnostic, not preregistered qualification, and will not be relabelled as such.
+
+Proposed, for the maintainer to accept or amend:
+
+1. **Corpus.** Three families of forced history, all run on the same ids for every arm: (a) 16-token and 512-token
+   prompts from `tools/kolibri/oracle_ids512.txt`; (b) the 8,191-id KV-wrap fixture; (c) the ~11,000-id
+   attention-transition fixture; (d) two additional prompt texts (one German, one code-shaped) of about 512 tokens,
+   recorded with their ids. Nine forced decode steps each, as in every run above.
+2. **Arms.** control (`EXPERT_F16=0`, `PF_PARTIAL=0`), cache-only (`24`, `0`), cache+partial (`24`, `1`), on the
+   current build; the preserved `5bbe6c4e` control also dumped on the same histories so the reference comparison is
+   not taken against a moving build.
+3. **Reference.** The pinned llama.cpp dumper (`kolibri_llama_dump`, `/home/gbo/llama.cpp` `a30fb4924`) with
+   `--ngl 99 --cpu-moe 999` — all experts on the CPU, which is the only arrangement that fits a 16 GB T4 with a
+   47 GB model. Its offload/precision arrangement is recorded with every dump, and it is labelled as a CPU-expert
+   reference, not an all-GPU one. `strata-kolibriref` is a diagnostic control only.
+4. **Metrics.** Full-distribution KL (mean/median/p95/p99/worst) per arm against the reference, `|dlogit|`
+   percentiles and worst, top-1 agreement, changes in the reference winner's rank and its margin, per prompt and
+   per position, plus control-vs-reference reported separately so a defective control is visible.
+5. **Proposed acceptance limit** (the maintainer must set or change this): mean KL <= 1e-3, p99 <= 5e-3, worst
+   `|dlogit|` <= 0.05, top-1 agreement 100 % on every prompt, and no rank-1 flip where the reference margin exceeds
+   0.05. Measured so far, the cache arms sit at mean KL 0.400 and 11.08 worst `|dlogit|` for a *diagnostic* 512-token
+   case, so this limit is expected to **reject** both cache arms; the value of running the protocol is then to record
+   that rejection on the record rather than to find a passing threshold. Any looser limit must be argued explicitly
+   and is not proposed here.
+6. **State checks.** Two repeats per arm plus first use, replay, prefix reuse, reset, cancellation and a clean
+   request after cancellation, for cache-only and cache+partial, comparing like-for-like cold and reused histories.
+   Non-finite values, stale outputs or unexplained same-arm variability reject regardless of the KL numbers.
+7. **What this cannot decide.** Task quality (Task 7) and speed (Task 8) are separate. No default changes, no push.
+
+**Status: blocked on approval.** No qualification data will be generated until the criteria in items 1-5 are agreed.
+
+### Tasks 7–8
+
+Not run. Task 7 requires its own approval of a preregistered protocol before any evaluation output is examined;
+Task 8 requires the fidelity/quality decision first.
 
 ## Artifacts
 
