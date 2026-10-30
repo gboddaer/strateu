@@ -3,17 +3,10 @@
   "target": "branch",
   "enforcement": "active",
   "bypass_actors": [
-    {
-      "actor_id": 5,
-      "actor_type": "RepositoryRole",
-      "bypass_mode": "pull_request"
-    }
+    {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}
   ],
   "conditions": {
-    "ref_name": {
-      "include": ["refs/heads/main"],
-      "exclude": []
-    }
+    "ref_name": {"include": ["refs/heads/main"], "exclude": []}
   },
   "rules": [
     {
@@ -24,6 +17,21 @@
         "require_code_owner_review": true,
         "require_last_push_approval": true,
         "required_review_thread_resolution": true
+      }
+    },
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": true,
+        "required_status_checks": [
+          {"context": "title", "integration_id": 15368},
+          {"context": "node-test", "integration_id": 15368},
+          {"context": "Linux / runtime requirements only", "integration_id": 15368},
+          {"context": "ubuntu-latest / Python 3.10", "integration_id": 15368},
+          {"context": "ubuntu-latest / Python 3.11", "integration_id": 15368},
+          {"context": "windows-latest / Python 3.10", "integration_id": 15368},
+          {"context": "windows-latest / Python 3.11", "integration_id": 15368}
+        ]
       }
     }
   ]
