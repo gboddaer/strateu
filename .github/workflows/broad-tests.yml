@@ -9,9 +9,24 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: broad-tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  probe:
-    name: probe
-    runs-on: ubuntu-latest
+  broad:
+    name: ${{ matrix.suite }} / ${{ matrix.os }} / Python 3.11
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        suite: [terminal, setup]
+    env:
+      STRATA_GGUF_PY: ${{ github.workspace }}/.test-deps/llama.cpp/gguf-py
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - run: echo hi
