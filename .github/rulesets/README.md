@@ -1,122 +1,128 @@
-# Protect main after publication
+# Repository protections
 
-Prepared for `gboddaer/strateu`. These files do not change GitHub settings by themselves.
-They are ready-to-submit REST API payloads, not an assertion that protection is active.
+Configuration for `gboddaer/strateu`. JSON files are API payloads; committing them
+alone does not change live GitHub settings. Use `gh api` to apply them.
 
-## Policy and limits
+## Main branch policy
 
-- `main-safety`: every change needs a PR; block force pushes and branch deletion;
-  resolve review conversations. No actor can bypass this ruleset.
-- `owner-approval`: one approval, including a code-owner approval; invalidate stale
-  approvals and require approval from someone other than the last pusher.
-- `.github/CODEOWNERS`: `@gboddaer` owns every path, including CODEOWNERS itself.
-  GitHub uses the file on the PR's base branch, so land it on main before activation.
-- The approval ruleset permits repository admins (GitHub's built-in role ID 5) to
-  bypass **through a PR only**. This lets the sole owner merge their own PRs, since
-  authors cannot approve themselves. The separate safety rules still apply.
-- This admin exception can bypass approval on ANY PR, not only your own. Use it
-  deliberately, normally only for your own PRs. Adding another admin gives them
-  this exception too. GitHub cannot make repository rules immutable to an admin
-  who can edit or delete them.
-- These rules require your approval for ordinary contributors; they do not stop
-  other people from leaving non-binding reviews. Keep yourself the only admin
-  and do not grant unnecessary write access.
-- CI checks are intentionally NOT required yet. After verifying which checks run
-  reliably on every PR, add `required_status_checks` to `main-safety`, with their
-  exact names and preferably their GitHub App integration IDs. Do not put checks
-  in the bypassable approval ruleset. Until then, inspect CI manually before merging.
-- Only `main` is protected. Tags, releases, other branches, Actions, secrets and
-  publication/history audits are outside this configuration's scope.
+- `main-safety` blocks deletion and force pushes. It has **no bypass actors**, so
+  these restrictions also apply to the owner.
+- `owner-approval` requires a PR, one approval including the code owner, fresh
+  approval after changes, approval from someone other than the last pusher,
+  resolved conversations, and the seven checks below against an up-to-date branch.
+- `.github/CODEOWNERS` assigns every path to `@gboddaer`, including this configuration.
+- The repository admin role (GitHub role ID 5) has an **always** bypass on
+  `owner-approval`. This is intentional: the owner can make normal direct pushes
+  to main without a PR or passing CI, and can merge their own PRs.
+- There is currently one admin, `gboddaer`. Adding another admin gives that account
+  the same bypass. Other contributors do not get this exception. Ordinary public
+  fork contributors cannot push to the repository at all.
+- An admin can change rulesets themselves. These rules are not an immutable lock
+  against a compromised owner account; protect that account with strong MFA.
 
-## Before publication
+Required checks, tied to the GitHub Actions App (integration ID 15368):
 
-1. Review and commit these files, then push them to main while it is still private.
-   Do not put credentials in the payloads or this document.
-2. Audit repository history and Actions before making anything public. These rules
-   do not make untrusted PR workflows safe or remove leaked secrets.
-3. Confirm you are still the only admin. If you add another admin, review this policy.
-4. Activate immediately after making the repo public, or first upgrade to a plan
-   that supports rulesets on this private repo. Publication is a separate manual
-   action: none of the commands below changes visibility.
+1. `title`
+2. `node-test`
+3. `Linux / runtime requirements only`
+4. `ubuntu-latest / Python 3.10`
+5. `ubuntu-latest / Python 3.11`
+6. `windows-latest / Python 3.10`
+7. `windows-latest / Python 3.11`
 
-## Apply once, from the repository root
+These workflows run on every PR without path filters. A rename requires updating
+this policy; an unavailable check blocks non-bypassing contributors. Metal is
+still conditional and is not a required check. These checks do not qualify GPU
+runtime correctness or replace engine accuracy gates.
 
-Requires authenticated `gh` with repository administration permission. The current
-private-repo plan returned HTTP 403 for rulesets during preparation. There is no
-server-side dry-run here; GitHub acceptance is only known when submitted.
+## Actions and security policy
 
-First confirm the account, target, visibility, and existing rulesets:
+- Default workflow token permissions: read; workflows cannot approve PRs.
+- All external contributors need approval for fork PR workflow runs. This does
+  not protect `pull_request_target` or other privileged events: the intake/reopen
+  workflows must continue to use trusted default-branch scripts only, never fork code.
+- Selected Actions only: checkout, setup-node, setup-python and github-script
+  under the `actions` organization. Full commit-SHA pinning is required. Existing
+  action versions are pinned without changing their major versions.
+- All workflow checkouts disable credential persistence. Privileged jobs still
+  explicitly request the permissions they need.
+- Dependabot alerts and automatic security-update PRs are enabled. Dependabot
+  cannot bypass owner review; merging its updates is still the owner's decision.
+- Secret scanning, push protection and private vulnerability reporting remain enabled.
+- Action restrictions do not pin tools downloaded by shell commands or Python/npm
+  dependencies. Review those supply chains separately.
+- Tags, releases, other branches and source-history privacy are outside these rulesets.
+
+## Apply or update
+
+From the repository root, authenticated as the repository admin. Review the
+payloads first. These commands do not change repository visibility.
+
+Find existing ruleset IDs:
 
 ```sh
-gh auth status
-gh api repos/gboddaer/strateu --jq '{full_name, visibility, default_branch, permissions}'
-gh api repos/gboddaer/strateu/rulesets --jq '.[] | {id, name, enforcement}'
+gh api repos/gboddaer/strateu/rulesets --jq '.[] | {id,name,enforcement}'
 ```
 
-If either name already exists, use the update commands below instead of creating
-another copy. Confirm CODEOWNERS has landed:
+At initial activation: `main-safety` was ID `26201611` and `owner-approval` was
+ID `26201578`. Verify IDs before updating. For a new repository use POST once;
+repeated POSTs create duplicates. For this repository update with PUT:
 
 ```sh
-gh api 'repos/gboddaer/strateu/contents/.github/CODEOWNERS?ref=main' --jq .sha
-```
-
-Create the approval gate first, then the non-bypassable safety gate. Stop if a
-command fails. If only one succeeds, protection is partial: finish the other
-before treating the branch as protected.
-
-```sh
-gh api --method POST repos/gboddaer/strateu/rulesets \
-  --input .github/rulesets/owner-approval.json --jq '{id, name, enforcement}'
-gh api --method POST repos/gboddaer/strateu/rulesets \
-  --input .github/rulesets/main-safety.json --jq '{id, name, enforcement}'
-```
-
-Record both returned IDs. POST creates a new ruleset on every invocation; it is
-not an update or an idempotent command.
-
-To update an existing rule, substitute its numeric ID:
-
-```sh
-gh api --method PUT repos/gboddaer/strateu/rulesets/APPROVAL_ID \
-  --input .github/rulesets/owner-approval.json
-gh api --method PUT repos/gboddaer/strateu/rulesets/SAFETY_ID \
+gh api --method PUT repos/gboddaer/strateu/rulesets/26201611 \
   --input .github/rulesets/main-safety.json
+gh api --method PUT repos/gboddaer/strateu/rulesets/26201578 \
+  --input .github/rulesets/owner-approval.json
 ```
 
-## Verify after application
-
-Read the stored configuration and the rules effective on main:
+Land SHA-pinned workflows **before** turning on SHA enforcement. Set selected
+mode first, then its allowlist. Do not dispatch workflows in between these calls.
 
 ```sh
-gh api repos/gboddaer/strateu/rulesets/APPROVAL_ID
-gh api repos/gboddaer/strateu/rulesets/SAFETY_ID
+gh api --method PUT repos/gboddaer/strateu/actions/permissions \
+  --input .github/rulesets/actions-permissions.json
+gh api --method PUT repos/gboddaer/strateu/actions/permissions/selected-actions \
+  --input .github/rulesets/actions-selected.json
+gh api --method PUT repos/gboddaer/strateu/actions/permissions/fork-pr-contributor-approval \
+  -f approval_policy=all_external_contributors
+gh api --method PUT repos/gboddaer/strateu/vulnerability-alerts
+gh api --method PUT repos/gboddaer/strateu/automated-security-fixes
+```
+
+On a fresh repository, keep the existing safe token settings or set them with:
+
+```sh
+gh api --method PUT repos/gboddaer/strateu/actions/permissions/workflow \
+  -f default_workflow_permissions=read -F can_approve_pull_request_reviews=false
+```
+
+## Verify
+
+```sh
+gh api repos/gboddaer/strateu/rulesets/26201611
+gh api repos/gboddaer/strateu/rulesets/26201578
 gh api repos/gboddaer/strateu/rules/branches/main
 gh api 'repos/gboddaer/strateu/codeowners/errors?ref=main'
-gh api repos/gboddaer/strateu/collaborators --jq '.[] | {login, role_name}'
+gh api repos/gboddaer/strateu/collaborators --jq '.[] | {login,role_name}'
+gh api repos/gboddaer/strateu/actions/permissions
+gh api repos/gboddaer/strateu/actions/permissions/selected-actions
+gh api repos/gboddaer/strateu/actions/permissions/fork-pr-contributor-approval
+gh api repos/gboddaer/strateu/actions/permissions/workflow
+gh api repos/gboddaer/strateu/automated-security-fixes
 ```
 
-Check that both enforcement values are `active`, both target `refs/heads/main`,
-main-safety has an empty bypass list, and owner-approval has exactly the admin
-role with `pull_request` bypass. Confirm no CODEOWNERS errors. Unexpected inherited
-or additional rules must be reviewed, not blindly removed.
+Both rulesets must be active and target `refs/heads/main`. The current owner should
+have `current_user_can_bypass: always` on owner-approval and `never` on main-safety.
+CODEOWNERS should have no errors. Check Actions results after changing pins.
+The classic branch-protection endpoint can return 404 when protection uses rulesets.
 
-Finally, test a harmless external-contributor PR:
-
-- Changes request `@gboddaer` as code owner; another person's approval cannot
-  satisfy your code-owner requirement.
-- Without your approval, GitHub shows review requirements as unmet. Your admin
-  account may display a bypass option; that is not an ordinary contributor's access.
-- Your approval permits merging after conversations are resolved; pushing another
-  change invalidates approval.
-- An owner-authored PR can be merged using the deliberate approval bypass, but
-  still needs resolved conversations and must use a PR.
-
-Do not test force pushes or deletion against main. The API readback verifies the
-configured prohibition; behavioral testing belongs on a disposable test repository.
-These checks are not claimed as executed during preparation.
+Do not test force pushes or deletion against main. Test ordinary contributor
+review/CI blocking with a harmless PR; an owner account's bypass is not a test of
+an ordinary contributor's access.
 
 ## References
 
-- [GitHub rules REST API](https://docs.github.com/en/rest/repos/rules)
-- [Creating rulesets and PR-only bypass](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/creating-rulesets-for-a-repository)
+- [Rules REST API](https://docs.github.com/en/rest/repos/rules)
+- [Actions permissions REST API](https://docs.github.com/en/rest/actions/permissions)
+- [Ruleset bypass permissions](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/creating-rulesets-for-a-repository)
 - [Code owners](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners)

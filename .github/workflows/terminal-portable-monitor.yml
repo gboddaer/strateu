@@ -13,18 +13,8 @@ on:
       - tools/portable_monitor_pty_smoke.py
       - requirements-monitor.txt
       - LICENSE
+  # Required checks: run on every PR, including documentation-only changes.
   pull_request:
-    paths:
-      - .github/workflows/terminal-portable-monitor.yml
-      - packaging/monitor_bundle.py
-      - strata.py
-      - strata_cli/**
-      - strata_control/**
-      - tools/minimal_cli_smoke.py
-      - tools/portable_monitor_smoke.py
-      - tools/portable_monitor_pty_smoke.py
-      - requirements-monitor.txt
-      - LICENSE
   workflow_dispatch:
 
 permissions:
@@ -40,10 +30,10 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         python: ['3.10', '3.11']
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: ${{ matrix.python }}
       - name: Check source CLI without optional packages
