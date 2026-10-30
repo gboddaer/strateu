@@ -149,6 +149,42 @@ correct. Options: reproduce the CPU value exactly (hard), or measure the diverge
 thing the probe must measure, before any kernel work: compare CPU `std::exp` and CUDA `expf` over the full
 single-precision range, count exact matches, and report.**
 
+### Phase 3b — the expf/SwiGLU probe: A survives, but not the way it was written
+
+`probe/exp_parity.cu` (nvcc -O3 -arch=sm_75, no fast-math), 40 million samples, gate values uniform in [-40, 5] plus a
+dense linspace, `u` uniform in [-2, 2]:
+
+```
+exp(+x):                    12,121,875 of 40,000,000 differ bitwise (30.30 %), worst 2 ulp at x = -31.977
+swiglu (g/(1+exp(-g)))*u:    8,647,247 of 40,000,000 differ bitwise (21.62 %)
+```
+
+**So a CUDA `expf` is not glibc's, and a port that computes SwiGLU on the GPU cannot be bit-exact.** That is not a
+reason to abandon A, because the SwiGLU does not have to move:
+
+**The bit-exact design that survives** — move only the two dot products, keep the elementwise stages on the CPU:
+
+```
+GPU: gate/up Q4_K x Q8_K dot          (bit-exact reproduction of q4k_dot)
+D2H: gate/up outputs                  rows x 2*n_ff floats   = 1,533 x 1,024 x 4 = 6.3 MB per chunk-layer
+CPU: SwiGLU  (g/(1+std::exp(-g)))*u  +  Q8_K quantisation of h   -- the existing code, unchanged
+H2D: h (Q8_K)                         rows x n_ff bytes       = 1,533 x 292        = 0.45 MB
+GPU: down Q6_K x Q8_K dot             (bit-exact reproduction of ggml's kernel)
+D2H: down outputs                     rows x n_embd floats    = 1,533 x 2,560 x 4 = 15.7 MB
+```
+
+The intermediate traffic is ~22 MB per chunk-layer against 281 MB of expert weights, so it costs ~2 ms at the measured
+9.6 GB/s PCIe — affordable against a 85.7 ms baseline. And the activation quantisation (x -> Q8_K) stays where it
+already is, on the CPU, so the values the dots consume are produced by the same code as today.
+
+The alternative — reimplementing glibc's `expf` on CUDA to the last bit — is a porting project with its own risk, and
+it is not needed for a bit-exact arm.
+
+**Revised go/no-go for A:** the Q4_K and Q6_K dots must be bit-identical on the real shapes (measurable in the next
+probe), the CPU SwiGLU/quantisation round trip must stay affordable, and the whole thing must beat the measured
+8.0 s prefill (63.6 tok/s) including the 28 GB of weight streaming. If the dots cannot be made bit-identical, or the
+round trip eats the gain, A is reported as a measured dead end.
+
 **Probe design (the next step, no engine change).** A standalone program in this worktree with its own build dir:
 1. drive the **CPU pool kernels** (`native_fmt` / `native_quant_act` / `native_gu_rows` / `native_quant_h` /
    `native_down_rows`) at the real shapes, 13 workers single-node → the 85.7 ms/chunk-layer, 194 GFLOP/s baseline;
