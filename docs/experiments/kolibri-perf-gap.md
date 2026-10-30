@@ -389,6 +389,17 @@ context sweep (512, 8,191, ~11,000) because that is where its value is; for 2b t
 Two repeats per arm plus first use, replay, prefix reuse, reset, cancellation and a clean request after cancellation, for
 each arm. Non-finite values, stale outputs or unexplained same-arm variability reject regardless of the KL numbers.
 
+### Operator decisions, recorded before any result (2026-10-30)
+
+| # | decision | what it authorises |
+|---|---|---|
+| **2a+2b** | **(i) approve both as written**, limits as proposed | KV int8 (`k8v4` optional) and Q4_K down may be implemented and measured; the corpus, reference, control-calibration-first rule and limits in this section are the approved protocol; the FP16 limits were kept identical on purpose and are not re-derived after results |
+| **A** | **benchmark first**, then **A1** if the floor is reachable | the chunk-scale streaming benchmark runs before any port work; if it shows the 2.93 s streaming floor is reachable, the port is built to A1 (emulate the AVX2 summation order exactly — bit-identical, no numerical qualification). If the floor is not reachable, A stops |
+| **memory binding** | **launcher prefix** (`setup.py` writes the node, `serve/server.py` applies `numactl --cpunodebind/--membind`) | this is the decode half of the free win (24.02 → 12.93 ms/token measured). It must fall back cleanly when `numactl` is absent or the machine has one node, and it changes no arithmetic |
+
+No measurement, implementation or result exists against these approvals yet: they are recorded here first, as the
+accuracy policy requires.
+
 ### What would make me stop early
 
 If 2a shows no gain at 8k-110k, or 2b's byte saving does not move prefill or decode measurably, the lever is dropped as
