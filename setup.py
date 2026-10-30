@@ -902,6 +902,36 @@ def expert_worker_count(root: str = "/sys") -> int:
         return cap
 
 
+def expert_numa_prefix(root: str = "/sys", numactl: str | None = None) -> list[str]:
+    """`numactl --cpunodebind=N --membind=N` for the GPU's NUMA node, or [] when it does not apply.
+
+    Measured (docs/experiments/kolibri-perf-gap.md Phase 1/1c): with the pool's workers and the 42.9 GiB pinned expert
+    table spread over two NUMA nodes, Kolibri's decode expert leg costs 24.0 ms/token; bound to the GPU's node it costs
+    12.9.  Pinning the workers alone (the engine's own --pool-cores / STRATA_NUMA_POOL) reproduces none of that - it is
+    the *memory* binding that matters, because the table is then read locally instead of across the interconnect.
+
+    So setup writes this prefix when, and only when, it can help: two or more NUMA nodes, `numactl` installed, and the
+    GPU's node known.  Otherwise the list is empty and the engine is started exactly as before.  `numactl` execs the
+    program it wraps, so the engine keeps its pid and the server's lifecycle handling is untouched.  It changes no
+    arithmetic: the same kernel runs on the same values, only the memory it reads is placed locally.
+    """
+    if WIN:
+        return []
+    exe = numactl if numactl is not None else shutil.which("numactl")
+    if not exe:
+        return []
+    try:
+        nodes = sorted(glob.glob(os.path.join(root, "devices", "system", "node", "node[0-9]*")))
+        if len(nodes) < 2:
+            return []
+        node = _gpu_numa_node(root)
+        if node is None or node >= len(nodes):
+            return []
+        return [exe, f"--cpunodebind={node}", f"--membind={node}"]
+    except (OSError, ValueError, IndexError):
+        return []
+
+
 def step(n, title):
     say()
     say(f"=== Step {n}: {title} ===")
@@ -8046,6 +8076,12 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
            "tokenizer": str(pack / "tokenizer"),
            "model_name": f"{fam['name']}-{model.lower()}", "arch": fam["arch"],
            "log": str(home() / f"strata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
+    if fam.get("binary"):                          # Kolibri: its CPU pool reads a 42.9 GiB pinned expert table
+        numa_prefix = expert_numa_prefix()
+        if numa_prefix:
+            cfg["launch_prefix"] = numa_prefix
+            ok(f"CPU pool bound to the graphics card's NUMA node ({numa_prefix[-2].split('=')[-1]}): "
+               f"measured 12.9 ms/token of expert work there against 24.0 when the table is read across the nodes")
     if cuda_tk == 12:
         cfg["cuda"] = 12
     if hip:

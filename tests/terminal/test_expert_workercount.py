@@ -84,3 +84,64 @@ class ExpertWorkerCount(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NumaPrefix(unittest.TestCase):
+    """setup.py expert_numa_prefix: bind the engine's memory to the GPU's node, or nothing at all."""
+
+    def prefix(self, root, numactl="/usr/bin/numactl", win=False):
+        with mock.patch.object(setup_mod, "WIN", win), \
+             mock.patch.object(setup_mod.subprocess, "run",
+                               return_value=mock.Mock(stdout="00000000:82:00.0\n", returncode=0)):
+            return setup_mod.expert_numa_prefix(str(root), numactl=numactl)
+
+    def test_two_nodes_binds_the_gpu_node(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_tree(root, {0: [0, 1], 1: [2, 3]}, [(0, 0), (0, 1), (1, 0), (1, 1)], gpu_node=1)
+            self.assertEqual(self.prefix(root), ["/usr/bin/numactl", "--cpunodebind=1", "--membind=1"])
+
+    def test_single_node_needs_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_tree(root, {0: [0, 1]}, [(0, 0), (0, 1)], gpu_node=0)
+            self.assertEqual(self.prefix(root), [])
+
+    def test_no_numactl_starts_the_engine_as_before(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_tree(root, {0: [0, 1], 1: [2, 3]}, [(0, 0), (0, 1), (1, 0), (1, 1)], gpu_node=1)
+            self.assertEqual(self.prefix(root, numactl=""), [])
+
+    def test_unknown_gpu_node_needs_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_tree(root, {0: [0, 1], 1: [2, 3]}, [(0, 0), (0, 1), (1, 0), (1, 1)], gpu_node=None)
+            self.assertEqual(self.prefix(root), [])
+
+    def test_windows_needs_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_tree(root, {0: [0, 1], 1: [2, 3]}, [(0, 0), (0, 1), (1, 0), (1, 1)], gpu_node=1)
+            self.assertEqual(self.prefix(root, win=True), [])
+
+
+class EngineCommand(unittest.TestCase):
+    """serve/server.py engine_cmd: the prefix goes in front, and an empty prefix changes nothing."""
+
+    def test_prefix_is_prepended(self):
+        from serve.server import engine_cmd
+        self.assertEqual(engine_cmd("/e/strata", ["--model", "m"], ["/usr/bin/numactl", "--membind=1"]),
+                         ["/usr/bin/numactl", "--membind=1", "/e/strata", "--serve", "--model", "m"])
+
+    def test_no_prefix_is_the_old_argv_exactly(self):
+        from serve.server import engine_cmd
+        self.assertEqual(engine_cmd("/e/strata", ["--model", "m"], None), ["/e/strata", "--serve", "--model", "m"])
+
+    def test_config_key_is_what_the_launcher_reads(self):
+        """setup.py writes "launch_prefix"; the server reads rc.get("launch_prefix")."""
+        import inspect
+        from serve import server
+        src = inspect.getsource(server)
+        self.assertIn('rc.get("launch_prefix")', src)
+        self.assertIn("engine_cmd(exe, args, self.launch_prefix)", src)
