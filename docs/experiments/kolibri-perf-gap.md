@@ -39,6 +39,47 @@ worktree `/data2/develop/native-q4q6`.
 
 ## Phase 0 measurements
 
+### Qwen3.8-Flash-Next — full run with the residency table (prefill + decode)
+
+Command: `engine/strata --pack …/unsloth-ud-q4_k_xl --native …00001-of-00004.gguf --expert-profile
+…/data/expert-profile.bin --expert-cache 1024 --tokens-file ids512.txt --max-new 128 --max-context 16384
+--kv int8 --kv-resident 16384 --prefill 512 --spec 2 --suffix-draft 0 --lookup-chain 0 --pool-workers 13 --stats`
+(load: ~77 GB read at ~110 MB/s before the first line; see finding 3.)
+
+```
+prefill  511 tokens in 2,670.0 ms -> 191.38 tok/s   (time to first token 3,923.5 ms)
+decode   128 tokens in 16,724.6 ms ->   7.65 tok/s  (130.66 ms/token wall clock)
+PLE      0.6 ms in this run; PLE io during decode: 12,832 rows, 26.3% row-cache hits, 2,880 SSD reads
+         (12.1 MB), p50 4,597 us, p99 571,285 us, **blocked 6,063 ms total**
+spec     "128 rounds of 2, drafts accepted 0 of 127 (0.000), 1.00 tokens per round"
+experts  prefill: 5,709 streamed (all by DMA), 747 resident, 6,526 on the CPU (share 0.70)
+         decode: 49.433 ms/token of CPU pool over 48 layers; 1.97 distinct experts/layer over PCIe
+         expert-cache hits 69,592 of 110,213 = 63.1 % (cache 1,024 slots, 100 % full)
+pool     gate/up 34.171 + quantize 0.428 + down 22.750 = 19.8 GB/s over the row phases
+```
+
+**The drafter contributed nothing** — 0 of 127 drafts accepted. So this *is* the no-drafter number the
+investigation wanted, by accident of the small verify window and this pack's MTP head.
+
+### Side-by-side on the same card and prompt (both measured this session)
+
+| | Kolibri-1 (pool, 8 workers) | Qwen3.8-Flash-Next (int8 KV, 1,024-slot cache) | winner |
+|---|---:|---:|---|
+| prefill, 511-512 tokens | 58-60 tok/s (8.46-8.87 s) | **191.4 tok/s** (2.67 s) | **Qwen 3.2x** |
+| decode, greedy/1 token per round | **~30.5 tok/s** | 7.65 tok/s (130.7 ms/token) | **Kolibri 4.0x** |
+| expert bytes streamed for the prefill | 28.09 GB | ~5,709 x 3.99 MB ≈ 22.8 GB | similar |
+| achieved streaming rate | **3.2-3.4 GB/s** (CPU pool) | **9.6-19.8 GB/s** (PCIe DMA + GPU) | **Qwen 3-6x** |
+| PLE table | none | 6.06 s of decode blocked on SSD reads | Kolibri |
+
+**This is the finding of Phase 0, and it is not the story we assumed.** Flash is not uniformly faster: it wins
+**prefill by 3.2x and loses decode by 4x**. And the prefill win is not a better kernel — it is **the same bytes moved
+3-6x faster**, because Strata streams experts by PCIe DMA to the GPU (the engine's own probe: 9.6 GB/s host→device)
+while Kolibri's pool reads them with AVX-2 CPU workers at 3.2-3.4 GB/s. Qwen's decode is slow for reasons Kolibri does
+not have: 60 % of its decode wall time is PLE table reads from the SSD (p99 0.57 s per read) and its pool drain is
+91.5 ms/token.
+
+
+
 ### Qwen3.8-Flash-Next, prefill (drafter-independent), 511 tokens, no residency
 
 Command: `engine/strata --pack …/unsloth-ud-q4_k_xl --native …00001-of-00004.gguf --tokens-file ids512.txt
