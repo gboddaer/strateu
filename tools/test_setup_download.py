@@ -314,14 +314,16 @@ class Resume(unittest.TestCase):
             "import sys; sys.path[:0] = [%r, %r]\n"
             "import setup\n"
             "setup.DL_CHUNK = %d; setup.DL_MIN_PARALLEL = 0; setup.DL_SAVE_EVERY = 0.05; setup.DL_CONNECTIONS = 4\n"
+            "setup.DL_BACKOFF = 0.05\n"          # a transient failed request must not hold the child past the wait
             "pin = (%d, %r)\n"
             "setup.file_pin = lambda u: pin\n"
             "setup.download(sys.argv[1], __import__('pathlib').Path(sys.argv[2]) / %r, 'the model')\n"
             % (str(ROOT), str(ROOT / "tools"), CHUNK, len(DATA), hashlib.sha256(DATA).hexdigest(), NAME))
-        with small_pieces(), Server(delay=0.05) as srv, tempfile.TemporaryDirectory() as d:
+        with small_pieces(), Server(delay=0.05) as srv, tempfile.TemporaryDirectory() as notes_d, tempfile.TemporaryDirectory() as d:
             env = dict(os.environ, STRATA_SOURCE="huggingface")
+            notes = Path(notes_d) / "child.log"
             proc = subprocess.Popen([sys.executable, "-c", runner, srv.url, d], env=env,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                    stdout=subprocess.DEVNULL, stderr=notes.open("wb"))
             try:
                 deadline = time.time() + 60
                 side = Path(d) / (NAME + ".part.chunks")
@@ -335,10 +337,14 @@ class Resume(unittest.TestCase):
             finally:
                 proc.kill()
                 proc.wait()
-            self.assertTrue((Path(d) / (NAME + ".part")).exists(), "the download finished before it was killed")
+            child_log = notes.read_text(errors="replace") if notes.exists() and notes.stat().st_size else ""
+            self.assertTrue((Path(d) / (NAME + ".part")).exists(),
+                            "the download finished before it was killed\n" + child_log)
+            if not side.exists():
+                self.fail("the piece list never appeared: the child took another path or died\n" + child_log)
             saved = json.loads(side.read_text())
             done = {i for a, b in saved["done"] for i in range(a, b)}
-            self.assertGreaterEqual(len(done), 12)
+            self.assertGreaterEqual(len(done), 12, child_log)
             srv.clear()
             code, out = run(srv, d)
             self.assertIsNone(code, out)
