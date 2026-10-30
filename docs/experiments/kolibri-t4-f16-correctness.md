@@ -625,13 +625,18 @@ reference; nothing here is a qualification result):
   CPU-mapped buffers (`--cpu-moe 999`), **K/V cache f16**, single sequence. So this is a **GPU-dense, CPU-expert**
   reference — not an all-GPU one — and every qualification table must say so. Reference dump identities:
   `85d2cfcf6f1612a2` (8,191 case) and `509ce249b7a00052` (11,000 case).
-* **The reference is deterministic at the KV boundary.** Three separate runs of the 8,191-token case produce
-  **byte-identical** dumps (`sha256 7e6c4f58…3211`, 4,608,000 bytes each, exit 0 three times). A KL taken against
-  this reference is therefore a difference between the two engines, not reference noise — at this context, on this
-  box, with this arrangement.
-* **Not yet done:** reference determinism at the ~11,000-token context (one more pair of runs), and the reference
-  dumps for the extra German and code-shaped prompts in item 1. Both are cheap and run first if the criteria are
-  approved.
+* **The reference is deterministic at both long contexts.** Three separate runs of each case produce
+  **byte-identical** dumps, all exit 0:
+
+  | history | runs | sha256 | bytes |
+  |---|---|---|---:|
+  | 8,191 ids (KV wrap) | 3 | `7e6c4f585a64173d33b22e0657950121be1c17cab8c8944f89e0c151d23d3211` | 4,608,000 |
+  | ~11,000 ids (attention transition) | 3 | `92f42f44e13455e836dbdda81704bfc7b56bb23c56a836d0c4bd7e7b9cbea7a8` | 4,608,000 |
+
+  A KL taken against this reference is therefore a difference between the two engines, not reference noise — at
+  these contexts, on this box, with this arrangement (GPU-dense, CPU-expert, f16 K/V).
+* **Not yet done:** the reference dumps for the extra German and code-shaped ~512-token prompts in item 1, which are
+  corpus material and will be produced together with the candidate dumps if the criteria are approved.
 
 **Status: blocked on approval.** No qualification data will be generated until the criteria in items 1-5 are agreed.
 
