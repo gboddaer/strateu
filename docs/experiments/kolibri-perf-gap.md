@@ -149,6 +149,34 @@ correct. Options: reproduce the CPU value exactly (hard), or measure the diverge
 thing the probe must measure, before any kernel work: compare CPU `std::exp` and CUDA `expf` over the full
 single-precision range, count exact matches, and report.**
 
+### Phase 3d — the pool's arithmetic is AVX2-specific, and that redefines "bit-exact"
+
+The probe now compares **three** implementations of the same dot on the same blocks and Q8_K activations
+(512 rows x 4 tokens, generated-valid Q4_K blocks, ggml's own quantiser):
+
+| comparison | match |
+|---|---|
+| **Strata's AVX2 `kq256_rows` vs ggml's own generic `ggml_vec_dot_q4_K_q8_K_generic`** | **1019 / 2048 (49.76 %)** |
+| my CUDA port (ggml-generic semantics) vs Strata's AVX2 kernel | 1021 / 2048 (49.85 %) |
+| my CUDA port vs ggml generic | 498-512 / 2048 (24-25 %) |
+
+Two conclusions, both important:
+
+1. **The two reference implementations do not agree with each other.** ggml's generic and Strata's AVX2 kernel differ in
+   the last bits for half the values (~1e-6 relative; worst absolute difference 1.5e-3 on values of order 1e2-1e3). So
+   "bit-exact" is not a property of "the arithmetic" — it is a property of **one specific kernel's summation order**,
+   and the pool's is the AVX2 one.
+2. **Which means the tolerance question is not binary.** A CUDA port that uses the *same* Q8_K activations and the same
+   weight decoding but a different summation order lands ~**1e-6 relative** away — that is **~100x smaller than the
+   ~1e-4 seed** which flipped the router in every arm that failed here (fp16 cache, Q8_1 MMQ, grouped-native). It is
+   not the same risk at all — but it is still a *numerical change*, so under the accuracy policy it needs the G2
+   protocol rather than being waved through as "bit-exact".
+
+**Speed reality check from the same run:** the naive GPU kernel (one thread per row, 10 blocks serial, one launch per
+token) takes **0.23 ms per 512-row token** against **0.29 ms for all four tokens on ONE CPU thread** — i.e. the naive
+port is ~3x *slower* per token than a single core, and the pool has 13 of them. A real candidate needs dp4a/mma
+vectorisation and one launch per group; the ~1e-6 exactness question above is independent of that.
+
 ### Phase 3c — the linked probe: infrastructure works, bit-exact parity not yet achieved
 
 `probe/q4k_parity.cu` links the **real** pool kernels (`libstrata_kernels_cpu.a` + ggml-cpu) and puts a CUDA

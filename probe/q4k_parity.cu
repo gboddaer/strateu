@@ -43,61 +43,69 @@ static void make_q4k(uint8_t* b) {
     for (int s = 0; s < 12; ++s) b[4 + s] = uint8_t(rnd() & 0x3f);
 }
 
-__device__ __forceinline__ float hsum8(float a0,float a1,float a2,float a3,float a4,float a5,float a6,float a7) {
-    // hsum_float_8's tree: (hi128 + lo128) elementwise, then pairwise within 4 lanes
-    const float b0 = a4 + a0, b1 = a5 + a1, b2 = a6 + a2, b3 = a7 + a3;   // _mm256_extractf128 + add
-    const float c0 = b2 + b0, c1 = b3 + b1;                                 // _mm_add_ps(res, _mm_movehl_ps(res,res))
-    return c1 + c0;                                                         // _mm_add_ss(res, _mm_movehdup_ps(res))
-}
-
-// One row x one token. `w` = the row's nb super-blocks; `a` = the token's Q8_K blocks.
-__global__ void k_q4k_dot(const uint8_t* __restrict__ w, const uint8_t* __restrict__ a, int nb, float* out, int rows) {
+// ggml's scalar q4_K x q8_K semantics (quants.c: ggml_vec_dot_q4_K_q8_K_generic), reproduced exactly:
+//   aux8[64g + l]   = low  nibble of qs[32g + l]        (values 0-31 of the 64-value group g)
+//   aux8[64g + 32+l] = high nibble of qs[32g + l]        (values 32-63)
+//   per 32-value sub-block j: scale = scales[j]; four 8-value chunks; aux32[l] += scale * q8*a  (int, exact)
+//   sums[l] += d * aux32[l]   with d = x.d * y.d, l = 0..7, per block
+//   sumf   -= dmin * sumi     with dmin = x.dmin * y.d, sumi = sum_j bsums[j] * mins[j/2]
+//   result  = sumf + sums[0] + ... + sums[7]
+__global__ void k_q4k_dot(const uint8_t* __restrict__ w, const uint8_t* __restrict__ a, int nb, float* out, int rows, int mode) {
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= rows) return;
-    const uint8_t* x = w + (size_t) r * nb * 144;
-    float acc[8] = {0,0,0,0,0,0,0,0};
-    float am[4] = {0,0,0,0};
+    const uint8_t* xrow = w + (size_t) r * nb * 144;
+    float sums[8] = {0,0,0,0,0,0,0,0};
+    float sumf = 0.f;
     for (int i = 0; i < nb; ++i) {
-        const uint8_t* xb = x + (size_t) i * 144;
+        const uint8_t* xb = xrow + (size_t) i * 144;
         uint16_t hd, hm; std::memcpy(&hd, xb, 2); std::memcpy(&hm, xb + 2, 2);
         const float xd = __half2float(*(__half*)&hd), xdmin = __half2float(*(__half*)&hm);
-        // 6-bit scales/mins, same unpacking as scale_min_k4 / the AVX2 kmask dance
-        int sc[8], mn[8];
-        for (int j = 0; j < 8; ++j) {
-            if (j < 4) { sc[j] = xb[4 + j] & 63; mn[j] = xb[4 + 4 + j] & 63; }
-            else { sc[j] = (xb[4 + j + 4] & 0x0F) | ((xb[4 + j - 4] >> 6) << 4);
-                   mn[j] = (xb[4 + j + 4] >> 4) | ((xb[4 + j] >> 6) << 4); }
-        }
-        const uint8_t* qs = xb + 16;
-        // Q8_K block: float d; int8 qs[256]; int16 bsums[16]
+        // 12 packed bytes -> 8 scales and 8 mins, as ggml's kmask dance produces
+        uint32_t u0, u1, u2;
+        std::memcpy(&u0, xb + 4, 4); std::memcpy(&u1, xb + 8, 4); std::memcpy(&u2, xb + 12, 4);
+        const uint32_t km1 = 0x3f3f3f3fu, km2 = 0x0f0f0f0fu, km3 = 0x03030303u;
+        uint32_t ut3 = ((u2 >> 4) & km2) | (((u1 >> 6) & km3) << 4);
+        const uint32_t uaux = u1 & km1;
+        uint32_t ut1 = (u2 & km2) | (((u0 >> 6) & km3) << 4);
+        uint32_t ut2 = uaux, ut0 = u0 & km1;
+        const uint32_t* uu = (const uint32_t*)(uint32_t[4]){ut0, ut1, ut2, ut3};
+        const uint8_t* scales = (const uint8_t*)&uu[0];
+        const uint8_t* mins = (const uint8_t*)&uu[2];
         const float yd = *(const float*)(a + (size_t) i * 292);
         const int8_t* yq = (const int8_t*)(a + (size_t) i * 292 + 4);
         const int16_t* ybs = (const int16_t*)(a + (size_t) i * 292 + 4 + 256);
-        const float d = yd * xd, dmin = -yd * xdmin;
-        // acc_m: 4 lanes over pairs of sub-blocks (mins . bsums)
-        for (int lane = 0; lane < 4; ++lane) {
-            const int p = mn[2*lane] * int(ybs[2*lane]) + mn[2*lane+1] * int(ybs[2*lane+1]);
-            am[lane] = fmaf(dmin, (float)p, am[lane]);
-        }
-        for (int j = 0; j < 8; ++j) {                 // sub-block of 32 values -> lane j
-            // ggml's q4_K layout: for 64-value group g = j/2, byte qs[32g + l] holds value (64g + l) in its low
-            // nibble and value (64g + 32 + l) in its high nibble. Sub-block j is the (j%2)-th half of group g.
-            const int g = j >> 1, hi = j & 1;
-            int32_t s = 0;
-            for (int l = 0; l < 32; ++l) {
-                const int b = qs[32 * g + l];
-                const int nib = hi ? (b >> 4) : (b & 0xF);
-                s += nib * int(yq[64 * g + 32 * hi + l]);
+        const uint8_t* qs = xb + 16;
+
+        int aux32[8] = {0,0,0,0,0,0,0,0};
+        for (int j = 0; j < 8; ++j) {               // 32-value sub-block
+            const int scale = int(scales[j]);
+            const int base = j * 32;
+            for (int c = 0; c < 4; ++c) {           // four 8-value chunks
+                const int o = base + c * 8;
+                for (int l = 0; l < 8; ++l) {
+                    const int v = o + l;
+                    const int g = v >> 6, lo = v & 63;             // 64-value group and offset within it
+                    const int b = qs[32 * g + (lo & 31)];
+                    const int nib = (lo < 32) ? (b & 0xF) : (b >> 4);
+                    aux32[l] += scale * (int(yq[v]) * nib);
+                }
             }
-            acc[j] = fmaf(d, (float)(s * sc[j]), acc[j]);
         }
+        int sumi = 0;
+        for (int j = 0; j < 16; ++j) sumi += int(ybs[j]) * int(mins[j / 2]);
+        const float d = xd * yd;
+        const float dmin = xdmin * yd;
+        if (mode & 1) { for (int l = 0; l < 8; ++l) sums[l] = __fmaf_rn(d, (float)aux32[l], sums[l]); }
+        else          { for (int l = 0; l < 8; ++l) sums[l] = __fadd_rn(sums[l], __fmul_rn(d, (float)aux32[l])); }
+        if (mode & 2) { sumf = __fmaf_rn(-dmin, (float)sumi, sumf); }
+        else          { sumf = __fadd_rn(sumf, __fmul_rn(-dmin, (float)sumi)); }
     }
-    float m0 = am[0], m1 = am[1], m2 = am[2], m3 = am[3];
-    const float mh0 = m2 + m0, mh1 = m3 + m1;          // _mm_add_ps(m, movehl(m,m))
-    const float msum = mh1 + mh0;                       // _mm_add_ss(m, movehdup(m))
-    out[r] = hsum8(acc[0],acc[1],acc[2],acc[3],acc[4],acc[5],acc[6],acc[7]) + msum;
+    for (int l = 0; l < 8; ++l) sumf += sums[l];
+    out[r] = sumf;
 }
 
+extern "C" void ggml_vec_dot_q4_K_q8_K_generic(int n, float* s, size_t bs, const void* vx, size_t bx,
+                                               const void* vy, size_t by, int nrc);
 int main() {
     ggml_cpu_init();
     const ggml_type_traits_cpu* t8 = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
@@ -114,44 +122,69 @@ int main() {
     std::vector<float> xv(size_t(nt) * n);
     for (auto& v : xv) v = -1.f + 2.f * float(rnd() % 20001) / 10000.f;
     std::vector<uint8_t> act(size_t(nt) * act_bytes);
-    std::printf("stage: xv ok\n"); std::fflush(stdout);
     std::vector<const void*> actp(nt);
-    for (int t = 0; t < nt; ++t) { std::printf("stage: quantise t=%d\n", t); std::fflush(stdout); t8->from_float(xv.data() + size_t(t) * n, act.data() + size_t(t) * act_bytes, n); actp[t] = act.data() + size_t(t) * act_bytes; }
+    for (int t = 0; t < nt; ++t) {
+        t8->from_float(xv.data() + size_t(t) * n, act.data() + size_t(t) * act_bytes, n);
+        actp[t] = act.data() + size_t(t) * act_bytes;
+    }
 
     std::vector<float> ref(size_t(nt) * rows);
     std::vector<float*> outp(nt);
     for (int t = 0; t < nt; ++t) outp[t] = ref.data() + size_t(t) * rows;
-    std::printf("stage: before kq256_rows\n"); std::fflush(stdout);
     auto t0 = std::chrono::steady_clock::now();
     kq256_rows(12, w.data(), gu_row, n, actp.data(), nt, outp.data(), 0, rows);
     auto t1 = std::chrono::steady_clock::now();
     const double cpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-    std::printf("stage: ref done\n"); std::fflush(stdout);
-    // GPU
+    // ggml's own generic reference, same inputs: is my port exact against it?
+    std::vector<float> gen(size_t(nt) * rows);
+    for (int t = 0; t < nt; ++t)
+        for (int r = 0; r < rows; ++r)
+            ggml_vec_dot_q4_K_q8_K_generic(n, &gen[size_t(t) * rows + r], 0, w.data() + (size_t) r * gu_row, 0,
+                                           actp[t], 0, 1);
+    long long gm = 0, gt = 0; double gw = 0;
+    for (size_t i = 0; i < gen.size(); ++i) { ++gt; if (std::memcmp(&gen[i], &outp[0][0], 0) == 0) {} }
+    for (int t = 0; t < nt; ++t)
+        for (int r = 0; r < rows; ++r) { ++gt; if (false) {} (void)r; (void)t; }
+    std::printf("generic ref computed (%lld values); comparing Strata AVX2 against generic next\n", (long long)gen.size());
+    long long avx_vs_gen = 0;
+    for (size_t i = 0; i < gen.size(); ++i) if (std::memcmp(&gen[i], &ref[i], 4) == 0) ++avx_vs_gen;
+    std::printf("Strata AVX2 kq256_rows vs ggml generic: %lld of %zu match (%.2f%%)\n", avx_vs_gen, gen.size(),
+                100.0 * avx_vs_gen / gen.size());
+
     uint8_t *dw, *da; float* dout;
     cudaMalloc(&dw, w.size()); cudaMalloc(&da, act.size()); cudaMalloc(&dout, size_t(rows) * 4);
     cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice);
     std::vector<float> got; got.resize((size_t)rows);
-    long long match = 0, total = 0; double worst = 0; int worst_r = -1;
-    double gpu_ms = 0;
-    for (int t = 0; t < nt; ++t) {
-        cudaMemcpy(da, act.data() + size_t(t) * act_bytes, act_bytes, cudaMemcpyHostToDevice);
-        cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
-        cudaEventRecord(e0);
-        k_q4k_dot<<<(rows + 127) / 128, 128>>>(dw, da, nb, dout, rows);
-        cudaEventRecord(e1); cudaEventSynchronize(e1);
-        float ms = 0; cudaEventElapsedTime(&ms, e0, e1); gpu_ms += ms;
-        cudaMemcpy(got.data(), dout, size_t(rows) * 4, cudaMemcpyDeviceToHost);
-        for (int r = 0; r < rows; ++r) {
-            ++total;
-            if (std::memcmp(&got[r], &outp[t][r], 4) == 0) ++match;
-            else { const double d = std::fabs(double(got[r]) - double(outp[t][r])); if (d > worst) { worst = d; worst_r = r; } }
+
+    double gpu_ms_best = 1e9;
+    for (int mode = 0; mode < 4; ++mode) {
+        long long m2 = 0, tot2 = 0; double w2 = 0, gpu_ms = 0;
+        for (int t = 0; t < nt; ++t) {
+            cudaMemcpy(da, act.data() + size_t(t) * act_bytes, act_bytes, cudaMemcpyHostToDevice);
+            cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+            cudaEventRecord(e0);
+            k_q4k_dot<<<(rows + 127) / 128, 128>>>(dw, da, nb, dout, rows, mode);
+            cudaEventRecord(e1); cudaEventSynchronize(e1);
+            float ms = 0; cudaEventElapsedTime(&ms, e0, e1); gpu_ms += ms;
+            cudaMemcpy(got.data(), dout, size_t(rows) * 4, cudaMemcpyDeviceToHost);
+            for (int r = 0; r < rows; ++r) {
+                ++tot2;
+                if (std::memcmp(&got[r], &outp[t][r], 4) == 0) ++m2;
+                else { const double d = std::fabs(double(got[r]) - double(outp[t][r])); if (d > w2) w2 = d; }
+            }
         }
+        gpu_ms /= nt;
+        if (gpu_ms < gpu_ms_best) gpu_ms_best = gpu_ms;
+        long long mgen = 0;
+        for (int t = 0; t < nt; ++t)
+            for (int r = 0; r < rows; ++r)
+                if (std::memcmp(&got[r], &gen[size_t(t) * rows + r], 4) == 0) ++mgen;
+        std::printf("mode %d (%s/%s): vs Strata AVX2 %lld/%lld match (%.2f%%) | vs ggml generic %lld/%d match (%.2f%%) | GPU %.3f ms/launch\n",
+                    mode, (mode & 1) ? "fma" : "mul", (mode & 2) ? "fma" : "mul", m2, tot2,
+                    100.0 * m2 / tot2, mgen, rows * nt, 100.0 * mgen / (rows * nt), gpu_ms);
     }
-    std::printf("bitwise: %lld of %lld match (%.2f%%), worst |diff| %.6g at row %d\n", match, total,
-                100.0 * match / total, worst, worst_r);
-    std::printf("time: CPU kq256_rows %.2f ms for %d rows x %d tokens (%.1f GFLOP/s); GPU %.3f ms\n",
-                cpu_ms, rows, nt, 2.0 * rows * nt * n / (cpu_ms / 1000) / 1e9, gpu_ms);
+    std::printf("time: CPU kq256_rows %.2f ms for %d rows x %d token(s) (%.1f GFLOP/s, one thread); GPU best %.3f ms/launch\n",
+                cpu_ms, rows, nt, 2.0 * rows * nt * n * 0 + 2.0 * rows * n / (cpu_ms / 1000) / 1e9 / nt * nt, gpu_ms_best);
     return 0;
 }
