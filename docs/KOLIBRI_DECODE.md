@@ -491,6 +491,9 @@ No drafter, MTP, speculation, or extra sequence is required for the scheduling w
 
 ## Gates and decision rules
 
+Follow the project-wide [Kolibri accuracy policy](KOLIBRI_ACCURACY_POLICY.md). It distinguishes
+unchanged-arithmetic optimizations from numerical changes and defines the qualification needed for each.
+
 - Scheduling-only arms: finite **bit-identical full logits** on identical forced histories, including
   first use and graph replay, plus six-run repeatability. Equal greedy ids alone are insufficient.
 - Prefill must remain unchanged: retain both existing pool and MMQ gate profiles and their expectations.

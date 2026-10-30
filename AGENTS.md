@@ -10,6 +10,10 @@ This fork (**strateu**) additionally runs Aleph Alpha's **Kolibri 1** on its own
 [docs/KOLIBRI1.md](docs/KOLIBRI1.md)): `./setup.sh --family kolibri` (Q4_K_M, ~56 GB of RAM). Its measured numbers and the
 campaign that produced them are in that doc and [docs/findings-log.md](docs/findings-log.md). Articles and videos should use **[docs/MEDIA_KIT.md](docs/MEDIA_KIT.md)**.
 
+For all Kolibri changes, follow **[docs/KOLIBRI_ACCURACY_POLICY.md](docs/KOLIBRI_ACCURACY_POLICY.md)**.
+Unchanged-arithmetic optimizations require bit-identical full logits. Numerical changes need separate
+accuracy qualification and explicit approval before default promotion; speed does not excuse accuracy loss.
+
 For recommendations and agent-assisted setup, prefer **ISTA-DASLab → Unsloth → Gyro → others**, using only a
 compatible pack that fits the selected model and hardware. ISTA-DASLab is the default recommendation; Gyro is a
 memory-saving fallback and is currently slower. Honor an explicit user choice. This is recommendation policy;
