@@ -174,7 +174,89 @@ environment is not recorded is not evidence.
 | reference tool identified, its llama.cpp revision recorded, and a load probe run on this card | **passed**; not yet exercised at 8191 / 11000 tokens |
 | no engine code changed in this task | **passed** — the diff for Task 0 is documentation only |
 
-### Tasks 1–8
+### Task 1 — reliable full-logit comparison and reproduction
+
+**Instrument.** `tools/kolibri/klcmp.py` with `tools/kolibri/test_klcmp.py`, committed together with this entry.
+Interface: `load(path, vocab)`, `summary(ref, cand)`, `main(argv=None)`;
+CLI `--ref --cand --vocab [--json]`. Exit 0 = comparable and finite, 1 = non-finite input, 2 = invalid
+shape or input. It reports record count, bytewise equality on float32 bits, differing records, max |a-b| and
+where, per-record KL(P||Q), mean/median/p95/p99/max KL with the worst step, top-1 agreement, the reference's
+winning margin, and the candidate's rank for the reference winner.
+
+| check | result |
+|---|---|
+| tests written first, run before the implementation existed | **failed as expected**: `ModuleNotFoundError: No module named 'klcmp'` (`/tmp/f16-t1-tests-before-genuine-failure.txt`) |
+| `pytest tools/kolibri/test_klcmp.py -q` | **passed**, 22 tests |
+| hand-computed KL: P=[0,0,0] against Q=[ln 2,0,0] | **passed**, 0.0566330 against the closed form `1/3[ln(2/3)+2ln(4/3)]` |
+| `-0.0` against `0.0`: bytewise different, value-equal | **passed**, reported not-identical with max |a-b| 0.0 |
+| non-finite, record-count mismatch, empty, truncated, extra trailing bytes, vocab 0 / -1 | **passed**, rejected with the documented exit codes |
+| do the tests detect wrong behaviour? | **passed**: reversing KL to `KL(Q||P)` fails the hand-computed and JSON tests; replacing the bitwise check with value equality fails the signed-zero and identity tests |
+| comparison never truncates to the shorter dump | **passed**: a size that is not a whole number of records is `InvalidInput`, exit 2 |
+
+A first version of `load()` used `np.fromfile` alone and **failed** the trailing-bytes test, because `numpy`
+silently drops a partial element. The file size is now checked before reading. That failure is kept in the test
+suite.
+
+**Retained-pair check** (`tools/kolibri/klcmp.py --ref /tmp/kolibri-t4-decode-gate/base512.bin --cand
+/tmp/t4-cand/f16only512.bin --vocab 128000`, exit 0):
+
+```
+records 9 x 128000 float32; bitwise identical: False
+differing records 9/9; max |a-b| 11.0808 at record 1 index 1776
+KL(P||Q)  mean 0.400402  median 0.000956086  p95 2.14169  p99 3.24207  max 3.51717 (step 1)
+top-1 agreement 1.0000 (9/9)
+reference margin at the worst step 0.638462; smallest margin 0.638462 at step 1
+worst rank of the reference winner in the candidate 1
+```
+
+This reproduces the recorded table in [the T4 note](../KOLIBRI_CUDA_PREVIEW.md) to every printed digit (0.400 /
+0.0010 / 3.24 / 11.08 / 9-of-9), so those two retained dumps are on the same forced history. The argv that made
+the `/tmp/t4-cand` trio is still unrecovered; this is a consistency check, not fresh evidence.
+
+**Three-arm matrix**, all with the preserved `5bbe6c4e` control binary
+(`74b0e2570d86231068a4193d9e2b226f77748c57bbf8ce89f72be6348ab7f418`), `ids512.txt`
+(`fecef9d5…1951`), forced `286,3515,310,262,14292,1343,1444,46`, `--ctx 2048 --prefill --cpu-threads 8`,
+`--expert-slots` default, the four decode arms off, `STRATA_GEMM_DETERMINISTIC=1`, two runs per arm:
+
+| arm | `EXPERT_F16` | `PF_PARTIAL` | runs | exit | dump bytes | wall |
+|---|---:|---:|---|---|---:|---|
+| control | 0 | 0 | 2 | 0 / 0 | 4,608,000 / 4,608,000 | 55 s / 55 s |
+| cache-only | 24 | 0 | 2 | 0 / 0 | 4,608,000 / 4,608,000 | 49 s / 50 s |
+| cache+partial | 24 | 1 | 2 | 0 / 0 | 4,608,000 / 4,608,000 | 48 s / 48 s |
+
+Same-arm repeats first: **all three arms are bitwise identical run to run** (`check_decode.py` PASS, max |a-b| 0.0;
+`klcmp.py` KL 0 everywhere). The divergence between arms is therefore deterministic arithmetic, not a race,
+and the cross-arm differences below are not run-to-run noise. The wall times are incidental here and are **not**
+a performance measurement.
+
+Cross-arm, on the identical inputs and the same binary (P = first column):
+
+| comparison | mean KL | median | p95 | p99 | max KL (step) | max abs |a-b| | top-1 | worst rank of ref winner |
+|---|---:|---:|---:|---:|---|---:|---|---:|
+| control → cache-only | 0.400402 | 0.000956 | 2.14169 | 3.24207 | 3.51717 (1) | **11.0808** (rec 1, idx 1776) | 9/9 | 1 |
+| control → cache+partial | 0.167928 | 0.000518 | 0.87110 | 1.25618 | 1.35245 (4) | 5.4710 (rec 8, idx 19969) | 7/9 | 3 |
+| cache-only → cache+partial | 0.465808 | 0.001796 | 2.29565 | 2.96170 | 3.12821 (1) | 10.3399 (rec 1, idx 1776) | 7/9 | 3 |
+
+The second run of each pair gives the same numbers as the first, to every digit.
+
+Shape of the error, recorded to point Task 3 and Task 4, **not** as an explanation: it is broad, not one bad
+value. Per record (control → cache-only) the RMS logit difference is
+0.22, 1.13, 0.82, 0.29, 0.59, 1.00, 0.65, 0.18, 0.46, and the count of logits differing by more than 1.0 is
+0, 47,041, 30,949, 105, 11,546, 38,784, 15,357, 0, 1,421. The 45 largest-error slots across the nine records are
+45 distinct vocabulary indices, so no single weight row explains the tail. At the worst slot (record 1, index
+1776) the reference logit is 15.4681 against 4.3873, which moves that token from rank 2 to rank 103 in the
+candidate.
+
+**What Task 1 establishes:** the recorded discrepancy reproduces on a preserved control build with recorded
+inputs and environment, it is deterministic, and it is not caused by the comparator. **What it does not establish:**
+whether the difference is a defect or expected fp16 arithmetic. That is Task 4, and no number here is an
+acceptance decision.
+
+Artifacts: `/data4/kolibri-f16-evidence/f16-t1/` (matrix dumps, per-run `.env`, `.err`, `.out`, `.status`,
+`SHA256SUMS`, `retained-pair-512.txt`, `repeats.txt`, `cross-arm.txt`, `error-shape.txt`), live copies under
+`/tmp/f16-t1/`.
+
+### Tasks 2–8
 
 Not run yet. Each will be filled in with its commands, exit statuses, raw artifacts and a status word.
 
