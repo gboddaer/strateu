@@ -382,7 +382,7 @@ Later execution is recorded separately; the corpus and limits have not been chan
 | arm | change | where the value is | why it is a numerical change |
 |---|---|---|---|
 | **2a — KV int8** (and optionally the `k8v4` hybrid) | the Kolibri path's KV cache goes from f16 to int8 codes + an f16 scale per 64 values | **long context**: at 512 tokens the KV is a few MB and the gain is ~0; at 8k-110k it halves the KV bytes and the attention traffic | KV values are quantised, so every attention score changes |
-| **2b — Q4_K down** | the down projection's weights go from Q6_K (210 B / 256 values) to Q4_K (144 B) | **~20 % of the expert bytes streamed per token** (down is 1.075 MB of the 2.55 MB per expert); helps every context, most when streaming dominates | different weight quantisation: the down result changes at the source |
+| **2b — Q4_K down (parked)** | Q6_K down weights (210 B / 256 values) become Q4_K (144 B); half the layers already use Q4_K down | **7.10 % fewer expert bytes/token** for this actual mixed-format pack; the original ~20 % estimate was wrong (see audit below) | different weight quantisation: the down result changes at the source |
 
 ### Corpus, arms and reference (fixed now, not after seeing numbers)
 
@@ -492,6 +492,23 @@ no cross-arm KL is computed on them. Load-to-READY and sampled VRAM high-water a
 If 2a shows no gain at 8k-110k, or 2b's byte saving does not move prefill or decode measurably, the lever is dropped as
 not worth a numerical change — recorded as a negative result, with no qualification run.
 
+### Read-only byte audit while Phase 2a runs — correction, not a Phase 2b restart
+
+`probe/expert_bytes.cpp` reads the actual GGUF metadata/tensor geometry through ggml without
+loading tensor data or using the GPU. Output: `phase2a/expert-bytes.txt`.
+
+* Q4_K: **144 B / 256 values**; Q6_K: **210 B / 256 values**. Ratio **1.45833**, not 2.05.
+* Gate/up: 50 Q4_K tensors each, input/output dimensions 2,560 x 512.
+* Down: **25 Q4_K and 25 Q6_K** tensors, dimensions 512 x 2,560. Half is already Q4_K.
+* The pack metadata says six active experts. Exact routed weight traffic is **714,240,000 B/token**,
+  agreeing with the measured 714.2 MB/token counter. All down weights contribute 271,872,000 B/token.
+* Replacing only the remaining Q6_K down weights would save **50,688,000 B/token = 7.096774 %**,
+  not ~20 %. This is format geometry, **not a measured speedup or a numerical result**.
+
+This corrects the old estimate in the proposal and ranking; it changes no numerical limits or arms.
+The parked Phase 2b task contract also repeats the old incorrect geometry and must be corrected
+with the operator before any later execution. Phase 2b remains unimplemented and unrun.
+
 ## Phase 4 — the ranked plan, with what each lever costs and what it does to accuracy
 
 Baseline for comparison after the free win: **Kolibri tuned 64.6 tok/s prefill / 39.2 tok/s decode** against
@@ -502,7 +519,7 @@ Baseline for comparison after the free win: **Kolibri tuned 64.6 tok/s prefill /
 | 1 | **13 workers + single-node NUMA** | **prefill +32 %, decode +29 %, expert work 1.85x** | **none — bitwise identical** | **done, config-only** |
 | 2 | **GPU compute for the prefill expert products** (the only lever that can close the remaining **3.0x** prefill gap) | the decomposition says prefill is **compute-bound**: 1,206 GFLOP at 194 GFLOP/s = 86 % of this pool's roof, while Qwen does the same work on the GPU at 19.8 GB/s and reaches 191 tok/s. The card is idle during Kolibri's prefill. | **changed arithmetic** — every GPU expert path measured here flips the router (fp16 0.400/11.08, Q8_1 0.266/9.51, grouped-native 0.370/11.64; 97/100 chunk-layers diverge from layer 2) | largest; needs G2 approval *and* a per-row-count design that avoids the 3.7-rows-per-expert shape where earlier GPU attempts lost |
 | 3 | **KV int8 (or k8v4)** | at 512 tokens the KV is a few MB, so ~0 for this prompt; real value at 8k-110k context | changed arithmetic (KV precision) → G2 | moderate; well-understood |
-| 4 | **Q4_K down instead of Q6_K** (down ≈ 20 % of expert bytes; Q6_K is ~2.05x Q4_K per value) | ~20 % fewer expert bytes → helps the *memory* side; **prefill here is compute-bound, so little at 512 tokens**, more at long context | changed arithmetic → G2 | moderate |
+| 4 | **Q4_K down instead of Q6_K (parked)** | **7.10 % fewer expert bytes** in this mixed pack (50.688 MB of 714.24 MB/token); no speed measured. Q6_K is **1.458x**, not 2.05x, Q4_K per value | changed weight quantisation → G2; no result collected | moderate; smaller byte lever than originally stated |
 | 5 | **Load/repack** (37 s to repack 903 tensors into 42.9 GiB pinned) | startup only; Qwen is worse (~11 min of disk reads) | none if the repacked table is cached bit-identically | small, accuracy-safe |
 | 6 | *(not a lever)* **copy Qwen's decode** | Qwen's decode is **7.65 tok/s** against Kolibri's 39.2 — PLE reads block 6.06 s of its 16.7 s | — | do not copy |
 
