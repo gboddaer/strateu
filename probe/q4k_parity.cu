@@ -50,62 +50,73 @@ static void make_q4k(uint8_t* b) {
 //   sums[l] += d * aux32[l]   with d = x.d * y.d, l = 0..7, per block
 //   sumf   -= dmin * sumi     with dmin = x.dmin * y.d, sumi = sum_j bsums[j] * mins[j/2]
 //   result  = sumf + sums[0] + ... + sums[7]
-__global__ void k_q4k_dot(const uint8_t* __restrict__ w, const uint8_t* __restrict__ a, int nb, float* out, int rows, int mode) {
+// Strata's AVX2 q4k_dot, reproduced exactly (src/kernels/cpu/kq_avx2.cpp:85-145):
+//   s[0..7], mn[0..7] from the 12 packed bytes, as ggml's kmask unpacking produces them
+//   sumi[k] (int32, 8 lanes) = sum over the four 64-value groups j of
+//        s[2j]   * sum of the 4 values at 64j + 4k
+//      + s[2j+1] * sum of the 4 values at 64j + 32 + 4k
+//   acc[k] = fma(d, (float)sumi[k], acc[k])                        per block, d = x.d * y.d
+//   am[i]  = fma(dmin, (float)(mn[2i]*(B[4i]+B[4i+1]) + mn[2i+1]*(B[4i+2]+B[4i+3])), am[i])
+//   result = hsum_float_8(acc) + ((am0+am2) + (am1+am3))
+// with hsum_float_8(x) = ((x0+x4)+(x2+x6)) + ((x1+x5)+(x3+x7)).
+__global__ void k_q4k_dot(const uint8_t* __restrict__ w, const uint8_t* __restrict__ a, int nb, float* out, int rows,
+                          int mode) {
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= rows) return;
     const uint8_t* xrow = w + (size_t) r * nb * 144;
-    float sums[8] = {0,0,0,0,0,0,0,0};
-    float sumf = 0.f;
+    float acc[8] = {0,0,0,0,0,0,0,0};
+    float am[4] = {0,0,0,0};
     for (int i = 0; i < nb; ++i) {
         const uint8_t* xb = xrow + (size_t) i * 144;
         uint16_t hd, hm; std::memcpy(&hd, xb, 2); std::memcpy(&hm, xb + 2, 2);
         const float xd = __half2float(*(__half*)&hd), xdmin = __half2float(*(__half*)&hm);
-        // 12 packed bytes -> 8 scales and 8 mins, as ggml's kmask dance produces
-        uint32_t u0, u1, u2;
-        std::memcpy(&u0, xb + 4, 4); std::memcpy(&u1, xb + 8, 4); std::memcpy(&u2, xb + 12, 4);
-        const uint32_t km1 = 0x3f3f3f3fu, km2 = 0x0f0f0f0fu, km3 = 0x03030303u;
-        uint32_t ut3 = ((u2 >> 4) & km2) | (((u1 >> 6) & km3) << 4);
-        const uint32_t uaux = u1 & km1;
-        uint32_t ut1 = (u2 & km2) | (((u0 >> 6) & km3) << 4);
-        uint32_t ut2 = uaux, ut0 = u0 & km1;
-        const uint32_t* uu = (const uint32_t*)(uint32_t[4]){ut0, ut1, ut2, ut3};
-        const uint8_t* scales = (const uint8_t*)&uu[0];
-        const uint8_t* mins = (const uint8_t*)&uu[2];
+        int s[8], mn[8];
+        for (int j = 0; j < 4; ++j) { s[j] = xb[4 + j] & 63; mn[j] = xb[8 + j] & 63; }
+        for (int j = 4; j < 8; ++j) {
+            s[j] = (xb[8 + j] & 0x0F) | ((xb[j] >> 6) << 4);
+            mn[j] = (xb[8 + j] >> 4) | ((xb[4 + j] >> 6) << 4);
+        }
+        const uint8_t* qs = xb + 16;
         const float yd = *(const float*)(a + (size_t) i * 292);
         const int8_t* yq = (const int8_t*)(a + (size_t) i * 292 + 4);
         const int16_t* ybs = (const int16_t*)(a + (size_t) i * 292 + 4 + 256);
-        const uint8_t* qs = xb + 16;
-
-        int aux32[8] = {0,0,0,0,0,0,0,0};
-        for (int j = 0; j < 8; ++j) {               // 32-value sub-block
-            const int scale = int(scales[j]);
-            const int base = j * 32;
-            for (int c = 0; c < 4; ++c) {           // four 8-value chunks
-                const int o = base + c * 8;
-                for (int l = 0; l < 8; ++l) {
-                    const int v = o + l;
-                    const int g = v >> 6, lo = v & 63;             // 64-value group and offset within it
-                    const int b = qs[32 * g + (lo & 31)];
-                    const int nib = (lo < 32) ? (b & 0xF) : (b >> 4);
-                    aux32[l] += scale * (int(yq[v]) * nib);
+        int32_t sumi[8] = {0,0,0,0,0,0,0,0};
+        for (int j = 0; j < 4; ++j) {
+            for (int half = 0; half < 2; ++half) {
+                const int base = 64 * j + 32 * half, sc = s[2 * j + half];
+                for (int k = 0; k < 8; ++k) {
+                    int v = 0;
+                    for (int t = 0; t < 4; ++t) {
+                        const int idx = base + 4 * k + t;              // value index in the 256-block
+                        const int byte = qs[32 * j + ((idx & 63) & 31)];   // one byte holds the low and high nibble pair
+                        const int nib = ((idx & 63) < 32) ? (byte & 0xF) : (byte >> 4);
+                        v += nib * int(yq[idx]);
+                    }
+                    sumi[k] += sc * v;                             // integer: exact, order-free
                 }
             }
         }
-        int sumi = 0;
-        for (int j = 0; j < 16; ++j) sumi += int(ybs[j]) * int(mins[j / 2]);
-        const float d = xd * yd;
-        const float dmin = xdmin * yd;
-        if (mode & 1) { for (int l = 0; l < 8; ++l) sums[l] = __fmaf_rn(d, (float)aux32[l], sums[l]); }
-        else          { for (int l = 0; l < 8; ++l) sums[l] = __fadd_rn(sums[l], __fmul_rn(d, (float)aux32[l])); }
-        if (mode & 2) { sumf = __fmaf_rn(-dmin, (float)sumi, sumf); }
-        else          { sumf = __fadd_rn(sumf, __fmul_rn(-dmin, (float)sumi)); }
+        const float d = xd * yd, dmin = xdmin * yd;
+        for (int k = 0; k < 8; ++k) {
+            if (mode & 1) acc[k] = __fmaf_rn(d, (float)sumi[k], acc[k]);
+            else          acc[k] = __fadd_rn(acc[k], __fmul_rn(d, (float)sumi[k]));
+        }
+        for (int q = 0; q < 4; ++q) {
+            const int prod = mn[2*q] * (int(ybs[4*q]) + int(ybs[4*q+1])) +
+                             mn[2*q+1] * (int(ybs[4*q+2]) + int(ybs[4*q+3]));
+            if (mode & 2) am[q] = __fmaf_rn(dmin, (float)prod, am[q]);
+            else          am[q] = __fadd_rn(am[q], __fmul_rn(dmin, (float)prod));
+        }
     }
-    for (int l = 0; l < 8; ++l) sumf += sums[l];
-    out[r] = sumf;
+    const float hsum = __fadd_rn(__fadd_rn(__fadd_rn(acc[0], acc[4]), __fadd_rn(acc[2], acc[6])),
+                                 __fadd_rn(__fadd_rn(acc[1], acc[5]), __fadd_rn(acc[3], acc[7])));
+    const float msum = __fadd_rn(__fadd_rn(am[0], am[2]), __fadd_rn(am[1], am[3]));
+    out[r] = __fadd_rn(hsum, msum);
 }
 
 extern "C" void ggml_vec_dot_q4_K_q8_K_generic(int n, float* s, size_t bs, const void* vx, size_t bx,
                                                const void* vy, size_t by, int nrc);
+
 int main() {
     ggml_cpu_init();
     const ggml_type_traits_cpu* t8 = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
