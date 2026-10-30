@@ -160,6 +160,33 @@ class ExistingSetupEnvironment(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((root / "setup-ran").exists())
 
+    @unittest.skipIf(sys.version_info < (3, 11), "needs a real supported interpreter for venv creation")
+    def test_setup_and_terminal_find_a_versioned_python_when_the_default_is_too_old(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shutil.copy2(ROOT / "setup.sh", root / "setup.sh")
+            (root / "setup.py").write_text("from pathlib import Path\nPath('setup-ran').touch()\n")
+            commands = root / "commands"
+            commands.mkdir()
+            (commands / "python3").write_text("#!/bin/sh\nexit 1\n")
+            (commands / "python3").chmod(0o755)
+            (commands / "python3.11").symlink_to(sys.executable)
+            for command in ("dirname", "grep", "uname"):
+                (commands / command).symlink_to(shutil.which(command))
+            env = {**os.environ, "PATH": str(commands), "STRATA_UV": "0"}
+            result = subprocess.run(["/bin/sh", str(root / "setup.sh"), "--help"], cwd=root,
+                                    env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((root / "setup-ran").exists())
+            (root / "bin").mkdir()
+            shutil.copy2(ROOT / "bin/strata", root / "bin/strata")
+            (root / "strata.py").write_text("import sys\nprint(sys.executable)\n")
+            env["STRATA_PYTHON"] = ""
+            result = subprocess.run(["/bin/sh", str(root / "bin/strata"), "--help"], cwd=root,
+                                    env=env, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.strip(), str(commands / "python3.11"))
+
     def test_terminal_rejects_an_old_explicit_override_before_package_probing(self):
         root, _ = self.run_wrapper((3, 10, 99))
         (root / "bin").mkdir()

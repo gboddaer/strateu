@@ -35,7 +35,7 @@ if [ ! -x .venv/bin/python ]; then
     # Prefer uv's own interpreter: unlike Nix's Python, it works naturally with pip wheels using dlopen.
     PY=3.12
   else
-    for c in python3 python; do
+    for c in python3 python python3.11 python3.12 python3.13 python3.14; do
       if command -v $c >/dev/null 2>&1 && ok_py $c; then
         PY=$c; break
       fi
