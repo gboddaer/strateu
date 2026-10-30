@@ -584,6 +584,30 @@ Lower VRAM here mixes offload, encoding and workspace differences; it is **not**
 benefit or a speedup. The accuracy failure makes further speed work on this arm unnecessary.
 The GPU is idle, the network server stayed stopped, and no default was changed.
 
+### A1 evidence — the multi-block oracle (branch `kolibri-a1-prefill`, from `7720e7e4`)
+
+`probe/q4k_multiblock.cpp` instruments the **real** `q4k_dot` at its FMA boundaries and, for every block, compares
+the eight integer lanes, the four minimum-correction lanes, both scale factors and the final result **bit for bit**
+against a scalar re-derivation. It is host-only, so it runs while the GPU is busy, and a mapping change costs a
+seconds-long host build instead of a CUDA rebuild.
+
+| blocks per dot | trials | outcome |
+|---|---:|---|
+| 1 | 2,048 | 100 % bit-identical |
+| 2 | 2,048 | 100 % bit-identical |
+| 10 | 2,048 | 100 % bit-identical |
+| 32 | 2,048 | 100 % bit-identical |
+
+Discrimination is checked too, so a "100 %" cannot be vacuous: the **positive** minimum correction — the original
+defect — is detected in **64/64** runs, and the correct sign passes **64/64**. Raw output: `a1-oracle/multiblock.txt`.
+
+Reproduce: `bash probe/run_q4k_oracle.sh` (the CUDA half is skipped with `SKIP_CUDA=1`). The same script still runs
+`q4k_oneblock` (4,096/4,096) and, with the GPU free, `q4k_parity` at nb = 1, 2, 10 and 32.
+
+**What this does and does not establish.** The summation order is now fully pinned for the Q4_K x Q8_K dot, including
+the sign convention that cost the earlier attempt. It does **not** establish anything about the engine: no kernel in
+`src/kolibri` uses this order yet, so there is still no engine-level bitwise result and no speed measurement.
+
 ### What would make me stop early
 
 If 2a shows no gain at 8k-110k, or 2b's byte saving does not move prefill or decode measurably, the lever is dropped as
