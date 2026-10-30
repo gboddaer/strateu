@@ -294,6 +294,55 @@ Go/no-go: bit-identical on (2) and (3), SwiGLU parity understood, and faster tha
 movement. Anything less and A is reported as a measured dead end.
 
 
+## Phase 2 — preregistration for the two numerical levers (awaiting the operator's approval; NO results collected)
+
+Written **before** any measurement of either lever, as the goal's G2 gate requires. Nothing below has been run.
+
+### What is proposed
+
+| arm | change | where the value is | why it is a numerical change |
+|---|---|---|---|
+| **2a — KV int8** (and optionally the `k8v4` hybrid) | the Kolibri path's KV cache goes from f16 to int8 codes + an f16 scale per 64 values | **long context**: at 512 tokens the KV is a few MB and the gain is ~0; at 8k-110k it halves the KV bytes and the attention traffic | KV values are quantised, so every attention score changes |
+| **2b — Q4_K down** | the down projection's weights go from Q6_K (210 B / 256 values) to Q4_K (144 B) | **~20 % of the expert bytes streamed per token** (down is 1.075 MB of the 2.55 MB per expert); helps every context, most when streaming dominates | different weight quantisation: the down result changes at the source |
+
+### Corpus, arms and reference (fixed now, not after seeing numbers)
+
+* **Corpus**: the same four families the FP16 experiment used, so the arms are comparable — 16- and 512-token prompts from
+  `tools/kolibri/oracle_ids512.txt`; the 8,191-id KV-wrap fixture; the ~11,000-id attention-transition fixture; and the
+  two extra ~512-token prompts (German, code-shaped) with their recorded ids. Nine forced decode steps each, same ids for
+  every arm. For 2a the 8,191 and ~11,000 cases are the ones that matter and both are in the set.
+* **Arms**: control (f16 KV, Q6_K down, current build), 2a alone, 2b alone, and both together. Every arm run twice.
+* **Reference**: the pinned llama.cpp dumper (`/home/gbo/llama.cpp` `a30fb4924`, `--ngl 99 --cpu-moe 999`, f16 KV), whose
+  arrangement is recorded with every dump. `strata-kolibriref` remains a diagnostic only.
+* **Control calibration first, as in FP16 Task 6**: control-vs-reference is measured and reported before any candidate
+  comparison. **The FP16 result must be carried into this text honestly: the control itself failed these limits against
+  that reference on all six families (mean KL 0.004-0.145, worst |dlogit| up to 5.5).** So the *same* rule applies: if the
+  control fails, the record reads "absolute limits not decidable against this reference", the absolute verdict is void,
+  and the arms are judged on **same-engine** numbers (candidate vs control, identical inputs).
+
+### Limits (proposed; the operator sets or replaces them)
+
+Same-engine, per arm, per prompt, per position: **mean KL <= 1e-3, p99 <= 5e-3, worst |dlogit| <= 0.05, top-1 agreement
+100 %, and no rank-1 flip where the reference margin exceeds 0.05.** Justification: identical to the FP16 proposal, kept
+identical deliberately so the two reports are comparable — and because 2a and 2b each change one thing only (KV precision,
+down weights), not the expert arithmetic wholesale.
+
+### Metrics reported
+
+KL (mean/median/p95/p99/worst) and `|dlogit|` percentiles per arm and position, top-1 agreement, reference-winner rank and
+margin, **KV bytes/token and expert bytes/token measured**, prefill and decode tok/s separately, VRAM high-water. For 2a a
+context sweep (512, 8,191, ~11,000) because that is where its value is; for 2b the byte accounting per token.
+
+### State checks (mandatory, independent of KL)
+
+Two repeats per arm plus first use, replay, prefix reuse, reset, cancellation and a clean request after cancellation, for
+each arm. Non-finite values, stale outputs or unexplained same-arm variability reject regardless of the KL numbers.
+
+### What would make me stop early
+
+If 2a shows no gain at 8k-110k, or 2b's byte saving does not move prefill or decode measurably, the lever is dropped as
+not worth a numerical change — recorded as a negative result, with no qualification run.
+
 ## Phase 4 — the ranked plan, with what each lever costs and what it does to accuracy
 
 Baseline for comparison after the free win: **Kolibri tuned 64.6 tok/s prefill / 39.2 tok/s decode** against
