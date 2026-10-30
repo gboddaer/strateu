@@ -28,7 +28,10 @@ class BroadCI(unittest.TestCase):
         self.assertEqual(set(matrix["os"]), {"ubuntu-latest", "windows-latest"})
         self.assertEqual(set(matrix["suite"]), {"terminal", "setup"})
         self.assertFalse(job["strategy"]["fail-fast"])
-        self.assertLessEqual(job["timeout-minutes"], 60)
+        # Bounded, but loose enough for the Windows runners: an expired job reports as
+        # "cancelled" and hides the real results, so the budget must cover the slowest OS.
+        self.assertGreaterEqual(job["timeout-minutes"], 90)
+        self.assertLessEqual(job["timeout-minutes"], 180)
         self.assertNotIn("continue-on-error", job)
         commands = "\n".join(step.get("run", "") for step in job["steps"])
         self.assertIn("python -m pytest tests/terminal", commands)
