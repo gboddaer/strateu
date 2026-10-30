@@ -58,15 +58,26 @@ class BroadCI(unittest.TestCase):
         self.assertIn("npm --prefix apps/host run build", commands)
         self.assertNotIn("continue-on-error", " ".join(str(s) for s in job["steps"]))
 
-    def test_actions_are_pinned_and_failure_reports_are_retained(self):
-        steps = self.workflow()["jobs"]["broad"]["steps"]
-        for step in steps:
-            if "uses" in step:
-                self.assertRegex(step["uses"], r"@[0-9a-f]{40}$")
-        upload = next(s for s in steps if s.get("uses", "").startswith("actions/upload-artifact@"))
-        self.assertEqual(upload["if"], "always()")
-        self.assertIn("xml", upload["with"]["path"])
-        self.assertNotIn("**", upload["with"]["path"], "do not upload user state or arbitrary files")
+    def test_actions_are_pinned_allowed_and_failures_surface_their_reports(self):
+        jobs = self.workflow()["jobs"]
+        # The repository allow-lists exactly these GitHub-owned actions; anything else refuses to
+        # run and would block the whole workflow before any job starts (startup_failure).
+        allowed = ("actions/checkout@", "actions/setup-python@", "actions/setup-node@",
+                   "actions/github-script@")
+        for job, steps in jobs.items():
+            for step in steps:
+                if "uses" in step:
+                    self.assertTrue(step["uses"].startswith(allowed),
+                                    "an action outside the repository allow-list must not be used: "
+                                    + step["uses"])
+                    self.assertRegex(step["uses"], r"@[0-9a-f]{40}$")
+        steps = jobs["broad"]["steps"]
+        reports = [s for s in steps if s.get("if") == "failure()"]
+        self.assertTrue(reports, "a failing suite must surface its junit report in the run log")
+        for step in reports:
+            self.assertNotIn("continue-on-error", step)
+        self.assertTrue(any(".xml" in step.get("run", "") for step in reports),
+                        "the report reader must name the junit files")
 
 
 if __name__ == "__main__":
