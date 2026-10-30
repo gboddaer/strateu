@@ -5,7 +5,6 @@ import { join } from 'node:path';
 
 // Name the Windows tools by path: Git for Windows puts a different whoami first on PATH.
 const system32 = name => join(process.env.SystemRoot || 'C:\\Windows', 'System32', name);
-const windowsPowershell = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 
 let userSid = null;
 /** The current user's SID, read once with whoami (language independent). */
@@ -17,20 +16,25 @@ export function currentUserSid() {
   return (userSid = match[0]);
 }
 
+function icacls(path, args) {
+  execFileSync(system32('icacls.exe'), [path, ...args], { stdio: 'ignore', timeout: 15000, windowsHide: true });
+}
+
 export function makePrivate(path, { platform = process.platform } = {}) {
   if (platform !== 'win32') { chmodSync(path, 0o600); return; }
-  // Windows PowerShell cannot autoload its Security module (Get-Acl, Set-Acl live there) when the
-  // user's PSModulePath points at PowerShell 7 folders, so the child starts with a clean module path.
-  const env = { ...process.env }; delete env.PSModulePath;
-  // Replace the whole DACL: protected (inherited entries gone, nothing copied), and exactly one
-  // entry, this user.  icacls's /inheritance:r alone turns inherited entries into explicit copies
-  // of Everyone, SYSTEM and Administrators on some machines, which is what a runner run showed.
-  const quoted = path.replace(/'/g, "''");
-  execFileSync(windowsPowershell, ['-NoProfile', '-NonInteractive', '-Command',
-    `$a = Get-Acl -LiteralPath '${quoted}'; $a.SetAccessRuleProtection($true, $false); ` +
-    `$a.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('${currentUserSid()}', 'FullControl', 'Allow'))); ` +
-    `Set-Acl -LiteralPath '${quoted}' -Value $a`],
-    { encoding: 'utf8', timeout: 20000, windowsHide: true, env });
+  // Three fast calls, in this order.  In one call, /inheritance:r next to /grant:r left the
+  // inherited entries standing as explicit copies of SYSTEM and Administrators (a runner run's
+  // Get-Acl printed D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;LA)).  Split: reset to the parent's
+  // rules, strip every inherited entry (a protected, empty DACL for the moment), then give this
+  // user full control.  The end state is one full-control entry, the user's.
+  icacls(path, ['/reset']);
+  try {
+    icacls(path, ['/inheritance:r']);
+    icacls(path, ['/grant:r', `*${currentUserSid()}:F`]);
+  } catch (e) {
+    try { icacls(path, ['/reset']); } catch { /* leave the file as the reset put it */ }
+    throw e;
+  }
   // The owner too, so a file an elevated run made is not left owned by Administrators (needs the right to; best effort).
-  try { execFileSync(system32('icacls.exe'), [path, '/setowner', `*${currentUserSid()}`], { stdio: 'ignore', timeout: 15000, windowsHide: true }); } catch { /* the DACL above already opens it to the user */ }
+  try { icacls(path, ['/setowner', `*${currentUserSid()}`]); } catch { /* the DACL above already opens it to the user */ }
 }
