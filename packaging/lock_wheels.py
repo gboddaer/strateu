@@ -59,23 +59,16 @@ def norm(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def _dropped_for_target(target: str) -> set[str]:
-    """Direct requirements whose environment marker is false for the target (pip evaluated markers for the host that
-    runs this script: a Windows-only package must not land in the Linux lock, nor the reverse)."""
+def _requirements_for_target(target: str) -> list[str]:
+    """Resolve direct markers before pip sees them: --platform does not change pip's marker environment.
+
+    Filtering the downloaded wheels afterwards cannot recover a missing Windows-only dependency or select the
+    right numpy version when the build host runs a different Python from the target.
+    """
     from packaging.requirements import Requirement
     env = {"python_version": PYTHON, "python_full_version": PYTHON + ".15", "implementation_name": "cpython",
            "platform_python_implementation": "CPython", **TARGETS[target]["env"]}
-    dropped = set()
-    for name in INPUTS:
-        for line in (ROOT / name).read_text(encoding="utf-8").splitlines():
-            line = line.split(" #")[0].strip()
-            if not line or line.startswith("#"):
-                continue
-            req = Requirement(line)
-            if req.marker is not None and not req.marker.evaluate(env):
-                dropped.add(norm(req.name))
-    # a requirement listed twice with different markers (numpy) is kept when any line applies
-    kept = set()
+    requirements = []
     for name in INPUTS:
         for line in (ROOT / name).read_text(encoding="utf-8").splitlines():
             line = line.split(" #")[0].strip()
@@ -83,8 +76,9 @@ def _dropped_for_target(target: str) -> set[str]:
                 continue
             req = Requirement(line)
             if req.marker is None or req.marker.evaluate(env):
-                kept.add(norm(req.name))
-    return dropped - kept
+                req.marker = None
+                requirements.append(str(req))
+    return requirements
 
 
 def build_lock(target: str) -> str:
@@ -94,14 +88,14 @@ def build_lock(target: str) -> str:
                "--python-version", PYTHON, "--implementation", "cp", "--abi", ABI, "-d", tmp]
         for p in spec["platforms"]:
             cmd += ["--platform", p]
-        for name in INPUTS:
-            cmd += ["-r", str(ROOT / name)]
+        requirements = Path(tmp) / "requirements.txt"
+        requirements.write_text("\n".join(_requirements_for_target(target)) + "\n", encoding="utf-8")
+        cmd += ["-r", str(requirements)]
         subprocess.run(cmd, check=True)
         wheels: dict[str, tuple[str, list[str]]] = {}
         for whl in sorted(Path(tmp).glob("*.whl")):
             name, version = whl.name.split("-")[:2]
             wheels.setdefault(norm(name), (version, []))[1].append(sha256(whl))
-    drop = _dropped_for_target(target)
     out = [
         "# Hash-pinned runtime packages for the " + target + " terminal archive (CPython 3.12, " + ABI + ").",
         "# Made by packaging/lock_wheels.py from requirements.txt + requirements-monitor.txt; installed at BUILD time with",
@@ -109,8 +103,6 @@ def build_lock(target: str) -> str:
         "# and never on the user's PC. To change a package: edit requirements.txt, run lock_wheels.py, review the diff.",
     ]
     for name in sorted(wheels):
-        if name in drop:
-            continue
         version, hashes = wheels[name]
         out.append(f"{name}=={version} \\")
         out.append(" \\\n".join(f"    --hash=sha256:{h}" for h in sorted(set(hashes))))

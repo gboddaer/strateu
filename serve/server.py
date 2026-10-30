@@ -57,6 +57,11 @@ from pathlib import Path
 from typing import Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
+# Direct invocations must reject an old Python before importing optional runtime packages.
+if __name__ == "__main__" and sys.version_info < (3, 11):
+    print("Strata's server needs Python 3.11 or newer. Use the bundled runtime or a supported Python.", file=sys.stderr)
+    raise SystemExit(2)
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
@@ -8661,6 +8666,10 @@ def _component_exe(reference: str, cfg: dict) -> str:
 
 
 def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> int:
+    if sys.version_info < (3, 11):
+        print("Strata's server needs Python 3.11 or newer. Use the bundled runtime or a supported Python.",
+              file=sys.stderr)
+        return 2
     try:                                               # files made by a run as administrator still belong to the user
         from strata_control import private_files as _pf
         _pf.adopt_user_defaults()

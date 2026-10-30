@@ -7,6 +7,16 @@ The repository includes `START-HERE.bat`, `SETUP.bat`, `UPDATE.bat`, `setup.sh` 
 Run them from a cloned or extracted **source folder**. They may install dependencies, prepare model files and
 acquire or build an engine. Check [model requirements](MODELS.md) before downloading.
 
+## Python runtime
+
+Source setup and the full Terminal/server need **Python 3.11 or newer**. Pillow 13, which fixes security issues in
+older image decoders, no longer supports Python 3.10. Released Terminal archives carry their own pinned Python 3.12;
+they do not need a system Python. The separate portable monitor still supports Python 3.10.
+
+If an earlier source install has a Python 3.10 `.venv`, setup stops without removing it. Rename that folder, make
+Python 3.11 or newer available, then run `START-HERE.bat` or `./setup.sh` again to make a new environment. Model files
+and run configurations outside `.venv` stay where they are.
+
 ## Quick start
 
 | I use | Run in the source folder |

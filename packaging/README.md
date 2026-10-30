@@ -129,9 +129,12 @@ separate, explicit action. `apps/host/tests/no-acquire.test.mjs` fails on any ou
 The Terminal bundles a private Python and its dependencies for `windows-x86_64`, `linux-x86_64` and `darwin-arm64`
 (`package_terminal.py --target ...`, built on the target OS).
 
-- The interpreter is python-build-standalone CPython 3.12.15, digest-checked at build time.
+- The interpreter is python-build-standalone CPython 3.12.15, digest-checked at build time. The full source runtime
+  needs Python 3.11 or newer; the separate portable monitor keeps its Python 3.10 minimum.
 - Packages come from `packaging/locks/runtime-<target>-cp312.txt` and are installed with
   `pip install --require-hashes --no-deps --only-binary=:all:` at build time only. `lock_wheels.py` makes the lock; review its diff when a pin changes.
+  It evaluates direct requirements' Python and OS markers for the target before calling pip, so a Linux build host
+  does not omit Windows-only packages or select the host's numpy pin.
 - Wrappers: `bin/strata.cmd` and `bin/strata.ps1` on Windows, `bin/strata` on POSIX. `START-HERE.bat`, `SETUP.bat`, `UPDATE.bat`, `setup.sh`
   and `update.sh` use a `python/` folder beside them when there is one.
 - `smoke_terminal.py <archive>` extracts an archive into a clean environment (a path with a space, a PATH with no Python) and runs

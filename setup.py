@@ -8846,6 +8846,10 @@ def mac_control_setup(a) -> int:
 
 
 def main() -> int:
+    if sys.version_info < (3, 11):
+        print("Strata setup needs Python 3.11 or newer. Run START-HERE.bat or ./setup.sh with a supported Python.",
+              file=sys.stderr)
+        return 2
     try:                                               # files made by a run as administrator still belong to the user
         from strata_control import private_files as _pf
         _pf.adopt_user_defaults()
