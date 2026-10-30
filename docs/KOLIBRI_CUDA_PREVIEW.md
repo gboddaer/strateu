@@ -54,24 +54,86 @@ The committed `oracle_gfx1201.txt` is AMD-specific. Do not overwrite it or use i
 Any T4-specific oracle must identify its model, reference build and configuration, and must be derived from an
 independently qualified reference rather than recorded from a candidate just to make a gate pass.
 
-## Operator-provided T4 report (not independently rerun here)
+## T4 qualification (measured on the card, 2026-10-30)
 
-Reported source: `82a2d5d2` plus the T4 agent's local fixes for the same two build blockers above. Those local
-control-word edits used volatile accesses and fences; they are not the identical implementation now in this tree.
-The T4 must be re-tested on the integrated fix before it is release qualification.
+Replaces the earlier operator-provided summary. Host: Tesla T4 16 GB, driver 580.196.07, kernel 6.1.0-52-amd64,
+PCI `82:00.0` = `numa_node 1`, `numactl --cpunodebind=1 --membind=1`. Revision **`5bbe6c4e`**, built with the recipe
+above including `STRATA_Q6K_EXPERTS=ON` (`build-kolibri-cuda`, Ninja, CUDA 12.8.93, arch 75): 0 errors.
 
-Environment reported: Tesla T4 16 GB, driver 580.196.07, Linux 6.1.0-52, NUMA node 1, 24 CPU lanes, 512 prompt
-ids, 128 generated tokens, ctx 8192. Baseline source `bdd3803a`.
+The T4 agent's earlier local control-word edits were discarded in favour of this tree's helpers, after reading both:
+the integrated version uses `__atomic_*` acquire/release with lock-freedom asserted, which is stronger than the
+local volatile+fence variant. The patch is not part of this tree.
 
-| Configuration | Baseline decode | Candidate decode | Interpretation |
-|---|---:|---:|---|
-| CPU pool, no expert cache/slots | 29.2 / 29.3 / 29.3 tok/s | 30.5 / 30.3 / 30.5 / 30.5 tok/s | Reported ~4.1% improvement |
-| Prior speed environment with cache and resident slots | 24.6 / 23.7 tok/s | 24.6 / 24.5 tok/s | Within reported spread; graph arms correctly disabled |
+### Correctness
 
-Prefill was bimodal in both builds. Seven CTest failures were reported reproduced on the baseline:
+| gate | result |
+|---|---|
+| `decode_gate.sh check`, prompts 16 / 511 / 512 / 513 | **PASS** - 9 records x 128,000 values bitwise identical, max \|a-b\| 0.0 |
+| prefix reuse (cold 512 ids, then +64) | **PASS** bitwise, headers included |
+| six repeats, activation marker | **PASS**; marker present in the candidate and absent in every control run |
+| **8191-id KV-wrap boundary**, forced full logits | **PASS** bitwise, max \|a-b\| 0.0 |
+| **11,000-token attention transition**, forced full logits | **PASS** bitwise, max \|a-b\| 0.0 |
+| `kolibri_decode_wait_test` | **PASS** |
+| `ctest` (210 tests) | 189 passed, 7 failed, 14 skipped |
+| `tools/kolibri/test_build_portability.py` | **2 passed** (needs pytest; run in a throwaway venv) |
+
+The seven failures are the pre-existing set, reproduced identically on a build of `bdd3803a` on the same box:
 `attn_k_parity`, `pf_wmma_parity`, `ple_parity`, `pool_tasks_test`, `pool_cores_test`, `isa_guard_check`,
-`cuda_spill_guard` (210 tests: 189 passed, 7 failed, 14 skipped/skipped groups).
+`cuda_spill_guard`. Causes are environmental (missing fixture GGUFs, wide-ISA listings, sm_75 kernel expectations), not
+this change. The 11,000-token sequence was the committed 8191-id fixture's ids cycled: synthetic, but identical on both
+sides of every comparison.
 
-The reported 16 generated ids matched across builds and repeats. The supplied report does not establish
-bit-identical full logits. Raw logs, exact integrated revision, forced-history parity, longer contexts and a
-CUDA release-package smoke test remain pending. No RTX 3090 runtime result is available.
+Conclusion: **the decode arms are bitwise against the plain decode on this card, including the KV boundary and the
+attention transition.** The generated-id match reported earlier is superseded by full-logit equality.
+
+### What the fast-prefill knob costs on this card
+
+Prefill here needs the fp16 expert cache (`STRATA_KOLIBRI_EXPERT_F16`), not the env members the R9700 campaign credited.
+Measured with 512 prompt ids, 128 greedy tokens, ctx 8192, `--prefill --cpu-threads 24 --expert-slots 0`, two runs each,
+box load 1.5-3.8:
+
+| environment | pp-512 tok/s | tg-128 tok/s |
+|---|---:|---:|
+| engine defaults (no `STRATA_KOLIBRI_*`) | **51.6 / 53.6** | **30.5 / 30.5** |
+| `PF_STAGE=1` | 52.2 / 51.9 | 30.6 / 30.6 |
+| `PF_STAGE` + `ATTN_MB=256` + `ATTN_FLASH=1` + `ROUTER_TILE=1` + `ROUTER_TJ=16` | 50.8 | 30.6 |
+| `EXPERT_F16=24` | 158.6 / 162.1 | 30.3 / 29.4 |
+| `EXPERT_F16=24` + `PF_PARTIAL=1` | 181.5 / 182.0 | 30.2 / 30.2 (EOS at 105 of 128 tokens) |
+| the whole 2026-10-27 "speed env" | 167.5 / 170.9 | 30.3 / 30.3 |
+
+`PF_STAGE`, `ROUTER_*` and `ATTN_*` are inert at this shape; the cache is the whole lever. And the cache changes the
+numbers, on the same forced history, against the same build's plain path (`EXPERT_F16=0`, `STRATA_GEMM_DETERMINISTIC=1`):
+
+| comparison | mean KL | median | p99 | max \|dlogit\| | top-1 |
+|---|---:|---:|---:|---:|---:|
+| plain vs `EXPERT_F16=24` | 0.400 | 0.0010 | 3.24 | 11.08 | 9/9 |
+| plain vs `EXPERT_F16=24 PF_PARTIAL=1` | 0.168 | 0.0005 | 1.26 | 5.47 | **7/9** |
+
+Both are bitwise identical run to run, so this is rounding and accumulation order rather than a race. It is ~2 orders
+of magnitude worse than the R9700's recorded `PF_PARTIAL` figure (answers-only mean KL 0.00133, top-1 0.9725), and an
+11-logit worst case is too large to accept as "fp16 rounding" without an explanation. Under
+[the accuracy policy](KOLIBRI_ACCURACY_POLICY.md) that is a separate numerical qualification, not a default change.
+
+### The accuracy-first configuration on this card
+
+Engine defaults, expert cache off, slots 0, decode arms on: **51.6 / 53.6 tok/s prefill** and **30.5 / 30.5 tok/s decode**,
+bitwise identical to the plain path at 512, 8191 and 11,000 prompt tokens. The arms are worth ~+4.1 % decode (30.5 against
+29.3 on the pool path, measured on the pre-pull build) and cost nothing numerically, so they stay on.
+
+On this box `--cpu-threads 24` also makes the engine warn that 24 expert workers share 14 physical cores
+(`Recommended: --pool-workers 13`). The 13-worker variant is unmeasured, including whether it stays bitwise.
+
+### Not tested here
+
+No RTX 3090 or other NVIDIA card (a CUDA build on one host does not qualify another); no KV-boundary or
+attention-transition parity for the fp16-cache configurations (only plain and arms paths were dumped); no long-context
+speed for any configuration; no CUDA release-package smoke test; no explanation yet for the 11-logit worst case.
+
+### Oracles
+
+The committed `oracle_gfx1201.txt` is AMD-specific and was not overwritten. On this T4 the plain path produces the
+pooled variant `... 32 50 55 58 4037 262 7771`, which `docs/AMD_R9700_PORT.md` documents as the pooled signature
+(14/16 ids, first divergence at the 11th). Both `bdd3803a` and `5bbe6c4e` produce it, so it is not a regression, and
+`oracle.sh check` against the committed file reads as a diff on this box whatever the build. A T4 oracle is not recorded
+yet; when it is, it must name the model, reference build and configuration, and be derived from an independent reference
+rather than from a candidate.
