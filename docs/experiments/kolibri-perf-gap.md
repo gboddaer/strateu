@@ -149,6 +149,43 @@ correct. Options: reproduce the CPU value exactly (hard), or measure the diverge
 thing the probe must measure, before any kernel work: compare CPU `std::exp` and CUDA `expf` over the full
 single-precision range, count exact matches, and report.**
 
+### Phase 3e — the ceiling is bytes, not dot products
+
+The dp4a micro-benchmark (`probe/q4k_speed.cu`, 512 rows x 4 tokens = 10.5 MFLOP) is **overhead-dominated and I am not
+using it**: CPU 0.89 ms on 1 thread, **2.22 ms on 13 threads** (thread spawn/join exceeds the work), GPU 0.94 ms. At
+this size every number is measurement artefact; the earlier per-launch figure (0.22-0.28 ms) and these 0.9 ms numbers
+disagree purely because of what is inside the timed region.
+
+The decisive arithmetic needs no micro-benchmark, because the engine already measured both sides of it:
+
+| | value | source |
+|---|---|---|
+| expert bytes streamed per 512-token prefill | **28.09 GB** | `CNT prefill pool` (Phase 0) |
+| host->device bandwidth measured on this box | **9.6-10.5 GB/s** | the engine's own PCIe probe, every run |
+| tuned prefill (13 workers, single node) | **8.0 s** | Phase 1 |
+| compute inside that | 1,205.6 GFLOP at 194 GFLOP/s | `CNT prefill pool work` |
+
+So if the expert bytes are moved by DMA instead of read by CPU workers:
+
+```
+streaming floor = 28.09 GB / 9.6 GB/s = 2.93 s
+ceiling vs today  = 8.0 s / 2.93 s     = 2.7x
+```
+
+and that floor assumes the compute is free. It is not free, but on this card it is not the constraint: the T4's int8
+path is an order of magnitude above the 194 GFLOP/s the CPU reaches, which is why Qwen — doing exactly this, DMA streaming
+plus GPU products — measures 191 tok/s against Kolibri's 64.6.
+
+**With resident weights instead of per-chunk streaming there is no floor at all**, which is why the parked native-residency
+arm was attractive: it removes the 28 GB, and its problem was never speed, it was arithmetic.
+
+**What this means for A, stated plainly.** The porting question (bit-exact vs ~1e-6) is second order: even a perfect dot
+kernel cannot beat **2.7x** while every chunk streams 28 GB, and it cannot beat *unity* if the streaming is done badly.
+The next measurement that matters is therefore a **chunk-scale GPU benchmark** — 117 experts x ~4 tokens, weights DMA'd
+over PCIe, one launch per group — checked against the pool's **85.7 ms per chunk-layer**. If that lands near the 2.93 s
+floor for a 100-chunk-layer prefill, A is worth building; if it lands at or above 85.7 ms, A is dead and the answer is
+the CPU pool we already have.
+
 ### Phase 3d — the pool's arithmetic is AVX2-specific, and that redefines "bit-exact"
 
 The probe now compares **three** implementations of the same dot on the same blocks and Q8_K activations
