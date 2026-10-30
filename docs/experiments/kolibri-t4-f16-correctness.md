@@ -337,7 +337,88 @@ build was **not run** (no ROCm host in this work); SYCL is unaffected by this te
 Artifacts: `/data4/kolibri-f16-evidence/f16-t2/` — the pre-implementation failure, the implemented run, both GGUF
 runs, the three mutation runs and both build logs.
 
-### Tasks 3–8
+### Task 3 — locate the first observable divergence
+
+**The writer, read before writing the reader.** `src/kolibri/kolibri_engine.cu` (Kolibri's `run()`, which is what
+`strata-kolibri` dispatches to at `generate.cpp` ~:2956) allocates
+`std::vector<float> layers(n_layers * n_embd)` and, per processed position, calls `forward(e, s, tok, layers.data())`
+and then writes `n_embd` floats per layer for `l = 0..n_layers-1`. Layout: **position-major, layer-minor, no input
+slot** — `512,000` bytes per position at 50 x 2560 x 4, so the gate's nine positions are **4,608,000 bytes**, which is
+what every run below produced. `forward()` fills it from `s.layer_trace_d` via `k_layer_snapshot` (one snapshot per
+layer into slot `l`), i.e. the residual *after* layer `l`. `tools/kolibri/compare_dumps.py` reshapes to
+`(-1, 50, 2560)`, which agrees with the writer.
+
+**Instrument.** `tools/kolibri/layer_delta.py` and `tools/kolibri/test_layer_delta.py` (15 tests, written first:
+the pre-implementation run failed with `ModuleNotFoundError: No module named 'layer_delta'`). It reports, per
+(position, layer), `||a-b||/||a||` with `a` the reference, plus the median and the max over positions for every
+layer *and* over layers for every position, so a single bad position cannot hide inside a median. It rejects empty,
+misaligned, wrong-record-count and non-finite input explicitly (exit 2 / 1). Two tests exist because of mistakes the
+first implementation made: the denominator was the candidate rather than the reference, and a zero reference norm
+was flagged even when the candidate was also zero. Both are now pinned.
+
+**Four runs**, preserved control binary, same ids/forced history as Task 1, `--ctx 2048 --prefill --cpu-threads 8`,
+`--dump-layers` plus `--dump-full-logits` plus `--counters`, the four decode arms off:
+
+| tag | `EXPERT_F16` | slots | exit | layer dump | logits |
+|---|---|---:|---|---:|---:|
+| `ctl_default` | 0 | default | 0 | 4,608,000 B | 4,608,000 B |
+| `cache_default` | 24 | default | 0 | 4,608,000 B | 4,608,000 B |
+| `ctl_slots0` | 0 | `--expert-slots 0` | 0 | 4,608,000 B | 4,608,000 B |
+| `cache_slots0` | 24 | `--expert-slots 0` | 0 | 4,608,000 B | 4,608,000 B |
+
+All four dumps are complete (size is a whole number of positions) and finite — `layer_delta.py` refuses either
+otherwise and returned 0. The full-logit pair `ctl_default` vs `cache_default` reproduces Task 1 exactly (mean KL
+0.400402, max |a-b| 11.0808 at record 1 index 1776, top-1 9/9), and both are **bitwise identical to Task 1's
+`ctl_r1` / `cache_r1`**, so enabling `--dump-layers` did not change the arithmetic being compared.
+
+**Resident activity, measured rather than assumed** (`--counters`, `print_counters` in `kolibri_engine.cu`):
+
+| line | control | `EXPERT_F16=24` |
+|---|---|---|
+| `CNT vram free` after dense upload | 13.53 GiB | **4.74 GiB** |
+| `CNT prefill pool` | `chunks=100 experts/chunk=117 bytes=28.09 GB pool=8347 ms` | `chunks=100 experts/chunk=118 bytes=22.44 GB pool=2439 ms **promotes=1551 fill=12.20 GB**` |
+| `CNT run` slot hits/misses | `hits=0 miss=0` | `hits=0 miss=0` |
+| `CNT prefill pool work` | `rows=153300` | `rows=43161` (the misses the fp16 cache absorbs) |
+
+So the fp16 expert cache *is* allocated and used — during **prefill** — and the decode loop's slot map is untouched
+in both arms.
+
+**Where the numbers first differ** (`layer_delta.py --a ctl_default.layers --b cache_default.layers`):
+
+```
+positions 9 x layers 50 x embd 2560; relative L2 ||a-b||/||a|| (a = reference)
+overall  median 0.103995  max 1.05077 at position 1 layer 33
+per layer median over positions: layer0 0 | l1 0.000155 | l2 0.00062 | l3 0.00145 | l4 0.00195 | l5 0.00294 ...
+per layer max   over positions: layer0 0 | l1 0.000267 | l2 0.000879 | l3 0.00455 ... l33 1.05 ... l49 0.704
+positions/layers above 1e-3: 421; first (0, 3)
+```
+
+* Layer 0 is **bitwise identical in all nine positions**; the first non-zero difference is layer 1 (`1.5e-4`
+  median), and the first crossing of the navigation threshold `1e-3` is at **position 0, layer 3**.
+* The difference then grows with depth: median `0.156` by layer 30, max `1.05` at position 1 / layer 33, and it stays
+  around `0.3-0.4` median to layer 49.
+* `--expert-slots 0` versus the default is **bitwise identical in both arms** (`rel` exactly 0 at every position and
+  layer), so the hot-slot count is not what this divergence depends on — the fp16 cache is a different cache from
+  the slot map (`b.f16_slot_id` versus `slot_of`).
+
+**The decode leg on its own is unaffected.** Two more runs with **no `--prefill`** (16 prompt ids fed through the
+decode path, 24 positions dumped, `nopf_ctl` / `nopf_cache`): the layer dumps (24 x 50 x 2560) and the nine full-logit
+records are **bitwise identical** between `EXPERT_F16=0` and `24`, and the counters show neither a `promotes=`/`fill=`
+line nor any change in bytes — the fp16 cache was never used.
+
+**What Task 3 establishes:** the divergence observed in the full logits is produced on the **prefill leg**, where the
+fp16 expert cache is actually exercised (`promotes=1551`, `fill=12.20 GB`), and reaches the decode outputs only
+through what prefill leaves behind (the KV values); the decode path's own expert arithmetic is identical between the
+arms. That is a narrowing, not an attribution: it does **not** say the difference was made in layer 3, and the
+layer-0/ layer-1 asymmetry is unexplained — a plausible reading is that prefill's layer-0 K/V stays bitwise
+identical while later layers' does not, but that is a hypothesis for Task 4, not a result. Task 4 therefore
+instruments the **prefill** expert path (first chunks, early layers) and the KV it writes, not the decode loop.
+
+Artifacts: `/data4/kolibri-f16-evidence/f16-t3/` — the four runs (`.layers`, `.bin`, `.env`, `.err` with the CNT
+lines, `.out`, `.status`), the two no-prefill runs, `layer-delta*.txt`, `logits-ctl-vs-cache.txt`,
+`nopf-*.txt`, `SHA256SUMS`.
+
+### Tasks 4–8
 
 Not run yet. Each will be filled in with its commands, exit statuses, raw artifacts and a status word.
 
