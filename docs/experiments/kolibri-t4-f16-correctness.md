@@ -681,6 +681,126 @@ reference; nothing here is a qualification result):
 **Status: blocked on approval.** No qualification data will be generated until the criteria in items 1-5 are agreed.**Status: preregistered, then run.** Results are recorded below in the ledger's status words, split into passed,
 failed, inconclusive, blocked and not run.
 
+### Task 6 results — qualified, rejected on the preregistered rule
+
+**What was run.** Six histories x four arms, identical ids, nine forced steps, `--prefill --cpu-threads 8`,
+`STRATA_GEMM_DETERMINISTIC=1`, the four decode arms off. Every one of the 24 engine runs exited 0 and wrote a
+complete 4,608,000-byte dump; six independent reference dumps were produced the same way. Pinned binaries, re-checked
+at run time and written into each run's `.cmd`: candidate `0bc772bf…acbdf`, control `74b0e257…f418`.
+
+Two corpus prompts were added for family (d), tokenized with the model's own tokenizer and recorded:
+
+| prompt | text sha256 | tokens | used | ids sha256 |
+|---|---|---:|---:|---|
+| German, prose about this engine | `a6bdc975f937c68a…` | 621 | first 512 | `b040cc0d38022d19e9468cce1cc00a8a5de96baffe72838eaed458ab379e2c95` |
+| code-shaped (Python/C++/Rust/SQL) | `6458e42bca70ff7b…` | 845 | first 512 | `10bca9f5b32ac2d153fad92a46de03db299fa006bd981bcb35684cf97f77270a` |
+
+**2. Control calibration, measured first as preregistered.** Control (current build) against the independent
+reference:
+
+| family | mean KL | p99 | worst abs dlogit | top-1 | rank-1 flips | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| 16 | 0.00391 | 0.0105 | 1.0457 | 1.000 | 0 | **FAIL** |
+| 512 | 0.07434 | 0.5999 | 5.5127 | 0.889 | 1 | **FAIL** |
+| de512 | 0.10479 | 0.3259 | 3.0710 | 0.889 | 1 | **FAIL** |
+| code512 | 0.05514 | 0.0868 | 2.1850 | 0.667 | 3 | **FAIL** |
+| 8,191 | 0.06827 | 0.1426 | 2.9165 | 0.889 | 1 | **FAIL** |
+| ~11,000 | 0.14481 | 0.3452 | 3.7170 | 0.556 | 4 | **FAIL** |
+
+**The control arm itself fails the agreed limits on all six families.** By the preregistered rule (item 2) the record
+therefore reads **"absolute limits not decidable against this reference"**; the absolute-vs-reference verdict is
+**void**, and the arms are decided by item 3. No limit was relaxed, tightened or re-derived.
+
+That outcome is itself a finding about this reference: a GPU-dense/CPU-expert llama.cpp with f16 K/V differs from the
+unmodified engine by 0.004-0.145 mean KL and up to 5.5 logits, so agreement with it at 1e-3 was never achievable —
+the limit could only ever have been applied to a like-for-like reference.
+
+**3. Same-engine numbers, which carry the decision.** Cache arm against this build's own control, same inputs:
+
+| family | arm | mean KL | x limit | p99 | worst abs dlogit | x limit | top-1 | flips |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 16 | cache-only | 0.00431 | 4.3 | 0.0217 | 0.9726 | 19.5 | 1.000 | 0 |
+| 512 | cache-only | **0.40040** | **400.4** | 3.2421 | **11.0808** | **221.6** | 1.000 | 0 |
+| de512 | cache-only | 0.03389 | 33.9 | 0.0909 | 2.6988 | 54.0 | 1.000 | 0 |
+| code512 | cache-only | 0.11724 | 117.2 | 0.3229 | 2.4130 | 48.3 | 0.667 | 3 |
+| 8,191 | cache-only | 0.04456 | 44.6 | 0.1288 | 2.4415 | 48.8 | 0.667 | 3 |
+| ~11,000 | cache-only | 0.01132 | 11.3 | 0.0298 | 2.6200 | 52.4 | 0.889 | 1 |
+| 16 | cache+partial | 0.00149 | 1.5 | 0.0042 | 0.4640 | 9.3 | 1.000 | 0 |
+| 512 | cache+partial | 0.16793 | 167.9 | 1.2562 | 5.4710 | 109.4 | 0.778 | 2 |
+| de512 | cache+partial | 0.02319 | 23.2 | 0.0518 | 1.2566 | 25.1 | 1.000 | 0 |
+| code512 | cache+partial | 0.07806 | 78.1 | 0.1268 | 4.0779 | 81.6 | 0.556 | 4 |
+| 8,191 | cache+partial | 0.01688 | 16.9 | 0.0537 | 2.6442 | 52.9 | 1.000 | 0 |
+| ~11,000 | cache+partial | 0.00944 | 9.4 | 0.0182 | 1.1950 | 23.9 | 0.889 | 1 |
+
+**Both cache arms fail the agreed limits on all six families, on the same-engine numbers alone**: 1.5x-400x the
+mean-KL limit and 9x-222x the worst-`|dlogit|` limit, with top-1 agreement as low as 0.556 and up to four rank-1
+flips at margins above 0.05.
+
+For completeness, the same arms against the reference (context only, not the decision):
+
+| family | cache-only mean KL / worst | cache+partial mean KL / worst |
+|---|---|---|
+| 16 | 0.00370 / 0.8432 | 0.00325 / 0.9887 |
+| 512 | 1.07311 / 11.2705 | 0.18386 / 6.9700 |
+| de512 | 0.10991 / 2.8529 | 0.11618 / 2.8338 |
+| code512 | 0.13502 / 2.9448 | 0.07591 / 2.8266 |
+| 8,191 | 0.10362 / 3.3720 | 0.07971 / 3.1147 |
+| ~11,000 | 0.15226 / 3.6711 | 0.15343 / 3.7905 |
+
+**Verdict: both FP16 cache arms are REJECTED for promotion.** Accuracy failure rejects an optimisation regardless of
+speed.
+
+**Cross-build and repeatability checks.**
+
+| check | result |
+|---|---|
+| `5bbe6c4e` control vs current build, all six histories | **PASS**, bitwise identical (9 x 128,000, max abs 0.0) |
+| item 7: cache-only 512, `5bbe6c4e` build vs current build | **PASS**, bitwise identical, `sha256 fcacb4a4…2f960ce` both |
+| three fresh processes per cache arm, 512 ids | **PASS**, bitwise identical within each arm (`cache fcacb4a4…`, `cpart bac56774…`) — no unexplained variability |
+
+**State checks (mandatory, independent of KL).** Driven over the engine's own serve protocol with greedy settings
+(`temperature=0 top_k=1`), 512-id prompt, ctx 2048:
+
+| check | cache-only | cache+partial |
+|---|---|---|
+| first use (fresh process) | 8 ids | 8 ids |
+| replay (same request again, same process) | **equals first use** | **equals first use** |
+| prefix reuse (512 + 64 = 576) | 8 ids, completes | 8 ids, completes |
+| cancellation (`GEN 400`, `STOP` after 4) | DONE reason `cancel`, 5 ids written | DONE reason `cancel`, 5 ids written |
+| clean request after cancellation | **equals first use** | **equals first use** |
+| different prefix, then the standard request again (reset path) | **equals first use** | **equals first use** |
+| verdict | **PASS** | **PASS** |
+
+Every one of these runs exercises the prefill promotion path (the fp16 cache is filled on each request), so the LRU
+promotion machinery the next arm will reuse is qualified for these transitions, at this configuration, with
+`expert-slots` at its default. What these checks do **not** cover: slot-level eviction under a mixed hit/miss chunk
+(only the earlier `dup=0` probe covers distinctness), and multi-sequence serving.
+
+**Two harness bugs were found and fixed during this task, kept on the record** because the first state-check attempt
+was invalid: (i) `select()` on a buffered `readline()` left the `READY` line in Python's buffer, so the run appeared
+dead; (ii) the engine's stderr was a pipe nobody drained until the end, which fills at ~64 KB and deadlocks the
+engine mid-run. One crashed state-check run (concurrent engines, CUDA OOM) is preserved as `state_cache.stale.json`
+and is **not** counted as evidence. `tools/kolibri/state_check.py` now redirects stderr to a file, prints one line per
+event and enforces a per-request timeout.
+
+**Status words for this task, split as the policy requires:**
+
+| item | status |
+|---|---|
+| same-engine arm rejection | **failed** (decisive: 1.5x-400x over the limits) |
+| absolute fidelity against the independent reference | **inconclusive / void** by the preregistered control-calibration rule (the control fails too) |
+| cache-off cross-build bitwise parity | **passed** (six histories, plus 8,191 and 11,000) |
+| cache-on cross-build bitwise parity (item 7) | **passed** |
+| repeatability, three runs per arm | **passed** |
+| state checks (first use, replay, reuse, cancel, after cancel, reset) | **passed** for both arms |
+| resident-path replay (SwiGLU, hidden-FP16, activation quantization vs float64) | **not established** — mandatory for any arm that would be promoted |
+| task quality (Task 7) | **not run** — approval-gated |
+| speed (Task 8) | **not run** — approval-gated; the pp-512 gain is the motive, never the evidence |
+
+Artifacts: `/data4/kolibri-f16-evidence/f16-t6/` (`qual/` with 24 arm dumps, 6 reference dumps, per-run `.cmd`/`.err`,
+all metric JSONs, `summary.txt`, item-7 and repeatability output, both state-check records and engine stderr;
+`corpus/` with the two prompt texts, their tokenizer output and the ids).
+
 ### Tasks 7–8
 
 Not run. Task 7 requires its own approval of a preregistered protocol before any evaluation output is examined;
