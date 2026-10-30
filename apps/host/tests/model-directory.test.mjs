@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, symlinkSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, symlinkSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:net';
@@ -64,9 +64,12 @@ test('image downloads are scoped per directory and existing real image files req
  directory=second;await demo.rescan(true);assert.equal(demo.library().variants[0].state,'available');assert.equal(demo.library().applied,'off');
  directory=first;await demo.rescan(true);assert.equal(demo.library().variants[0].state,'installed');
  const bytes=Buffer.from('GGUFverified-small-image'), catalog={...IMAGE_CATALOG,variants:[{...IMAGE_CATALOG.variants[0],bytes:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex')}]};
- writeFileSync(join(second,catalog.variants[0].file),bytes);
+ const file=join(second,catalog.variants[0].file), stamp=new Date(1_000_000);
+ writeFileSync(file,bytes);utimesSync(file,stamp,stamp);
  const real=createImageModels({dataDir:join(home,'real-data'),modelsDir:second,real:true,catalog});await real.rescan();assert.equal(real.library().variants[0].state,'installed');
- writeFileSync(join(second,catalog.variants[0].file),Buffer.from('GGUFmodified-small-image'));await real.rescan();assert.equal(real.library().variants[0].state,'available');
+ // Same-size rewrites can retain mtime and share a coarse change timestamp; they must still be reverified.
+ writeFileSync(file,Buffer.from('GGUFmodified-small-image'));utimesSync(file,stamp,stamp);
+ await real.rescan();assert.equal(real.library().variants[0].state,'available');
 });
 
 async function freePort(){const server=createServer();await new Promise(r=>server.listen(0,'127.0.0.1',r));const port=server.address().port;await new Promise(r=>server.close(r));return port;}
@@ -75,7 +78,7 @@ test('directory API protects loaded models, active requests and downloads, then 
  const original=join(home,'models'),keep=join(original,'keep.txt');writeFileSync(keep,'preserve');
  writeFileSync(join(home,'data','state.json'),JSON.stringify({installed:{'qwen38-q4_k_m':{simulated:true}},loaded:'qwen38-q4_k_m',setup:{complete:true,flowVersion:2,step:4}}));
  const port=await freePort(),base=`http://127.0.0.1:${port}`;
- const host=spawn(process.execPath,['server/index.mjs'],{cwd,env:{...process.env,STRATA_HOME:home,STRATA_MODELS_DIR:join(home,'models'),STRATA_REAL_ENGINE:'0',STRATA_PORT:String(port),STRATA_BIND:'127.0.0.1'},stdio:'ignore'});
+ const host=spawn(process.execPath,['server/index.mjs'],{cwd,env:{...process.env,STRATA_HOME:home,STRATA_MODELS_DIR:join(home,'models'),STRATA_REAL_ENGINE:'0',STRATA_FORCE_DEMO:'1',STRATA_PORT:String(port),STRATA_BIND:'127.0.0.1'},stdio:'ignore'});
  async function call(path,body){const response=await fetch(base+path,{method:body===undefined?'GET':'POST',headers:{'content-type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});return {status:response.status,body:await response.json()};}
  try {
   let ready=false;for(let i=0;i<100;i++){try{ready=(await call('/api/runtime')).status===200;if(ready)break;}catch{}await pause(100);}assert.ok(ready);
