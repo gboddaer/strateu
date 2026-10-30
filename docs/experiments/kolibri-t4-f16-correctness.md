@@ -256,7 +256,88 @@ Artifacts: `/data4/kolibri-f16-evidence/f16-t1/` (matrix dumps, per-run `.env`, 
 `SHA256SUMS`, `retained-pair-512.txt`, `repeats.txt`, `cross-arm.txt`, `error-shape.txt`), live copies under
 `/tmp/f16-t1/`.
 
-### Tasks 2–8
+### Task 2 — verify the fp16 conversion separately from fidelity
+
+**What existed.** `dequant_bf16_test` was a GGUF-driven `main()` that compares the device dequantizers against the
+artifact's CPU decoders for FP32 and BF16. It never called `dequant_f16`, which is the function the expert cache
+uses. `dequant_f16` writes fp16 bits with `__float2half_rn` (`src/kernels/cuda/dequant_bf16.cu`); Q6_K's `d` is at
+byte **208** (the kernel reads `h2f(b + 208)`), Q4_K's `d`/`dmin` at bytes 0/2.
+
+**GGUF mode, before the change** (`dequant_bf16_test …Kolibri-1-Q4_K_M.gguf`, exit 0):
+`type 14 output.weight 4 x 2560: f32 ok … bf16 ok`, `type 12 token_embd.weight 4 x 2560: f32 ok … bf16 ok`,
+`2 types checked, OK`. Only two of the model's many tensors are 2-D and supported by that path.
+
+**Registered, then run before implementing.** `add_test(NAME kolibri_dequant_f16_selftest COMMAND
+dequant_bf16_test --selftest)` was added inside the existing `if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)` guard and
+the test was run first. It **failed** with
+
+```
+terminate called after throwing an instance of 'std::runtime_error'
+  what():  cannot open --selftest
+```
+
+ctest exit 8 (subprocess aborted), not a usage exit 2 — exactly the trap the plan named: the unknown flag had
+reached the GGUF-opening path.
+
+**What the selftest does.** `--selftest` builds synthetic but valid Q4_K (144-byte) and Q6_K (210-byte) super-blocks
+from a splitmix64 seed, evaluates them with the artifact's CPU decoder `strata::dequantize_q4_K/q6_K`, and compares
+three things separately:
+
+1. GPU `dequant_f32` against the CPU decoder, relative 1e-6 — catches a wrong offset, stride or scale unpack;
+2. GPU `dequant_f16` bits against a **host round-to-nearest-even fp32→fp16 conversion written in the test**, applied
+   to the GPU's own f32 values — this is the conversion check, and it does not share an implementation with
+   `__float2half_rn`;
+3. the same against the CPU f32 values, reported separately, so a CPU/GPU f32 difference is never blamed on the
+   conversion.
+
+The host converter is itself pinned to a 13-entry table of halfway, subnormal and overflow cases (`65519 → 0x7bff`,
+`65520 → 0x7c00`, `2^-25 → 0`, `3·2^-25 → 0x0002`, `1+2^-11 → 0x3c00`, `1+3·2^-11 → 0x3c02`, …); the expected bits
+were taken from an independent `numpy.float16` conversion, not from this code. Fixtures cover Q4_K and Q6_K
+independently, exact zeros, normal values with a **non-power-of-two** scale (0.0001234 / 0.0000371, so the products
+are inexact and the rounding path is taken), fp16-subnormal-range products (d = 2^-20), one and two super-blocks per
+row, a row slice at `row0 = 1`, and an output stride `ld = cols + 8` whose padding must stay untouched. A type this
+test claims to cover that is not registered is a **failure, not a skip**.
+
+**Result** (`ctest --test-dir build-kolibri-cuda -R '^kolibri_dequant_f16_selftest$' -V`, exit 0):
+
+```
+selftest: host RNE conversion table ok (13 cases, halves and subnormals included)
+selftest: Q4_K normal    4 x 256  f32 vs CPU ok (0 off, worst rel 0.00e+00);  f16 vs RNE(GPU f32) ok (0 off, worst 0 ulp) … rounded 980, subnormal 3
+selftest: Q6_K normal    4 x 256  f32 vs CPU ok (0 off, worst rel 0.00e+00);  f16 vs RNE(GPU f32) ok (0 off, worst 0 ulp) … rounded 977
+selftest: Q6_K           row slice row0=1 rows=2  ok (0 off)
+selftest: Q6_K           ld=cols+8                ok (launched 1, 0 off, 0 padding value(s) written)
+selftest: 7168 value(s) covered, 4935 rounded, 146 subnormal -> OK
+```
+
+On every covered value the GPU's f32 path is bit-identical to the CPU decoder, and the fp16 bits are the
+round-to-nearest-even result of the GPU's own f32 values (0 ulp). 4,935 of the 7,168 values actually took the
+rounding path and 146 landed in the fp16 subnormal range, so the pass is not a pass over exact values only.
+
+**Do the assertions detect a wrong conversion or offset?** Three disposable mutations, all detected:
+
+| mutation | result |
+|---|---|
+| `dequant_f16` replaced by `dequant_bf16` in the test (a bf16/f16 mix-up) | **failed**: 1,022 / 984 values off, worst 13,778 ulp |
+| row slice called with `row0 = 0` instead of 1 | **failed**: 512 values off |
+| kernel's Q6_K `d` offset `b + 208` changed to `b + 202`, rebuilt | **failed, exit 1**: f32 vs CPU off by up to 1.2e8 relative; the source was then `git checkout`-restored byte-identically and the rerun was exit 0 |
+
+**GGUF mode after the change** is byte-identical to before it (`2 types checked, OK`, exit 0). The engine binary
+`build-kolibri-cuda/strata-kolibri` is unchanged (`07e37adc…`), because only the test target and the kernel library
+were rebuilt.
+
+**What this establishes:** the fp16 *weight* conversion is round-to-nearest-even and its block offsets are right for
+covered Q4_K/Q6_K inputs, so an 11-logit error is not explained by a broken converter. **What it does not
+establish:** that the conversion is the whole fp16 story. The expert path also converts *activations* and the SwiGLU
+hidden state to fp16 (`kolibri_engine.cu`), and it accumulates over a K of thousands rather than 256. Task 4 owns
+those, and a primitive pass here is not an end-to-end fidelity result.
+
+**Backends:** the test is registered under the CUDA/HIP guard and built and run here with CUDA on `sm_75`. A HIP
+build was **not run** (no ROCm host in this work); SYCL is unaffected by this test.
+
+Artifacts: `/data4/kolibri-f16-evidence/f16-t2/` — the pre-implementation failure, the implemented run, both GGUF
+runs, the three mutation runs and both build logs.
+
+### Tasks 3–8
 
 Not run yet. Each will be filled in with its commands, exit statuses, raw artifacts and a status word.
 

@@ -2663,6 +2663,11 @@ if(STRATA_BUILD_TESTS)
   if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)   # #93: it needs the device dequantizers and a GPU runtime
     add_executable(dequant_bf16_test src/kernels/dequant_bf16_test.cpp)
     target_link_libraries(dequant_bf16_test PRIVATE strata_kernels strata_artifact ${_strata_gpu_runtime_target})
+    # The fp16 conversion selftest (2026-10-30, the EXPERT_F16 correctness plan): synthetic Q4_K/Q6_K blocks against
+    # the artifact's independent CPU decoder and a host round-to-nearest-even fp32->fp16 conversion. No model file
+    # and no 47 GB read, so it can run in a normal test sweep; it says nothing about end-to-end accuracy.
+    add_test(NAME kolibri_dequant_f16_selftest COMMAND dequant_bf16_test --selftest)
+    set_tests_properties(kolibri_dequant_f16_selftest PROPERTIES TIMEOUT 300)
   endif()
 
   add_executable(expert_multi_test src/kernels/cpu/expert_multi_test.cpp)
