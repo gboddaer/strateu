@@ -25,8 +25,8 @@ prefill placement depend on the configuration and card.
 **Kolibri preview preparation:** see [the preview guide](docs/KOLIBRI_PREVIEW.md) for installation, evidence and
 publication status. The extracted Linux R9700/gfx1201 candidate measures **23.94 tok/s** after 512 prompt ids and
 **17.75 tok/s** after 8191 (Ryzen 7 5700G, eight CPU lanes, Q4_K_M, 96 generated tokens). It uses MMQ prefill and a
-host-assisted decode graph. CUDA sm_75/sm_86 compilation passes; integrated T4 full-logit/package qualification
-is still pending. No RTX 3090 runtime or speed result is claimed.
+host-assisted decode graph. CUDA sm_75/sm_86 compilation passes; the T4 contributor has recorded integrated
+full-logit parity, but CUDA package qualification is still pending. No RTX 3090 runtime or speed result is claimed.
 
 Regression parity is not a general accuracy guarantee. Read [the accuracy policy](docs/KOLIBRI_ACCURACY_POLICY.md)
 and the preview's known failures/reference limits. Earlier T4 and AMD measurements, including unsuccessful arms,
@@ -107,12 +107,25 @@ experts by how often the router picks them:
 - The engine takes whatever `--ctx` gives it; for a 16 GB Tesla T4 `setup.py` now recommends **128K**, because the KV
   of 128K costs 2.5 GiB of the 16. An explicit `--context`, or the config's `--max-context`, overrides it.
 
+**The T4 prefill rates above are not free of accuracy cost, and that is measured.**  On the T4 the fast prefill comes
+from the fp16 expert cache (`EXPERT_F16`), which is on in the shipped T4 configuration. Measured 2026-10-30 against the
+plain path on identical forced histories (512-id prompt, 9 forced steps, full 128,000-value logits): mean KL **0.400**
+and a worst single-logit difference of **11.08** for the cache alone, and mean KL **0.168** with top-1 agreement on only
+**7 of 9** steps once `PF_PARTIAL` is added. Two runs of either configuration are bitwise identical, but repeatability
+alone does not establish the cause or rule out a deterministic implementation defect. The reported KL is two orders
+of magnitude worse than the R9700 figure, and neither configuration is qualified under [the accuracy policy](docs/KOLIBRI_ACCURACY_POLICY.md). The accuracy-first T4
+configuration is therefore the engine's own default with the expert cache off: **51.6 / 53.6 tokens/s** reading a
+512-token prompt and **30.5 / 30.5 tokens/s** writing, bitwise identical to the plain path at 512, 8,191 and 11,000
+prompt tokens. The fp16 cache is being investigated on its own branch; the numbers and the open questions are in
+[docs/KOLIBRI_CUDA_PREVIEW.md](docs/KOLIBRI_CUDA_PREVIEW.md).
+
 The cost of a round is bounded: 96 experts is 218-222 MiB over PCIe in ~22 ms mid-request, and the after-prompt round
 of up to 2,048 is 4,691 MiB in ~470 ms (the campaign's unbudgeted round moved 57 experts, 6.5 GiB, ~690 ms). Residency
 moves bytes, and with a CPU pool in play that does change them - an expert in a slot is read in fp32, the same expert
 on the pool in q8_1 (findings-log 0.3: mean |dlogit| 0.855, the id flips at token 8); with the pool off the two device
 legs are bitwise. Shipped T4 speed, two runs pinned to NUMA node 1: **154.0 / 158.6 tokens/s** reading a 512-token
-prompt, **24.83 / 24.93 tokens/s** writing, and a repeated prompt reads in **0 ms**. Box spec, full tables and context:
+prompt, **24.83 / 24.93 tokens/s** writing, and a repeated prompt reads in **0 ms**. The shipped T4 configuration runs
+the fp16 expert cache, so those prefill rates carry the accuracy cost noted above. Box spec, full tables and context:
 [the campaign report](docs/strateu-campaign-report.md).
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>

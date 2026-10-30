@@ -6,8 +6,8 @@ on the same idea as Flash-Next: every expert in system RAM, the most-used ones o
 GPU computing experts side by side.
 
 For the current AMD/CUDA **preview preparation**, installation and qualification limits, start with
-[the preview guide](KOLIBRI_PREVIEW.md). Its R9700 package is qualified; CUDA build checks and earlier T4 reports
-are recorded separately, with integrated full-logit/package qualification still pending. The historical
+[the preview guide](KOLIBRI_PREVIEW.md). Its R9700 package is qualified; the T4 contributor's integrated
+full-logit qualification is recorded separately, with CUDA package qualification still pending. The historical
 measurements below do not automatically qualify a new release.
 
 ## What the model is (measured from the GGUF)

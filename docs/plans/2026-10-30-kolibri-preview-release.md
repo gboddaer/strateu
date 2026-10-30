@@ -88,8 +88,28 @@ Follow [the accuracy policy](../KOLIBRI_ACCURACY_POLICY.md). Do not change expec
   accuracy targets and current finite-fixture limits remain disclosed.
 - **Job 5 blocked, prepared:** final AMD engine archive, evidence archive and SHA256SUMS are prepared under
   `build-mmq/release/kolibri-preview/assets/`. Intended tag is `v0.1.52-kolibri-preview.1`. No release/tag/upload
-  has been created: no GitHub API authentication is available, and integrated T4 full-logit/runtime plus CUDA
-  package qualification are still pending. Source/docs can be pushed over SSH; that is not a GitHub release.
+  has been created: no GitHub API authentication is available, and CUDA package qualification/raw-log handoff
+  are still pending. Integrated T4 source qualification was subsequently supplied by commit `9373ef88`, below.
+  Source/docs can be pushed over SSH; that is not a GitHub release.
 - **Final review:** self-review; no independent reviewer was delegated. Actual CUDA 13.1 compile/link checks
   also cover the primary `strata` target. sm_75 and sm_86 images were verified with cuobjdump. NVIDIA execution,
   CUDA 12.8 project compilation, Windows and other GPU architectures remain unverified locally.
+
+## Concurrent T4 contribution integrated
+
+- The first documentation push was rejected because `origin/main` advanced to `9373ef88`. Fetched and merged
+  the concurrent documentation without forcing or overwriting the contributor's measurements. Engine source
+  remains `5bbe6c4e`; no code changed in the merge.
+- The T4 contributor records CUDA 12.8.93 build and full-logit qualification on integrated source `5bbe6c4e`:
+  short decode/reuse/six-repeat gate, 8191/11000 forced-history boundaries and wait test PASS. This supersedes
+  the initial matching-id-only report. These are contributed hardware measurements, not local AMD-host runs.
+- Its T4 suite remains 189 PASS / 7 baseline-reproduced FAIL / 14 skipped out of 210. No RTX 3090 execution or
+  CUDA package smoke test was supplied; raw T4 logs still need to accompany the CUDA package.
+- Preserve the contributor's fp16-cache measurements: cache alone mean KL 0.400, max logit difference 11.08;
+  cache plus PF_PARTIAL mean KL 0.168 and top-1 7/9. Do not recommend those old speed presets as qualified.
+- Review ruling: repeatability alone does not establish that the cause is rounding or exclude a deterministic
+  implementation bug. Corrected that inference in the merged prose while preserving every reported number.
+  Cost: the cause remains explicitly unresolved instead of being prematurely attributed.
+- Refreshed release docs and bundled validation/evidence to include the contributed source qualification.
+  Source qualification is no longer the CUDA blocker; a tested CUDA package, raw-log handoff and GitHub API
+  authentication are. The preview remains unpublished.

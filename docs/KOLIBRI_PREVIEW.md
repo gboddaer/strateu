@@ -1,8 +1,9 @@
 # Kolibri AMD and CUDA preview
 
 **Status: release candidate, not yet a published GitHub release.** The Linux gfx1201 package has been qualified.
-CUDA compilation passes locally; integrated T4 full-logit/runtime qualification and a CUDA package are still
-pending. GitHub release creation/upload also needs an authenticated publishing session.
+CUDA compilation passes locally, and the T4 contributor has recorded integrated-revision full-logit/runtime
+qualification. A tested CUDA package is still pending. GitHub release creation/upload also needs an
+authenticated publishing session.
 
 This is **strateu's** Kolibri preview, not an upstream Strata release. It runs Kolibri-1 Q4_K_M as a single stream,
 without a drafter. The engine package is text-only. Model weights, tokenizer files and the Python server are not
@@ -16,7 +17,7 @@ Engine source: `5bbe6c4e7327992d10888cc0c9478ea864b4f324`, engine version 0.1.52
 |---|---|---|
 | Linux gfx1201, R9700 32 GB | Fresh HIP build; extracted-package decode and both prefill gates; HTTP acceptance; paired speed runs | Ryzen 7 5700G, 93 GiB RAM, Debian 13, glibc 2.41, ROCm 7.2.2; card0 only |
 | CUDA sm_75 / sm_86 | CUDA 13.1.115 compile/link of `strata`, `strata-kolibri`, rollover and wait test targets | No NVIDIA execution on this build host |
-| Tesla T4 | Operator-provided earlier source-build report; see [CUDA qualification](KOLIBRI_CUDA_PREVIEW.md) | Different local build fix; integrated revision/full-logit qualification and package pending |
+| Tesla T4 | Contributor-recorded `5bbe6c4e` build, full-logit/reuse/repeat/8191/11000 gates and wait test; see [CUDA qualification](KOLIBRI_CUDA_PREVIEW.md) | Source configuration qualified on that host; tested CUDA package and raw-log handoff pending |
 | RTX 3090 | sm_86 code is present in the compiled CUDA binary | No hardware test; no performance claim |
 
 Other AMD architectures, Windows, Metal, SYCL, vision, additional model quantizations and multi-GPU are not
@@ -157,8 +158,21 @@ Fresh validation of this candidate:
   `ple_parity`, `platform_memory_test`, `conversation_copy_streams_test`, `isa_guard_check`. These are the same
   six names previously reproduced on the baseline; the full suite is **not green**.
 - The full Terminal suite is not claimed green; prior attempts did not finish. The subset above is not a
-  substitute for that result. CUDA runtime, RTX 3090, Windows and GPU race-detector coverage are not established
-  by the local build checks.
+  substitute for that result. RTX 3090, Windows and GPU race-detector coverage are not established by the local
+  build checks. The contributed T4 runtime qualification is separate from those build checks.
+
+The T4 contributor's later qualification is recorded in commit `9373ef88`, for engine source `5bbe6c4e`, with
+CUDA 12.8.93 and driver 580.196.07. It reports full-logit parity through both long boundaries and the full short
+reuse/repeat gate. Its suite is also not green: 189 passed, 7 baseline-reproduced failures, 14 skipped of 210.
+These are contributor measurements, not runs performed on the AMD build host; raw T4 logs still need to accompany
+its release artifact.
+
+**Do not use the old T4 fp16 expert-cache speed configuration as an accuracy-qualified preset.** The contributor
+measured mean KL 0.400 and a worst logit difference of 11.08 for `EXPERT_F16=24` versus the same build's plain path;
+with `PF_PARTIAL=1`, mean KL was 0.168 and top-1 matched on only 7 of 9 forced steps. These are engine-vs-engine
+screens, not llama.cpp-reference KL. The cause is not established by repeatability: rounding/accumulation changes
+and deterministic implementation defects must still be distinguished. The preview recommendation is cache off,
+slots 0 and decode arms on. See the CUDA guide for exact configuration and measurements.
 
 ## Evidence and publication
 
@@ -167,7 +181,7 @@ The evidence contains sanitized commands/configuration, raw full-logit compariso
 HTTP responses, build identities and clearly labelled historical records. It contains no weights or credentials.
 Hashes detect corruption; this unsigned preview has no publisher-signature verification.
 
-Publication must keep passed, failed and untested checks separate. Do not describe the T4 agent's earlier
-matching-id report as a full-logit pass. CUDA needs the integrated revision's runtime/full-logit results and a
-qualified artifact before being listed as a validated binary release. The release upload remains blocked until
+Publication must keep passed, failed and untested checks separate. The earlier T4 matching-id report has been
+superseded by contributed integrated-revision full-logit results; preserve that provenance. CUDA still needs a
+qualified package and its raw-log handoff before being listed as a validated binary release. Upload remains blocked until
 GitHub API authentication is available; SSH source pushes alone cannot create/upload a GitHub release.

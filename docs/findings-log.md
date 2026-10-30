@@ -1454,3 +1454,63 @@ deterministic run to run (re-anchored PFHASH identical twice, G1) and its accura
 **Not measured.**  Any card other than this T4; F and G are one run each (their gap to E is 5.8 and 0.7 tok/s, far outside
 run-to-run spread but not a two-run pair); and the 20-slot vs 75-slot hit-rate difference was not separated from the
 `ATTN_FLASH`/`ROUTER_*` part of the speed env (one env bundle, not its members, was toggled).
+
+
+## 0.8 The T4 prefill lever is the fp16 expert cache, and it is two orders of magnitude off (2026-10-30)
+
+**Why this exists.**  §0.7 credits the step from ~55 to 150-190 tok/s to the "speed env" and names `PF_STAGE` as the
++95 tok/s member.  Taking that env apart one member at a time on the T4 does not reproduce that attribution, and the
+member that actually carries the gain is also the one that moves the numbers, far more than the R9700 recorded.
+
+**Measured** (Tesla T4 16 GB, driver 580.196.07, kernel 6.1.0-52-amd64, PCI `82:00.0` = `numa_node 1`,
+`numactl --cpunodebind=1 --membind=1`; `build-kolibri-cuda` from revision `5bbe6c4e`, CUDA 12.8.93, arch 75,
+`STRATA_Q6K_EXPERTS=ON`; 512-id prompt `tools/kolibri/oracle_ids512.txt`, 128 greedy tokens, ctx 8192,
+`--prefill --cpu-threads 24 --expert-slots 0`; box load 1.5-3.8; two runs per row):
+
+| environment | pp-512 | tg-128 |
+| --- | --- | --- |
+| engine defaults (no `STRATA_KOLIBRI_*`) | 51.6 / 53.6 | 30.5 / 30.5 |
+| `PF_STAGE=1` | 52.2 / 51.9 | 30.6 / 30.6 |
+| `PF_STAGE` + `ATTN_MB=256` + `ATTN_FLASH=1` + `ROUTER_TILE=1` + `ROUTER_TJ=16` | 50.8 | 30.6 |
+| `EXPERT_F16=24` | 158.6 / 162.1 | 30.3 / 29.4 |
+| `EXPERT_F16=24` + `PF_PARTIAL=1` | 181.5 / 182.0 | 30.2 / 30.2 (EOS at 105 of 128) |
+| the whole "speed env" of §0.7 | 167.5 / 170.9 | 30.3 / 30.3 |
+
+So the prefill lever is the **fp16 expert cache** (52 -> ~160, 3x), `PF_PARTIAL` adds ~15-18 %, and `PF_STAGE`, `ROUTER_*`
+and `ATTN_*` are inert at this shape.  §0.7's row C (150.9/167.7, "speed env without `PF_PARTIAL`") is reproduced by
+`EXPERT_F16=24` alone; the +95 tok/s it gives `PF_STAGE` does not reproduce.  `EXPERT_F16` dequantizes the layer's first N
+experts to fp16 and feeds them to the prefill GEMMs (`kolibri_engine.cu:276`), so this was always an arithmetic change,
+not a placement one.
+
+**And it is the expensive kind of arithmetic change on this card.**  Full logits on the same forced history
+(`--force 286,3515,310,262,14292,1343,1444,46`; 9 records x 128,000 values; `STRATA_GEMM_DETERMINISTIC=1`; reference =
+the same build's plain path with `EXPERT_F16=0`):
+
+| comparison | mean KL | median | p95 | p99 | max | max \|dlogit\| | top-1 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| plain vs `EXPERT_F16=24` | 0.400 | 0.0010 | 2.14 | 3.24 | 3.52 | 11.08 | 9/9 |
+| plain vs `EXPERT_F16=24 PF_PARTIAL=1` | 0.168 | 0.0005 | 0.87 | 1.26 | 1.35 | 5.47 | **7/9** |
+| candidate run 1 vs run 2 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | bitwise identical |
+
+The difference is repeatable; that does not establish whether its cause is rounding/accumulation order or a
+deterministic implementation defect. The shape is the one the accuracy policy warns about: a near-zero median with a heavy tail, and two argmax flips in nine steps for the pair.  An 11-logit
+worst case is also too large to accept as fp16 rounding without an explanation - a real question for the next step, and
+not one this campaign answers.  The R9700's `PF_PARTIAL` figure (answers-only mean KL 0.00133, top-1 0.9725, §0.7) must
+not be reused as evidence for this card.
+
+**The decode side of the same revision is clean, at length.**  The four decode arms are on by default here and full logits
+are bitwise against the plain decode (max |a-b| 0.0) at 16/511/512/513 prompt tokens, at the **8191** KV-wrap boundary
+and at an **11,000**-token attention transition, with six repeats and the arm marker present only in the candidate.  On
+the pool path the arms are worth 30.5 against 29.3 tok/s (+4.1 %), measured on the pre-pull build.
+
+**Provenance.**  Revision `5bbe6c4e`, `build-kolibri-cuda` (`strata-kolibri` md5 recorded in the working tree's report);
+gates via `tools/kolibri/decode_gate.sh check` and `tools/kolibri/check_decode.py`; KL via `klcmp.py`, which is
+engine-vs-engine against the same build's plain path - **not** the llama.cpp-referenced `tools/kolibri/kl.py`, which was
+not run here.  The 8191 run used the committed `tools/kolibri/decode_ids8191.txt`; the 11,000-token sequence was that
+fixture's ids cycled, so it is synthetic, and both sides of that comparison saw the same input.  The seven CTest failures
+(`attn_k_parity`, `pf_wmma_parity`, `ple_parity`, `pool_tasks_test`, `pool_cores_test`, `isa_guard_check`,
+`cuda_spill_guard`) were reproduced identically on a build of `bdd3803a` and are not attributed to this revision.
+
+**Not measured.**  Any card other than this T4; KV-boundary and attention-transition parity for the fp16-cache
+configurations; whether the 11-logit worst case is a Turing path defect or expected fp16 loss; long-context speed under any
+configuration; the `--cpu-threads 13` (physical-core) pool variant, including whether it stays bitwise.

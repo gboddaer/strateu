@@ -1,8 +1,9 @@
 # Kolibri-1 preview.1 — release notes (draft)
 
 **Not published.** Intended tag: `v0.1.52-kolibri-preview.1`, repository `gboddaer/strateu`.
-AMD qualification is complete for the scope below. Integrated T4 full-logit/runtime qualification and a CUDA
-package remain pending. GitHub release upload needs an authenticated publishing session. Do not remove these
+AMD package qualification and contributor-recorded T4 source full-logit/runtime qualification are complete
+for the scopes below. A qualified CUDA package and its raw-log handoff remain pending. GitHub upload needs
+an authenticated publishing session. Do not remove these
 limits or publish a combined validated AMD/CUDA release until the missing checks are supplied.
 
 ## Result
@@ -34,10 +35,11 @@ Prepared assets:
 - `Strateu-Kolibri-preview.1-evidence.tar.gz`
 - `SHA256SUMS`
 
-**No qualified CUDA binary asset is available yet.** CUDA 13.1 compile/link checks pass for sm_75 and sm_86,
-including both engine entrypoints and decode tests. The operator's T4 report on earlier source plus local fixes
-reports ~4.1% pool decode improvement and matching generated ids; it is not an integrated-revision full-logit
-pass. No RTX 3090 runtime result exists. See [CUDA qualification](../KOLIBRI_CUDA_PREVIEW.md).
+**No qualified CUDA binary asset is available yet.** Local CUDA 13.1 compile/link checks pass for sm_75 and
+sm_86, including both engine entrypoints and decode tests. The T4 contributor's later report on `5bbe6c4e`,
+recorded in `9373ef88`, establishes full-logit/reuse/repeat/8191/11000 parity and the wait test using CUDA 12.8.93.
+This supersedes the earlier matching-id-only report. The contributor reports ~4.1% pool decode improvement;
+no RTX 3090 runtime result exists. See [CUDA qualification](../KOLIBRI_CUDA_PREVIEW.md).
 
 ## Validation
 
@@ -60,15 +62,19 @@ Failed/limited:
   previously reproduced on the baseline. The suite is not green.
 - CUDA 12.8 compiler identification failed against the build host's glibc 2.41 before project compilation.
   CUDA 13.1 compilation is not CUDA 12.8 validation or GPU execution.
-- The full Terminal suite is not claimed green; earlier attempts timed out. CUDA runtime/package, RTX 3090,
-  other AMD architectures, Windows and GPU race-detector checks remain outside local qualification.
+- The full Terminal suite is not claimed green; earlier attempts timed out. CUDA package, RTX 3090,
+  other AMD architectures, Windows and GPU race-detector checks remain outside qualification. The contributed
+  T4 source suite is also not green: 189 passed, 7 baseline-reproduced failures, 14 skipped out of 210.
 
 ## Accuracy
 
 Decode parity establishes that scheduling preserves the tested engine outputs. It is not proof of perfect
 model fidelity or general task quality. A historical strict reference-KL target was not closed; later P4
 finite-fixture screens passed their different stated thresholds using reused reference arrays. No fresh broad
-quality evaluation or universal numerical tolerance is claimed. Follow the
+quality evaluation or universal numerical tolerance is claimed. The T4 contributor also found large,
+repeatable deviations with the old fp16 expert cache (mean KL 0.400, worst logit difference 11.08; with
+`PF_PARTIAL`, mean KL 0.168 and top-1 agreement 7/9). The cause is unresolved; those configurations are not
+accuracy-qualified. Use cache off and slots 0 for the preview recommendation. Follow the
 [Kolibri accuracy policy](../KOLIBRI_ACCURACY_POLICY.md).
 
 ## Publishing handoff
@@ -86,7 +92,7 @@ gh release create v0.1.52-kolibri-preview.1 --repo gboddaer/strateu \
   "$ASSET_DIR/Strateu-Kolibri-preview.1-evidence.tar.gz" "$ASSET_DIR/SHA256SUMS"
 ```
 
-Before making it public: integrate exact-revision T4 full-logit/lifecycle results and logs; qualify/checksum the
-CUDA package on its target driver; update the notes and support matrix; confirm any untested platforms remain
+Before making it public: attach the raw logs for the contributed T4 full-logit/lifecycle qualification;
+qualify/checksum the CUDA package on its target driver; update the notes and support matrix; confirm any untested platforms remain
 labelled untested; verify every remote asset matches the local checksum. Never paste a publishing token into
 chat or upload weights/credentials. Source pushes over SSH do not grant release-upload authentication.
