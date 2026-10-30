@@ -39,4 +39,35 @@ worktree `/data2/develop/native-q4q6`.
 
 ## Phase 0 measurements
 
+### Qwen3.8-Flash-Next, prefill (drafter-independent), 511 tokens, no residency
+
+Command: `engine/strata --pack …/unsloth-ud-q4_k_xl --native …00001-of-00004.gguf --tokens-file ids512.txt
+--max-new 128 --max-context 16384 --kv int8 --kv-resident 16384 --prefill 512 --spec 2 --suffix-draft 0
+--lookup-chain 0 --pool-workers 13 --stats` (no `--expert-cache`; the `--spec` requirement was satisfied only up to
+the loader's own check, which then refused — see below).
+
+```
+prefill 511 tokens in 1 chunks, 7762.4 ms (65.8 tok/s); experts streamed 6253 (6253 by DMA, host 36.1 ms),
+resident 0, on the CPU 6658 (share 0.69); PLE 4682.9 ms
+```
+
+| component | ms | share of prefill |
+|---|---:|---:|
+| prefill total | 7,762 | 100 % |
+| **PLE table reads** | **4,683** | **60 %** |
+| everything else (attention + experts + dense) | 3,079 | 40 % |
+
+Two things follow immediately. First, **the flash path's prefill is not 3x faster than Kolibri's; it is ~66 tok/s
+against Kolibri's ~58-60 tok/s** (8 pool workers, measured this session: 28.09 GB streamed in 8.46-8.87 s for 512
+tokens; the 24-worker documentation figure is 51.6-53.6 tok/s). Second, **60 % of the flash prefill is PLE row reads
+from the SSD**, a component Kolibri does not have at all — i.e. on this box the flash path is paying a large
+SSD-table cost and is *still* marginally ahead, which means its compute+expert leg is substantially cheaper than
+Kolibri's: ~3.08 s for 511 tokens ≈ 166 tok/s equivalent.
+
+`--spec` then refused: *"--spec needs the device residency table (--expert-profile, --expert-cache and the token
+graph)"*, so decode cannot be measured on this pack without the expert cache (and therefore without the ~76 GB load
+and the cache preload). That is the next run.
+
+
+
 *(to be filled as the runs complete; nothing is asserted above beyond what is written here)*
