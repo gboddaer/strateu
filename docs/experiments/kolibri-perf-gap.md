@@ -294,6 +294,31 @@ Go/no-go: bit-identical on (2) and (3), SwiGLU parity understood, and faster tha
 movement. Anything less and A is reported as a measured dead end.
 
 
+### Phase 1c — what the free win actually requires (for the product change)
+
+Two attempts to reproduce the `numactl` win **without** `numactl`, so that `setup.py` could emit it as flags:
+
+| configuration | prefill (511 tok) | decode expert work | achieved GB/s |
+|---|---:|---:|---:|
+| 13 workers, 2 nodes (baseline) | 10,398 ms | 24.02 ms/tok | 29.7 |
+| `numactl --cpunodebind=1 --membind=1`, 13 workers | **7,922-8,039 ms** | **12.93-12.96 ms/tok** | **55.1-55.3** |
+| `STRATA_NUMA_POOL=0 --pool-cores <node 1's 13 physical cores> --cpu-threads 13` | **10,680 ms** | **23.16 ms/tok** | **30.8** |
+
+**The lever is memory locality, not core pinning.** Pinning the workers to one node's physical cores — through the engine's
+own `--pool-cores` — reproduces none of the gain (10,680 ms and 23.2 ms/token, i.e. the baseline). Only binding the
+**memory** as well (`--membind`) recovers it (7.9 s and 12.9 ms/token). The pinned expert table is 42.9 GiB; when it is
+allocated on the far node, half the workers read it across the interconnect at roughly half the bandwidth.
+
+**Consequence for the product change:** the free win cannot be shipped as engine flags alone. Either
+
+* **the launcher wraps the engine in `numactl --cpunodebind=N --membind=N`** when the machine has more than one NUMA node,
+  `numactl` is installed, and the GPU sits on node N; `--cpu-threads` then follows that node's physical core count, or
+* **the engine binds memory itself** (`set_mempolicy`/`mbind` on the pinned expert table and its workers), which is a code
+  change in the pool's allocation path and works for every launcher including the app.
+
+Both keep the arithmetic identical, so neither needs qualification — the bit-identity was already proven for the
+`numactl` configuration (9 x 128,000 logits, max |a-b| = 0).
+
 ## Phase 2 — preregistration for the two numerical levers (awaiting the operator's approval; NO results collected)
 
 Written **before** any measurement of either lever, as the goal's G2 gate requires. Nothing below has been run.
