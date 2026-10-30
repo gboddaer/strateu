@@ -3296,6 +3296,25 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                          hits);
             std::fflush(stderr);
         }
+        // 2026-10-30, EXPERT_F16 correctness plan: an opt-in routing digest, one line per (chunk, layer), so "did the
+        // two arms route the same experts?" can be answered without going through a KL.  Default off.  No arithmetic
+        // changes and no extra synchronisation: `A.ids_h` is published by the PRE half and the event synchronised
+        // above is what makes it valid here, which is why this sits next to the SLOTTRACE block below.
+        if (std::getenv("STRATA_KOLIBRI_F16TRACE") != nullptr) {
+            static long long f16_tr_chunk = -1;
+            if (l == 0) ++f16_tr_chunk;
+            uint32_t h = 2166136261u;
+            int uniq = 0;
+            std::vector<char> seen((size_t) g.n_expert, 0);
+            for (int i = 0; i < NKc; ++i) {
+                const int id = A.ids_h[(size_t) i];
+                h = (h ^ (uint32_t) id) * 16777619u;
+                if (!seen[(size_t) id]) { seen[(size_t) id] = 1; ++uniq; }
+            }
+            std::fprintf(stderr, "F16TRACE chunk=%lld l=%d picks=%d uniq=%d ids=%08x\n", f16_tr_chunk, (int) l,
+                         NKc, uniq, h);
+            std::fflush(stderr);
+        }
         if (b.native_ok && !(pool_all && e.cpu_threads > 0)) {
             if (e.counters && e.slots > 0) {   // pricing only; --counters runs
                 const int* hid = A.ids_h;   // already published - this used to be a SECOND synchronous D2H of the same ids
@@ -3463,6 +3482,18 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                     }
                 } else {
                     for (int x : s.pf_touch) s.pf_miss.push_back(x);
+                }
+                // 2026-10-30, EXPERT_F16 correctness plan step 4: the cache-ownership invariant, measured rather than
+                // argued - every resident in this chunk owns its own slot, and no more residents than slots.  Opt-in
+                // (STRATA_KOLIBRI_F16TRACE), reads host state the loop already holds, changes no arithmetic.
+                if (std::getenv("STRATA_KOLIBRI_F16TRACE") != nullptr && b.f16) {
+                    std::vector<int> slots(s.pf_res_slot);
+                    std::sort(slots.begin(), slots.end());
+                    int dup = 0;
+                    for (size_t i = 1; i < slots.size(); ++i) if (slots[i] == slots[i - 1]) ++dup;
+                    std::fprintf(stderr, "F16SLOT chunk=%lld l=%d residents=%zu n_cached=%d res_eff=%d dup=%d\n",
+                                 s.pf_clock, (int) l, s.pf_res_slot.size(), b.n_cached, res_eff, dup);
+                    std::fflush(stderr);
                 }
                 // S7 increment C: resident GEMMs as ONE batched cublas call per slice per layer.  Each touched
                 // expert's tokens are cut into blocks of kResBlk rows (last block zero-padded via tok = -1); the

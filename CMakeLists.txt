@@ -1049,6 +1049,18 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           $<$<TARGET_EXISTS:strata_mmq_w4a4>:strata_mmq_w4a4>
                           $<$<TARGET_EXISTS:strata_kq>:strata_kq> strata_warnings ${_strata_gpu_runtime_target})
     add_test(NAME q4k_grouped_vram_parity COMMAND q4k_grouped_vram_parity)
+    # The FP16 expert GEMM measured in three steps (2026-10-30, the EXPERT_F16 correctness plan): the CPU-dequantized
+    # f32 operands, the FP16 operands cuBLAS actually receives, and the GPU's own result.  Operand rounding and
+    # accumulation are reported separately, each against the element's own sum|w*x|.  `--mutate swap|offset|rows`
+    # shows the gate detects a wrong-expert pointer, a corrupted block offset and a missing row.  Default shapes are
+    # synthetic; the model's shapes are passed explicitly (--embd 2560 --ff 512).
+    add_executable(f16_expert_gemm_parity tests/kolibri/f16_expert_gemm_parity.cu)
+    target_include_directories(f16_expert_gemm_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                               ${_strata_gpu_include_directories})
+    target_link_libraries(f16_expert_gemm_parity PRIVATE strata_kernels strata_prefill strata_warnings
+                          ${_strata_gpu_runtime_target})
+    add_test(NAME f16_expert_gemm_parity COMMAND f16_expert_gemm_parity)
+    set_tests_properties(f16_expert_gemm_parity PROPERTIES TIMEOUT 900)
   endif()
   # the reference forward pass (plan T6): plain kernels + Strata native MMVQ/router, no graphs, no cache; the
   # routed experts (3-D tensors) live in managed memory so a 47 GB file runs on a 16 GB card (pages from RAM)

@@ -418,7 +418,99 @@ Artifacts: `/data4/kolibri-f16-evidence/f16-t3/` — the four runs (`.layers`, `
 lines, `.out`, `.status`), the two no-prefill runs, `layer-delta*.txt`, `logits-ctl-vs-cache.txt`,
 `nopf-*.txt`, `SHA256SUMS`.
 
-### Tasks 4–8
+### Task 4 — isolate the arithmetic and the actual cache wiring
+
+**The instrument.** `tests/kolibri/f16_expert_gemm_parity.cu`, registered as `f16_expert_gemm_parity` (synthetic
+shapes by default, model shapes with `--embd 2560 --ff 512`). It separates the two things the FP16 expert path can
+contribute, for the two expert projections the model actually runs — gate/up as **Q4_K** (`N = 512`, `K = 2560`) and
+down as **Q6_K** (`N = 2560`, `K = 512`), the shapes read from the model's own metadata (`expert_feed_forward_length`
+512, `embedding_length` 2560, 384 experts, 6 used):
+
+* **(a)** float64 dot over the *unrounded* operands: CPU-dequantized f32 weights and the f32 activations;
+* **(b)** float64 dot over the operands cuBLAS *actually receives*: the FP16 weights the device produced and the FP16
+  activations, widened exactly;
+* **(c)** the GPU's `Gemm::f16_batched` result.
+
+The cuBLAS contract was read from `src/prefill/gemm.cu`: `cublasGemmBatchedEx`, A = W `CUDA_R_16F`, B = X
+`CUDA_R_16F`, C = Y `CUDA_R_32F`, `CUBLAS_COMPUTE_32F`, `CUBLAS_GEMM_DEFAULT` — FP16 inputs, FP32 accumulate. The
+gate is therefore **accumulation <= 4 · gamma_K · sum|w·x|** with `gamma_K = K·u/(1-K·u)`, `u = 2^-24`; the factor 4
+is headroom for the order, not a fitted threshold. Operand rounding is reported, not gated: it is inherent to
+storing weights and activations as FP16, and the plan asks for it to be kept separate.
+
+A third, gating check was added after a mutation showed it was needed: **the FP16 weights the GPU used must be the
+host's RNE conversion of the CPU-dequantized blocks**. Without it the test is blind to a shifted block offset or a
+wrong-conversion path, because those move (a) and (b) together. Only 0 mismatches are accepted.
+
+**Result** — 16 comparisons per shape set, `T` at the `kResBlk = 32` block boundary (1, 31, 32, 33), `batch` 1 and 3:
+
+```
+f16_expert_gemm_parity (toy, 256/256):      16 comparison(s), 0 failing value(s) -> PASS
+f16_expert_gemm_parity --embd 2560 --ff 512: 16 comparison(s), 0 failing value(s) -> PASS
+  gate N= 512 K=2560 T=33 batch=3  max|Y| 482.2  max sum|w*x| 4590.8  operand-rounding 4.98e-05  accumulation 2.85e-03 (0.01x of gamma_K*sum|w*x|)  weights not the reference's: 0
+  down N=2560 K= 512 T=33 batch=3  max|Y| 413.3  max sum|w*x| 2083.0  operand-rounding 9.17e-05  accumulation 6.98e-04 (0.02x of gamma_K*sum|w*x|)  weights not the reference's: 0
+```
+
+Across every model-shape comparison: **operand rounding 3.0e-5 … 9.7e-5** relative to that element's own
+`sum|w·x|`, and **accumulation at most 0.02x** of the fp32 ordering bound. So on the model's expert shapes the FP16
+GEMM is fp32 accumulation over the rounded operands, and the rounding it introduces is ~1e-4 relative — the same
+order as the first layer-to-layer residual difference Task 3 measured.
+
+**The gate detects the wiring failures it exists for** (`--mutate`, three disposable runs):
+
+| mutation | result |
+|---|---|
+| `swap` — two experts' weight pointers exchanged in the device array | **failed**: 99,287 values |
+| `offset` — the Q6_K blob read one super-block late (pointer shifted, reference not) | **failed**: 2,095,858 values |
+| `rows` — the reference covers `T-1` rows while the GPU computes `T` | **failed**: 8,192 values |
+
+The `offset` mutation is worth recording twice: the first two attempts were **not detected**, because shifting the
+fixture symmetrically moves both sides, and because a reference derived from the device's own weights cannot see a
+wrong weight. Only the pointer-only shift plus the explicit weight-bits check caught it. That is the failure mode the
+plan warned about, found by trying to break the test rather than by trusting it.
+
+**Opt-in trace, default off** (`STRATA_KOLIBRI_F16TRACE=1`, `src/kolibri/kolibri_engine.cu`), two lines per
+(chunk, layer), both placed where the loop already has the values on the host, so **no arithmetic change and no extra
+synchronisation**:
+
+* `F16TRACE chunk=… l=… picks=… uniq=… ids=<FNV-1a over the selected ids>` — did the two arms route the same experts?
+* `F16SLOT chunk=… l=… residents=… n_cached=… res_eff=… dup=…` — the cache-ownership invariant of the promotion loop.
+
+**What the trace shows** (512 ids, one prompt, `EXPERT_F16=0` against `24`, same inputs, 100 (chunk, layer) records):
+
+| record | control digest | cache digest |
+|---|---|---|
+| chunk 0, layer 0 | `d5f5346b` | `d5f5346b` (identical) |
+| chunk 0, layer 1 | `faf887c0` | `faf887c0` (identical) |
+| chunk 0, layer 2 | `5db9db00` | `7c471334` (**differs**) |
+| chunk 0, layer 3 | `4fdc34d7` | `210bb70a` (differs) |
+
+**4 of 100** records route identically; 96 differ, while the pick count stays 1536 in every record. So the arms
+agree completely through the first two layers and then select different experts — the router, a discrete function
+of a slightly different hidden state, starts flipping once the first FP16-rounded expert output has propagated into
+it. That is the amplification path from a ~1e-4 rounding difference to a ~1.0 relative residual difference and an
+11-logit tail, and it is consistent with everything measured so far.
+
+**The cache-ownership invariant**, measured in situ over the same 100 records: `residents=24`, `n_cached=24`,
+`res_eff=24`, **`dup=0` in all 100** — every resident of a chunk owns its own slot, and residency is capped at the
+slot count. This is the invariant whose violation the engine's own comments record as a previously fixed P1 bug
+(duplicate slot indices, wrong expert weights). It holds on this configuration; the probe is default-off and the
+run with it is bitwise identical to the run without it (`klcmp` reports bitwise identical, 0 differing records).
+
+**What Task 4 establishes:** the FP16 expert GEMM converts and multiplies correctly on the model's shapes within an
+fp32 accumulation bound, and the cache gives each resident in a chunk its own slot. The large full-logit difference
+is explained by measured components — ~1e-4 per-GEMM rounding, then router flips from layer 2 onward, then
+amplification — rather than by a demonstrated wiring defect. **What it does not establish:** that this explanation
+covers the whole 11-logit tail, or that the path is accurate. The engine's SwiGLU and hidden-FP16 conversion inside
+the resident path were **not** replayed against a float64 reference here, and no invariant was tested across
+requests, resets or cancellations (the plan's Task 6 owns state transitions). The static reading of the promotion
+loop (reuse by id, free slot, else least-recently-touched, `res_eff = min(res_top, n_cached)`) is **unconfirmed
+static analysis** beyond the distinctness the probe measured.
+
+Artifacts: `/data4/kolibri-f16-evidence/f16-t4/` — `toy.txt`, `model-shapes.txt`, the four `mutate-*.txt` runs,
+`trace/` (both arms' `.err` with the F16TRACE lines, the normalized traces, the differing records, the slot-probe
+run and its bitwise comparison).
+
+### Tasks 5–8
 
 Not run yet. Each will be filled in with its commands, exit statuses, raw artifacts and a status word.
 
