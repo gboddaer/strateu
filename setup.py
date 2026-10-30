@@ -846,6 +846,62 @@ def say(msg=""):
     print(msg, flush=True)
 
 
+def _gpu_numa_node(root: str = "/sys") -> int | None:
+    """The NUMA node of the first GPU, from the PCI device's sysfs entry; None when it cannot be read."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=pci.bus_id", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=10).stdout.split()
+        if not out:
+            return None
+        bus = out[0].strip().lower()
+        if len(bus) > 12:                      # 00000000:82:00.0 -> 0000:82:00.0 (sysfs spells the domain in 4 hex digits)
+            bus = bus[4:]
+        n = int(Path(root, "bus", "pci", "devices", bus, "numa_node").read_text().strip())
+        return n if n >= 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def expert_worker_count(root: str = "/sys") -> int:
+    """Workers for Kolibri's CPU expert pool: the physical cores of the GPU's own NUMA node.
+
+    Measured on the T4 box (docs/experiments/kolibri-perf-gap.md, Phase 1): 8 workers with the pool split over two NUMA
+    nodes gave 10,398 ms for a 511-token prefill; 13 workers, one node's physical cores, gave 8,128 ms.  With the memory
+    bound to that node as well it was 7,922 ms and the decode expert work halved (24.0 -> 12.9 ms/token) - the memory
+    binding itself is the launcher's or the engine's job, not this function's.  Without any of it the engine sizes the
+    pool from every logical CPU and spreads it over both nodes, so half the workers read the 42.9 GiB pinned expert table
+    across the interconnect at about half the bandwidth.  Falls back to the old rule (min(24, logical CPUs)) whenever the
+    topology cannot be read, so a machine this cannot describe behaves exactly as before.
+    """
+    cap = min(24, os.cpu_count() or 8)
+    try:
+        nodes = sorted(glob.glob(os.path.join(root, "devices", "system", "node", "node[0-9]*")))
+        if len(nodes) < 2:
+            return cap
+        node = _gpu_numa_node(root)
+        if node is None or node >= len(nodes):
+            return cap
+        cpus: list[int] = []
+        for part in Path(nodes[node], "cpulist").read_text().strip().split(","):
+            if "-" in part:
+                a, b = part.split("-")
+                cpus += list(range(int(a), int(b) + 1))
+            elif part:
+                cpus.append(int(part))
+        seen, physical = set(), 0
+        for c in cpus:
+            topo = Path(root, "devices", "system", "cpu", f"cpu{c}", "topology")
+            key = (topo.joinpath("physical_package_id").read_text().strip(),
+                   topo.joinpath("core_id").read_text().strip())
+            if key in seen:
+                continue
+            seen.add(key)
+            physical += 1
+        return min(physical, cap) or cap
+    except (OSError, ValueError, IndexError):
+        return cap
+
+
 def step(n, title):
     say()
     say(f"=== Step {n}: {title} ===")
@@ -7975,7 +8031,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         # restarts.  --prefill with the CPU pool's threads is the prefill path; without it the engine reads a prompt
         # one token at a time (measured: 55 tok/s against 154-159 with these flags on a Tesla T4, findings-log 0.7).
         args = ["--model", str(gguf), "--ctx", str(ctx),
-                "--prefill", "--cpu-threads", str(min(24, os.cpu_count() or 8)),
+                "--prefill", "--cpu-threads", str(expert_worker_count()),
                 "--expert-slots", "auto", "--expert-slots-hot",
                 "--expert-slots-profile", str(data / f"hot-{tag.lower()}.prof"),
                 "--vram-reserve-mib", str(a.vram_reserve_mib if a.vram_reserve_mib is not None else 1024)]

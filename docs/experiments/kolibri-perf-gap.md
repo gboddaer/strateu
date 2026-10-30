@@ -294,6 +294,32 @@ Go/no-go: bit-identical on (2) and (3), SwiGLU parity understood, and faster tha
 movement. Anything less and A is reported as a measured dead end.
 
 
+### Phase 1d — shipped: the worker count now follows the GPU's NUMA node
+
+`setup.py` used to write `--cpu-threads min(24, os.cpu_count())`, i.e. every logical CPU on every node. It now calls
+`expert_worker_count()`, which reads the GPU's PCI device from `nvidia-smi`, finds its NUMA node, and counts that node's
+**physical** cores (SMT siblings counted once), capped at 24, falling back to the old rule whenever the topology cannot be
+read (no `nvidia-smi`, one node, `numa_node` = -1, unreadable sysfs). Six tests in
+`tests/terminal/test_expert_workercount.py` pin both the rule and every fallback; the existing
+`tools/test_setup_choices.py` and `tools/test_setup_amd.py` still pass.
+
+On this box the rule returns **14** (the node's physical cores). Measured, single node, 511-token prefill:
+
+| workers | prefill | pool GFLOP/s |
+|---:|---:|---:|
+| 13 (what I had swept) | 8,056 ms | 190 |
+| **14 (what the rule picks)** | **7,773 ms** | **199** |
+
+So the shipped value is at least as good as the one I had measured, and the gain is the prefill half of the free win:
+**+25-30 % prefill** against the 10,398 ms the old rule produced here (8 workers, two nodes).
+
+**Still open, and not shippable by a flag: the memory binding.** Phase 1c measured that the engine's own
+`--pool-cores`/`STRATA_NUMA_POOL` knobs reproduce *none* of the decode half (23.2 ms/token against 12.9 with
+`numactl`), because it is `--membind` — the pinned 42.9 GiB expert table's placement — that matters. Delivering it needs
+either a launcher prefix (`numactl --cpunodebind=N --membind=N`, with a fallback when `numactl` is absent) or an
+engine-side `mbind`/`set_mempolicy`, which is a change in the pool's allocation path. Both keep the arithmetic
+identical, so neither needs qualification; neither is in this change.
+
 ### Phase 1c — what the free win actually requires (for the product change)
 
 Two attempts to reproduce the `numactl` win **without** `numactl`, so that `setup.py` could emit it as flags:
