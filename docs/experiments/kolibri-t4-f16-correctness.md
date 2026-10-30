@@ -602,6 +602,33 @@ Proposed, for the maintainer to accept or amend:
    Non-finite values, stale outputs or unexplained same-arm variability reject regardless of the KL numbers.
 7. **What this cannot decide.** Task quality (Task 7) and speed (Task 8) are separate. No default changes, no push.
 
+**Pre-qualification work done while the criteria are unapproved** (no candidate has been measured against the
+reference; nothing here is a qualification result):
+
+* **A harness that fixes the four limits of `tools/kolibri/kl.py`.** `tools/kolibri/qualify.py` with
+  `tools/kolibri/test_qualify.py` (13 tests, passing). It requires an **exact** record count (a shorter or longer dump
+  is an error, never a prefix), takes the context and every other setting **explicitly per executable**, keys a
+  reference dump by a SHA-256 of the configuration that produced it, and **never deletes a raw dump**. It refuses to
+  run a child when the calling shell carries a setting that would change the numbers but is not in the explicit
+  environment, and it writes argv, environment, exit status and byte count into a manifest beside the dump. It
+  reports KL mean/median/p95/p99/worst, `|dlogit|` p50/p95/p99/worst, top-1 agreement, the worst rank of the
+  reference winner, and the reference margin at every rank-1 flip. `--limit` compares a metric bundle with limits
+  agreed in advance; it does not decide task quality.
+* **The independent reference works at the required contexts.** `kolibri_llama_dump`
+  (`/home/gbo/llama.cpp` `a30fb4924`), `--ngl 99 --cpu-moe 999`, with `STRATA_DUMP_CTX` set per run:
+  | history | ctx | batch | exit | dump | records | finite |
+  |---|---:|---:|---|---:|---|---|
+  | 8,191 ids (KV wrap) | 12,288 | 2048 | 0 | 4,608,000 B | 9 | yes, range −13.82 … 13.98 |
+  | ~11,000 ids (attention transition) | 14,336 | 2048 | 0 | 4,608,000 B | 9 | yes, range −13.52 … 18.29 |
+
+  Recorded arrangement, from the dumper's own log: 51/51 layers offloaded to the T4, the expert tensors in
+  CPU-mapped buffers (`--cpu-moe 999`), **K/V cache f16**, single sequence. So this is a **GPU-dense, CPU-expert**
+  reference — not an all-GPU one — and every qualification table must say so. Reference dump identities:
+  `85d2cfcf6f1612a2` (8,191 case) and `509ce249b7a00052` (11,000 case).
+* **Not yet done, and needed before qualification means anything:** the reference's own repeat-to-repeat
+  determinism at these contexts (two identical runs compared bitwise), and the same dumps for the extra German and
+  code-shaped prompts in item 1. Both are cheap and will be run first if the criteria are approved.
+
 **Status: blocked on approval.** No qualification data will be generated until the criteria in items 1-5 are agreed.
 
 ### Tasks 7–8
