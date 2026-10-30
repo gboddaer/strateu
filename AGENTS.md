@@ -13,6 +13,8 @@ campaign that produced them are in that doc and [docs/findings-log.md](docs/find
 For all Kolibri changes, follow **[docs/KOLIBRI_ACCURACY_POLICY.md](docs/KOLIBRI_ACCURACY_POLICY.md)**.
 Unchanged-arithmetic optimizations require bit-identical full logits. Numerical changes need separate
 accuracy qualification and explicit approval before default promotion; speed does not excuse accuracy loss.
+Current packaging, validation and publication status: **[docs/KOLIBRI_PREVIEW.md](docs/KOLIBRI_PREVIEW.md)**.
+Do not infer CUDA runtime qualification from AMD tests or from a successful CUDA compile.
 
 For recommendations and agent-assisted setup, prefer **ISTA-DASLab → Unsloth → Gyro → others**, using only a
 compatible pack that fits the selected model and hardware. ISTA-DASLab is the default recommendation; Gyro is a

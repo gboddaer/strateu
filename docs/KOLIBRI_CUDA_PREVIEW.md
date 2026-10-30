@@ -1,5 +1,6 @@
 # Kolibri CUDA preview qualification
 
+See [the preview guide](KOLIBRI_PREVIEW.md) for package installation and publication status.
 The preview targets AMD gfx1201/R9700 and CUDA, but each backend needs its own evidence. A CUDA build on an AMD
 host proves compilation/linking only. T4 results do not qualify RTX 3090 or other cards.
 
@@ -15,7 +16,7 @@ Two regressions in the R9700 campaign were reproduced with CUDA before fixing th
 
 Regression checks are in `tools/kolibri/test_build_portability.py`, including a C++17 host publication test.
 
-Locally observed: CUDA 13.1 (`nvcc` 13.1.115), GCC 14.2, CMake 3.31, `sm_75;sm_86`: `strata-kolibri`,
+Locally observed: CUDA 13.1 (`nvcc` 13.1.115), GCC 14.2, CMake 3.31, `sm_75;sm_86`: `strata`, `strata-kolibri`,
 `kolibri_decode_rollover` and `kolibri_decode_wait_test` compile and link after both fixes. No NVIDIA GPU is
 present on this host, so CUDA runtime, race behaviour, numerical parity and speed were not tested here.
 
