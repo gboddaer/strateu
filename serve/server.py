@@ -994,8 +994,12 @@ class StrataEngine:
             tl.last = value
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
-                 env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0):
-        self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
+                 env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0,
+                 prefix: list[str] | None = None):
+        # numactl execs the engine, preserving its PID and signal handling. Keep the
+        # existing spawn tuple for conversation-cache and replica consumers.
+        self.launch_prefix = list(prefix or [])
+        self.spawn = (exe, list(args), cwd, log, env, False, cpus)
         self.session_save_reclaim = '--session-save-reclaim' in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
@@ -1053,7 +1057,7 @@ class StrataEngine:
         end_leftover_engines(exe)                        # one an earlier run lost still holds the GPU and the memory
         spawned_at = time.monotonic()
         try:
-            self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
+            self.proc = popen("the Strata engine", engine_cmd(exe, args, self.launch_prefix), cwd=cwd, stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env,
                               **pin)
         except OSError:                                  # nothing started: the narrator stops, the log handle goes back
@@ -1117,7 +1121,8 @@ class StrataEngine:
                           f"ready yet: starting it again in {wait_s:.0f} s (try {_attempt + 2} of {START_RETRIES + 1})",
                           flush=True)
                 time.sleep(wait_s)
-                StrataEngine.__init__(self, exe, args, cwd, log, env, lazy, cpus, _attempt + 1)
+                StrataEngine.__init__(self, exe, args, cwd, log, env, lazy, cpus, _attempt + 1,
+                                      prefix=self.launch_prefix)
                 return
             why = (f"the engine did not report READY within {ENGINE_READY_S:.0f} s" if timed_out else
                    "the engine exited before it was ready")
@@ -1324,7 +1329,7 @@ class StrataEngine:
                 # (0)".  __init__ clears `ended` itself once READY (before its pump thread can set it again).
                 self.ended = True
                 try:
-                    self.__init__(*self.spawn)
+                    self.__init__(*self.spawn, prefix=self.launch_prefix)
                     break
                 except RuntimeError:
                     try:
@@ -3163,6 +3168,11 @@ def tool_call_recovery_of(cfg: dict, template: ChatTemplate) -> bool:
     if not isinstance(asked, bool):
         raise ValueError(f'config "tool_call_recovery" must be true or false, not {asked!r}')
     return asked
+
+
+def engine_cmd(exe: str, args: list[str], prefix: list[str] | None = None) -> list[str]:
+    """Prepend an optional launcher argv prefix; without one, preserve the existing command."""
+    return [*(prefix or []), exe, "--serve", *args]
 
 
 def engine_args(cfg: dict) -> list[str]:
@@ -8494,7 +8504,8 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
         rc = rp.replica_cfg(cfg, i, groups[i])
         try:
             engines[i] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
-                                      env=child_env(rc, offline=offline), lazy=lazy, cpus=cpus[i] if cpus else None)
+                                      env=child_env(rc, offline=offline), lazy=lazy, cpus=cpus[i] if cpus else None,
+                                      prefix=rc.get("launch_prefix"))
         except BaseException as e:        # noqa: BLE001
             errors.append((i, e))
     rc0 = rp.replica_cfg(cfg, 0, groups[0])
@@ -8541,7 +8552,7 @@ def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bo
             if role == "prefill":
                 warn_budget_over_ram(engine_args(rc) if "args" in rc else [])
             engines[role] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
-                                         env=child_env(rc, offline=offline), lazy=lazy)
+                                         env=child_env(rc, offline=offline), lazy=lazy, prefix=rc.get("launch_prefix"))
     except BaseException:
         for e in engines.values():
             try:
