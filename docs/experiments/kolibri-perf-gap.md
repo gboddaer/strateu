@@ -83,6 +83,53 @@ same NUMA node** (24.0 -> 14.7 ms/tok from placement alone at 8 workers, a furth
 On this box the current default splits the pool 5+4 across two nodes, which costs roughly half the decode expert
 throughput.
 
+## Phase 1b — the worker knee, and the win in tok/s
+
+Worker sweep at single-node placement (same everything else):
+
+| workers | prefill (511 tok) | pool GFLOP/s | % of the 226 roof |
+|---:|---:|---:|---:|
+| 8 | 9,920 ms | 147 | 65 % |
+| **13** | **7,905 ms** | **194** | **86 %** |
+| 16 | 7,904 ms | 195 | 86 % |
+| 20 | 7,959 ms | 193 | 85 % |
+
+**The knee is 13** — the engine's own recommendation, matching this box's 14 physical cores. More workers buy nothing.
+
+End-to-end, measured as the difference between one 128-token run and one 1-token run with the same prefill
+(55,210 − 51,971 ms over 127 tokens): **25.5 ms/token = 39.2 tok/s** decode, against the 30.5 tok/s baseline
+(32.8 ms/token). So the two accuracy-safe levers together give:
+
+| | baseline (8 workers, 2-node) | tuned (13 workers, single node) | change |
+|---|---:|---:|---:|
+| prefill, 511 tokens | 49.1 tok/s | **64.6 tok/s** | **+32 %** |
+| decode | 30.5 tok/s | **39.2 tok/s** | **+29 %** |
+| prefill pool compute | 141 GFLOP/s (62 % roof) | 194 GFLOP/s (86 % roof) | +38 % |
+| decode expert work | 24.02 ms/tok | 12.96 ms/tok | **1.85x** |
+| numerics | — | **bitwise identical** (9 x 128,000) | unchanged |
+
+This is a **configuration change only** (worker count and NUMA placement). It needs no qualification; it is not a
+default change and has not been made one.
+
+## Phase 4 — the ranked plan, with what each lever costs and what it does to accuracy
+
+Baseline for comparison after the free win: **Kolibri tuned 64.6 tok/s prefill / 39.2 tok/s decode** against
+**Qwen 191 tok/s prefill / 7.65 tok/s decode** on the same card, same prompt, drafter contributing nothing.
+
+| # | lever | measured value | accuracy | cost / gate |
+|---|---|---|---|---|
+| 1 | **13 workers + single-node NUMA** | **prefill +32 %, decode +29 %, expert work 1.85x** | **none — bitwise identical** | **done, config-only** |
+| 2 | **GPU compute for the prefill expert products** (the only lever that can close the remaining **3.0x** prefill gap) | the decomposition says prefill is **compute-bound**: 1,206 GFLOP at 194 GFLOP/s = 86 % of this pool's roof, while Qwen does the same work on the GPU at 19.8 GB/s and reaches 191 tok/s. The card is idle during Kolibri's prefill. | **changed arithmetic** — every GPU expert path measured here flips the router (fp16 0.400/11.08, Q8_1 0.266/9.51, grouped-native 0.370/11.64; 97/100 chunk-layers diverge from layer 2) | largest; needs G2 approval *and* a per-row-count design that avoids the 3.7-rows-per-expert shape where earlier GPU attempts lost |
+| 3 | **KV int8 (or k8v4)** | at 512 tokens the KV is a few MB, so ~0 for this prompt; real value at 8k-110k context | changed arithmetic (KV precision) → G2 | moderate; well-understood |
+| 4 | **Q4_K down instead of Q6_K** (down ≈ 20 % of expert bytes; Q6_K is ~2.05x Q4_K per value) | ~20 % fewer expert bytes → helps the *memory* side; **prefill here is compute-bound, so little at 512 tokens**, more at long context | changed arithmetic → G2 | moderate |
+| 5 | **Load/repack** (37 s to repack 903 tensors into 42.9 GiB pinned) | startup only; Qwen is worse (~11 min of disk reads) | none if the repacked table is cached bit-identically | small, accuracy-safe |
+| 6 | *(not a lever)* **copy Qwen's decode** | Qwen's decode is **7.65 tok/s** against Kolibri's 39.2 — PLE reads block 6.06 s of its 16.7 s | — | do not copy |
+
+**Where the gap actually is, in one sentence:** after the free fix Kolibri's prefill is 3.0x behind Qwen and its decode
+is 5.1x ahead, and the prefill gap is not bytes — it is that Kolibri multiplies prompt experts on 13 CPU cores at 86 %
+of that pool's compute roof while the T4 sits idle, whereas Qwen hands the same products to the GPU.
+
+
 ## Phase 0b — where the milliseconds actually are
 
 | leg | Kolibri-1 | Qwen3.8-Flash-Next | what it means |
