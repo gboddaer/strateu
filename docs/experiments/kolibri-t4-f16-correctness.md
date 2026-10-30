@@ -570,37 +570,77 @@ suite was not run** in this task; only the affected subset above.
 Artifacts: `/data4/kolibri-f16-evidence/f16-t5/` — `cross/` (all twelve runs with `.env`, `.err`, `.out`, dumps,
 `compare.txt`, `binaries.txt`), `gate/` and `gate-output.txt`, `ctest-affected.txt`.
 
-### Task 6 — proposed qualification protocol, awaiting approval (no results collected)
+### Task 6 — qualification protocol, approved and preregistered
 
-**Nothing has been measured for qualification yet, and this section is written before any is.** The numbers quoted
-anywhere above are diagnostic, not preregistered qualification, and will not be relabelled as such.
+**Preregistration.** The maintainer approved option (1) — the proposed limits — with eight amendments, on
+2026-10-30. This section is committed **before the first qualification run**: nothing below is a result, and no
+number in this ledger was produced under this protocol before this text existed. The numbers quoted in Tasks 1-5 are
+diagnostic. They are not relabelled as qualification.
 
-Proposed, for the maintainer to accept or amend:
+**Pinned identities, before the first run.**
 
-1. **Corpus.** Three families of forced history, all run on the same ids for every arm: (a) 16-token and 512-token
-   prompts from `tools/kolibri/oracle_ids512.txt`; (b) the 8,191-id KV-wrap fixture; (c) the ~11,000-id
-   attention-transition fixture; (d) two additional prompt texts (one German, one code-shaped) of about 512 tokens,
-   recorded with their ids. Nine forced decode steps each, as in every run above.
-2. **Arms.** control (`EXPERT_F16=0`, `PF_PARTIAL=0`), cache-only (`24`, `0`), cache+partial (`24`, `1`), on the
-   current build; the preserved `5bbe6c4e` control also dumped on the same histories so the reference comparison is
-   not taken against a moving build.
-3. **Reference.** The pinned llama.cpp dumper (`kolibri_llama_dump`, `/home/gbo/llama.cpp` `a30fb4924`) with
-   `--ngl 99 --cpu-moe 999` — all experts on the CPU, which is the only arrangement that fits a 16 GB T4 with a
-   47 GB model. Its offload/precision arrangement is recorded with every dump, and it is labelled as a CPU-expert
-   reference, not an all-GPU one. `strata-kolibriref` is a diagnostic control only.
-4. **Metrics.** Full-distribution KL (mean/median/p95/p99/worst) per arm against the reference, `|dlogit|`
-   percentiles and worst, top-1 agreement, changes in the reference winner's rank and its margin, per prompt and
-   per position, plus control-vs-reference reported separately so a defective control is visible.
-5. **Proposed acceptance limit** (the maintainer must set or change this): mean KL <= 1e-3, p99 <= 5e-3, worst
-   `|dlogit|` <= 0.05, top-1 agreement 100 % on every prompt, and no rank-1 flip where the reference margin exceeds
-   0.05. Measured so far, the cache arms sit at mean KL 0.400 and 11.08 worst `|dlogit|` for a *diagnostic* 512-token
-   case, so this limit is expected to **reject** both cache arms; the value of running the protocol is then to record
-   that rejection on the record rather than to find a passing threshold. Any looser limit must be argued explicitly
-   and is not proposed here.
-6. **State checks.** Two repeats per arm plus first use, replay, prefix reuse, reset, cancellation and a clean
-   request after cancellation, for cache-only and cache+partial, comparing like-for-like cold and reused histories.
-   Non-finite values, stale outputs or unexplained same-arm variability reject regardless of the KL numbers.
-7. **What this cannot decide.** Task quality (Task 7) and speed (Task 8) are separate. No default changes, no push.
+| what | sha256 |
+|---|---|
+| candidate binary (`build-kolibri-cuda/strata-kolibri`, `c1efc4a6` plus the default-off trace) | `0bc772bf1aad455617605108b1c415335db36de4dbe5522eb1a7212d87facbdf` |
+| preserved control binary (`/data2/develop/f16-control-5bbe6c4e`, revision `5bbe6c4e`) | `74b0e2570d86231068a4193d9e2b226f77748c57bbf8ce89f72be6348ab7f418` |
+| model | `/data4/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf`, sha256 `c2ac1301424441ef210b6de50ce25e8ccf69f86494df53d6ba52ed558456062e` |
+| independent reference | `kolibri_llama_dump` from `strata-speed-wt` `023cbf2e`, linking `/home/gbo/llama.cpp` `a30fb4924` |
+
+Both binary hashes are re-checked at the start of the run and written into each run manifest; a mismatch aborts.
+
+**1. Limits, exactly as proposed** — mean KL <= 1e-3, p99 <= 5e-3, worst `|dlogit|` <= 0.05, top-1 agreement 100 %
+on every prompt, and no rank-1 flip where the reference margin exceeds 0.05 — measured **per arm, per prompt, per
+position**.
+
+**2. Control-calibration rule (preregistered).** Control-vs-reference is measured and reported **first**, on the same
+corpus. If the control arm itself fails these same limits, the record reads *"absolute limits not decidable against
+this reference"*; the absolute-vs-reference verdict is then **void**, and the arms are judged by item 3. No limit is
+relaxed, tightened or re-derived after any result is seen.
+
+**3. Same-engine numbers carry the rejection on their own.** Cache-vs-control metrics from the same engine are
+reported alongside, and a **REJECT stands on them alone**: the diagnostic 512-token case already sits ~400x over the
+mean-KL limit and ~220x over the worst-`|dlogit|` limit. The reference is independent context; it cannot rescue an
+arm. Re-agreement with the maintainer is required only if an arm were to pass on the same-engine numbers while the
+reference mismatch stands.
+
+**4. Corpus — four families**, the same ids for every arm and nine forced decode steps each:
+(a) the 16-token and 512-token prompts from `tools/kolibri/oracle_ids512.txt`;
+(b) the 8,191-id KV-wrap fixture; (c) the ~11,000-id attention-transition fixture;
+(d) two additional ~512-token prompts — one German, one code-shaped — with their ids recorded and hashed.
+Both binaries (the current build and the preserved `5bbe6c4e` control) are dumped on the same histories, so no
+comparison is taken against a moving build.
+
+**5. Binaries pinned in the protocol text before the first run**, as in the table above, and recorded in the ledger.
+
+**6. State checks are mandatory regardless of KL.** Two repeats per arm plus **first use, replay, prefix reuse,
+reset, cancellation and a clean request after cancellation**, for cache-only and cache+partial, comparing
+like-for-like cold and reused histories. Non-finite values, stale outputs or unexplained same-arm variability reject.
+These checks also qualify the **LRU promotion machinery** the next arm will reuse; they are not optional even though a
+KL rejection is expected.
+
+**7. The cache-on cross-build check Task 5 left open.** While producing the cache arms, one cache-only 512-id run is
+made **from the current binary** and compared **bitwise** with the retained `f16-t1` cache dump
+(`/data4/kolibri-f16-evidence/f16-t1/matrix/cache_r1.bin`). Bitwise identical is the expected result; either outcome is
+recorded.
+
+**8. Ledger hygiene, recorded with this Task 6 entry.** Two plan-vs-executed deviations:
+
+* `tools/kolibri/test_f16_expert_trace.py`, named in the plan's Task 4, was **never created**. The trace was
+  validated by retained runs instead (the two arms' `F16TRACE` lines, the slot probe, and the bitwise comparison of a
+  traced run against an untraced one). That is weaker than a test and is recorded as such.
+* The **resident-path replay** — SwiGLU, hidden-FP16 conversion and activation quantization replayed against a
+  float64 reference — was **not run** and stays **"not established"**. It is **mandatory for any arm that will be
+  promoted**, and is the first thing the next arm must add.
+
+The executed plan revision — working-tree sha256 `0f4ad114126342abe18433acf55addc8277b937ddbbcefc1c9dcd7f313fef9e9`
+— is review-approved and committed (`732d629e`), so the branch carries the plan it actually executed.
+
+**9. Standing decisions.** `STRATA_KOLIBRI_EXPERT_F16` stays a **documented opt-in**; the measured prefill gain on a
+16 GB card is real and is why the path exists. No default, shipped configuration or running server changes. Nothing
+is pushed. Task 7 (task quality) and Task 8 (speed, promotion) stay **pending and approval-gated for whichever arm
+passes fidelity** — they are not run for the FP16 arms. The stated expectation, recorded before the run, is that
+**both cache arms FAIL** these limits; the value of the run is the formal rejection record plus the state-check
+coverage, not a search for a passing threshold.
 
 **Pre-qualification work done while the criteria are unapproved** (no candidate has been measured against the
 reference; nothing here is a qualification result):
@@ -638,7 +678,8 @@ reference; nothing here is a qualification result):
 * **Not yet done:** the reference dumps for the extra German and code-shaped ~512-token prompts in item 1, which are
   corpus material and will be produced together with the candidate dumps if the criteria are approved.
 
-**Status: blocked on approval.** No qualification data will be generated until the criteria in items 1-5 are agreed.
+**Status: blocked on approval.** No qualification data will be generated until the criteria in items 1-5 are agreed.**Status: preregistered, then run.** Results are recorded below in the ledger's status words, split into passed,
+failed, inconclusive, blocked and not run.
 
 ### Tasks 7–8
 
