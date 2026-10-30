@@ -1,5 +1,8 @@
 #pragma once
 #include <cstdint>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 namespace strata::kolibri {
 
@@ -13,6 +16,28 @@ struct alignas(64) DecodeWaitControl {
     uint32_t abort = 0;
     uint32_t status = 0;
 };
+
+// Host accesses to naturally aligned mapped control words. CUDA TUs use C++17, so do not require
+// C++20 atomic_ref or reinterpret ordinary storage as a std::atomic object. The compiler intrinsics
+// operate on the actual uint32_t storage; MSVC's interlocked operations provide stronger ordering.
+inline uint32_t decode_control_load(const uint32_t& word) noexcept {
+#if defined(_MSC_VER)
+    static_assert(sizeof(long) == sizeof(uint32_t));
+    return static_cast<uint32_t>(_InterlockedCompareExchange(
+        reinterpret_cast<volatile long*>(const_cast<uint32_t*>(&word)), 0, 0));
+#else
+    static_assert(__atomic_always_lock_free(sizeof(uint32_t), nullptr), "mapped control needs lock-free words");
+    return __atomic_load_n(&word, __ATOMIC_ACQUIRE);
+#endif
+}
+
+inline void decode_control_store(uint32_t& word, uint32_t value) noexcept {
+#if defined(_MSC_VER)
+    _InterlockedExchange(reinterpret_cast<volatile long*>(&word), static_cast<long>(value));
+#else
+    __atomic_store_n(&word, value, __ATOMIC_RELEASE);
+#endif
+}
 
 enum : uint32_t { DecodeWaitOk = 0, DecodeWaitAborted = 1, DecodeWaitTimedOut = 2 };
 

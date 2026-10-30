@@ -13,7 +13,7 @@ using namespace strata::kolibri;
     std::fprintf(stderr, "%s: %s\n", #call, cudaGetErrorString(e)); return 2; } } while (0)
 
 static void store(uint32_t& dst, uint32_t value) {
-    std::atomic_ref<uint32_t>(dst).store(value, std::memory_order_release);
+    decode_control_store(dst, value);
 }
 
 #include "decode_chain_test.inc"

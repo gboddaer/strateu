@@ -1553,12 +1553,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # T2 (plan 2026-10-28-kolibri-r9700-speed.md): the grid-shape micro-bench, opt-in.  Prices the shape questions the
   # decode answers with launches (LM-head GEMV, Q4_K GEMV, packed deq32, dp4a, launch latency) and asserts the
   # bitwise pairs agree.  Needs a card, no model.
-  set_source_files_properties(tools/kolibri/grid_shape_bench.cu PROPERTIES LANGUAGE HIP)
-  add_executable(grid_shape_bench tools/kolibri/grid_shape_bench.cu)
-  target_include_directories(grid_shape_bench PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(grid_shape_bench PRIVATE ${_strata_gpu_runtime_target})
-  add_test(NAME kolibri_grid_shape_bench COMMAND grid_shape_bench --selftest)
-  set_tests_properties(kolibri_grid_shape_bench PROPERTIES TIMEOUT 600)
+  if(STRATA_ENABLE_HIP)  # this diagnostic directly includes HIP headers and calls HIP APIs
+    set_source_files_properties(tools/kolibri/grid_shape_bench.cu PROPERTIES LANGUAGE HIP)
+    add_executable(grid_shape_bench tools/kolibri/grid_shape_bench.cu)
+    target_include_directories(grid_shape_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(grid_shape_bench PRIVATE ${_strata_gpu_runtime_target})
+    add_test(NAME kolibri_grid_shape_bench COMMAND grid_shape_bench --selftest)
+    set_tests_properties(kolibri_grid_shape_bench PROPERTIES TIMEOUT 600)
+  endif()
   # #783 PR-c: the multi-token router and the k = 10 float4 combine, bitwise against the single-token contracts
   add_executable(native_multi_parity src/kernels/native_multi_parity.cpp)
   target_include_directories(native_multi_parity PRIVATE ${_strata_gpu_include_directories})

@@ -4050,9 +4050,9 @@ void forward(const Engine& e, Scratch& s, int tok, float* layers_host) {
         if (hb.expect > UINT32_MAX - (uint32_t) g.n_layers) {
             KC(cudaDeviceSynchronize());  // rare token-boundary quiescence before descriptor reuse
             hb.expect = 0;
-            std::atomic_ref<uint32_t>(hb.host_control->ready).store(0, std::memory_order_release);
-            std::atomic_ref<uint32_t>(hb.host_control->acknowledged).store(0, std::memory_order_release);
-            std::atomic_ref<uint32_t>(hb.host_control->acknowledged_generation).store(0, std::memory_order_release);
+            strata::kolibri::decode_control_store(hb.host_control->ready, 0);
+            strata::kolibri::decode_control_store(hb.host_control->acknowledged, 0);
+            strata::kolibri::decode_control_store(hb.host_control->acknowledged_generation, 0);
         }
     }
     const Dense& emb = e.dense.at("token_embd.weight");

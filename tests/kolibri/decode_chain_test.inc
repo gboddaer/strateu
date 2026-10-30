@@ -35,7 +35,7 @@ static int chain_test() {
         CHECK(cudaStreamEndCapture(stream, &graphs[mode]));
         CHECK(cudaGraphInstantiate(&execs[mode], graphs[mode], 0));
     }
-    auto load = [](uint32_t& word) { return std::atomic_ref<uint32_t>(word).load(std::memory_order_acquire); };
+    auto load = decode_control_load;
     std::vector<float> input(N), result(N), weights(L * K);
     std::vector<int32_t> ids(L * K);
     for (uint32_t replay = 0; replay < 38; ++replay) {

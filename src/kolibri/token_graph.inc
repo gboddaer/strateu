@@ -36,10 +36,8 @@ static bool run_token_graph(const Engine& e, Scratch& s, cudaStream_t stream) {
     }
     HandoffBuffers& hb = *handoff_buffers(N, K);
     auto* control = hb.host_control;
-    auto load = [](uint32_t& word) { return std::atomic_ref<uint32_t>(word).load(std::memory_order_acquire); };
-    auto store = [](uint32_t& word, uint32_t value) {
-        std::atomic_ref<uint32_t>(word).store(value, std::memory_order_release);
-    };
+    auto load = strata::kolibri::decode_control_load;
+    auto store = strata::kolibri::decode_control_store;
     uint32_t generation = load(control->generation) + 1u;
     if (generation == 0) generation = 1;
     store(control->generation, generation);
