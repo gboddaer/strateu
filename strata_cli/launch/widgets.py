@@ -122,8 +122,16 @@ class Menu(Static):
         self.index = 0
         self.top = 0
         self.window = window            # 0 = show all rows
-        self.g = glyphs or Glyphs()
+        self.g = glyphs if glyphs is not None else self._screen_glyphs()
         self.show_header = bool(self.columns and any(t for t, _ in self.columns))
+
+    def _screen_glyphs(self) -> Glyphs:
+        """The app's glyphs when it carries them (one rule for the whole screen); plain console detection otherwise."""
+        try:
+            g = self.app.ctx.glyphs                    # type: ignore[attr-defined]
+            return g if g is not None else Glyphs()
+        except Exception:
+            return Glyphs()
 
     def set_items(self, items: list[Item], index: int | None = None) -> None:
         self.items = items

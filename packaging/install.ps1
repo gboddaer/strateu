@@ -58,7 +58,8 @@ try {
     $zip = Join-Path $work 'terminal.zip'
     try { Invoke-WebRequest -UseBasicParsing -Uri "$feed/$rel" -OutFile $zip }
     catch { Die "the download failed ($($_.Exception.Message)). Check your internet connection and run this again; nothing was installed." }
-    $got = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+    try { $got = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower() }
+    catch { Die "the download could not be checked ($($_.Exception.Message)). Nothing was installed; try again." }
     if ($got -ne $want) { Die "the download does not match the release's checksum (got $got, wanted $want). It was not installed; try again." }
     Write-Host '  Checksum ok.'
 
