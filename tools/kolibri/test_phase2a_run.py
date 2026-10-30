@@ -1,10 +1,12 @@
 """Guard the experimental matrix against silently testing the wrong arm."""
 import sys
+import json
 from pathlib import Path
 import numpy as np
 import pytest
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 import phase2a_run as run
+import phase2a_speed as speed
 
 
 def test_environment_removes_unrequested_numerical_arms(monkeypatch):
@@ -48,6 +50,29 @@ def test_recorded_environment_redacts_credentials_without_mutating_child():
     assert public['STRATA_KOLIBRI_DEC_TOKEN_GRAPH']=='0'
     assert public['PATH']=='/usr/bin'
     assert env['OPENAI_API_KEY']=='private'
+
+
+def test_speed_gate_rejects_failed_accuracy(tmp_path):
+    metrics={fam:dict(pass_limits=True,repeat_bitwise=True) for fam,_,_ in run.CORPUS}
+    metrics['16']['pass_limits']=False
+    (tmp_path/'candidate-metrics.json').write_text(json.dumps(metrics))
+    with pytest.raises(RuntimeError,match='rejected accuracy'):
+        speed.require_accuracy(tmp_path)
+
+
+def test_speed_gate_requires_complete_evidence(tmp_path):
+    with pytest.raises(RuntimeError): speed.require_accuracy(tmp_path)
+    metrics={fam:dict(pass_limits=True,repeat_bitwise=True) for fam,_,_ in run.CORPUS}
+    (tmp_path/'candidate-metrics.json').write_text(json.dumps(metrics))
+    with pytest.raises(RuntimeError): speed.require_accuracy(tmp_path)
+
+
+def test_speed_gate_accepts_only_numerical_and_state_success(tmp_path):
+    metrics={fam:dict(pass_limits=True,repeat_bitwise=True) for fam,_,_ in run.CORPUS}
+    (tmp_path/'candidate-metrics.json').write_text(json.dumps(metrics))
+    for arm in ['f16','int8']:
+        (tmp_path/f'state-{arm}.json').write_text(json.dumps(dict(result='PASS',prefix_cold_comparison=dict(pass_check=True))))
+    speed.require_accuracy(tmp_path)
 
 
 def test_corpus_and_limits_are_fixed():

@@ -12,11 +12,29 @@ import phase2a_run as matrix
 import state_check
 
 
+def require_accuracy(out):
+    """Minimum numerical/state gate, not a waiver of task-quality or promotion policy."""
+    try:
+        metrics=json.loads((out/'candidate-metrics.json').read_text())
+        expected={fam for fam,_,_ in matrix.CORPUS}
+        if set(metrics)!=expected:
+            raise RuntimeError('speed gate: incomplete accuracy corpus')
+        if not all(r.get('pass_limits') is True and r.get('repeat_bitwise') is True for r in metrics.values()):
+            raise RuntimeError('speed gate: rejected accuracy; no speed run is useful for acceptance')
+        for arm in ['f16','int8']:
+            state=json.loads((out/f'state-{arm}.json').read_text())
+            if state.get('result')!='PASS' or not state.get('prefix_cold_comparison',{}).get('pass_check'):
+                raise RuntimeError(f'speed gate: failed state checks for {arm}')
+    except (OSError,ValueError,KeyError,TypeError,AttributeError) as ex:
+        raise RuntimeError('speed gate: missing or invalid accuracy/state evidence') from ex
+
+
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--bin',required=True,type=Path)
     ap.add_argument('--out',required=True,type=Path)
     args=ap.parse_args()
+    require_accuracy(args.out)  # Before reading a binary, sampling hardware or starting any engine.
     calibration=json.loads((args.out/'manifest-control.json').read_text())
     binary=args.bin.resolve()
     if matrix.sha(binary)!=calibration['binary_sha256']:

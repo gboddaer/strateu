@@ -381,7 +381,7 @@ Later execution is recorded separately; the corpus and limits have not been chan
 
 | arm | change | where the value is | why it is a numerical change |
 |---|---|---|---|
-| **2a — KV int8** (and optionally the `k8v4` hybrid) | the Kolibri path's KV cache goes from f16 to int8 codes + an f16 scale per 64 values | **long context**: at 512 tokens the KV is a few MB and the gain is ~0; at 8k-110k it halves the KV bytes and the attention traffic | KV values are quantised, so every attention score changes |
+| **2a — KV int8** (and optionally the `k8v4` hybrid) | the Kolibri path's KV cache goes from f16 to int8 codes + an f16 scale per 64 values | **original expectation, not a result**: smaller storage at long context. The tested staged/offloaded arm fails fidelity; no speed test is justified. Encoded bytes decrease 48.44%, not all KV traffic | KV values are quantised, so every attention score changes |
 | **2b — Q4_K down (parked)** | Q6_K down weights (210 B / 256 values) become Q4_K (144 B); half the layers already use Q4_K down | **7.10 % fewer expert bytes/token** for this actual mixed-format pack; the original ~20 % estimate was wrong (see audit below) | different weight quantisation: the down result changes at the source |
 
 ### Corpus, arms and reference (fixed now, not after seeing numbers)
@@ -438,16 +438,21 @@ and scale. Decode/attention consumes FP16-rounded reconstructions so that the ex
 arithmetic is otherwise unchanged. This is an experimental, default-off numerical change.
 
 Ruling: first implement a **staged compressed cache** behind `STRATA_KOLIBRI_KV_INT8=1`.
-Per-layer durable packed K/V has the same host/device placement as the f16 control; one shared
-FP16 K/V workspace restores a layer before its attention preparation, then only new rows are
-packed and rounded back into that workspace. This genuinely reduces durable cache bytes but
-adds unpack traffic and staging allocation. Speed results describe this staging implementation,
-**not a ceiling for fused/direct int8 attention**. No claim of halved attention traffic is valid
-for this arm. The staging also changes where attention reads its FP16 operands (GPU workspace
-rather than the control's mapped host cache). Any gain therefore belongs to the whole staged
-arm; it cannot be attributed to reduced precision alone. A same-placement FP16 staging control
-would be needed to separate that accuracy-safe placement effect from compression. Reject incompatible pipelining/graph/mirror combinations rather than silently running
-a different arm. Existing f16 code remains the exact gate-off path.
+One shared FP16 K/V workspace restores a layer before its attention preparation, then only new
+rows are packed and rounded back into that workspace. This reduces encoded durable-cache bytes
+but adds unpack traffic and staging allocation. It does not establish a speed case for fused/direct
+int8 attention, nor halve the FP16 attention traffic.
+
+**Placement correction:** the initial claim that this preserved control placement was wrong.
+Allocator inspection is **static analysis, not a runtime pointer-attribute audit**: `halloc()` in
+`src/kolibri/kolibri_engine.cu` calls `cudaMalloc`, despite the nearby legacy comment about host KV.
+The control therefore requests GPU KV storage. This prototype explicitly requests **host** packed
+storage when `KV_DEV` is unset, plus a GPU FP16 workspace. It is an offload/compression prototype,
+not a same-placement dtype comparison. The earlier predicted long-context speed benefit based
+on a host-resident control is withdrawn. No speed result is claimed.
+
+Existing mirrors are retained; pipelining, graphs, grouped decode and prefix fingerprints are
+refused as recorded below. The f16 gate-off arithmetic remains unchanged.
 
 The fixed six histories, nine records, two runs, independent reference, calibration-first rule,
 limits and state checks above remain unchanged. Preserve pinned old references read-only; collect
@@ -466,7 +471,7 @@ mandatory state checks use short-lived stdio engine processes only.
   the implementation. The registered `kolibri_kv_int8_test` passes on the T4.
   It checks wrap, partial per-head restore, zeros, underflow scale, repeat unpack,
   and pack/roundtrip agreement. CUDA engine build passes; HIP/SYCL not run (unavailable).
-* Focused Python checks: **69 passed**, one plugin deprecation warning (matrix environment,
+* Focused Python checks: **72 passed**, one plugin deprecation warning (matrix environment,
   comparison gates, KL/layer/qualification tools, worker-count/launcher rules).
 * Bare repository-wide `python -m pytest`: **collection failed, 33 errors**. Missing
   `regex`, `safetensors`, `textual`, and `libtqenc.so`, plus standalone script collection
@@ -480,12 +485,17 @@ mandatory state checks use short-lived stdio engine processes only.
   require a positive reported reuse count, and check cancellation's actual reason.
   The older state helper's simple extension alone did not prove that reuse occurred.
 
-An unprofiled timing sweep is queued **after** qualification and state checks, never concurrently
-with another GPU job. `phase2a_speed.py` uses two cold requests at 512, 8,191 and 11,000 ids,
-32 greedy decode steps, fixed context capacity 14,336, the same binary/worker/NUMA configuration
-for both arms, and the stdio `DONE` prompt/decode timers. These generated speed histories are
-not the forced histories used for numerical qualification; their ids/counts are recorded and
-no cross-arm KL is computed on them. Load-to-READY and sampled VRAM high-water are separate.
+The planned dedicated timing sweep was **cancelled before launch** after numerical rejection
+and the operator's accuracy-first feedback. The original queue incorrectly treated successful
+experiment completion as acceptance, even though the numerical results rejected the arm.
+`phase2a_speed.py` now refuses rejected/incomplete numerical or state evidence **before** reading
+an executable, sampling hardware or starting an engine. Regression tests were red before this
+gate and green after it. An actual invocation against these results refuses before even opening
+a deliberately nonexistent binary (`speed-gate-confirmation.log`).
+
+No dedicated prefill/decode speedup is reported. Incidental correctness-run timings remain raw
+observations, not a reason to continue an inaccurate optimization. This minimum numerical/state
+gate does not waive task-quality qualification or separate approval before promotion.
 
 ### Phase 2a failed preflights and recovery — preserve the existing mirror path
 
@@ -522,6 +532,58 @@ Recorded environments now redact inherited credentials and PI session fields wit
 the actual child environment. Existing new-experiment manifests were sanitized too; this touched
 no FP16 evidence or other protected artifacts.
 
+### Phase 2a final result — reject the staged int8 arm; no speed sweep
+
+The mirror-preserving build finished twelve fresh f16 controls and twelve int8 runs. Every history
+has nine forced records of 128,000 logits. Both arms repeat bitwise on every history. Every f16
+control matches the preserved control. All six independent-reference calibrations fail the absolute
+limits, so that absolute verdict is **void**; the agreed same-engine limits still decide the arm.
+
+| history | mean KL | p99 KL | worst absolute logit difference | top-1 |
+|---|---:|---:|---:|---:|
+| 16 | 0.00264595 | 0.0127555 | 0.708475 | 9/9 |
+| 512 | 0.443848 | 3.63066 | 12.6105 | 9/9 |
+| German 512 | 0.0392575 | 0.0796853 | 2.02248 | 8/9 |
+| Code 512 | 0.0704882 | 0.137821 | 4.18967 | 7/9 |
+| 8,191 | 0.0573471 | 0.158806 | 3.08119 | 7/9 |
+| 11,000 | 0.00907386 | 0.0255144 | 1.55351 | 8/9 |
+| **limits** | **<= 0.001** | **<= 0.005** | **<= 0.05** | **9/9** |
+
+**All six histories reject.** Matching the English top-1 tokens does not rescue the distributions.
+Source: `phase2a-mirrors/candidate-metrics.json` and the raw dumps; limits were not changed.
+
+**Passed:** CUDA format unit test; forced-history repeatability; gate-off control bit identity;
+token-level first-use/replay/after-cancel/after-reset checks for both arms; actual cancellation
+reason `cancel`; warm-prefix/cold token agreement with **256 reused ids** for both arms.
+These are token-level state checks, not full-logit proofs after every state transition.
+
+**Failed:** numerical fidelity on every history. The result rejects this implementation, not every
+possible int8 quantization scheme. No numerical fix, default promotion or task-quality pass is inferred.
+
+**Inconclusive/void:** absolute fidelity versus the independent reference, because the control fails.
+
+**Not run:** dedicated speed sweep (cancelled after the operator questioned timing a rejected arm),
+paired task-quality qualification, optional k8v4, and Phase 2b. HIP/SYCL were unavailable. The broad
+Python suite could not collect (33 errors); focused checks pass (72).
+
+### Phase 2a storage and sampled VRAM — not a speed claim
+
+The wire format is **66 bytes / 64 values**, against 128 bytes for f16: 48.44% fewer encoded bytes.
+The table gives allocated durable K+V capacity, not active-token traffic. Control capacity is derived
+from the same geometry and its f16 allocator; packed capacity/staging are printed by the engine.
+Existing FP16 transpose mirrors are additional and unchanged in both arms.
+
+| prompt / context capacity | f16 K+V capacity, GPU in source (MiB) | int8 K+V capacity, host (MiB) | int8 GPU workspace (MiB) | sampled total GPU peak, f16 / int8 (MiB) |
+|---|---:|---:|---:|---:|
+| 512 / 2,048 | 80.078 | 41.290 | 4 | 2,953 / 2,863 |
+| 8,191 / 12,288 | 280.078 | 144.415 | 24 | 3,175 / 2,905 |
+| 11,000 / 14,336 | 320.078 | 165.040 | 28 | 3,219 / 2,913 |
+
+Peaks are the maximum of two runs, sampled every 0.5 s, not an allocation-level high-water mark.
+Lower VRAM here mixes offload, encoding and workspace differences; it is **not** a pure quantization
+benefit or a speedup. The accuracy failure makes further speed work on this arm unnecessary.
+The GPU is idle, the network server stayed stopped, and no default was changed.
+
 ### What would make me stop early
 
 If 2a shows no gain at 8k-110k, or 2b's byte saving does not move prefill or decode measurably, the lever is dropped as
@@ -536,9 +598,10 @@ loading tensor data or using the GPU. Output: `phase2a/expert-bytes.txt`.
 * Gate/up: 50 Q4_K tensors each, input/output dimensions 2,560 x 512.
 * Down: **25 Q4_K and 25 Q6_K** tensors, dimensions 512 x 2,560. Half is already Q4_K.
 * The pack metadata says six active experts. Exact routed weight traffic is **714,240,000 B/token**,
-  agreeing with the measured 714.2 MB/token counter. All down weights contribute 271,872,000 B/token.
+  agreeing with the measured **decode** counter of 714.2 MB/token. All down weights contribute 271,872,000 B/token.
 * Replacing only the remaining Q6_K down weights would save **50,688,000 B/token = 7.096774 %**,
-  not ~20 %. This is format geometry, **not a measured speedup or a numerical result**.
+  not ~20 %. This is **decode** format geometry, not a measured speedup or a numerical result;
+  prefill savings also depend on the layer-specific expert touch counts.
 
 This corrects the old estimate in the proposal and ranking; it changes no numerical limits or arms.
 The parked Phase 2b task contract also repeats the old incorrect geometry and must be corrected
@@ -552,8 +615,8 @@ Baseline for comparison after the free win: **Kolibri tuned 64.6 tok/s prefill /
 | # | lever | measured value | accuracy | cost / gate |
 |---|---|---|---|---|
 | 1 | **13 workers + single-node NUMA** | **prefill +32 %, decode +29 %, expert work 1.85x** | **none — bitwise identical** | **done, config-only** |
-| 2 | **GPU compute for the prefill expert products** (the only lever that can close the remaining **3.0x** prefill gap) | the decomposition says prefill is **compute-bound**: 1,206 GFLOP at 194 GFLOP/s = 86 % of this pool's roof, while Qwen does the same work on the GPU at 19.8 GB/s and reaches 191 tok/s. The card is idle during Kolibri's prefill. | **changed arithmetic** — every GPU expert path measured here flips the router (fp16 0.400/11.08, Q8_1 0.266/9.51, grouped-native 0.370/11.64; 97/100 chunk-layers diverge from layer 2) | largest; needs G2 approval *and* a per-row-count design that avoids the 3.7-rows-per-expert shape where earlier GPU attempts lost |
-| 3 | **KV int8 (or k8v4)** | at 512 tokens the KV is a few MB, so ~0 for this prompt; real value at 8k-110k context | changed arithmetic (KV precision) → G2 | moderate; well-understood |
+| 2 | **GPU compute for the prefill expert products** (the only lever that can close the remaining **3.0x** prefill gap) | the decomposition says prefill is **compute-bound**: 1,206 GFLOP at 194 GFLOP/s = 86 % of this pool's roof, while Qwen does the same work on the GPU at 19.8 GB/s and reaches 191 tok/s. The card is idle during Kolibri's prefill. | **changed arithmetic** — every GPU expert path measured here flips the router (fp16 0.400/11.08, Q8_1 0.266/9.51, grouped-native 0.370/11.64; 97/100 chunk-layers diverge from layer 2) | largest engineering effort; A1 needs full-engine bitwise/state gates and a real pipelined timing case. Any arithmetic change needs new G2 approval; the small rows/expert shape still matters |
+| 3 | **Staged KV int8 — rejected** | Encoded bytes decrease, but all six fidelity cases fail. Dedicated speed testing cancelled; memory reduction also includes offload | G2 **fails**; keep f16. Optional k8v4 not run | Do not spend more speed work on this rejected arm |
 | 4 | **Q4_K down instead of Q6_K (parked)** | **7.10 % fewer expert bytes** in this mixed pack (50.688 MB of 714.24 MB/token); no speed measured. Q6_K is **1.458x**, not 2.05x, Q4_K per value | changed weight quantisation → G2; no result collected | moderate; smaller byte lever than originally stated |
 | 5 | **Load/repack** (37 s to repack 903 tensors into 42.9 GiB pinned) | startup only; Qwen is worse (~11 min of disk reads) | none if the repacked table is cached bit-identically | small, accuracy-safe |
 | 6 | *(not a lever)* **copy Qwen's decode** | Qwen's decode is **7.65 tok/s** against Kolibri's 39.2 — PLE reads block 6.06 s of its 16.7 s | — | do not copy |
