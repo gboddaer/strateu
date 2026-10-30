@@ -83,7 +83,11 @@ test('Serving cancellation stops active and queued demo requests; test keys enfo
   const id = 'qwen38-q4_k_m';
   await writeFile(join(home, 'data/state.json'), JSON.stringify({ installed: { [id]: { installedAt: new Date().toISOString(), bytes: 491400032, simulated:true } }, beginner:{priority:'balanced',contextLength:'32k',readImages:false,gpuIdle:'never'}, current: id, loaded: id }));
   const socket = http.createServer(); const port = await listen(socket); await close(socket);
-  const host = spawn(process.execPath, ['server/index.mjs'], { cwd: join(import.meta.dirname, '..'), env: { ...process.env, STRATA_HOME:home,STRATA_MODELS_DIR:join(home,'models'), STRATA_PORT: String(port), STRATA_REAL_ENGINE: '0', STRATA_FORCE_DEMO: '1' }, stdio: 'ignore' });
+  const host = spawn(process.execPath, ['server/index.mjs'], { cwd: join(import.meta.dirname, '..'), env: { ...process.env, STRATA_HOME:home,STRATA_MODELS_DIR:join(home,'models'), STRATA_PORT: String(port), STRATA_REAL_ENGINE: '0', STRATA_FORCE_DEMO: '1',
+    // Pinned hardware: the boot restore of the persisted load must not depend on how much memory the
+    // machine happens to have free. Without an instance the turn is refused before it is queued and
+    // /api/serving stays empty, which is what a loaded macOS runner produced.
+    STRATA_TEST_HARDWARE: '{"totalGb":64,"freeGb":48,"gpus":[]}' }, stdio: 'ignore' });
   const base = `http://127.0.0.1:${port}`;
   const call = async (path, method = 'GET', body, key) => {
     const res = await fetch(base + path, { method, headers: { 'content-type': 'application/json', ...(key ? { authorization: `Bearer ${key}` } : {}) }, body: body ? JSON.stringify(body) : undefined });

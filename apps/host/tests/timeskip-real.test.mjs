@@ -17,6 +17,9 @@ const hasPython = spawnSync(PYTHON, ['--version'], { windowsHide: true }).status
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+/** Delete a test tree on Windows while a detached run host may still hold files open: retry EPERM. */
+function removeTree(dir) { rmSync(dir, { recursive: true, force: true, maxRetries: 40, retryDelay: 250 }); }
+
 test('the revision request tells the assistant to stay in the copy and to say what it did', () => {
   const text = timeskipRevisionMessage('make a launch plan');
   assert.match(text, /current folder is that copy/);
@@ -33,7 +36,7 @@ test('measureFolder stops early on a folder that is too big to copy', () => {
     mkdirSync(join(dir, 'node_modules'));
     writeFileSync(join(dir, 'node_modules', 'big.txt'), 'y'.repeat(1000));
     assert.equal(measureFolder(dir, { maxBytes: 100 }).tooBig, false, 'node_modules is not copied for a trial, so it does not count');
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { removeTree(dir); }
 });
 
 test('diffRun lists added, changed and removed files and says which revision to apply', () => {
@@ -49,7 +52,7 @@ test('diffRun lists added, changed and removed files and says which revision to 
     assert.deepEqual(found.files.map(f => [f.path, f.status]), [['edit.txt', 'changed'], ['gone.txt', 'removed'], ['new.md', 'added']]);
     assert.equal(found.files[0].original, 'one'); assert.equal(found.files[0].updated, 'one two');
     assert.equal(found.applyAttempt, 1, 'nothing was kept by the checks, so the person applies the last revision');
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { removeTree(dir); }
 });
 
 test('a run starts without the caller waiting, shows its changed files, and applies the chosen revision with a rollback copy', { skip: !hasPython && 'no python on this machine', timeout: 120000 }, async () => {
@@ -81,7 +84,7 @@ test('a run starts without the caller waiting, shows its changed files, and appl
     const restored = await ts.apply({ id, restore: true });
     assert.ok(restored.ok, JSON.stringify(restored));
     assert.equal(readFileSync(join(workspace, 'plan.md'), 'utf8'), 'first draft\n');
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { removeTree(dir); }
 });
 
 test('a run whose host is gone reads as interrupted, not as still working', { skip: !hasPython && 'no python on this machine', timeout: 60000 }, async () => {
@@ -92,7 +95,7 @@ test('a run whose host is gone reads as interrupted, not as still working', { sk
     writeFileSync(join(state, id, 'run.json'), JSON.stringify({ id, state: 'generating', workspace: dir, prompt: 'x', checkpoints: [], attempts: [] }));
     const ts = createTimeSkip({ repoRoot: REPO, python: PYTHON, env: { ...process.env, STRATA_TIMESKIP_DIR: state } });
     assert.equal(ts.status(id).phase, 'interrupted');
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { removeTree(dir); }
 });
 
 test('Stop ends the job and everything it started, deletes the copies, leaves the person\'s files alone, and the run then reads as cancelled', { skip: !hasPython && 'no python on this machine', timeout: 120000 }, async () => {
@@ -120,7 +123,7 @@ test('Stop ends the job and everything it started, deletes the copies, leaves th
     assert.equal(readFileSync(join(workspace, 'plan.md'), 'utf8'), 'first draft\n');
     assert.equal(existsSync(join(workspace, 'half-done.md')), false, 'nothing reached the person\'s folder');
     assert.equal(await ts.stop('b'.repeat(32)), false, 'an id that is not a run is not "stopped"');
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { removeTree(dir); }
 });
 
 test('the revision step reads the host\'s stream: a long silent turn is fine, a failure is told in the host\'s words, a vanished host is "could not be reached"', { timeout: 60000 }, async () => {

@@ -13,5 +13,15 @@ export function assertPrivate(path) {
   const sddl = execFileSync(join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command', `(Get-Acl -LiteralPath '${path.replace(/'/g, "''")}').Sddl`],
     { encoding: 'utf8', timeout: 30000, windowsHide: true, env }).trim();
   const dacl = sddl.slice(sddl.indexOf('D:'));
-  assert.equal(dacl, `D:PAI(A;;FA;;;${currentUserSid()})`, `ACL is not owner-only: ${sddl}`);
+  // Get-Acl writes well-known accounts as SDDL aliases: the local Administrator account (RID 500)
+  // becomes LA, SYSTEM becomes SY, and BUILTIN\Administrators becomes BA. Translate them back to
+  // SIDs so the comparison does not depend on which account name the runner resolves.
+  const sid = currentUserSid();
+  const resolve = token => token === 'SY' ? 'S-1-5-18'
+    : token === 'BA' ? 'S-1-5-32-544'
+    : token === 'LA' && /^[Ss]-1-5-\d+-\d+-\d+-\d+-\d+(?:-\d+)*$/.test(sid) ? `${sid.slice(0, sid.lastIndexOf('-') + 1)}500`
+    : token;
+  const aceList = [...dacl.matchAll(/\(A;;FA;;;([^)]+)\)/g)].map(m => resolve(m[1]));
+  assert.match(dacl, /^D:P/, `ACL keeps inherited entries: ${sddl}`);
+  assert.deepEqual(aceList.sort(), [resolve(sid)].sort(), `ACL is not owner-only: ${sddl}`);
 }
