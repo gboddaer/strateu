@@ -37,7 +37,49 @@ worktree `/data2/develop/native-q4q6`.
 4. **`--kv-resident 32768` with a small `--max-context` is inconsistent** (the shipped config pairs it with
    `--max-context 262144`); the Phase 0 runs use `--max-context 16384 --kv-resident 16384` and say so.
 
-## Phase 0 measurements
+### Kolibri-1, same prompt and generation length (two runs, exit 0)
+
+Command: `strata-kolibri --model …Kolibri-1-Q4_K_M.gguf --n 128 --prefill --cpu-threads 8 --tokens-file ids512.txt
+--ctx 2048 --counters` (binary `0bc772bf…acbdf`, the FP16 branch's build, arm off).
+
+```
+PFchunk 256/511   5,434 ms
+PFchunk 511/511  10,398 ms                      -> 511 tokens / 10.398 s = 49.1 tok/s
+CNT prefill pool: chunks=100 experts/chunk=117 bytes=28.09 GB pool=8,569 ms (85.7 ms/chunk, 3.3 GB/s)
+CNT prefill pool work: rows=153300 = 1,205.6 GFLOP at 141 GFLOP/s (62% of the 226 GFLOP/s pool roof)
+CNT decode: pool 714.2 MB/tok (91.42 GB total) = 3,074 ms -> 24.02 ms/tok at 29.7 GB/s
+CNT branches per tok: pool 50.0 gpu-expert 0.0 slots-path 0.0 grouped 0.0
+```
+
+## Phase 0b — where the milliseconds actually are
+
+| leg | Kolibri-1 | Qwen3.8-Flash-Next | what it means |
+|---|---|---|---|
+| prefill, 511 tokens | **10,398 ms** (49.1 tok/s) | **2,670 ms** (191.4 tok/s) | Qwen **3.9x** faster |
+| prefill bottleneck | **compute**: 1,205.6 GFLOP at **141 GFLOP/s** on 8 CPU workers, 62 % of the pool's 226 GFLOP/s roof | **DMA + GPU products**: 19.8 GB/s over the row phases, CPU share 0.70 | Kolibri's prefill is **CPU-bound**; the T4's tensor cores are idle |
+| expert bytes for the prefill | 28.09 GB (3.3 GB/s) | ~22.8 GB (9.6-19.8 GB/s) | same order of bytes, 3-6x the rate |
+| decode per token | **24.0 ms** pool work (714 MB at **29.7 GB/s**) → ~30.5 tok/s | **130.7 ms**/token → 7.65 tok/s | Kolibri **4x** faster in decode |
+| decode bottleneck (Qwen) | — | PLE table **6,063 ms blocked** of the 16.7 s, pool drain 91.5 ms/round, cache hits 63.1 % | Qwen's decode pays SSD reads and a slower pool drain it does not overlap |
+| load | 37 s repack of 903 tensors into 42.9 GiB pinned | ~77 GB read at ~110 MB/s (≈11 min) + 48 s projections + PLE map | Kolibri loads far faster |
+| drafter | none | `--spec 2`, **0 of 127 drafts accepted** | the comparison *is* drafter-free in effect |
+| KV | f16 | int8 (+16 k resident) | Qwen's KV is half the bytes |
+
+**Three conclusions, all measured:**
+
+1. **The user's premise is half right, and the half that is right is the important one.** Flash is not faster overall — it
+   loses decode by 4x on this card — but it wins prefill by **3.9x**, and it does so *on a model 2.3x larger*. The
+   mechanism is not a better expert kernel: it is that **Qwen's prompt experts run on the GPU while Kolibri's run on 8
+   CPU workers at 141 GFLOP/s**, which the engine itself reports as 62 % of the pool's compute roof. Kolibri's prefill
+   is compute-bound, not byte-bound — the 3.3 GB/s is what 141 GFLOP/s *costs* over 28 GB of Q4_K/Q6_K rows.
+2. **Kolibri's decode is already excellent and Qwen's is not.** 24 ms/token of pool work at 29.7 GB/s, versus 130 ms
+   with 6 s of that blocked on SSD PLE reads. Any plan that "makes Kolibri more like flash" must not copy the decode
+   side.
+3. **The 9x asymmetry inside Kolibri is the real anomaly.** Decode moves 714 MB/token at **29.7 GB/s**; prefill moves
+   28 GB at **3.3 GB/s**. Same kernels, same workers, same RAM. The difference is *row count per expert* (1 vs ~3.7)
+   and the batch shape the pool runs — which is exactly the shape where the earlier GPU experiments looked bad. That
+   asymmetry, not the model size, is what a plan should attack.
+
+
 
 ### Qwen3.8-Flash-Next — full run with the residency table (prefill + decode)
 
