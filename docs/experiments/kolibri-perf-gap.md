@@ -51,6 +51,38 @@ CNT decode: pool 714.2 MB/tok (91.42 GB total) = 3,074 ms -> 24.02 ms/tok at 29.
 CNT branches per tok: pool 50.0 gpu-expert 0.0 slots-path 0.0 grouped 0.0
 ```
 
+## Phase 1 — accuracy-safe levers (gate G1): one variable at a time, same binary
+
+No numerical change: same binary `0bc772bf…acbdf`, same model, same 512-id prompt, same environment except the two
+variables named. `--counters` on every run.
+
+| configuration | prefill (511 tok) | pool GFLOP/s (% of the 226 roof) | decode pool work | achieved GB/s |
+|---|---:|---:|---:|---:|
+| **8 workers, 2-node (baseline)** | **10,388-10,398 ms** (49.1 tok/s) | 141 (62 %) | **24.02 ms/tok** (714 MB) | 29.7 |
+| 8 workers, single node | 9,920 ms (51.5 tok/s) | 147 (65 %) | 14.66 ms/tok | 48.7 |
+| 13 workers, 2-node | 8,128 ms (62.9 tok/s) | 189 (84 %) | 24.17 ms/tok | 29.6 |
+| **13 workers, single node** | **7,922-8,039 ms** (63.6-64.5 tok/s) | **190-194 (84-86 %)** | **12.93-12.96 ms/tok** | **55.1-55.3** |
+
+**And it is bit-identical.** Baseline (8 workers, two nodes) against the tuned configuration (13 workers, one node),
+same forced history, full logits:
+
+```
+PFchunk 511/511 10,388 ms   vs   7,954 ms
+9 records x 128,000 values: bitwise identical = True   (max |a-b| = 0)
+```
+
+So the two levers together are:
+
+* **prefill 49.1 -> 63.6 tok/s (+30 %)**,
+* **decode expert work 24.0 -> 13.0 ms/token (1.85x)**, at 55 GB/s instead of 29.7 GB/s.
+
+Both are scheduling and placement only — worker count and NUMA — with zero arithmetic change, so they need no
+qualification at all. The prefill gain comes from using 13 workers instead of 8 (84-86 % of the pool's compute roof
+instead of 62 %); the decode gain comes almost entirely from putting the workers **and the pinned expert table on the
+same NUMA node** (24.0 -> 14.7 ms/tok from placement alone at 8 workers, a further 13 % from the extra workers).
+On this box the current default splits the pool 5+4 across two nodes, which costs roughly half the decode expert
+throughput.
+
 ## Phase 0b — where the milliseconds actually are
 
 | leg | Kolibri-1 | Qwen3.8-Flash-Next | what it means |
