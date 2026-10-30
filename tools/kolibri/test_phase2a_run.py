@@ -16,6 +16,7 @@ def test_environment_removes_unrequested_numerical_arms(monkeypatch):
         env=run.environment(arm)
         assert env['STRATA_KOLIBRI_KV_INT8']==want
         assert env['STRATA_KOLIBRI_PF_PARTIAL']=='0'
+        assert env['STRATA_KOLIBRI_ATTN_KT']=='1'
         assert 'STRATA_KOLIBRI_DENSE_F16' not in env
         assert 'KOLIBRI_UNREQUESTED' not in env
 
@@ -35,6 +36,18 @@ def test_nonfinite_candidate_is_not_a_tolerance_failure(tmp_path):
     first=tmp_path/'a.bin'; second=tmp_path/'b.bin'
     first.write_bytes(a.tobytes());a[0,0]=np.nan;second.write_bytes(a.tobytes())
     with pytest.raises(run.qualify.NonFiniteInput): run.comparison(first,second)
+
+
+def test_recorded_environment_redacts_credentials_without_mutating_child():
+    env={'OPENAI_API_KEY':'private','HF_TOKEN':'private','PI_SESSION_TOKEN':'private',
+         'PATH':'/usr/bin','STRATA_KOLIBRI_DEC_TOKEN_GRAPH':'0'}
+    public=run.public_env(env)
+    assert public['OPENAI_API_KEY']=='<redacted>'
+    assert public['HF_TOKEN']=='<redacted>'
+    assert public['PI_SESSION_TOKEN']=='<redacted>'
+    assert public['STRATA_KOLIBRI_DEC_TOKEN_GRAPH']=='0'
+    assert public['PATH']=='/usr/bin'
+    assert env['OPENAI_API_KEY']=='private'
 
 
 def test_corpus_and_limits_are_fixed():

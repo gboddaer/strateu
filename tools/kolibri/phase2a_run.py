@@ -8,6 +8,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import time
@@ -33,13 +34,27 @@ def save(path,data):
     path.write_text(json.dumps(data,indent=2)+'\n')
 
 
+def public_env(env):
+    """Record relevant execution settings without storing inherited credentials."""
+    def sensitive(key):
+        key=key.upper()
+        return (key.startswith('PI_') or bool(re.search(r'KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|COOKIE',key))
+                or ('TOKEN' in key and not key.startswith('STRATA_KOLIBRI_')))
+    return {k:('<redacted>' if sensitive(k) else v) for k,v in env.items()}
+
+
+def numeric_env(env):
+    return {k:v for k,v in env.items() if k.startswith(('STRATA_','CUDA_','GGML_'))}
+
+
 def environment(arm):
     env = {k:v for k,v in os.environ.items() if not k.startswith(('STRATA_','KOLIBRI_'))}
     env.update(CUDA_VISIBLE_DEVICES='0',STRATA_GEMM_DETERMINISTIC='1',
                STRATA_KOLIBRI_EXPERT_F16='0',STRATA_KOLIBRI_PF_PARTIAL='0',
                STRATA_KOLIBRI_DEC_HANDOFF='0',STRATA_KOLIBRI_DEC_STREAM='0',
                STRATA_KOLIBRI_DEC_HANDOFF_GRAPH='0',STRATA_KOLIBRI_DEC_TOKEN_GRAPH='0',
-               STRATA_KOLIBRI_KV_INT8=str(int(arm=='int8')))
+               STRATA_KOLIBRI_KV_INT8=str(int(arm=='int8')),
+               STRATA_KOLIBRI_ATTN_KT='0' if arm=='f16plain' else '1')
     return env
 
 
@@ -72,12 +87,12 @@ def main():
     ap.add_argument('--model',default='/data4/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf')
     ap.add_argument('--inputs',type=Path,default=Path('/tmp/f16-t0/inputs'))
     ap.add_argument('--refs',type=Path,default=Path('/data4/kolibri-f16-evidence/f16-t6/qual'))
-    ap.add_argument('--stage',choices=['control','candidate','state'],required=True)
+    ap.add_argument('--stage',choices=['control','bridge','candidate','state'],required=True)
     args=ap.parse_args()
     args.out.mkdir(parents=True,exist_ok=True)
     binary=args.bin.resolve()
     prefix=['/usr/bin/numactl','--cpunodebind=1','--membind=1']
-    envs={arm:environment(arm) for arm in ['f16','int8']}
+    envs={arm:environment(arm) for arm in ['f16','f16plain','int8']}
     # Fail before spending GPU time if a preregistered input is absent or malformed.
     corpus={}
     for fam,ids,ctx in CORPUS:
@@ -90,10 +105,16 @@ def main():
                          reference_command=(args.refs/f'ref_{fam}.cmd').read_text())
     manifest=dict(binary=str(binary),binary_sha256=sha(binary),model=args.model,
                   model_size=Path(args.model).stat().st_size,limits=LIMITS,corpus=corpus,
-                  env=envs,prefix=prefix,workers=14,stage=args.stage,
+                  env={arm:public_env(env) for arm,env in envs.items()},prefix=prefix,workers=14,stage=args.stage,
                   hardware=subprocess.check_output(['nvidia-smi','--query-gpu=name,driver_version,memory.total',
                                                      '--format=csv,noheader'],text=True).strip())
-    save(args.out/f'manifest-{args.stage}.json',manifest)
+    manifest_path=args.out/f'manifest-{args.stage}.json'
+    if args.stage=='control' and manifest_path.exists():
+        old=json.loads(manifest_path.read_text())
+        if (old['binary_sha256']!=manifest['binary_sha256'] or old['corpus']!=manifest['corpus']
+                or numeric_env(old['env']['f16'])!=numeric_env(envs['f16'])):
+            raise RuntimeError('refuse overwriting a different control configuration; use --stage bridge')
+    save(manifest_path,manifest)
 
     def run(arm,fam,ids,ctx,rep):
         stem=args.out/f'{arm}_{fam}_r{rep}'
@@ -103,12 +124,12 @@ def main():
             old=json.loads(record.read_text())
             if old.get('exit')==0 and old.get('binary_sha256')==manifest['binary_sha256']:
                 qualify.load_exact(dump,128000,9)
-                if sha(dump)==old['dump_sha256']: return dump
+                if sha(dump)==old['dump_sha256'] and numeric_env(old['env'])==numeric_env(envs[arm]): return dump
             raise RuntimeError(f'refuse overwriting incompatible/incomplete run: {stem}')
         argv=prefix+[str(binary),'--model',args.model,'--tokens-file',str(args.inputs/ids),
                      '--ctx',str(ctx),'--n','8','--force',FORCE,'--prefill','--cpu-threads','14',
                      '--counters','--dump-full-logits',str(dump)]
-        data=dict(argv=argv,env=envs[arm],binary_sha256=manifest['binary_sha256'],
+        data=dict(argv=argv,env=public_env(envs[arm]),binary_sha256=manifest['binary_sha256'],
                   started=time.strftime('%Y-%m-%dT%H:%M:%S%z'))
         print(f'START {arm} {fam} repeat {rep}',flush=True)
         t=time.monotonic()
@@ -152,12 +173,27 @@ def main():
         save(args.out/'calibration.json',calibration)
         print('CALIBRATION COMPLETE: '+('absolute usable' if all(x['pass_limits'] for x in calibration.values())
                                              else 'absolute verdict void; use same-engine comparisons'),flush=True)
+    elif args.stage=='bridge':
+        # Baseline mirrors were enabled by default. Prove their removal changes no logits
+        # before using the original two-repeat control dumps for the mirror-off candidate.
+        bridge={}
+        for fam,ids,ctx in CORPUS:
+            a=run('f16plain',fam,ids,ctx,1)
+            control=args.out/f'f16_{fam}_r1.bin'
+            exact=sha(a)==sha(control)
+            bridge[fam]=dict(bitwise=exact,binary_sha256=manifest['binary_sha256'],
+                             mirror_off_sha256=sha(a),control_sha256=sha(control))
+            save(args.out/'bridge.json',bridge)
+            print(f'BRIDGE {fam}: mirror-off == original f16 control: {exact}',flush=True)
+            if not exact: raise RuntimeError(f'mirror removal changed full logits: {fam}')
     elif args.stage=='candidate':
         prior=json.loads((args.out/'manifest-control.json').read_text())
         if prior['binary_sha256']!=manifest['binary_sha256'] or prior['corpus']!=manifest['corpus']:
             raise RuntimeError('control/candidate identity mismatch')
         calibration=json.loads((args.out/'calibration.json').read_text())
         if set(calibration)!=set(corpus): raise RuntimeError('incomplete calibration')
+        if numeric_env(prior['env']['f16'])!=numeric_env(manifest['env']['f16']):
+            raise RuntimeError('control configuration changed; no mirror-off substitution is permitted')
         results={}
         for fam,ids,ctx in CORPUS:
             a=run('int8',fam,ids,ctx,1)
@@ -174,7 +210,7 @@ def main():
         ids=[int(x) for x in (args.inputs/'ids512.txt').read_text().strip().split(',') if x.strip()]
         for arm in ['f16','int8']:
             argv=prefix+[str(binary),'--serve','--model',args.model,'--prefill','--cpu-threads','14','--ctx','2048']
-            log=dict(argv=argv,env=envs[arm],note='stdio engine only; no network/HTTP server started')
+            log=dict(argv=argv,env=public_env(envs[arm]),note='stdio engine only; no network/HTTP server started')
             try:
                 ok=state_check.run_checks(argv,envs[arm],ids,ids[:64],log,str(args.out/f'state-{arm}.err'))
                 ok=ok and log['cancel']['done'].split()[4]=='cancel'

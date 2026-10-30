@@ -4452,9 +4452,13 @@ void init_scratch(const Engine& e, Scratch& s) {
     const bool kv_dev = env_on("STRATA_KOLIBRI_KV_DEV");
     s.kv_int8 = env_on("STRATA_KOLIBRI_KV_INT8");
     if (s.kv_int8) {
-        if (g.head_dim % 64 || pf_pipe_on() || attn_kt_on() || dec_graph_on() || e.grouped > 0 ||
-            env_on("STRATA_KOLIBRI_DEC_TOKEN_GRAPH")) {
-            std::fprintf(stderr, "strata-kolibri: experimental KV_INT8 refuses pipelining, mirrors, graphs, grouped decode or head_dim not divisible by 64\n");
+        // Existing per-layer transposed mirrors remain valid: restore and quantize this
+        // layer's stage BEFORE its full/incremental mirror copy. Keep their arithmetic.
+        // The cross-layer fingerprint diagnostic, however, assumes persistent FP16 kc/vc.
+        const char* prefix_diag = std::getenv("STRATA_KOLIBRI_PREFIX_FINGERPRINT");
+        if (g.head_dim % 64 || pf_pipe_on() || dec_graph_on() || e.grouped > 0 ||
+            env_on("STRATA_KOLIBRI_DEC_TOKEN_GRAPH") || (prefix_diag && *prefix_diag)) {
+            std::fprintf(stderr, "strata-kolibri: experimental KV_INT8 refuses pipelining, graphs, grouped decode, prefix fingerprints or head_dim not divisible by 64\n");
             std::exit(2);
         }
         const size_t cap = (size_t) g.n_head_kv * std::max<int64_t>(s.ctx,g.n_swa) * g.head_dim;

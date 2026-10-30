@@ -466,7 +466,7 @@ mandatory state checks use short-lived stdio engine processes only.
   the implementation. The registered `kolibri_kv_int8_test` passes on the T4.
   It checks wrap, partial per-head restore, zeros, underflow scale, repeat unpack,
   and pack/roundtrip agreement. CUDA engine build passes; HIP/SYCL not run (unavailable).
-* Focused Python checks: **68 passed**, one plugin deprecation warning (matrix environment,
+* Focused Python checks: **69 passed**, one plugin deprecation warning (matrix environment,
   comparison gates, KL/layer/qualification tools, worker-count/launcher rules).
 * Bare repository-wide `python -m pytest`: **collection failed, 33 errors**. Missing
   `regex`, `safetensors`, `textual`, and `libtqenc.so`, plus standalone script collection
@@ -486,6 +486,41 @@ with another GPU job. `phase2a_speed.py` uses two cold requests at 512, 8,191 an
 for both arms, and the stdio `DONE` prompt/decode timers. These generated speed histories are
 not the forced histories used for numerical qualification; their ids/counts are recorded and
 no cross-arm KL is computed on them. Load-to-READY and sampled VRAM high-water are separate.
+
+### Phase 2a failed preflights and recovery — preserve the existing mirror path
+
+The first matrix in `phase2a/` finished all twelve f16 controls. Every family repeated bitwise
+and matched the preserved control; all six independent-reference calibrations failed the absolute
+limits, so the absolute verdict is void under the preregistered rule.
+
+The first int8 run exited **2 before generation**: the initial compatibility check rejected K/V
+mirrors, which are **on by default**. That was an implementation restriction, not an int8 fidelity
+result. Its logs/manifest remain in `phase2a/failed-mirror-preflight/`.
+
+An attempted mirror-off bridge was then **rejected**, not substituted for the control. On the
+16-id history, 1,151,993 / 1,152,000 logit bit patterns differed; mean KL **0.001246524**, worst
+absolute difference **1.050734**, top-1 9/9. The source comment claiming mirror placement is
+bit-identical is not sufficient proof for this build/configuration. Details are retained in
+`phase2a/mirror-off-diagnostic.json`. No int8 numerical comparison was made against that bridge.
+
+**Superseding ruling:** keep mirrors **explicitly on for both arms**. The packed arm restores and
+quantizes the current layer's FP16 workspace *before* the existing full/incremental mirror copy;
+that copy and its attention arithmetic remain unchanged. The overbroad mirror refusal was removed.
+Graphs, pipelining, grouped decode and cross-layer prefix fingerprints remain refused (the latter
+assumes persistent per-layer FP16 buffers and would otherwise inspect the wrong staged layer).
+Neither the quantization rule nor any acceptance limit changed.
+
+A new build and entirely fresh paired matrix use `phase2a-mirrors/`. The first build is frozen
+with its original hash in `phase2a/frozen-first-build-strata-kolibri`; old results are not passed
+off as controls for the changed binary. Startup with int8 plus existing mirrors succeeded:
+**exit 0, `READY 2048 stop`, zero generation requests**. The initial smoke wrapper incorrectly
+required a bare `READY` line; its failed derived check and raw output remain recorded, alongside
+the corrected prefix-based validation (`startup-validation.json`). No extra candidate generation
+was used to bypass calibration.
+
+Recorded environments now redact inherited credentials and PI session fields without modifying
+the actual child environment. Existing new-experiment manifests were sanitized too; this touched
+no FP16 evidence or other protected artifacts.
 
 ### What would make me stop early
 

@@ -37,7 +37,7 @@ def main():
         sampler=threading.Thread(target=monitor,daemon=True);sampler.start()
         t0=time.monotonic()
         eng=None
-        record=dict(argv=argv,env=env,binary_sha256=calibration['binary_sha256'],
+        record=dict(argv=argv,env=matrix.public_env(env),binary_sha256=calibration['binary_sha256'],
                     context_capacity=14336,note='32 greedy steps; not used for numerical fidelity; decode includes last prompt token')
         try:
             eng=state_check.Engine(argv,env,stderr_path=str(args.out/f'speed-{arm}.err'))
