@@ -637,6 +637,31 @@ Raw output: `a1-oracle/multiblock.txt`, `a1-oracle/q6k-nb*.txt`. Reproduce: `bas
 on random blocks with signed scales, both signs of `dmin`, and all six-bit encodings. Nothing in the engine uses them
 yet: no engine-level bitwise result exists and no speed has been measured.
 
+### A1 status — kernels proven, engine wiring not started
+
+Done and committed on `kolibri-a1-prefill` (`33b79257`, `de29e3d6`):
+
+| piece | state |
+|---|---|
+| Multi-block oracle vs the real AVX2 kernel | 100 % bit-identical at nb = 1, 2, 10, 32; sign mutant caught 64/64 |
+| Q4_K gate/up kernel (`src/kolibri/kq_a1.cuh`) | 2,048/2,048 at nb = 1, 2, 10, 32, worst difference 0 |
+| Q6_K down kernel | 2,048/2,048 against `ggml_vec_dot_q6_K_q8_K`, worst difference 0 |
+| Shape guards | refuse null, `nb` 0 or > 1,024, out-of-range rows |
+
+Not started: `a1-engine`. This is the honest boundary, and the reason is size, not doubt about the arithmetic.
+
+Wiring it is a **new expert leg**, not a flag. The chunk's activations must be quantised to Q8_K, the touched expert
+blobs staged, the gate/up dots run on the GPU, the results returned to the CPU for SwiGLU — which cannot move to the
+GPU, because CUDA's `expf` differs from glibc's in 30 % of sampled values (Phase 3g) — and then the down dot run
+again on the GPU. Each stage has to produce byte-identical `ey` rows to `pool_experts`, in the same selection order,
+for 100 chunk-layers per prefill.
+
+It also needs the card to itself: `a1-gates` and `a1-timing` cannot run while the operator's 160K server holds
+14.9 GiB of the T4's 16 GiB. The kernels themselves were tested alongside it because they are tiny.
+
+So the remaining work is the 1-3 days estimated earlier for the arm, plus the two later tasks, and it should start
+with a quiet GPU.
+
 ### What would make me stop early
 
 If 2a shows no gain at 8k-110k, or 2b's byte saving does not move prefill or decode measurably, the lever is dropped as
