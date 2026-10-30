@@ -111,6 +111,56 @@ End-to-end, measured as the difference between one 128-token run and one 1-token
 This is a **configuration change only** (worker count and NUMA placement). It needs no qualification; it is not a
 default change and has not been made one.
 
+## Phase 3a — can a bit-exact CUDA port actually exist? The arithmetic contract
+
+Read from the tree, not assumed:
+
+| leg | implementation the pool calls | file |
+|---|---|---|
+| gate/up, **Q4_K x Q8_K** | **Strata's own AVX2 kernel** `q4k_dot` | `src/kernels/cpu/kq_avx2.cpp:85-145` |
+| down, **Q6_K x Q8_K** | **not** in Strata's kernels — `dot_rows()` dispatches only types 12 / 7 / 8, so Q6_K goes through ggml-cpu's `vec_dot` trait | `src/kernels/cpu/kq_avx2.cpp:217-226`; ggml's `ggml_vec_dot_q6_K_q8_K` |
+
+`q4k_dot`, exactly as written (this is the contract a CUDA kernel must reproduce):
+
+```
+per 256-value block i:
+  xd, xdmin = fp16->fp32 of the block's d, dmin
+  d = y.d * xd ;  dmin = -y.d * xdmin
+  sumi    = int32 vector: maddubs(q4l, q8l) + maddubs(q4h, q8h), madd'ed with the 6-bit scales,
+            accumulated over the four 64-value groups -- all INTEGER, hence exact and order-free
+  acc_m  += fma(dmin, (float)int32(prod_of_mins_and_q8_sums), acc_m)      (__m128, 4 lanes)
+  acc    += fma(d,    (float)sumi,                       acc)            (__m256, 8 lanes)
+after all blocks:
+  result = hsum_float_8(acc) + reduce(acc_m)      -- two FIXED reduction trees
+```
+
+**Why bit-exact is structurally possible.** Everything order-sensitive is enumerable: the int32 sums per block are
+exact; the only floating-point sequencing is (i) the per-lane FMA accumulation across blocks **in block order**,
+(ii) the fixed 8-lane and 4-lane reduction trees, and (iii) FMA contraction (CUDA `fmaf` matches
+`_mm256_fmadd_ps`; a separate multiply-add would not). None of that needs the GPU to be clever — one thread per output
+row, eight fp32 lane accumulators in registers, blocks walked in order, then the same tree. The kernel would be
+*deliberately* the same shape as the AVX2 code, not a generic GEMM.
+
+**The hazard that can still sink it — SwiGLU.** Between the two products the pool evaluates
+`(g / (1.f + std::exp(-g))) * u` on the CPU. CUDA's `expf` and glibc's `expf` are not guaranteed to agree to the last
+bit, and a 1-ulp difference there would break bit-exactness for every element while leaving the arithmetic itself
+correct. Options: reproduce the CPU value exactly (hard), or measure the divergence and decide whether the arm is
+"bit-exact except an expf ulp" — which is a *numerical change* and would fall back under gate G2. **This is the first
+thing the probe must measure, before any kernel work: compare CPU `std::exp` and CUDA `expf` over the full
+single-precision range, count exact matches, and report.**
+
+**Probe design (the next step, no engine change).** A standalone program in this worktree with its own build dir:
+1. drive the **CPU pool kernels** (`native_fmt` / `native_quant_act` / `native_gu_rows` / `native_quant_h` /
+   `native_down_rows`) at the real shapes, 13 workers single-node → the 85.7 ms/chunk-layer, 194 GFLOP/s baseline;
+2. a **CUDA Q4_K x Q8_K kernel** with the contract above, bitwise-compared against `q4k_dot` on random valid blocks
+   and on real expert blobs from the model;
+3. the same for **Q6_K down** against ggml's x86 kernel;
+4. the **expf/SwiGLU parity** measurement;
+5. timing including getting the bytes to the card (28 GB per 512-token prefill at the measured 9.6 GB/s PCIe).
+Go/no-go: bit-identical on (2) and (3), SwiGLU parity understood, and faster than 194 GFLOP/s *including* data
+movement. Anything less and A is reported as a measured dead end.
+
+
 ## Phase 4 — the ranked plan, with what each lever costs and what it does to accuracy
 
 Baseline for comparison after the free win: **Kolibri tuned 64.6 tok/s prefill / 39.2 tok/s decode** against
