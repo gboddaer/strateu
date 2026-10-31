@@ -43,6 +43,7 @@ class MockStrata:
         self.active = 0
         self.max_active = 0
         self.dead = False
+        self.errors: list[str] = []
         self.lock = threading.Lock()
         self.requests_before = 0
         self.gpu_name = "Mock GPU 12 GB"
@@ -89,6 +90,9 @@ class MockStrata:
                     owner.max_active = max(owner.max_active, owner.active)
                 try:
                     self.respond(rid, body)
+                except Exception as exc:               # a crashed handler ends the connection without a reason
+                    owner.errors.append(f"{rid}: {type(exc).__name__}: {exc}")
+                    raise
                 finally:
                     with owner.lock:
                         owner.active -= 1
@@ -690,6 +694,10 @@ class RunTests(StandardBase):
     def test_a_round_total_is_null_when_a_counted_request_has_no_token_count(self):
         self.server.script["concurrency-r2-c3"] = {"usage": False}
         doc, _ = self.run_standard(optional_concurrency=True)
+        failed = [(r["id"], (r["error"] or {}).get("kind")) for r in doc["requests"] if r["status"] == "failed"]
+        self.assertEqual(doc["run"]["status"], "complete",
+                         f"the run did not complete; reasons {doc['extensions']['status_reasons']}; "
+                         f"failed requests {failed}; server errors {self.server.errors}")
         second = doc["concurrency_rounds"][1]
         self.assertIsNone(second["output_tokens"])
         self.assertIsNone(second["aggregate_tps"])

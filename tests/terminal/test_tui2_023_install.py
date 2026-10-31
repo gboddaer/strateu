@@ -57,7 +57,7 @@ class WindowsInstaller(unittest.TestCase):
         runner = self.root / "run.ps1"
         runner.write_text("$ErrorActionPreference = 'Continue'\n"
                           f"$env:STRATA_FEED = '{feed}'; $env:STRATA_DATA_DIR = '{data}'; $env:STRATA_NO_PATH = '1'\n"
-                          "try { Invoke-Expression (Get-Content -Raw -LiteralPath '" + INSTALL_PS1 + "') } catch {\n"
+                          f"try {{ Invoke-Expression (Get-Content -Raw -LiteralPath '{INSTALL_PS1}') }} catch {{\n"
                           "  Write-Host \"STOPPED\"\n"
                           "  Write-Host ($_.Exception | Format-List -Force | Out-String)\n"
                           "  Write-Host ($_.ScriptStackTrace | Out-String)\n"
