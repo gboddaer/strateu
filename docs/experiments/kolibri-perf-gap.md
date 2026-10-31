@@ -745,8 +745,16 @@ the arm off (and, where it exists, with the preserved control):
 State checks with the arm on: first use, replay (`equals_first_use`), a 576-id reuse request, cancellation (reason
 `cancel`), a clean request after cancellation and after a reset — **PASS** (`a1-oracle/state_a1.json`).
 
-Prefill cost of the arm at long context: 8,190 ids took 288.5 s against 115.8 s arm-off (2.49x), 10,999 ids 388 s
-against 155.4 s (2.5x). Consistent with the 2.02x measured at 511 ids.
+Prefill cost of the arm, measured from the engines' own chunk timers (not wall time):
+
+| ids | arm on | arm off | ratio |
+|---|---:|---:|---:|
+| 511 | 16.164 s | 7.989 s | 2.02x |
+| 8,190 | 288.5 s | 115.793 s | 2.49x |
+| 10,999 | 344.407 s | 155.42 s | 2.22x |
+
+An earlier line in this ledger said 388 s / 2.5x for the 10,999 case; that was the wall clock, which includes load
+and decode. The prefill ratio there is 2.22x, and the table above supersedes it.
 
 ### The 160K server's prefill rate — its configuration is NOT the cause
 
@@ -758,9 +766,16 @@ Same 10,999-id prompt, same binary, same 14 workers, one run each:
 | context 163,840, `--expert-slots auto` (73 slots/layer, 8,465 MiB) + NUMA binding | 157.5 s | **69.8 tok/s** |
 
 1.4 % apart. So neither the large context nor the expert cache explains the **56 tok/s** observed when the same
-prompt went through the HTTP server as its first request (11,149 tokens in 199.5 s). The difference must lie in the
-server path — first-request warm-up (CUDA module load, cuBLAS handle, allocator growth) or the server's own prompt
-handling — which this campaign did **not** measure. Recorded as an open, named gap rather than a guess.
+prompt went through the HTTP server as its first request (11,149 tokens in 199.5 s).
+
+One thing that is settled, because it was checked on the running process rather than assumed: that server run **did**
+have the memory binding applied — `/proc/<engine>/numa_maps` showed `bind:1` on 210 mappings and `Cpus_allowed_list`
+was exactly NUMA node 1's cores. It got there from the config's `launch_prefix`, built by the setup functions by
+hand, not from the pushed launcher (whose single-engine path was missing the prefix at the time — fixed and pushed
+as `f9c73a6b` on `fix/kolibri-numa-launch`). So the residual 199.5 s against 159 s cannot be the binding either.
+
+What remains is the server path: first-request warm-up (CUDA module load, cuBLAS handle, allocator growth) or its
+own prompt handling. This campaign did **not** measure that, so it stays an open, named gap rather than a guess.
 
 ### Decomposition completed — dense legs measured, and what stays unattributed
 
