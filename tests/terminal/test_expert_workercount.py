@@ -214,6 +214,19 @@ class EngineCommand(unittest.TestCase):
                               prefix=["/usr/bin/numactl", "--membind=1"])
         self.assertEqual(conversation_slots(engine), 7)
 
+    def test_every_engine_construction_passes_the_launch_prefix(self):
+        """All three paths - single engine, replicas, split - must hand the config's prefix on.
+        A missing keyword here is silent: the engine starts unbound and looks healthy."""
+        import ast
+        from serve import server
+        tree = ast.parse((Path(server.__file__)).read_text())
+        calls = [n for n in ast.walk(tree)
+                 if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "StrataEngine"]
+        self.assertEqual(len(calls), 3, "expected the single, replica and split construction sites")
+        for call in calls:
+            names = [k.arg for k in call.keywords]
+            self.assertIn("prefix", names, f"StrataEngine call at line {call.lineno} drops the launch prefix")
+
     def test_config_key_is_what_the_launcher_reads(self):
         """setup.py writes "launch_prefix"; the server reads rc.get("launch_prefix")."""
         import inspect
