@@ -1,0 +1,5 @@
+# CPU-only Terminal / Control, setup and MCP regression suites.
+# gguf-py comes from setup.py's pinned llama.cpp checkout, not the unrelated PyPI version.
+-r requirements.txt
+-r requirements-monitor.txt
+pytest==9.2.0

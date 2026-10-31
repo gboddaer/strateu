@@ -157,6 +157,7 @@ class Install(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.calls = []
         self.github_up = True
+        self.fetch_engine = mock.Mock(return_value=None)  # no package available; never contact a real update feed
         self.cfg = {}
         self.exe = self.root / "engine" / ("strata-dsv41.exe" if setup.WIN else "strata-dsv41")
         eng = self.root / "engine"
@@ -176,6 +177,7 @@ class Install(unittest.TestCase):
                    mock.patch.object(setup, "github_reachable", lambda timeout=10.0: self.github_up),
                    mock.patch.object(setup, "pip_install", lambda *a, **k: None),
                    mock.patch.object(setup, "engine_step", engine_step),
+                   mock.patch.object(setup, "get_dsv41_engine", self.fetch_engine),
                    mock.patch.object(setup, "run", lambda cmd, **k: self.calls.append(("run", cmd))),
                    mock.patch.object(setup, "data_folder", lambda d, *a, **k: (self.root / "data", [])),
                    mock.patch.object(setup, "write_setup_config", write_cfg),
@@ -229,6 +231,7 @@ class Install(unittest.TestCase):
     def test_no_engine_stops_before_the_download(self):
         rc, out = self.install(engine=False)
         self.assertEqual(rc, 1, out)
+        self.fetch_engine.assert_called_once()
         self.assertIn("DeepSeek's engine is not available for this computer yet", out)
         self.assertIn("RTX 30, 40 and 50", out)
         self.assertNotIn("cmake", out)
