@@ -48,6 +48,7 @@
 #include "strata/prefill/gemm.hpp"
 #include <cuda_fp16.h>
 #include "kv_int8.cuh"
+#include "kq_a1.cuh"
 
 #include <algorithm>
 #include <atomic>
@@ -2923,6 +2924,134 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
 }
 
 
+// A1 (STRATA_KOLIBRI_A1_CHECK=1): redo ONE selection's expert row on the GPU - gate/up dots, the CPU's SiLU,
+// the CPU's hidden quantisation, the down dots - and compare it bit for bit with the row the pool just produced.
+// One layer-chunk, one selection, real weights and real activations: this proves the plumbing before any arm is
+// wired into the default path. Returns false (with a printed reason) when the row differs.
+static bool a1_check_row(const strata::kernels::cpu::NativeFmt& f, const uint8_t* blob, const void* act,
+                         const float* pool_ff, const float* pool_ey, int64_t N, int64_t FF, int64_t K, int layer) {
+    namespace a1 = strata::kolibri::a1;
+    const int nb_gu = (int) (f.n_embd / a1::kQK), nb_dn = (int) (f.n_ff / a1::kQK);
+    const char* why = a1::unsupported(nb_gu, (int) FF, blob, act);
+    if (!why && f.gu_type != 12) why = "gate/up is not Q4_K on this layer";
+    if (!why && f.d_type != 14 && f.d_type != 12) why = "down is neither Q6_K nor Q4_K on this layer";
+    if (!why && (size_t) nb_gu * a1::kQ4KBlock != f.gu_row) why = "gate/up row stride is not nb * 144";
+    if (!why && (size_t) nb_dn * (f.d_type == 14 ? a1::kQ6KBlock : a1::kQ4KBlock) != f.d_row) why = "down row stride mismatch";
+    if (!why && f.act_bytes != (size_t) nb_gu * a1::kQ8KBlock) why = "activation is not Q8_K for gate/up";
+    if (!why && f.h_bytes < (size_t) nb_dn * a1::kQ8KBlock) why = "hidden is not Q8_K for down";
+    if (why) { std::fprintf(stderr, "A1CHECK layer %d: refused: %s\n", layer, why); return false; }
+
+    uint8_t *dw = nullptr, *da = nullptr, *dh = nullptr; float *dg = nullptr, *du = nullptr, *dout = nullptr;
+    bool ok = false;
+    std::vector<float> g((size_t) FF), u((size_t) FF), ff((size_t) FF), out((size_t) N);
+    std::vector<uint8_t> hq(f.h_bytes);
+    KC(cudaMalloc((void**) &dw, f.bytes));
+    KC(cudaMalloc((void**) &da, f.act_bytes));
+    KC(cudaMalloc((void**) &dh, f.h_bytes));
+    KC(cudaMalloc((void**) &dg, sizeof(float) * (size_t) FF));
+    KC(cudaMalloc((void**) &du, sizeof(float) * (size_t) FF));
+    KC(cudaMalloc((void**) &dout, sizeof(float) * (size_t) N));
+    KC(cudaMemcpy(dw, blob, f.bytes, cudaMemcpyHostToDevice));
+    KC(cudaMemcpy(da, act, f.act_bytes, cudaMemcpyHostToDevice));
+
+    const int threads = 128, rpb = (threads / 32) * a1::kRowsPerWarp;
+    const int ggrid = ((int) FF + rpb - 1) / rpb, dgrid = ((int) N + rpb - 1) / rpb;
+    a1::kq_a1_dot_rows<<<ggrid, threads>>>(dw, da, nb_gu, (int) FF, dg);                 // gate
+    a1::kq_a1_dot_rows<<<ggrid, threads>>>(dw + f.up_off, da, nb_gu, (int) FF, du);      // up
+    if (cudaDeviceSynchronize() != cudaSuccess || cudaGetLastError() != cudaSuccess) return false;
+    KC(cudaMemcpy(g.data(), dg, sizeof(float) * (size_t) FF, cudaMemcpyDeviceToHost));
+    KC(cudaMemcpy(u.data(), du, sizeof(float) * (size_t) FF, cudaMemcpyDeviceToHost));
+    // the CPU's own expression, character for character (native_expert.cpp: the x512_one branch)
+    for (int64_t r = 0; r < FF; ++r) ff[(size_t) r] = (g[(size_t) r] / (1.f + std::exp(-g[(size_t) r]))) * u[(size_t) r];
+
+    int64_t ff_bad = 0;
+    for (int64_t r = 0; r < FF; ++r) if (std::memcmp(&ff[(size_t) r], &pool_ff[r], 4) != 0) ++ff_bad;
+
+    strata::kernels::cpu::native_quant_h(f, ff.data(), hq.data());
+    KC(cudaMemcpy(dh, hq.data(), f.h_bytes, cudaMemcpyHostToDevice));
+    if (f.d_type == 14) a1::kq_a1_dot_rows_q6k<<<dgrid, threads>>>(dw + f.down_off, dh, nb_dn, (int) N, dout);
+    else                a1::kq_a1_dot_rows<<<dgrid, threads>>>(dw + f.down_off, dh, nb_dn, (int) N, dout);
+    if (cudaDeviceSynchronize() != cudaSuccess || cudaGetLastError() != cudaSuccess) return false;
+    KC(cudaMemcpy(out.data(), dout, sizeof(float) * (size_t) N, cudaMemcpyDeviceToHost));
+    int64_t ey_bad = 0;
+    for (int64_t r = 0; r < N; ++r) if (std::memcmp(&out[(size_t) r], &pool_ey[r], 4) != 0) ++ey_bad;
+
+    std::fprintf(stderr, "A1CHECK layer %d: hidden (gate/up + SwiGLU) %lld/%lld bit-identical; row (down) %lld/%lld bit-identical%s\n",
+                 layer, (long long) (FF - ff_bad), (long long) FF, (long long) (N - ey_bad), (long long) N,
+                 (ff_bad == 0 && ey_bad == 0) ? " -> PASS" : " -> FAIL");
+    ok = (ff_bad == 0 && ey_bad == 0);
+    cudaFree(dw); cudaFree(da); cudaFree(dh); cudaFree(dg); cudaFree(du); cudaFree(dout);
+    return ok;
+}
+
+// A1 arm (STRATA_KOLIBRI_EXPERT_GPU=1): the same three stages for every selection of the layer-chunk, with the
+// touched experts staged to the device once. Unset, none of this runs. A layer this cannot serve is REFUSED, never
+// quietly handed back to the pool: a silent fallback would make an A/B measure nothing.
+static void a1_run_selections(const LayerBlobs& b, Scratch& s, ActSet& A, int NKc, int K, int64_t FF, int64_t N,
+                              int layer, int n_expert) {
+    namespace a1 = strata::kolibri::a1;
+    const auto& f = b.fmt;
+    const int nb_gu = (int) (f.n_embd / a1::kQK), nb_dn = (int) (f.n_ff / a1::kQK);
+    const char* why = a1::unsupported(nb_gu, (int) FF, b.table, A.ey_h);
+    if (!why && f.gu_type != 12) why = "gate/up is not Q4_K";
+    if (!why && f.d_type != 14 && f.d_type != 12) why = "down is neither Q6_K nor Q4_K";
+    if (!why && (size_t) nb_gu * a1::kQ4KBlock != f.gu_row) why = "gate/up row stride is not nb * 144";
+    if (!why && (size_t) nb_dn * (f.d_type == 14 ? a1::kQ6KBlock : a1::kQ4KBlock) != f.d_row) why = "down row stride mismatch";
+    if (!why && f.act_bytes != (size_t) nb_gu * a1::kQ8KBlock) why = "activation is not Q8_K for gate/up";
+    if (!why && f.h_bytes < (size_t) nb_dn * a1::kQ8KBlock) why = "hidden is not Q8_K for down";
+    if (why) {
+        std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_EXPERT_GPU refused on layer %d: %s\n", layer, why);
+        std::fflush(stderr);
+        std::exit(2);
+    }
+
+    std::vector<int> slot((size_t) n_expert, -1);
+    int n_slot = 0;
+    for (int sel = 0; sel < NKc; ++sel) {
+        const int id = A.ids_h[(size_t) sel];
+        if (slot[(size_t) id] < 0) slot[(size_t) id] = n_slot++;
+    }
+    uint8_t* dblob = nullptr; uint8_t* dact = nullptr; uint8_t* dh = nullptr;
+    float *dg = nullptr, *du = nullptr, *dout = nullptr;
+    KC(cudaMalloc((void**) &dblob, (size_t) n_slot * b.stride));
+    KC(cudaMalloc((void**) &dact, f.act_bytes));
+    KC(cudaMalloc((void**) &dh, f.h_bytes));
+    KC(cudaMalloc((void**) &dg, sizeof(float) * (size_t) FF));
+    KC(cudaMalloc((void**) &du, sizeof(float) * (size_t) FF));
+    KC(cudaMalloc((void**) &dout, sizeof(float) * (size_t) N));
+    std::vector<int> staged((size_t) n_slot, 0);
+    std::vector<float> g((size_t) FF), u((size_t) FF), ff((size_t) FF), out((size_t) N);
+    std::vector<uint8_t> hq(f.h_bytes);
+
+    const int threads = 128, rpb = (threads / 32) * a1::kRowsPerWarp;
+    const int ggrid = ((int) FF + rpb - 1) / rpb, dgrid = ((int) N + rpb - 1) / rpb;
+    for (int sel = 0; sel < NKc; ++sel) {
+        const int id = A.ids_h[(size_t) sel];
+        const int sl = slot[(size_t) id];
+        if (!staged[(size_t) sl]) {
+            KC(cudaMemcpy(dblob + (size_t) sl * b.stride, b.table + (size_t) id * b.stride, b.stride,
+                          cudaMemcpyHostToDevice));
+            staged[(size_t) sl] = 1;
+        }
+        const uint8_t* blob = dblob + (size_t) sl * b.stride;
+        KC(cudaMemcpy(dact, s.act_cur + (size_t) (sel / K) * f.act_bytes, f.act_bytes, cudaMemcpyHostToDevice));
+        a1::kq_a1_dot_rows<<<ggrid, threads>>>(blob, dact, nb_gu, (int) FF, dg);
+        a1::kq_a1_dot_rows<<<ggrid, threads>>>(blob + f.up_off, dact, nb_gu, (int) FF, du);
+        KC(cudaDeviceSynchronize());
+        KC(cudaMemcpy(g.data(), dg, sizeof(float) * (size_t) FF, cudaMemcpyDeviceToHost));
+        KC(cudaMemcpy(u.data(), du, sizeof(float) * (size_t) FF, cudaMemcpyDeviceToHost));
+        for (int64_t r = 0; r < FF; ++r)
+            ff[(size_t) r] = (g[(size_t) r] / (1.f + std::exp(-g[(size_t) r]))) * u[(size_t) r];   // the CPU expression
+        strata::kernels::cpu::native_quant_h(f, ff.data(), hq.data());
+        KC(cudaMemcpy(dh, hq.data(), f.h_bytes, cudaMemcpyHostToDevice));
+        if (f.d_type == 14) a1::kq_a1_dot_rows_q6k<<<dgrid, threads>>>(blob + f.down_off, dh, nb_dn, (int) N, dout);
+        else                a1::kq_a1_dot_rows<<<dgrid, threads>>>(blob + f.down_off, dh, nb_dn, (int) N, dout);
+        KC(cudaDeviceSynchronize());
+        KC(cudaMemcpy(A.ey_h + (size_t) sel * N, dout, sizeof(float) * (size_t) N, cudaMemcpyDeviceToHost));
+    }
+    cudaFree(dblob); cudaFree(dact); cudaFree(dh); cudaFree(dg); cudaFree(du); cudaFree(dout);
+}
+
 /// Chunked prompt processing (--prefill): T rows at once.  Dense projections run as GEMMs (FP16 activations, the
 /// weights dequantized to FP16 in the Gemm scratch - what llama.cpp's batched CUDA path does), the attention
 /// scores and P.V as batched FP16 GEMMs with the causal (and window) softmax in between, the routed experts as
@@ -3883,6 +4012,10 @@ static const int grp_max = [] {
                 }
 #endif
                 if (!mmq_did) e.pool.run([&](int shard) {
+                    if (env_on("STRATA_KOLIBRI_EXPERT_GPU")) {   // A1: the expert products on the GPU, same three stages
+                        if (shard == 0) a1_run_selections(b, s, A, NKc, K, FF, N, (int) l, (int) e.g.n_expert);
+                        return;
+                    }
                     const auto sh_t0 = std::chrono::steady_clock::now();
                     const void* acts[64]; float* ffs[64]; const void* hqs[64]; float* eys[64];
                     for (size_t xi = (size_t) shard; xi < pool_list.size(); xi += (size_t) NS) {
@@ -3911,6 +4044,15 @@ static const int grp_max = [] {
                             const auto tC = std::chrono::steady_clock::now();
                             strata::kernels::cpu::native_down_rows(b.fmt, blob, hqs, mm, eys, 0, N);
                             const auto tD = std::chrono::steady_clock::now();
+                            if (std::getenv("STRATA_KOLIBRI_A1_CHECK") != nullptr && shard == 0 && lo + a == 0) {
+                                static bool checked = false;
+                                if (!checked) {
+                                    checked = true;
+                                    const bool good = a1_check_row(b.fmt, blob, acts[a], ffs[a], eys[a], N, FF, K, (int) l);
+                                    KC(cudaGetLastError());
+                                    std::exit(good ? 0 : 1);
+                                }
+                            }
                             if (e.counters) e.pf_rows += mm;   // the pool's real work: one row = gate/up + down over N
                             e.pf_gu_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(tB - tA).count();
                             e.pf_qh_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(tC - tB).count();

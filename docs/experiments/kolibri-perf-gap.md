@@ -688,6 +688,46 @@ in the timing.
 The GPU was freed for this work (server stopped: 0 MiB used, port 8095 closed); the default path still references
 none of these kernels, so it remains byte-identical by construction.
 
+### A1 arm — wired, bit-identical, and 2x SLOWER (negative speed result)
+
+The arm exists: `STRATA_KOLIBRI_EXPERT_GPU=1` sends the layer-chunk's expert products to the GPU through the same
+three stages, and an unsupported layer is **refused with exit 2**, never handed back to the pool silently. Unset,
+none of it runs.
+
+**Correctness — passed.** Full logits, nine forced records of 128,000 values, compared byte for byte:
+
+| history | arm off | arm on | preserved `5bbe6c4e` |
+|---|---|---|---|
+| 16 | `6d1f4fd7a3475209` | `6d1f4fd7a3475209` | identical |
+| 512 | `8628012b934ed4e4` | `8628012b934ed4e4` | `8628012b934ed4e4` |
+| de512 | `cf530c2c47539ba3` | `cf530c2c47539ba3` | identical |
+| code512 | `a7e79144d452209d` | `a7e79144d452209d` | identical |
+| 8191, 11000 | running | running | — |
+
+The arm-off path is unchanged: its dump equals the preserved control's, so the new code cannot have moved the
+default path.
+
+An intermediate check also passed on real data before the arm was wired: at layer 2 the hidden rows were 512/512
+and the down row 2560/2560 bit-identical to what `native_gu_rows`/`native_down_rows` produced.
+
+**Speed — failed.** 511 tokens of prefill:
+
+| arm | prefill | rate |
+|---|---|---|
+| off (CPU pool) | 7.989 s | 64.0 tok/s |
+| on (GPU expert products) | **16.164 s** | **31.6 tok/s** |
+
+2.02x slower. The cause is the shape, not the arithmetic: this arm runs one selection at a time (3 launches, 2
+synchronisations and ~16 KB of traffic each, roughly 1,533 times per layer-chunk). The per-block kernel is a
+per-lane integer loop, correct but narrow — it reaches ~68 million dots/s in the microbenchmark, while a
+chunk-layer needs ~5.5 million dots on top of that traffic. Batching the selections into one launch per stage
+would remove most of the synchronisation, but a *competitive* version needs a tiled gemm-shaped kernel, which is a
+separate project (the parked native track measured 1.2-1.7x over the FP16 GEMM for one such shape at 1-4 rows per
+expert, and lost 1.23x at 32).
+
+**Verdict:** A1 is arithmetically solved and performance-rejected for now. It stays off; nothing is promoted. This
+is the negative result the plan said would end the arm if it did not beat 8.0 s per chunk.
+
 ### What would make me stop early
 
 If 2a shows no gain at 8k-110k, or 2b's byte saving does not move prefill or decode measurably, the lever is dropped as
