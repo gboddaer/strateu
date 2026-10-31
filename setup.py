@@ -846,6 +846,88 @@ def say(msg=""):
     print(msg, flush=True)
 
 
+def _gpu_numa_node(root: str = "/sys") -> int | None:
+    """Resolve an unambiguous single NVIDIA GPU to its Linux NUMA node; otherwise return None."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=pci.bus_id", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=10).stdout.split()
+        # A setup-wide prefix cannot describe engines assigned to different GPU nodes.
+        if len(out) != 1:
+            return None
+        bus = out[0].strip().lower()
+        if len(bus) > 12:                      # 00000000:82:00.0 -> 0000:82:00.0 (sysfs spells the domain in 4 hex digits)
+            bus = bus[4:]
+        n = int(Path(root, "bus", "pci", "devices", bus, "numa_node").read_text().strip())
+        return n if n >= 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def expert_worker_count(root: str = "/sys", *, nvidia: bool = True) -> int:
+    """Use the single GPU's node-local physical cores for Kolibri's CPU pool, capped at 24.
+
+    On single-node machines, ambiguous multi-GPU systems or unreadable topology, retain
+    the previous min(24, logical CPUs) rule. Memory placement is handled separately.
+    """
+    cap = min(24, os.cpu_count() or 8)
+    if not nvidia:
+        return cap
+    try:
+        nodes = sorted(glob.glob(os.path.join(root, "devices", "system", "node", "node[0-9]*")))
+        if len(nodes) < 2:
+            return cap
+        node = _gpu_numa_node(root)
+        if node is None:
+            return cap
+        cpus: list[int] = []
+        # Node IDs need not be dense or lexicographically ordered.
+        for part in Path(root, "devices", "system", "node", f"node{node}", "cpulist").read_text().strip().split(","):
+            if "-" in part:
+                a, b = part.split("-")
+                cpus += list(range(int(a), int(b) + 1))
+            elif part:
+                cpus.append(int(part))
+        seen, physical = set(), 0
+        for c in cpus:
+            topo = Path(root, "devices", "system", "cpu", f"cpu{c}", "topology")
+            key = (topo.joinpath("physical_package_id").read_text().strip(),
+                   topo.joinpath("core_id").read_text().strip())
+            if key in seen:
+                continue
+            seen.add(key)
+            physical += 1
+        return min(physical, cap) or cap
+    except (OSError, ValueError, IndexError):
+        return cap
+
+
+def expert_numa_prefix(root: str = "/sys", numactl: str | None = None, *, nvidia: bool = True) -> list[str]:
+    """Bind a single GPU's engine CPU/memory allocations to its NUMA node when known.
+
+    Require multiple NUMA nodes and numactl. Unsupported or ambiguous topology returns
+    no prefix. numactl execs the engine, preserving its PID and signal handling.
+    """
+    if WIN or not nvidia:
+        return []
+    exe = numactl if numactl is not None else shutil.which("numactl")
+    if not exe:
+        return []
+    try:
+        nodes = sorted(glob.glob(os.path.join(root, "devices", "system", "node", "node[0-9]*")))
+        if len(nodes) < 2:
+            return []
+        node = _gpu_numa_node(root)
+        if node is None or not Path(root, "devices", "system", "node", f"node{node}", "cpulist").read_text().strip():
+            return []
+        prefix = [exe, f"--cpunodebind={node}", f"--membind={node}"]
+        # Containers may expose topology and numactl while denying memory-policy changes.
+        probe = subprocess.run([*prefix, sys.executable, "-S", "-c", ""],
+                               capture_output=True, timeout=5)
+        return prefix if probe.returncode == 0 else []
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return []
+
+
 def step(n, title):
     say()
     say(f"=== Step {n}: {title} ===")
@@ -7975,7 +8057,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         # restarts.  --prefill with the CPU pool's threads is the prefill path; without it the engine reads a prompt
         # one token at a time (measured: 55 tok/s against 154-159 with these flags on a Tesla T4, findings-log 0.7).
         args = ["--model", str(gguf), "--ctx", str(ctx),
-                "--prefill", "--cpu-threads", str(min(24, os.cpu_count() or 8)),
+                "--prefill", "--cpu-threads", str(expert_worker_count(nvidia=not (hip or amd))),
                 "--expert-slots", "auto", "--expert-slots-hot",
                 "--expert-slots-profile", str(data / f"hot-{tag.lower()}.prof"),
                 "--vram-reserve-mib", str(a.vram_reserve_mib if a.vram_reserve_mib is not None else 1024)]
@@ -7990,6 +8072,11 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
            "tokenizer": str(pack / "tokenizer"),
            "model_name": f"{fam['name']}-{model.lower()}", "arch": fam["arch"],
            "log": str(home() / f"strata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
+    if fam.get("binary"):                          # Kolibri: its CPU pool reads a 42.9 GiB pinned expert table
+        numa_prefix = expert_numa_prefix(nvidia=not (hip or amd))
+        if numa_prefix:
+            cfg["launch_prefix"] = numa_prefix
+            ok(f"Engine launch will bind CPU and memory to NUMA node {numa_prefix[-2].split('=')[-1]}")
     if cuda_tk == 12:
         cfg["cuda"] = 12
     if hip:
