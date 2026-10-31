@@ -762,6 +762,43 @@ prompt went through the HTTP server as its first request (11,149 tokens in 199.5
 server path — first-request warm-up (CUDA module load, cuBLAS handle, allocator growth) or the server's own prompt
 handling — which this campaign did **not** measure. Recorded as an open, named gap rather than a guess.
 
+### Decomposition completed — dense legs measured, and what stays unattributed
+
+`STRATA_KOLIBRI_ATTN_PHASES=1` on the 511-token prefill gives per (chunk, layer) milliseconds, so the split below is
+measured, not inferred (`a1-oracle/phases.err`). Summed over the 100 chunk-layers it reproduces the 7.99 s run.
+
+| Kolibri prefill leg | per chunk-layer | total | share |
+|---|---:|---:|---:|
+| **CPU pool (expert products)** | 67.0 ms | 6.70 s | **84 %** |
+| expert bookkeeping (routing, staging) | 10.9 ms | 1.09 s | 14 % |
+| dense (norms, projections at chunk scale) | 2.4 ms | 0.24 s | 3 % |
+| attention | 1.6 ms | 0.16 s | 2 % |
+| shared expert | 0.4 ms | 0.04 s | <1 % |
+| post / tail | 1.5 / 0.0 ms | 0.15 s / 0 | 2 % |
+
+The pool's own split is **gate/up 61 %, down 39 %**, at 181 GFLOP/s (80 % of the 226 GFLOP/s roof) with 0.2 MB of
+weights streamed per row.
+
+**Qwen, from its own log** (`kolibri-perf0/qwen_d_r1.out`, same day, same card, no drafter: 0 of 127 drafts
+accepted): prefill **511 tokens in 2,670.0 ms = 191.38 tok/s**, time to first token 3,923.5 ms; **6.43 distinct
+experts and 6.61 routed per layer**; per verify round its CPU pool spends **gate/up 34.171 ms, down 22.750 ms,
+quantize 0.428 ms** and moves **19.8 GB/s** over the rows phases; 1.97 distinct experts per layer come over PCIe,
+2333 experts were moved into the VRAM tier.
+
+**Batch utilisation.** Kolibri routes 1,533 rows per chunk-layer over 117 experts = **13.1 rows per expert**;
+Qwen routes 6.61 per layer at one token per decode round, so **~1 row per expert** — yet it is the faster one at
+prefill, which confirms the gap is placement, not batch shape.
+
+**KV bytes.** Kolibri writes one row per layer per token: 2 x 4 kv heads x 128 dims x 2 B = 2,048 B, over 50 layers
+= **100 KB per token** (~10 MiB/s at 100 tok/s); its 14,336-context cache measured 320.078 MiB, consistent with 10
+full-attention layers at 28.0 MiB plus 40 sliding layers at 1.0 MiB. **Qwen's per-token KV bytes are NOT measured
+here**: its config records `--kv int8` and `--kv-resident 32768`, but neither its geometry nor a KV counter was
+extracted, so this cell is **unattributed** rather than estimated. The instrumentation it needs is a KV-bytes
+counter (or a `--dump-kv` equivalent) on the Qwen path.
+
+**Still unattributed, and named:** Qwen's prefill *dense-vs-expert* split (its phase counters cover decode rounds
+only), and Kolibri's decode-side dense legs beyond the pool (the pool dominates at 14.25 ms/token, measured).
+
 ### What would make me stop early
 
 If 2a shows no gain at 8k-110k, or 2b's byte saving does not move prefill or decode measurably, the lever is dropped as
