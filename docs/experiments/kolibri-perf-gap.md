@@ -313,12 +313,17 @@ On this box the rule returns **14** (the node's physical cores). Measured, singl
 So the shipped value is at least as good as the one I had measured, and the gain is the prefill half of the free win:
 **+25-30 % prefill** against the 10,398 ms the old rule produced here (8 workers, two nodes).
 
-**Still open, and not shippable by a flag: the memory binding.** Phase 1c measured that the engine's own
+**The memory binding, delivered (Phase 1e, and shipped in the same PR).** Phase 1c measured that the engine's own
 `--pool-cores`/`STRATA_NUMA_POOL` knobs reproduce *none* of the decode half (23.2 ms/token against 12.9 with
-`numactl`), because it is `--membind` — the pinned 42.9 GiB expert table's placement — that matters. Delivering it needs
-either a launcher prefix (`numactl --cpunodebind=N --membind=N`, with a fallback when `numactl` is absent) or an
-engine-side `mbind`/`set_mempolicy`, which is a change in the pool's allocation path. Both keep the arithmetic
-identical, so neither needs qualification; neither is in this change.
+`numactl`), because it is `--membind` — the pinned 42.9 GiB expert table's placement — that matters. It is now a
+launcher prefix: `setup.py` writes `launch_prefix`, `serve/server.py` puts it in front of the engine, and every
+construction path carries it. It keeps the arithmetic identical, so it needs no qualification.
+
+One correction of record: the first revision of that PR passed the prefix to the replica and split paths but **not**
+to the single-engine path — the one a one-GPU machine actually uses — so the binding was silently absent there. It
+was found by running a real server and reading the engine's `/proc/<pid>/numa_maps`, fixed, and pushed as
+`f9c73a6b` on branch `fix/kolibri-numa-launch`, with a regression test that fails without the keyword
+(`test_every_engine_construction_passes_the_launch_prefix`, red before, green after).
 
 ### Phase 1c — what the free win actually requires (for the product change)
 
