@@ -19,6 +19,19 @@ INSTALL_PS1 = ROOT / "packaging" / "install.ps1"
 POWERSHELL = shutil.which("powershell") if os.name == "nt" else None
 
 
+def ps_child_env():
+    """The environment for a Windows PowerShell child.
+
+    GitHub Actions sets PSModulePath to point at PowerShell 7 folders, and under that inheritance Windows
+    PowerShell 5.1 cannot autoload further in-box cmdlets (on the runner Get-FileHash was 'not recognized'
+    while engine-start modules kept working). With the variable absent the child rebuilds its default module
+    path, the same shape the installer meets on a user's desktop. Same recipe as apps/host assert-private.
+    """
+    env = dict(os.environ)
+    env.pop("PSModulePath", None)
+    return env
+
+
 class ReplayedFeedWords(test_updater.UpdaterCase):
     def test_the_refusal_gives_both_numbers_the_folder_and_one_next_step(self):
         self.publish(("0.1.46", test_updater.fx.GOOD_ENGINE), sequence=108)
@@ -62,10 +75,11 @@ class WindowsInstaller(unittest.TestCase):
                           "  Write-Host ($_.Exception | Format-List -Force | Out-String)\n"
                           "  Write-Host ($_.ScriptStackTrace | Out-String)\n"
                           "  Write-Host (\"PS \" + $PSVersionTable.PSVersion.ToString())\n"
+                          "  Write-Host (\"PSModulePath \" + $env:PSModulePath)\n"
                           "}\n",
                           encoding="utf-8-sig")
         done = subprocess.run([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(runner)], capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", timeout=300)
+                              encoding="utf-8", errors="replace", timeout=300, env=ps_child_env())
         return done.stdout + done.stderr
 
     def test_a_folder_with_accented_letters_is_unpacked(self):
