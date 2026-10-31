@@ -508,6 +508,22 @@ class RunTests(StandardBase):
         self.assertEqual(doc["run"]["status"], "complete")
         self.assertLess(time.monotonic() - started, 30)
 
+    def test_a_socket_timeout_still_counts_as_a_timeout_when_the_timer_thread_is_not_first(self):
+        # The client watches the deadline twice: the timer thread sets the flag and the connection's own
+        # socket timeout raises TimeoutError. On a loaded runner the socket can raise before the timer
+        # thread has set the flag, and the run must still call that a timeout, not a connection error.
+        self.server.script["performance-short-r1"] = {"hang": 3}
+        stopped = ["start", "cancel"]
+        class StoppedTimer:
+            def __init__(self, *args, **kwargs): pass
+            def start(self): pass
+            def cancel(self): pass
+        with mock.patch.object(bs.threading, "Timer", StoppedTimer):
+            doc, _ = self.run_standard(timeout_s=0.6)
+        record = self.record(doc, "performance-short-r1")
+        self.assertEqual((record["status"], record["error"]["kind"]), ("failed", "timeout"))
+        self.assertEqual(doc["run"]["status"], "complete")
+
     def test_a_stream_without_done_or_finish_reason_is_a_failure(self):
         self.server.script["performance-short-r1"] = {"no_done": True}
         self.server.script["performance-short-r2"] = {"finish": None}
