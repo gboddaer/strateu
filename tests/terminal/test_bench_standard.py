@@ -43,6 +43,7 @@ class MockStrata:
         self.active = 0
         self.max_active = 0
         self.dead = False
+        self.errors: list[str] = []
         self.lock = threading.Lock()
         self.requests_before = 0
         self.gpu_name = "Mock GPU 12 GB"
@@ -89,6 +90,9 @@ class MockStrata:
                     owner.max_active = max(owner.max_active, owner.active)
                 try:
                     self.respond(rid, body)
+                except Exception as exc:               # a crashed handler ends the connection without a reason
+                    owner.errors.append(f"{rid}: {type(exc).__name__}: {exc}")
+                    raise
                 finally:
                     with owner.lock:
                         owner.active -= 1
@@ -504,6 +508,22 @@ class RunTests(StandardBase):
         self.assertEqual(doc["run"]["status"], "complete")
         self.assertLess(time.monotonic() - started, 30)
 
+    def test_a_socket_timeout_still_counts_as_a_timeout_when_the_timer_thread_is_not_first(self):
+        # The client watches the deadline twice: the timer thread sets the flag and the connection's own
+        # socket timeout raises TimeoutError. On a loaded runner the socket can raise before the timer
+        # thread has set the flag, and the run must still call that a timeout, not a connection error.
+        self.server.script["performance-short-r1"] = {"hang": 3}
+        stopped = ["start", "cancel"]
+        class StoppedTimer:
+            def __init__(self, *args, **kwargs): pass
+            def start(self): pass
+            def cancel(self): pass
+        with mock.patch.object(bs.threading, "Timer", StoppedTimer):
+            doc, _ = self.run_standard(timeout_s=0.6)
+        record = self.record(doc, "performance-short-r1")
+        self.assertEqual((record["status"], record["error"]["kind"]), ("failed", "timeout"))
+        self.assertEqual(doc["run"]["status"], "complete")
+
     def test_a_stream_without_done_or_finish_reason_is_a_failure(self):
         self.server.script["performance-short-r1"] = {"no_done": True}
         self.server.script["performance-short-r2"] = {"finish": None}
@@ -690,6 +710,13 @@ class RunTests(StandardBase):
     def test_a_round_total_is_null_when_a_counted_request_has_no_token_count(self):
         self.server.script["concurrency-r2-c3"] = {"usage": False}
         doc, _ = self.run_standard(optional_concurrency=True)
+        failed = [(r["id"], (r["error"] or {}).get("kind")) for r in doc["requests"] if r["status"] == "failed"]
+        self.assertEqual(failed, [],
+                         f"unexpected failed requests (they cost the round its token counts); "
+                         f"server errors {self.server.errors}")
+        self.assertEqual(doc["run"]["status"], "complete",
+                         f"the run did not complete; reasons {doc['extensions']['status_reasons']}; "
+                         f"failed requests {failed}; server errors {self.server.errors}")
         second = doc["concurrency_rounds"][1]
         self.assertIsNone(second["output_tokens"])
         self.assertIsNone(second["aggregate_tps"])

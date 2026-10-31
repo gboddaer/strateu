@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # Keep security updates enabled without introducing routine version-update PRs.
+  # Their titles must satisfy the same required area-prefix check as human PRs.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: "[Other] build(deps)"
+  - package-ecosystem: npm
+    directory: /apps/host
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: "[Other] build(deps)"
+  - package-ecosystem: cargo
+    directory: /apps/desktop/src-tauri
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: "[Other] build(deps)"

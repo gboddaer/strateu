@@ -82,6 +82,13 @@ async function probeStrata(baseUrl) {
 }
 
 export async function detectBackend({ force = false } = {}) {
+  // Explicit development/demo tests must not adopt a person's running inference service.
+  // Packaged builds still require a real engine, regardless of this development-only flag.
+  if (process.env.STRATA_FORCE_DEMO === '1' && process.env.STRATA_PACKAGED !== '1') {
+    backend = { kind: 'demo', name: 'Strata demo engine', baseUrl: null, models: [], binary: null, simulated: true };
+    checkedAt = Date.now();
+    return backend;
+  }
   // 1. Strata's own engine, always first: it is the product's inference path.
   const strata = await probeStrata(strataUrl());
   if (strata) {

@@ -336,11 +336,24 @@ class FolderStep(Base):
             self.assertIn("Not downloaded yet: about 90 GB", t)
             self.assertIn("Free space in that folder's drive", t)
             f = app.screen.query_one("#folderpath")
+            self.assertEqual(f.value, str(ctx.default_folder()))
+            custom = str(self.home.base / "custom-models")
             f.value = ""
-            await typed(pilot, str(self.home.base / "Strata-data"))
-            self.assertEqual(f.value, str(self.home.base / "Strata-data"))
+            await typed(pilot, custom)
+            self.assertEqual(f.value, custom)
             await press(pilot, "enter")
-            self.assertEqual(ctx.settings.data_dir, str(self.home.base / "Strata-data"))
+            self.assertEqual(ctx.settings.data_dir, custom)
+            self.assertIn("How much text should it remember at once?", text_of(app))
+        self.run_app(case)
+
+    def test_accepting_the_default_keeps_the_setting_implicit(self):
+        async def case(app, pilot, ctx):
+            await press(pilot, "enter", "enter")
+            default = ctx.default_folder()
+            self.assertEqual(app.screen.query_one("#folderpath").value, str(default))
+            await press(pilot, "enter")
+            self.assertIsNone(ctx.settings.data_dir)
+            self.assertEqual(ctx.default_folder(), default)
             self.assertIn("How much text should it remember at once?", text_of(app))
         self.run_app(case)
 

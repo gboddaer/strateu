@@ -217,9 +217,12 @@ class HipPackageLibraryPath(unittest.TestCase):
     def test_rocm_bin_comes_after_the_package_folder(self):
         folder = self.package({"lib_dirs": ["rocm/bin"]})
         self.assertEqual(dsv41_engine.lib_dirs(folder / EXE), [str(folder), str(folder / "rocm" / "bin")])
-        env = dsv41_engine.start_env(folder / EXE, {"PATH": "C:\\Windows"})
-        first = env["PATH"].split(os.pathsep)[:2]
-        self.assertEqual(first, [str(folder), str(folder / "rocm" / "bin")])
+        # start_env prepares the host's loader path: PATH on Windows, LD_LIBRARY_PATH on Linux.
+        previous = os.pathsep.join(["existing-a", "existing-b"])
+        env = dsv41_engine.start_env(folder / EXE, {dsv41_engine.LIB_VAR: previous, "KEEP": "untouched"})
+        self.assertEqual(env[dsv41_engine.LIB_VAR].split(os.pathsep),
+                         [str(folder), str(folder / "rocm" / "bin"), "existing-a", "existing-b"])
+        self.assertEqual(env["KEEP"], "untouched")
 
     def test_a_cuda_package_needs_only_its_folder(self):
         folder = self.package(None)

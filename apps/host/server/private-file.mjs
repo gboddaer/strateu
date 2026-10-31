@@ -16,11 +16,25 @@ export function currentUserSid() {
   return (userSid = match[0]);
 }
 
+function icacls(path, args) {
+  execFileSync(system32('icacls.exe'), [path, ...args], { stdio: 'ignore', timeout: 15000, windowsHide: true });
+}
+
 export function makePrivate(path, { platform = process.platform } = {}) {
   if (platform !== 'win32') { chmodSync(path, 0o600); return; }
-  // Grant first, then drop every inherited entry, so the file is never left without an owner entry.
-  execFileSync(system32('icacls.exe'), [path, '/grant:r', `*${currentUserSid()}:F`, '/inheritance:r'],
-    { stdio: 'ignore', timeout: 15000, windowsHide: true });
+  // Three fast calls, in this order.  In one call, /inheritance:r next to /grant:r left the
+  // inherited entries standing as explicit copies of SYSTEM and Administrators (a runner run's
+  // Get-Acl printed D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;LA)).  Split: reset to the parent's
+  // rules, strip every inherited entry (a protected, empty DACL for the moment), then give this
+  // user full control.  The end state is one full-control entry, the user's.
+  icacls(path, ['/reset']);
+  try {
+    icacls(path, ['/inheritance:r']);
+    icacls(path, ['/grant:r', `*${currentUserSid()}:F`]);
+  } catch (e) {
+    try { icacls(path, ['/reset']); } catch { /* leave the file as the reset put it */ }
+    throw e;
+  }
   // The owner too, so a file an elevated run made is not left owned by Administrators (needs the right to; best effort).
-  try { execFileSync(system32('icacls.exe'), [path, '/setowner', `*${currentUserSid()}`], { stdio: 'ignore', timeout: 15000, windowsHide: true }); } catch { /* the explicit entry above already opens it to the user */ }
+  try { icacls(path, ['/setowner', `*${currentUserSid()}`]); } catch { /* the DACL above already opens it to the user */ }
 }

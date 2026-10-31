@@ -3,7 +3,7 @@ name = "strata-desktop"
 version = "0.2.7"
 description = "Strata Desktop — local AI, tuned to one model."
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.90"
 license = "MIT"
 
 # Linux: the drop of a file on the window is read straight from the GTK drag signals (see hook_linux_drops in main.rs); the versions are the ones Tauri itself uses.
@@ -19,7 +19,8 @@ tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-shell = "2"
 # Desktop notifications for an approval that waits (#3477); the tray icon above is Tauri's own.
 tauri-plugin-notification = "2"
-tauri-plugin-updater = "2"
+# 2.14.1 moves the updater to zip 9, allowing the security fix blocked by zip 4.
+tauri-plugin-updater = "2.14.1"
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

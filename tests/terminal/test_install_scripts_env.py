@@ -16,7 +16,13 @@ class Text(unittest.TestCase):
         for name in ("README.md", "README.de.md", "docs/INSTALL.md", "docs/TERMINAL_LAUNCH.md"):
             text = (ROOT / name).read_text(encoding="utf-8")
             self.assertNotIn("install.sh | sh", text, name)                    # `curl ... | sh` runs nothing and exits 0 when curl fails
-            self.assertIn("install.sh -o install.sh && sh install.sh", text, name)
+            if name in ("README.md", "README.de.md"):
+                # The fork publishes source setup in these READMEs, not an upstream binary installer.
+                self.assertIn("https://github.com/gboddaer/strateu/archive/refs/heads/main.zip", text)
+                self.assertIn("START-HERE.bat", text)
+                self.assertIn("./setup.sh", text)
+            else:
+                self.assertIn("install.sh -o install.sh && sh install.sh", text, name)
 
     def setUp(self):
         self.ps1 = PS1.read_text(encoding="utf-8")

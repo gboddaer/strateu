@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { existsSync } from 'node:fs';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, realpathSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { bundledPython, componentsDirectory, controlEnvironment, createControl, findControl, runCli } from '../server/control-runtime.mjs';
@@ -89,7 +89,9 @@ test('runCli passes the arguments untouched (no shell) and reads JSON', async ()
 // ---------------------------------------------------------------------------------- native-control in packaged mode
 
 function packagedFixture({ engineUsable = true, updater = null, repair = false, ids = ['iq2_xs', 'iq3_s'] } = {}) {
-  const root = mkdtempSync(join(tmpdir(), 'strata-packaged-test-'));
+  // Resolved (realpathSync): the product resolves every path it stores, and on macOS /tmp is a
+  // symlink to /private/tmp, so a raw mkdtemp path would never compare equal to what Control reports.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'strata-packaged-test-')));
   const install = join(root, 'install'), data = join(root, 'data');
   mkdirSync(install, { recursive: true });
   const earlierInstallEnv = process.env.STRATA_INSTALL_DIR;
