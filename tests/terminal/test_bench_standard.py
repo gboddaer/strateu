@@ -711,6 +711,9 @@ class RunTests(StandardBase):
         self.server.script["concurrency-r2-c3"] = {"usage": False}
         doc, _ = self.run_standard(optional_concurrency=True)
         failed = [(r["id"], (r["error"] or {}).get("kind")) for r in doc["requests"] if r["status"] == "failed"]
+        self.assertEqual(failed, [],
+                         f"unexpected failed requests (they cost the round its token counts); "
+                         f"server errors {self.server.errors}")
         self.assertEqual(doc["run"]["status"], "complete",
                          f"the run did not complete; reasons {doc['extensions']['status_reasons']}; "
                          f"failed requests {failed}; server errors {self.server.errors}")
