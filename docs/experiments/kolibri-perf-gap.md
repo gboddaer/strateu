@@ -728,6 +728,40 @@ expert, and lost 1.23x at 32).
 **Verdict:** A1 is arithmetically solved and performance-rejected for now. It stays off; nothing is promoted. This
 is the negative result the plan said would end the arm if it did not beat 8.0 s per chunk.
 
+### A1 gates — all six histories bit-identical, state checks pass
+
+With `STRATA_KOLIBRI_EXPERT_GPU=1`, nine forced records of 128,000 logits per history, compared byte for byte with
+the arm off (and, where it exists, with the preserved control):
+
+| history | arm on | control | |
+|---|---|---|---|
+| 16 | `6d1f4fd7a3475209` | identical | pass |
+| 512 | `8628012b934ed4e4` | `8628012b934ed4e4` (preserved `5bbe6c4e`) | pass |
+| de512 | `cf530c2c47539ba3` | identical | pass |
+| code512 | `a7e79144d452209d` | identical | pass |
+| 8191 | `59d1b413d88e709f` | identical | pass |
+| 11000 | `f046946aed454eba` | identical | pass |
+
+State checks with the arm on: first use, replay (`equals_first_use`), a 576-id reuse request, cancellation (reason
+`cancel`), a clean request after cancellation and after a reset — **PASS** (`a1-oracle/state_a1.json`).
+
+Prefill cost of the arm at long context: 8,190 ids took 288.5 s against 115.8 s arm-off (2.49x), 10,999 ids 388 s
+against 155.4 s (2.5x). Consistent with the 2.02x measured at 511 ids.
+
+### The 160K server's prefill rate — its configuration is NOT the cause
+
+Same 10,999-id prompt, same binary, same 14 workers, one run each:
+
+| configuration | prefill | rate |
+|---|---|---|
+| context 14,336, expert cache off | 155.4 s | **70.8 tok/s** |
+| context 163,840, `--expert-slots auto` (73 slots/layer, 8,465 MiB) + NUMA binding | 157.5 s | **69.8 tok/s** |
+
+1.4 % apart. So neither the large context nor the expert cache explains the **56 tok/s** observed when the same
+prompt went through the HTTP server as its first request (11,149 tokens in 199.5 s). The difference must lie in the
+server path — first-request warm-up (CUDA module load, cuBLAS handle, allocator growth) or the server's own prompt
+handling — which this campaign did **not** measure. Recorded as an open, named gap rather than a guess.
+
 ### What would make me stop early
 
 If 2a shows no gain at 8k-110k, or 2b's byte saving does not move prefill or decode measurably, the lever is dropped as
