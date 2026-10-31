@@ -20,14 +20,14 @@ def fake_tree(root: Path, node_cpus: dict[int, list[int]], cores: list[tuple[int
         d.mkdir(parents=True)
         (d / "physical_package_id").write_text(f"{pkg}\n")
         (d / "core_id").write_text(f"{core}\n")
-    bus = "0000:82:00.0"
+    bus = "0000-82-00.0"
     d = root / "bus" / "pci" / "devices" / bus
     d.mkdir(parents=True)
     (d / "numa_node").write_text(("-1" if gpu_node is None else str(gpu_node)) + "\n")
 
 
 class ExpertWorkerCount(unittest.TestCase):
-    def count(self, root, smi="00000000:82:00.0\n", cpus=56):
+    def count(self, root, smi="00000000-82-00.0\n", cpus=56):
         with mock.patch.object(setup_mod.subprocess, "run",
                                return_value=mock.Mock(stdout=smi, returncode=0)), \
              mock.patch.object(setup_mod.os, "cpu_count", return_value=cpus):
@@ -82,7 +82,7 @@ class ExpertWorkerCount(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             fake_tree(root, {0: [0, 1], 1: [2, 3]}, [(0, 0), (0, 1), (1, 0), (1, 1)], gpu_node=1)
-            self.assertEqual(self.count(root, smi="00000000:82:00.0\n00000000:83:00.0\n", cpus=8), 8)
+            self.assertEqual(self.count(root, smi="00000000-82-00.0\n00000000-83-00.0\n", cpus=8), 8)
 
     def test_non_nvidia_setup_keeps_existing_count_without_probing(self):
         with mock.patch.object(setup_mod.os, "cpu_count", return_value=8), \
@@ -104,7 +104,7 @@ class NumaPrefix(unittest.TestCase):
     def prefix(self, root, numactl="/usr/bin/numactl", win=False):
         with mock.patch.object(setup_mod, "WIN", win), \
              mock.patch.object(setup_mod.subprocess, "run",
-                               return_value=mock.Mock(stdout="00000000:82:00.0\n", returncode=0)):
+                               return_value=mock.Mock(stdout="00000000-82-00.0\n", returncode=0)):
             return setup_mod.expert_numa_prefix(str(root), numactl=numactl)
 
     def test_two_nodes_binds_the_gpu_node(self):
@@ -148,7 +148,7 @@ class NumaPrefix(unittest.TestCase):
             root = Path(tmp)
             fake_tree(root, {0: [0, 1], 1: [2, 3]}, [(0, 0), (0, 1), (1, 0), (1, 1)], gpu_node=1)
             with mock.patch.object(setup_mod.subprocess, "run", return_value=mock.Mock(
-                    stdout="00000000:82:00.0\n00000000:83:00.0\n", returncode=0)):
+                    stdout="00000000-82-00.0\n00000000-83-00.0\n", returncode=0)):
                 self.assertEqual(setup_mod.expert_numa_prefix(str(root), numactl="/usr/bin/numactl"), [])
 
     def test_non_nvidia_setup_has_no_prefix(self):
@@ -160,7 +160,7 @@ class NumaPrefix(unittest.TestCase):
             root = Path(tmp)
             fake_tree(root, {0: [0, 1], 1: [2, 3]}, [(0, 0), (0, 1), (1, 0), (1, 1)], gpu_node=1)
             with mock.patch.object(setup_mod.subprocess, "run", side_effect=[
-                    mock.Mock(stdout="00000000:82:00.0\n", returncode=0), mock.Mock(returncode=1)]):
+                    mock.Mock(stdout="00000000-82-00.0\n", returncode=0), mock.Mock(returncode=1)]):
                 self.assertEqual(setup_mod.expert_numa_prefix(str(root), numactl="/usr/bin/numactl"), [])
 
     def test_binding_probe_timeout_has_no_prefix(self):
@@ -168,7 +168,7 @@ class NumaPrefix(unittest.TestCase):
             root = Path(tmp)
             fake_tree(root, {0: [0, 1], 1: [2, 3]}, [(0, 0), (0, 1), (1, 0), (1, 1)], gpu_node=1)
             with mock.patch.object(setup_mod.subprocess, "run", side_effect=[
-                    mock.Mock(stdout="00000000:82:00.0\n", returncode=0),
+                    mock.Mock(stdout="00000000-82-00.0\n", returncode=0),
                     setup_mod.subprocess.TimeoutExpired("numactl", 5)]):
                 self.assertEqual(setup_mod.expert_numa_prefix(str(root), numactl="/usr/bin/numactl"), [])
 
