@@ -21,6 +21,16 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+# A PowerShell 7 parent exports its own module folders in PSModulePath. In this Windows PowerShell 5.1 session
+# those PS7 modules are found first for further autoloads, their load fails here, and the in-box cmdlets the
+# installer needs next (Get-FileHash, Expand-Archive) resolve to nothing. Engine-start cmdlets still work, so
+# the failure looks like 'not recognized'. Restore the folders Windows keeps for Windows PowerShell.
+try {
+    if ($PSVersionTable.PSVersion.Major -lt 6 -and "$env:PSModulePath" -match 'powershell\\7\\') {
+        $env:PSModulePath = "$env:ProgramFiles\WindowsPowerShell\Modules;$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules"
+    }
+} catch { }
+
 function Die([string]$msg) { [Console]::Error.WriteLine("strata installer: $msg"); throw "strata installer stopped" }
 # older Windows 10 builds offer only TLS 1.0/1.1 to Windows PowerShell 5.1, and GitHub accepts only 1.2; a company proxy may want the Windows sign-in
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
