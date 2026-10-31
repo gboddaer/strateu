@@ -709,7 +709,16 @@ class RunTests(StandardBase):
 
     def test_a_round_total_is_null_when_a_counted_request_has_no_token_count(self):
         self.server.script["concurrency-r2-c3"] = {"usage": False}
-        doc, _ = self.run_standard(optional_concurrency=True)
+        raws: dict[str, dict] = {}
+        real = bs.stream_chat
+
+        def watched(target, spec, model, **kwargs):
+            raw = real(target, spec, model, **kwargs)
+            raws[spec["id"]] = raw
+            return raw
+
+        with mock.patch.object(bs, "stream_chat", watched):
+            doc, _ = self.run_standard(optional_concurrency=True)
         failed = [(r["id"], (r["error"] or {}).get("kind")) for r in doc["requests"] if r["status"] == "failed"]
         self.assertEqual(failed, [],
                          f"unexpected failed requests (they cost the round its token counts); "
@@ -720,7 +729,25 @@ class RunTests(StandardBase):
         second = doc["concurrency_rounds"][1]
         self.assertIsNone(second["output_tokens"])
         self.assertIsNone(second["aggregate_tps"])
-        self.assertIsNotNone(doc["concurrency_rounds"][0]["aggregate_tps"])
+        first = doc["concurrency_rounds"][0]
+
+        def client_view(rid: str) -> str:
+            raw = raws.get(rid)
+            if raw is None:
+                return f"{rid}: the client view was not captured"
+            events = ",".join(f"{o}:{k}" for o, k in raw["events"][:10])
+            return (f"{rid}: http {raw['http_status']}, done {raw['done']}, timed_out {raw['timed_out']}, "
+                    f"interrupted {raw['interrupted']}, finish {raw['finish_reason']}, error {raw['error']}, "
+                    f"usage {raw['usage']}, timings present {raw['timings'] is not None}, "
+                    f"events {events}"
+                    + (f" (+{len(raw['events']) - 10} more)" if len(raw["events"]) > 10 else ""))
+
+        round_ids = [r["id"] for r in doc["requests"] if r["phase"] == "concurrency" and r["round"] == 1]
+        self.assertIsNotNone(first["aggregate_tps"],
+                             f"round 1 (wall {first['wall_s']} s, output_tokens {first['output_tokens']}, "
+                             f"failed {first['failed']}) has no aggregate; "
+                             f"the server took {self.server.order[-12:]} with errors {self.server.errors}; "
+                             + "; ".join(client_view(rid) for rid in round_ids))
         self.assertEqual(bs.validate(doc), [])
 
     def test_the_plain_summary(self):
