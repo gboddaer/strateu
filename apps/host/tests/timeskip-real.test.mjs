@@ -61,14 +61,19 @@ test('a run starts without the caller waiting, shows its changed files, and appl
     const workspace = join(dir, 'work'); mkdirSync(workspace);
     writeFileSync(join(workspace, 'plan.md'), 'first draft\n');
     const script = join(dir, 'revise.mjs');
-    writeFileSync(script, "import { writeFileSync, appendFileSync } from 'node:fs'; await new Promise(r => setTimeout(r, 1500)); appendFileSync('plan.md', 'second line\\n'); writeFileSync('extra.md', process.env.STRATA_TIMESKIP_PROMPT);");
+    writeFileSync(script, "import { writeFileSync, appendFileSync } from 'node:fs'; await new Promise(r => setTimeout(r, 12000)); appendFileSync('plan.md', 'second line\\n'); writeFileSync('extra.md', process.env.STRATA_TIMESKIP_PROMPT);");
     const state = join(dir, 'state');
     const ts = createTimeSkip({ repoRoot: REPO, python: PYTHON, env: { ...process.env, STRATA_TIMESKIP_DIR: state } });
     const started = Date.now();
     const result = await ts.startDetached({ workspace, prompt: 'extend the plan', attempts: 1, reviseCommand: `"${process.execPath}" "${script}"` });
     assert.ok(result.ok, JSON.stringify(result));
-    assert.ok(Date.now() - started < 1400, 'the call returned while the revision was still running');
+    // Starting the job costs python and node starts, seconds on a loaded runner and far more than the old
+    // fixed 1400 ms bound assumed. What the name promises is the caller not waiting for the revision to
+    // end, so check it directly: the revision sleeps much longer than starting the job takes, so the run
+    // still reads as generating after the call returns.
+    assert.ok(Date.now() - started < 12000, 'the call took longer than starting the job should');
     const id = result.run.id;
+    assert.equal(ts.status(id).phase, 'generating', 'the call returned while the revision was still running');
     let run;
     for (let i = 0; i < 100; i++) { run = ts.status(id); if (['completed', 'failed'].includes(run.phase)) break; await sleep(300); }
     assert.equal(run.phase, 'completed', JSON.stringify(run));
