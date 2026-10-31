@@ -662,6 +662,32 @@ It also needs the card to itself: `a1-gates` and `a1-timing` cannot run while th
 So the remaining work is the 1-3 days estimated earlier for the arm, plus the two later tasks, and it should start
 with a quiet GPU.
 
+### A1 engine wiring — the hook, and why it is a three-stage leg
+
+The prefill expert call site is `pool_experts` / the per-shard `native_*` group. Reading
+`include/strata/kernels/cpu/native_expert.hpp` settles the shape:
+
+```
+native_gu_rows(f, blob, act, nt, ff, r0, r1);   // ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t])   <- SwiGLU INSIDE
+native_quant_h(f, ff[k], hqp);                  // hidden -> the down activation (Q8_K / Q8_0)
+native_down_rows(f, blob, hqs, nt, out, r0, r1); // out[t][r] = down_r . hq[t]
+```
+
+So the GPU leg is **three stages, with a CPU round trip in the middle**, not a kernel swap:
+
+1. GPU: `gate_r . a` and `up_r . a` for the FF rows (the A1 kernel, already bit-exact).
+2. CPU: `silu(g) * u` — this must stay on the CPU, because CUDA's `expf` differs from glibc's in 30 % of sampled
+   values (Phase 3g), so moving it would change the arithmetic; then `native_quant_h`, unchanged.
+3. GPU: `down_r . hq` for the N rows (the Q6_K/Q4_K kernel, already bit-exact).
+
+That also fixes the staging requirement: per layer-chunk the GPU needs the touched expert blobs (already staged for
+the grouped path) and the Q8_K activations, and the host needs FF floats per selection between stages 1 and 2 — for a
+512-token chunk that is roughly 1,533 selections x FF floats, which is small, but it is a real round trip and belongs
+in the timing.
+
+The GPU was freed for this work (server stopped: 0 MiB used, port 8095 closed); the default path still references
+none of these kernels, so it remains byte-identical by construction.
+
 ### What would make me stop early
 
 If 2a shows no gain at 8k-110k, or 2b's byte saving does not move prefill or decode measurably, the lever is dropped as
