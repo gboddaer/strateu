@@ -46,6 +46,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include "strata/prefill/gemm.hpp"
+#include "strata/prefill/hipblaslt_policy.hpp"   // why the prompt MMQ path is off (pure, tested on CPU)
 #include <cuda_fp16.h>
 
 #include <algorithm>
@@ -2911,15 +2912,19 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
     const int NK = T * K;
     // The uncalibrated rocBLAS -> hipBLASLt route corrupted shared gate/up outputs in this launch mix.
     // A compatible direct tuning entry is required; otherwise keep the CPU pool. No timing drains are needed.
-    [[maybe_unused]] const bool mmq_safe = pf_mmq_on() && !pf_pipe_on() &&
-        !env_on("STRATA_DENSE_MMQ") && !env_on("STRATA_PF_GEMM") && !env_on("STRATA_WMMA_GEMM") &&
-        e.gemm.f16_tuned(T, FS, N);
-    if (pf_mmq_on() && !mmq_safe) {
+    [[maybe_unused]] const char* mmq_block = pf_mmq_on()
+        ? strata::prefill::hipblaslt::mmq_block_reason(pf_pipe_on(), env_on("STRATA_DENSE_MMQ"),
+              env_on("STRATA_PF_GEMM"), env_on("STRATA_WMMA_GEMM"), e.gemm.f16_tuned(T, FS, N))
+        : nullptr;
+    [[maybe_unused]] const bool mmq_safe = mmq_block == nullptr;
+    if (mmq_block != nullptr) {
         static bool warned = false;
         if (!warned) {
-            std::fprintf(stderr, "strata-kolibri: MMQ falling back to the pool: requires compatible direct "
-                                 "hipBLASLt shared-expert tuning, PF_PIPE=0 and no experimental dense overrides. "
-                                 "See docs/AMD_R9700_PORT.md.\n");
+            // Name the reason that actually applied.  The old sentence listed PF_PIPE and the dense overrides
+            // even when the user had set neither, so a fallback caused by the tuning lookup read as a
+            // configuration the user never chose.
+            std::fprintf(stderr, "strata-kolibri: MMQ falling back to the pool: %s (T=%d, shared FF=%d, N=%d). "
+                                 "See docs/AMD_R9700_PORT.md.\n", mmq_block, T, FS, N);
             warned = true;
         }
     }
