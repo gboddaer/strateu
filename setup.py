@@ -847,11 +847,12 @@ def say(msg=""):
 
 
 def _gpu_numa_node(root: str = "/sys") -> int | None:
-    """The NUMA node of the first GPU, from the PCI device's sysfs entry; None when it cannot be read."""
+    """Resolve an unambiguous single NVIDIA GPU to its Linux NUMA node; otherwise return None."""
     try:
         out = subprocess.run(["nvidia-smi", "--query-gpu=pci.bus_id", "--format=csv,noheader"],
                              capture_output=True, text=True, timeout=10).stdout.split()
-        if not out:
+        # A setup-wide prefix cannot describe engines assigned to different GPU nodes.
+        if len(out) != 1:
             return None
         bus = out[0].strip().lower()
         if len(bus) > 12:                      # 00000000:82:00.0 -> 0000:82:00.0 (sysfs spells the domain in 4 hex digits)
@@ -862,27 +863,25 @@ def _gpu_numa_node(root: str = "/sys") -> int | None:
         return None
 
 
-def expert_worker_count(root: str = "/sys") -> int:
-    """Workers for Kolibri's CPU expert pool: the physical cores of the GPU's own NUMA node.
+def expert_worker_count(root: str = "/sys", *, nvidia: bool = True) -> int:
+    """Use the single GPU's node-local physical cores for Kolibri's CPU pool, capped at 24.
 
-    Measured on the T4 box (docs/experiments/kolibri-perf-gap.md, Phase 1): 8 workers with the pool split over two NUMA
-    nodes gave 10,398 ms for a 511-token prefill; 13 workers, one node's physical cores, gave 8,128 ms.  With the memory
-    bound to that node as well it was 7,922 ms and the decode expert work halved (24.0 -> 12.9 ms/token) - the memory
-    binding itself is the launcher's or the engine's job, not this function's.  Without any of it the engine sizes the
-    pool from every logical CPU and spreads it over both nodes, so half the workers read the 42.9 GiB pinned expert table
-    across the interconnect at about half the bandwidth.  Falls back to the old rule (min(24, logical CPUs)) whenever the
-    topology cannot be read, so a machine this cannot describe behaves exactly as before.
+    On single-node machines, ambiguous multi-GPU systems or unreadable topology, retain
+    the previous min(24, logical CPUs) rule. Memory placement is handled separately.
     """
     cap = min(24, os.cpu_count() or 8)
+    if not nvidia:
+        return cap
     try:
         nodes = sorted(glob.glob(os.path.join(root, "devices", "system", "node", "node[0-9]*")))
         if len(nodes) < 2:
             return cap
         node = _gpu_numa_node(root)
-        if node is None or node >= len(nodes):
+        if node is None:
             return cap
         cpus: list[int] = []
-        for part in Path(nodes[node], "cpulist").read_text().strip().split(","):
+        # Node IDs need not be dense or lexicographically ordered.
+        for part in Path(root, "devices", "system", "node", f"node{node}", "cpulist").read_text().strip().split(","):
             if "-" in part:
                 a, b = part.split("-")
                 cpus += list(range(int(a), int(b) + 1))
@@ -902,20 +901,13 @@ def expert_worker_count(root: str = "/sys") -> int:
         return cap
 
 
-def expert_numa_prefix(root: str = "/sys", numactl: str | None = None) -> list[str]:
-    """`numactl --cpunodebind=N --membind=N` for the GPU's NUMA node, or [] when it does not apply.
+def expert_numa_prefix(root: str = "/sys", numactl: str | None = None, *, nvidia: bool = True) -> list[str]:
+    """Bind a single GPU's engine CPU/memory allocations to its NUMA node when known.
 
-    Measured (docs/experiments/kolibri-perf-gap.md Phase 1/1c): with the pool's workers and the 42.9 GiB pinned expert
-    table spread over two NUMA nodes, Kolibri's decode expert leg costs 24.0 ms/token; bound to the GPU's node it costs
-    12.9.  Pinning the workers alone (the engine's own --pool-cores / STRATA_NUMA_POOL) reproduces none of that - it is
-    the *memory* binding that matters, because the table is then read locally instead of across the interconnect.
-
-    So setup writes this prefix when, and only when, it can help: two or more NUMA nodes, `numactl` installed, and the
-    GPU's node known.  Otherwise the list is empty and the engine is started exactly as before.  `numactl` execs the
-    program it wraps, so the engine keeps its pid and the server's lifecycle handling is untouched.  It changes no
-    arithmetic: the same kernel runs on the same values, only the memory it reads is placed locally.
+    Require multiple NUMA nodes and numactl. Unsupported or ambiguous topology returns
+    no prefix. numactl execs the engine, preserving its PID and signal handling.
     """
-    if WIN:
+    if WIN or not nvidia:
         return []
     exe = numactl if numactl is not None else shutil.which("numactl")
     if not exe:
@@ -925,10 +917,14 @@ def expert_numa_prefix(root: str = "/sys", numactl: str | None = None) -> list[s
         if len(nodes) < 2:
             return []
         node = _gpu_numa_node(root)
-        if node is None or node >= len(nodes):
+        if node is None or not Path(root, "devices", "system", "node", f"node{node}", "cpulist").read_text().strip():
             return []
-        return [exe, f"--cpunodebind={node}", f"--membind={node}"]
-    except (OSError, ValueError, IndexError):
+        prefix = [exe, f"--cpunodebind={node}", f"--membind={node}"]
+        # Containers may expose topology and numactl while denying memory-policy changes.
+        probe = subprocess.run([*prefix, sys.executable, "-S", "-c", ""],
+                               capture_output=True, timeout=5)
+        return prefix if probe.returncode == 0 else []
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         return []
 
 
@@ -8061,7 +8057,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         # restarts.  --prefill with the CPU pool's threads is the prefill path; without it the engine reads a prompt
         # one token at a time (measured: 55 tok/s against 154-159 with these flags on a Tesla T4, findings-log 0.7).
         args = ["--model", str(gguf), "--ctx", str(ctx),
-                "--prefill", "--cpu-threads", str(expert_worker_count()),
+                "--prefill", "--cpu-threads", str(expert_worker_count(nvidia=not (hip or amd))),
                 "--expert-slots", "auto", "--expert-slots-hot",
                 "--expert-slots-profile", str(data / f"hot-{tag.lower()}.prof"),
                 "--vram-reserve-mib", str(a.vram_reserve_mib if a.vram_reserve_mib is not None else 1024)]
@@ -8077,11 +8073,10 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
            "model_name": f"{fam['name']}-{model.lower()}", "arch": fam["arch"],
            "log": str(home() / f"strata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
     if fam.get("binary"):                          # Kolibri: its CPU pool reads a 42.9 GiB pinned expert table
-        numa_prefix = expert_numa_prefix()
+        numa_prefix = expert_numa_prefix(nvidia=not (hip or amd))
         if numa_prefix:
             cfg["launch_prefix"] = numa_prefix
-            ok(f"CPU pool bound to the graphics card's NUMA node ({numa_prefix[-2].split('=')[-1]}): "
-               f"measured 12.9 ms/token of expert work there against 24.0 when the table is read across the nodes")
+            ok(f"Engine launch will bind CPU and memory to NUMA node {numa_prefix[-2].split('=')[-1]}")
     if cuda_tk == 12:
         cfg["cuda"] = 12
     if hip:
@@ -8938,6 +8933,10 @@ def mac_control_setup(a) -> int:
 
 
 def main() -> int:
+    if sys.version_info < (3, 11):
+        print("Strata setup needs Python 3.11 or newer. Run START-HERE.bat or ./setup.sh with a supported Python.",
+              file=sys.stderr)
+        return 2
     try:                                               # files made by a run as administrator still belong to the user
         from strata_control import private_files as _pf
         _pf.adopt_user_defaults()

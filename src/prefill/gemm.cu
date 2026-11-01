@@ -1,5 +1,6 @@
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include "strata/prefill/gemm.hpp"
+#include "strata/prefill/hipblaslt_policy.hpp"   // when a tuned solution is given up on (pure, tested on CPU)
 #include "strata/kernels/dequant_bf16.hpp"
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
 #include "strata/prefill/moe_mmq.hpp"
@@ -192,6 +193,7 @@ struct HipLtCachedAlgo {
     bool supported = false;
     hipblasLtMatmulAlgo_t algo{};
     size_t workspace_bytes = 0;
+    int failures = 0;   // launches this solution lost; see strata/prefill/hipblaslt_policy.hpp
 };
 
 struct HipLtState {
@@ -429,8 +431,8 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
         return true;
     }
 
-    std::fprintf(stderr, "prefill gemm: hipBLASLt launch failed with status %d\n", (int) status);
     if (beta != 0.0f) {
+        std::fprintf(stderr, "prefill gemm: hipBLASLt launch failed with status %d\n", (int) status);
         std::fprintf(stderr, "prefill gemm: refusing a fallback after hipBLASLt failed with nonzero beta\n");
         std::exit(1);
     }
@@ -438,9 +440,31 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
     uint32_t beta_bits = 0;
     std::memcpy(&beta_bits, &beta, sizeof(beta_bits));
     auto cached = mutable_state->cache.find(HipLtCallKey{type, (int) t, (int) n, (int) k, (int) ldy, beta_bits});
-    if (cached != mutable_state->cache.end()) cached->second.supported = false;
     ++mutable_state->fallbacks;
     mutable_state->fallback_shapes.emplace(type, (int) t, (int) n, (int) k, (int) ldy);
+    const char* dtype = type == strata::prefill::hipblaslt::InputType::bf16 ? "bf16" : "f16";
+    if (cached == mutable_state->cache.end()) {   // a launch this state holds no tuned record of
+        std::fprintf(stderr, "prefill gemm: hipBLASLt launch failed with status %d for dtype=%s T=%d N=%d K=%d ldy=%d\n",
+                     (int) status, dtype, (int) t, (int) n, (int) k, (int) ldy);
+        return false;
+    }
+    // One failed launch does not make a tuned solution wrong for the shape: the first can be the library still
+    // setting the kernel up (the rocBLAS table below waits for three for the same reason), and giving up on the
+    // first one costs the rest of the session its tuned route.  Measured on an R9700 serve: three launches with
+    // status 6 (INTERNAL_ERROR), and the prompt MMQ path stayed off for the whole session although the startup
+    // probe had just verified it.  The untuned route runs this call either way; this only decides whether the
+    // next call tries the tuned solution again.
+    ++cached->second.failures;
+    if (strata::prefill::hipblaslt::drop_solution_after_failure((int) status, cached->second.failures)) {
+        std::fprintf(stderr, "prefill gemm: hipBLASLt solution refused with status %d for dtype=%s T=%d N=%d K=%d "
+                             "ldy=%d (%d failures); the untuned route runs this shape from now on\n",
+                     (int) status, dtype, (int) t, (int) n, (int) k, (int) ldy, cached->second.failures);
+        cached->second.supported = false;
+    } else if (std::getenv("STRATA_HIPBLASLT_VERBOSE")) {
+        std::fprintf(stderr, "prefill gemm: hipBLASLt launch failed with status %d for dtype=%s T=%d N=%d K=%d "
+                             "ldy=%d (%d failures); the untuned route runs this call\n",
+                     (int) status, dtype, (int) t, (int) n, (int) k, (int) ldy, cached->second.failures);
+    }
     return false;
 }
 #endif

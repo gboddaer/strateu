@@ -1,7 +1,7 @@
 # Kolibri-1 decode on the R9700
 
 The first reassessment corrected several wrong interpretations. The historical runs below are retained.
-The current implementation is an opt-in host-assisted layer-stack graph. It keeps the CPU experts and
+The current implementation is a host-assisted layer-stack graph. It keeps the CPU experts and
 has passed the full decode gate against both the plain and the segmented engines, including the final
 8191-id KV-wrap parity. The four decode arms are **on by default** where the engine supports them, and each has an
 explicit off switch (`=0`); a configuration they cannot serve runs the plain decode with one line saying why.
@@ -9,8 +9,10 @@ explicit off switch (`=0`); a configuration they cannot serve runs the plain dec
 Scope: single-stream Kolibri decode, **no drafter**, card0 only (`HIP_VISIBLE_DEVICES=0`).
 Box: Ryzen 7 5700G, 93 GiB RAM, R9700 32 GB, ROCm 7.2.2. Model: Kolibri-1-Q4_K_M.
 P4 improves prefill; the next work must preserve that path and establish decode gains separately.
+For the packaged candidate's current measurements, installation and publication status, see
+[the Kolibri preview guide](KOLIBRI_PREVIEW.md). CUDA qualification is recorded separately there.
 
-## Current opt-in layer-stack graph
+## Current default layer-stack graph
 
 `STRATA_KOLIBRI_DEC_HANDOFF_GRAPH=1` selects segmented PRE/POST replay.
 `STRATA_KOLIBRI_DEC_TOKEN_GRAPH=1` adds one parent executable containing all 50 layers:

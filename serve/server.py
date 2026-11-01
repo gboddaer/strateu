@@ -57,6 +57,11 @@ from pathlib import Path
 from typing import Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
+# Direct invocations must reject an old Python before importing optional runtime packages.
+if __name__ == "__main__" and sys.version_info < (3, 11):
+    print("Strata's server needs Python 3.11 or newer. Use the bundled runtime or a supported Python.", file=sys.stderr)
+    raise SystemExit(2)
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
@@ -991,12 +996,10 @@ class StrataEngine:
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0,
                  prefix: list[str] | None = None):
-        # `prefix` (2026-10-30, docs/experiments/kolibri-perf-gap.md Phase 1c/1d): the launcher's command prefix, used
-        # for the NUMA memory binding.  `numactl` execs the program it wraps, so the child's pid is still the engine and
-        # the lifecycle code below is unaffected.  It changes no arithmetic.  `spawn` is a dict of keyword arguments so a
-        # restart replays every one by name, including this one.
+        # numactl execs the engine, preserving its PID and signal handling. Keep the
+        # existing spawn tuple for conversation-cache and replica consumers.
         self.launch_prefix = list(prefix or [])
-        self.spawn = dict(exe=exe, args=list(args), cwd=cwd, log=log, env=env, lazy=False, cpus=cpus, prefix=prefix)
+        self.spawn = (exe, list(args), cwd, log, env, False, cpus)
         self.session_save_reclaim = '--session-save-reclaim' in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
@@ -1118,7 +1121,8 @@ class StrataEngine:
                           f"ready yet: starting it again in {wait_s:.0f} s (try {_attempt + 2} of {START_RETRIES + 1})",
                           flush=True)
                 time.sleep(wait_s)
-                StrataEngine.__init__(self, exe, args, cwd, log, env, lazy, cpus, _attempt + 1, self.launch_prefix)
+                StrataEngine.__init__(self, exe, args, cwd, log, env, lazy, cpus, _attempt + 1,
+                                      prefix=self.launch_prefix)
                 return
             why = (f"the engine did not report READY within {ENGINE_READY_S:.0f} s" if timed_out else
                    "the engine exited before it was ready")
@@ -1325,7 +1329,7 @@ class StrataEngine:
                 # (0)".  __init__ clears `ended` itself once READY (before its pump thread can set it again).
                 self.ended = True
                 try:
-                    self.__init__(**self.spawn)
+                    self.__init__(*self.spawn, prefix=self.launch_prefix)
                     break
                 except RuntimeError:
                     try:
@@ -3167,13 +3171,7 @@ def tool_call_recovery_of(cfg: dict, template: ChatTemplate) -> bool:
 
 
 def engine_cmd(exe: str, args: list[str], prefix: list[str] | None = None) -> list[str]:
-    """The engine's command line: the launcher's prefix, the executable, `--serve`, and the config's arguments.
-
-    The prefix carries the NUMA memory binding the launcher measured as worth ~2x on the decode expert leg
-    (docs/experiments/kolibri-perf-gap.md Phase 1/1c).  It is empty unless `setup.py` wrote one, so nothing changes on a
-    machine that does not need it, and `numactl` execs the engine, leaving the child's pid - and therefore the lifecycle
-    code - exactly as it was.
-    """
+    """Prepend an optional launcher argv prefix; without one, preserve the existing command."""
     return [*(prefix or []), exe, "--serve", *args]
 
 
@@ -8679,6 +8677,10 @@ def _component_exe(reference: str, cfg: dict) -> str:
 
 
 def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> int:
+    if sys.version_info < (3, 11):
+        print("Strata's server needs Python 3.11 or newer. Use the bundled runtime or a supported Python.",
+              file=sys.stderr)
+        return 2
     try:                                               # files made by a run as administrator still belong to the user
         from strata_control import private_files as _pf
         _pf.adopt_user_defaults()
@@ -9000,7 +9002,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             engine = start_split(cfg, split, exe, effort_end or [], lazy, offline=a.offline)
         else:
             engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
-                                  env=env, lazy=lazy)
+                                  env=env, lazy=lazy, prefix=cfg.get("launch_prefix"))
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],

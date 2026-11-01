@@ -8,11 +8,11 @@
 # Search order:
 #   1. $STRATA_PYTHON                        — an explicit override, always wins
 #   2. <this dir>/python/bin/python3         — the private runtime shipped with the distribution
-#   3. A Python 3.10+ found on PATH          — a developer convenience, never a requirement
+#   3. A Python 3.11+ found on PATH          — a developer convenience, never a requirement
 #
 # The private runtime is a *relocatable* CPython plus this distribution's dependencies, staged into
 # `python/` beside this script. `docs/work/QUALIFICATION-KIT.md` gives the staging command. When it
-# is absent the launcher still works anywhere a 3.10+ interpreter exists, and says so clearly rather
+# is absent the launcher still works anywhere a 3.11+ interpreter exists, and says so clearly rather
 # than failing obscurely.
 set -eu
 
@@ -51,11 +51,15 @@ pick_python() {
   # Anything on PATH that is new enough, then the usual places an interpreter lives on macOS
   # without being on a non-interactive PATH (Homebrew, python.org, and the interpreter a DeepSeek
   # Harness installation already ships, which is a legitimate Python 3.12 to reuse rather than
-  # download a second copy of). Strata needs 3.10 or newer; macOS's own /usr/bin/python3 is 3.9 and
+  # download a second copy of). Strata needs 3.11 or newer; macOS's own /usr/bin/python3 is 3.9 and
   # is correctly rejected below.
   for candidate in \
       "$(command -v python3 2>/dev/null || true)" \
       "$(command -v python 2>/dev/null || true)" \
+      "$(command -v python3.11 2>/dev/null || true)" \
+      "$(command -v python3.12 2>/dev/null || true)" \
+      "$(command -v python3.13 2>/dev/null || true)" \
+      "$(command -v python3.14 2>/dev/null || true)" \
       /opt/homebrew/bin/python3 /usr/local/bin/python3 \
       /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 \
       /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 \
@@ -65,7 +69,7 @@ pick_python() {
   do
     [ -n "$candidate" ] || continue
     [ -x "$candidate" ] || continue
-    if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 10) else 1)' 2>/dev/null; then
+    if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 11) else 1)' 2>/dev/null; then
       printf '%s\n' "$candidate"; return 0
     fi
   done
@@ -78,12 +82,18 @@ if ! PY=$(pick_python); then
 strata: no usable Python found.
 
 This distribution is meant to run on its own. If you are seeing this, the private runtime is
-missing from the install and no Python 3.10+ is on your PATH.
+missing from the install and no Python 3.11+ is on your PATH.
 
   * Reinstall the distribution, which restores the bundled runtime, or
-  * set STRATA_PYTHON=/path/to/python3 (3.10 or newer), or
-  * install Python 3.10+ and run this launcher again.
+  * set STRATA_PYTHON=/path/to/python3 (3.11 or newer), or
+  * install Python 3.11+ and run this launcher again.
 MSG
+  exit 5
+fi
+
+# An override or an old source environment must meet the same minimum as a PATH interpreter.
+if ! "$PY" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 11) else 1)' 2>/dev/null; then
+  echo "strata: Python 3.11 or newer is needed; $PY is not a supported runtime." >&2
   exit 5
 fi
 

@@ -1,5 +1,6 @@
 # Kolibri CUDA preview qualification
 
+See [the preview guide](KOLIBRI_PREVIEW.md) for package installation and publication status.
 The preview targets AMD gfx1201/R9700 and CUDA, but each backend needs its own evidence. A CUDA build on an AMD
 host proves compilation/linking only. T4 results do not qualify RTX 3090 or other cards.
 
@@ -15,7 +16,7 @@ Two regressions in the R9700 campaign were reproduced with CUDA before fixing th
 
 Regression checks are in `tools/kolibri/test_build_portability.py`, including a C++17 host publication test.
 
-Locally observed: CUDA 13.1 (`nvcc` 13.1.115), GCC 14.2, CMake 3.31, `sm_75;sm_86`: `strata-kolibri`,
+Locally observed: CUDA 13.1 (`nvcc` 13.1.115), GCC 14.2, CMake 3.31, `sm_75;sm_86`: `strata`, `strata-kolibri`,
 `kolibri_decode_rollover` and `kolibri_decode_wait_test` compile and link after both fixes. No NVIDIA GPU is
 present on this host, so CUDA runtime, race behaviour, numerical parity and speed were not tested here.
 
@@ -109,7 +110,8 @@ numbers, on the same forced history, against the same build's plain path (`EXPER
 | plain vs `EXPERT_F16=24` | 0.400 | 0.0010 | 3.24 | 11.08 | 9/9 |
 | plain vs `EXPERT_F16=24 PF_PARTIAL=1` | 0.168 | 0.0005 | 1.26 | 5.47 | **7/9** |
 
-Both are bitwise identical run to run, so this is rounding and accumulation order rather than a race. It is ~2 orders
+Both are bitwise identical run to run. That establishes repeatability, not the cause: rounding/accumulation
+changes and deterministic implementation defects still need to be distinguished. The reported mean KL is ~2 orders
 of magnitude worse than the R9700's recorded `PF_PARTIAL` figure (answers-only mean KL 0.00133, top-1 0.9725), and an
 11-logit worst case is too large to accept as "fp16 rounding" without an explanation. Under
 [the accuracy policy](KOLIBRI_ACCURACY_POLICY.md) that is a separate numerical qualification, not a default change.

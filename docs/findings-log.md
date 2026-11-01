@@ -1492,8 +1492,8 @@ the same build's plain path with `EXPERT_F16=0`):
 | plain vs `EXPERT_F16=24 PF_PARTIAL=1` | 0.168 | 0.0005 | 0.87 | 1.26 | 1.35 | 5.47 | **7/9** |
 | candidate run 1 vs run 2 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | bitwise identical |
 
-It is deterministic, so this is rounding and accumulation order, not a race.  But the shape is the one the accuracy
-policy warns about: a near-zero median with a heavy tail, and two argmax flips in nine steps for the pair.  An 11-logit
+The difference is repeatable; that does not establish whether its cause is rounding/accumulation order or a
+deterministic implementation defect. The shape is the one the accuracy policy warns about: a near-zero median with a heavy tail, and two argmax flips in nine steps for the pair.  An 11-logit
 worst case is also too large to accept as fp16 rounding without an explanation - a real question for the next step, and
 not one this campaign answers.  The R9700's `PF_PARTIAL` figure (answers-only mean KL 0.00133, top-1 0.9725, §0.7) must
 not be reused as evidence for this card.

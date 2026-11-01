@@ -1,5 +1,9 @@
 # Kolibri P4 shipping validation
 
+This is the historical P4-only package record. The newer package includes the decode graph and CUDA build
+compatibility fixes; current installation, measurements and publication status are in
+[the preview guide](KOLIBRI_PREVIEW.md). Do not ship the older local archive as the current preview.
+
 Measured on 28 October 2026: Ryzen 7 5700G, 93 GiB RAM, Radeon AI PRO R9700 32 GB (gfx1201), card0 only.
 Model: `/fast/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf`. ROCm 7.2.2, hipBLASLt 100202.
 

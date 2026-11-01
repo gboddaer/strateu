@@ -13,6 +13,10 @@ SERVER_PACKAGES = ("jinja2", "yaml", "regex", "psutil", "requests", "numpy", "PI
 
 def _preflight(argv):
     """A missing package is a typed, actionable error, never an install: starting does not run pip."""
+    if sys.version_info < (3, 11):
+        sys.stderr.write("strata: Python 3.11 or newer is needed. Use the Terminal archive's bundled runtime "
+                         "or a supported Python. The separate portable monitor still supports Python 3.10.\n")
+        return 5
     command = next((a for a in argv if not a.startswith("-")), "")
     if command not in ("serve", "bench"):
         return 0

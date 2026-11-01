@@ -330,7 +330,8 @@ class Tuner:
 
     # ---- one engine run
     def _run(self, args: list[str], env: dict[str, str | None], spec: RequestSet, label: str,
-             points: Callable[[Any], None] | None = None, delta_mib: int = 0) -> RunResult:
+             points: Callable[[Any], None] | None = None, delta_mib: int = 0,
+             retry_dead_start: bool = False) -> RunResult:
         self._check_cancel()
         t0 = self.clock()
 
@@ -347,13 +348,23 @@ class Tuner:
                 raise StartFailed("SKIPPED", why)
             entered.append(self.clock())
 
-        try:
-            with self.session.engine(args, env, pre_start=pre_start) as eng:
-                res = eng.measure(spec)
-                if points is not None and res.status == "PASS":
-                    points(eng)
-        except StartFailed as e:
-            res = RunResult(status=e.status, reason=e.reason)
+        for attempt in (1, 2):
+            try:
+                with self.session.engine(args, env, pre_start=pre_start) as eng:
+                    res = eng.measure(spec)
+                    if points is not None and res.status == "PASS":
+                        points(eng)
+                break
+            except StartFailed as e:
+                res = RunResult(status=e.status, reason=e.reason)
+                if e.status != "FAIL_BOOT" or attempt == 2 or not retry_dead_start:
+                    break
+                # A start that dies measured nothing, and without a second attempt the arm is simply lost. When
+                # this happened on the Kolibri engine on an R9700 (2026-10-31) all nine restart arms died at
+                # their first start, while nine engine starts measured afterwards, each one right after a just-
+                # exited engine, all came ready - so a second attempt has a good chance of measuring the arm,
+                # and it costs only seconds when the engine dies at once.
+                self.result.notes.append(f"{label}: the engine stopped while starting, so it was started once more")
         dt = self.clock() - (entered[0] if entered else t0)          # the run itself, not the waiting before it
         if res.status != "SKIPPED":
             self.run_times.append(dt)
@@ -498,7 +509,7 @@ class Tuner:
                     continue
                 self._say("rounds", f"Trying: {p.arm.label} (round {rnd + 1} of {per_arm})", arm=p.arm.id)
                 res = self._run(tune_knobs.apply_to_argv(self.base_args, p.args), dict(p.env), spec, p.arm.id,
-                                delta_mib=p.arm.ram_delta_mib)
+                                delta_mib=p.arm.ram_delta_mib, retry_dead_start=True)
                 if res.status == "SKIPPED":
                     rep.status, rep.reason = "skipped", res.reason
                     alive = [x for x in alive if x.arm.id != p.arm.id]
@@ -655,12 +666,19 @@ class Tuner:
                 r.outcome = "inconclusive"
                 r.reason_code = "noisy"
                 r.message = "The PC was too noisy to tell settings apart, so nothing was changed. Try again when it is idle."
-            elif arms and not any(a.status in ("tested", "dropped", "failed") for a in arms) and not r.per_request:
-                # candidates were planned but none could be measured (no free memory, no time): that is not "already the fastest"
+            elif arms and not any(a.status in ("tested", "dropped") for a in arms) and not r.per_request:
+                # candidates were planned but none could be measured: that is not "already the fastest". An arm
+                # that failed is not a comparison either - its engine stopped before anything was measured.
                 r.outcome = "inconclusive"
-                r.reason_code = "not_tried"
-                r.message = ("Other settings could not be tried (not enough free memory or time), so nothing was compared and nothing was "
-                             "changed. Try again when the PC is quiet.")
+                died = [a for a in arms if a.status == "failed"]
+                if died:
+                    r.reason_code = "engine_died"
+                    r.message = (f"The engine stopped while starting for {len(died)} of {len(arms)} settings, so nothing "
+                                 "was compared and nothing was changed. Try again when nothing else is running.")
+                else:
+                    r.reason_code = "not_tried"
+                    r.message = ("Other settings could not be tried (not enough free memory or time), so nothing was compared and nothing was "
+                                 "changed. Try again when the PC is quiet.")
             else:
                 r.outcome = "default_confirmed"
                 r.message = "Your current settings are already the fastest we found. Nothing was changed."
