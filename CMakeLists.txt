@@ -306,6 +306,12 @@ target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
 target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
 if(STRATA_BUILD_TESTS)
+  # Streaming grouping/capacity accounting is host-only: no GPU, ggml or model needed.
+  add_executable(kolibri_expert_stream_plan_test tests/kolibri/expert_stream_plan_test.cpp)
+  target_include_directories(kolibri_expert_stream_plan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                             ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME kolibri_expert_stream_plan_test COMMAND kolibri_expert_stream_plan_test)
+  set_tests_properties(kolibri_expert_stream_plan_test PROPERTIES TIMEOUT 60)
   add_executable(batch_telemetry_test src/core/batch_telemetry_test.cpp)
   target_include_directories(batch_telemetry_test PRIVATE include)
   add_test(NAME batch_telemetry_test COMMAND batch_telemetry_test)
@@ -1034,39 +1040,29 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_link_libraries(kolibri_kv_int8_test PRIVATE ${_strata_gpu_runtime_target})
       add_test(NAME kolibri_kv_int8_test COMMAND kolibri_kv_int8_test)
     endif()
-    # plan 2026-10-31-kolibri-gpu-streaming Task 1: the streamed expert prefill's grouping and capacity accounting.
-    # Host-only by design (no CUDA, no ggml, no model): it pins the numbers the slot allocation is derived from, and
-    # the refusal of every geometry this initial path does not support.
-    # plan 2026-10-31-kolibri-gpu-streaming Task 2: the tiled grouped Q4_K/Q6_K experts products.  Its criterion is
-    # bitwise identity with the CPU pool's own kernels (kq256_rows and ggml-cpu's vec_dot), never a tolerance.
-    # Task 3: the two-slot pipeline, compiled straight into the test (no engine internals), compared bit for bit
-    # with the pool's own native_gu_rows / native_quant_h / native_down_rows.
-    add_executable(kolibri_expert_stream_pipeline_test tests/kolibri/expert_stream_pipeline_test.cu
-                   src/kolibri/expert_stream.cu)
-    target_include_directories(kolibri_expert_stream_pipeline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
-                               ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(kolibri_expert_stream_pipeline_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
-    add_test(NAME kolibri_expert_stream_pipeline_test COMMAND kolibri_expert_stream_pipeline_test)
-    set_tests_properties(kolibri_expert_stream_pipeline_test PROPERTIES TIMEOUT 3600)
-    add_executable(kolibri_expert_stream_kernel_test tests/kolibri/expert_stream_kernel_test.cu)
-    target_include_directories(kolibri_expert_stream_kernel_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
-                               ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(kolibri_expert_stream_kernel_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
-    add_test(NAME kolibri_expert_stream_kernel_test COMMAND kolibri_expert_stream_kernel_test)
-    set_tests_properties(kolibri_expert_stream_kernel_test PROPERTIES TIMEOUT 1800)
-    add_executable(kolibri_expert_stream_plan_test tests/kolibri/expert_stream_plan_test.cpp)
-    target_include_directories(kolibri_expert_stream_plan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
-                               ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    add_test(NAME kolibri_expert_stream_plan_test COMMAND kolibri_expert_stream_plan_test)
-    set_tests_properties(kolibri_expert_stream_plan_test PROPERTIES TIMEOUT 60)
-    # Task 1's replay harness: the CPU control arm of the streamed-prefill comparison.  It reads a capture, replays
-    # the expert leg through the engine's own native kernels and shard fan-out, and refuses to report a timing when
-    # any output byte differs from the capture.  Task 4 adds its --gpu arm; nothing here needs a device yet.
-    add_executable(expert_stream_replay tools/kolibri/expert_stream_replay.cu src/kolibri/expert_stream.cu)
-    target_include_directories(expert_stream_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
-                               ${CMAKE_CURRENT_SOURCE_DIR}/tools/kolibri
-                               ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(expert_stream_replay PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
+    # These kernels and the replay pipeline use CUDA directly, not the HIP compatibility layer.
+    if(STRATA_ENABLE_CUDA)
+      # Tiled grouped Q4_K/Q6_K products must match the CPU pool bit for bit, never within a tolerance.
+      add_executable(kolibri_expert_stream_pipeline_test tests/kolibri/expert_stream_pipeline_test.cu
+                     src/kolibri/expert_stream.cu)
+      target_include_directories(kolibri_expert_stream_pipeline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/include)
+      target_link_libraries(kolibri_expert_stream_pipeline_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
+      add_test(NAME kolibri_expert_stream_pipeline_test COMMAND kolibri_expert_stream_pipeline_test)
+      set_tests_properties(kolibri_expert_stream_pipeline_test PROPERTIES TIMEOUT 3600)
+      add_executable(kolibri_expert_stream_kernel_test tests/kolibri/expert_stream_kernel_test.cu)
+      target_include_directories(kolibri_expert_stream_kernel_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/include)
+      target_link_libraries(kolibri_expert_stream_kernel_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
+      add_test(NAME kolibri_expert_stream_kernel_test COMMAND kolibri_expert_stream_kernel_test)
+      set_tests_properties(kolibri_expert_stream_kernel_test PROPERTIES TIMEOUT 1800)
+      # The replay harness contains CPU and GPU arms and refuses timings if captured outputs differ.
+      add_executable(expert_stream_replay tools/kolibri/expert_stream_replay.cu src/kolibri/expert_stream.cu)
+      target_include_directories(expert_stream_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/kolibri
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/include)
+      target_link_libraries(expert_stream_replay PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
+    endif()
     add_executable(kolibri_decode_rollover tests/kolibri/decode_rollover.cu
                    src/kolibri/pf_combine.cu src/kolibri/decode_wait.cu)
     target_include_directories(kolibri_decode_rollover PRIVATE $<TARGET_PROPERTY:strata_kolibri,INCLUDE_DIRECTORIES>)
@@ -1100,13 +1096,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # accumulation are reported separately, each against the element's own sum|w*x|.  `--mutate swap|offset|rows`
     # shows the gate detects a wrong-expert pointer, a corrupted block offset and a missing row.  Default shapes are
     # synthetic; the model's shapes are passed explicitly (--embd 2560 --ff 512).
-    add_executable(f16_expert_gemm_parity tests/kolibri/f16_expert_gemm_parity.cu)
-    target_include_directories(f16_expert_gemm_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
-                               ${_strata_gpu_include_directories})
-    target_link_libraries(f16_expert_gemm_parity PRIVATE strata_kernels strata_prefill strata_warnings
-                          ${_strata_gpu_runtime_target})
-    add_test(NAME f16_expert_gemm_parity COMMAND f16_expert_gemm_parity)
-    set_tests_properties(f16_expert_gemm_parity PROPERTIES TIMEOUT 900)
+    if(STRATA_ENABLE_CUDA)
+      add_executable(f16_expert_gemm_parity tests/kolibri/f16_expert_gemm_parity.cu)
+      target_include_directories(f16_expert_gemm_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                 ${_strata_gpu_include_directories})
+      target_link_libraries(f16_expert_gemm_parity PRIVATE strata_kernels strata_prefill strata_warnings
+                            ${_strata_gpu_runtime_target})
+      add_test(NAME f16_expert_gemm_parity COMMAND f16_expert_gemm_parity)
+      set_tests_properties(f16_expert_gemm_parity PROPERTIES TIMEOUT 900)
+    endif()
   endif()
   # the reference forward pass (plan T6): plain kernels + Strata native MMVQ/router, no graphs, no cache; the
   # routed experts (3-D tensors) live in managed memory so a 47 GB file runs on a 16 GB card (pages from RAM)

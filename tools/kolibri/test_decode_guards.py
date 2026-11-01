@@ -10,9 +10,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 BIN = Path(os.environ.get('KOLIBRI_BIN', ROOT / 'build-mmq/strata-kolibri'))
+pytestmark = pytest.mark.skipif(not BIN.is_file(), reason='build strata-kolibri first or set KOLIBRI_BIN')
 
 
-@pytest.mark.skipif(not BIN.exists(), reason='build strata-kolibri first')
 @pytest.mark.parametrize('arm', ['STRATA_KOLIBRI_DEC_HANDOFF', 'STRATA_KOLIBRI_DEC_STREAM'])
 @pytest.mark.parametrize('args,reason', [(['--cpu-threads', '0'], '--cpu-threads'),
                                        (['--cpu-threads', '8', '--grouped'], '--grouped'),
@@ -27,7 +27,6 @@ def test_unsupported_arm_fails_before_model_read(arm, args, reason):
     assert 'cannot open' not in result.stderr
 
 
-@pytest.mark.skipif(not BIN.exists(), reason='build strata-kolibri first')
 @pytest.mark.parametrize('budget', ['-1', '1000000001', '18446744073709551615', 'oops', '1junk', ''])
 def test_token_wait_budget_rejects_unbounded_or_malformed_values_before_model_read(budget):
     env = {k: v for k, v in os.environ.items() if not k.startswith('STRATA_KOLIBRI_DEC_')}
