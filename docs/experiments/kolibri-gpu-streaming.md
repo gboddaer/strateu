@@ -238,3 +238,63 @@ byte-bound, not occupancy-bound, and 16x4 stays until parity says otherwise.
   the row tail is undefined behaviour — the first version's second bug.
 - **`nt` is bounded to 1..1024 and split into tiles of four by the launcher**: a 64-token chunk is 16 launches, and
   the token count is a kernel argument so the tail tile needs no separate code path.
+
+## Task 3 — the two-slot pipeline
+
+`src/kolibri/expert_stream.hpp` (CUDA-free API) and `src/kolibri/expert_stream.cu` implement the design's lifecycle:
+
+```
+FREE -> H2D -> GU -> GU_D2H -> CPU_ACT_QUANT -> HIDDEN_H2D -> DOWN -> OUT_D2H -> FREE
+```
+
+Batch i loads and computes gate/up on slot i%2 while the host runs batch i-1's CPU SwiGLU, `native_quant_h`, its
+hidden upload and its down product on the other slot. The slot batch i reuses was released by batch i-2's scatter,
+which happened in the previous iteration, so no slot is ever waited on while the other could advance.
+
+Bounded by the plan: eight groups and the weight cap per batch, 32 MiB per slot by default, a 256 MiB device budget,
+and every buffer allocated at `create()`. A run allocates nothing, calls no `cudaDeviceSynchronize`, and publishes
+`ey_h`-equivalent rows only after their event. Weights go straight from the caller's table (the engine's is pinned,
+so that copy is real asynchronous DMA); the gathered activations and both results use the slot's own pinned staging.
+
+`create()` sizes the slots for BOTH down formats of this model (Kolibri alternates Q4_K and Q6_K down between
+layers), taking the larger of the two capacities. A later call may therefore use either; only the down type, the
+weights, the ids, the activations and the output may differ from the view `create()` was given, and anything else is
+refused by name.
+
+### What the test proves
+
+`tests/kolibri/expert_stream_pipeline_test.cu`, 76 cases (`--selftest`), all bitwise against
+`native_gu_rows` + `native_quant_h` + `native_down_rows`:
+
+| case | why |
+|---|---|
+| empty input | no GPU work, zeroed counters |
+| 256 tokens x top_k 6, Q4_K down, then a second context on Q6_K | the real chunk |
+| one context, both down formats, three calls | the layer alternation the engine will actually do |
+| skewed groups: one expert takes a token's whole route, another every token's first slot | batches that hold one huge group next to tiny ones |
+| one expert holding all 32 selections | a single group spanning the batch bound |
+| 100 calls through the same two slots with the output poisoned (`0x40 + call` bytes) between them | slot reuse, stale data, allocation-free steady state |
+| five failure cases (top_k 0, non-Q4_K gate, out-of-range id, wrong activation stride, 1 KiB budget) | refused by `std::invalid_argument`, nothing published |
+| every allocation ordinal of `create()` failed in turn (64 ordinals, 18 real) | a partial allocation is released, not leaked |
+
+Counters, as the plan requires: `weight_h2d_bytes` equals the sum of the UNIQUE touched blobs, `device_allocations`
+is zero on a warm run, and `kernel_launches` is tile-scaled (one launch per four-token tile per product), never one
+per selection.
+
+Compute Sanitizer on `--tails-only`: memcheck, racecheck and synccheck all report 0 errors.
+
+### Rulings taken in Task 3
+
+- **The weight staging pins are allocated but unused.** The plan allows copying "from pinned slot staging for
+  genuinely asynchronous DMA". The engine's expert table is already pinned, so staging every blob through another
+  pinned copy would add a memcpy of ~2.5 MB per expert for no gain; the copy is taken straight from the caller's
+  table. The pinned weight buffer stays accounted for by Task 1's capacity arithmetic (32 MiB per slot, ~64 MiB of
+  host memory) rather than shrunk, because a caller with a pageable table would need it. Cost if wrong: 64 MiB of
+  pinned host memory unused while the streamed flag is on.
+- **Rows, not tokens, are the unit of a group.** A group's gathered activations are one row per SELECTION (in
+  original order), not one row per distinct token: the same token routed to two experts of the same batch needs two
+  products. Duplicated rows are the correct input, and they are why the scatter is per selection.
+- **The pipeline test's weights are ggml-quantized float rows**, not random bytes. Random block bytes produce
+  weights whose scales are unrelated to their nibbles and outputs up to 1e38: at that magnitude the first version of
+  this test compared NaN against FLT_MAX and reported a difference that said nothing about the pipeline. Task 4
+  replays the model's real captured weights through this same code, which is the fidelity check that matters.

@@ -1034,6 +1034,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # the refusal of every geometry this initial path does not support.
     # plan 2026-10-31-kolibri-gpu-streaming Task 2: the tiled grouped Q4_K/Q6_K experts products.  Its criterion is
     # bitwise identity with the CPU pool's own kernels (kq256_rows and ggml-cpu's vec_dot), never a tolerance.
+    # Task 3: the two-slot pipeline, compiled straight into the test (no engine internals), compared bit for bit
+    # with the pool's own native_gu_rows / native_quant_h / native_down_rows.
+    add_executable(kolibri_expert_stream_pipeline_test tests/kolibri/expert_stream_pipeline_test.cu
+                   src/kolibri/expert_stream.cu)
+    target_include_directories(kolibri_expert_stream_pipeline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                               ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(kolibri_expert_stream_pipeline_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
+    add_test(NAME kolibri_expert_stream_pipeline_test COMMAND kolibri_expert_stream_pipeline_test)
+    set_tests_properties(kolibri_expert_stream_pipeline_test PROPERTIES TIMEOUT 3600)
     add_executable(kolibri_expert_stream_kernel_test tests/kolibri/expert_stream_kernel_test.cu)
     target_include_directories(kolibri_expert_stream_kernel_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
                                ${CMAKE_CURRENT_SOURCE_DIR}/include)
