@@ -16,6 +16,7 @@
 // table - the GPU is the expert cache, the model is bigger than any PC's VRAM (Q4_K_M: 42.6 GiB of experts,
 // 3.5 GiB of dense).  --load-only runs just the load and reports.
 #include "strata/kolibri/engine.hpp"
+#include "expert_stream.hpp"   // plan 2026-10-31-kolibri-gpu-streaming: the opt-in streamed expert leg
 #include "strata/kolibri/decode_wait.hpp"
 #include "pf_combine.hpp"   // G1: the prefill MoE combiner (src/kolibri/pf_combine.cu)
 // plan 2026-10-31-kolibri-gpu-streaming Task 1: the streamed-prefill workload capture (host-only, no CUDA).
@@ -2121,6 +2122,76 @@ static void stream_capture_record(const Engine& e, const LayerBlobs& b, Scratch&
     stream_capture_writer().add(r, blobs);
 }
 
+
+// ------------------------------------------------------------------------------------------------------------------
+// STREAMED EXPERT PREFILL (plan 2026-10-31-kolibri-gpu-streaming, Tasks 5-7).
+//
+// `STRATA_KOLIBRI_EXPERT_STREAM=1` replaces ONE thing: the CPU pool's expert products for a prefill chunk-layer
+// (native_gu_rows -> native_quant_h -> native_down_rows over the pinned blobs) with the two-slot CUDA pipeline in
+// expert_stream.cu.  Everything else - the router, the weighting of ey_h, attention, the KV cache, the token graph,
+// generation and every published buffer - is untouched, and with the variable absent or 0 the code below is not
+// entered at all: no context, no allocation, no branch taken.
+//
+// The arm's contract is bit equality, not closeness: the pipeline reproduces the pool's arithmetic lane by lane
+// (kq_a1.cuh's order) and its CPU SwiGLU is the pool's own expression, quantized by the pool's own native_quant_h.
+// A refusal is fatal (exit 2) and is named: this path never falls back to the CPU while claiming streamed coverage.
+// ------------------------------------------------------------------------------------------------------------------
+static inline bool expert_stream_on() {
+#if defined(__CUDACC__)
+    static const bool on = env_on("STRATA_KOLIBRI_EXPERT_STREAM");
+    return on;
+#else
+    if (env_on("STRATA_KOLIBRI_EXPERT_STREAM")) {
+        std::fprintf(stderr, "kolibri: expert streaming refused: this binary is not a CUDA build\n");
+        std::exit(2);
+    }
+    return false;
+#endif
+}
+
+#if defined(__CUDACC__)
+static std::unique_ptr<strata::kolibri::stream::Context> g_expert_stream;
+static strata::kolibri::stream::Stats g_expert_stream_stats;
+static long long g_expert_stream_layers = 0;
+
+/// One prefill chunk-layer's expert leg on the GPU.  The context is created on the first layer (that cost is
+/// first-use, not per-layer) and sized for both down formats this model alternates between.
+static void expert_stream_layer(const LayerBlobs& b, Scratch& s, const ActSet& A, int NKc, int K, int FF, int N,
+                                int experts) {
+    strata::kolibri::stream::LayerView v;
+    v.fmt = b.fmt;
+    v.weights = b.table;
+    v.weight_stride = b.stride;
+    v.expert_count = experts;
+    v.token_acts = (const uint8_t*) s.act_cur;
+    v.expert_ids = A.ids_h;
+    v.selection_count = NKc;
+    v.top_k = K;
+    v.output = A.ey_h;
+    try {
+        if (!g_expert_stream) g_expert_stream = strata::kolibri::stream::create(v, strata::kolibri::stream::Config{});
+        const strata::kolibri::stream::Stats st = strata::kolibri::stream::run(*g_expert_stream, v);
+        g_expert_stream_stats.groups += st.groups;
+        g_expert_stream_stats.selections += st.selections;
+        g_expert_stream_stats.weight_h2d_bytes += st.weight_h2d_bytes;
+        g_expert_stream_stats.activation_h2d_bytes += st.activation_h2d_bytes;
+        g_expert_stream_stats.gu_d2h_bytes += st.gu_d2h_bytes;
+        g_expert_stream_stats.hidden_h2d_bytes += st.hidden_h2d_bytes;
+        g_expert_stream_stats.output_d2h_bytes += st.output_d2h_bytes;
+        g_expert_stream_stats.kernel_launches += st.kernel_launches;
+        g_expert_stream_stats.slot_waits += st.slot_waits;
+        g_expert_stream_stats.device_allocations += st.device_allocations;
+        g_expert_stream_stats.wall_ms += st.wall_ms;
+        g_expert_stream_stats.cpu_activation_ms += st.cpu_activation_ms;
+        ++g_expert_stream_layers;
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr, "kolibri: expert streaming refused: %s\n", ex.what());
+        std::fflush(stderr);
+        std::exit(2);
+    }
+}
+#endif
+
 static inline int router_tk() {
     // K31: DEFAULT 3 (three experts per block, TJ=8).  Measured at 32K, both sockets: TK=0 120.5, TK=2/TJ=16 141.8,
     // TK=2/TJ=32 143.3, **TK=3/TJ=8 147.6** (148.7/144.1/150.0); at 4K TK=3 161.0 against TK=0 120.7.  Bitwise: identical
@@ -4083,6 +4154,13 @@ static const int grp_max = [] {
                         }
                     }
                 }
+#endif
+#if defined(__CUDACC__)
+                if (!mmq_did && expert_stream_on()) {
+                    // Task 5: the streamed arm.  A.ey_h is published on the host before this returns, exactly where
+                    // the pool would have left it, so the weighting below is the same code on the same input.
+                    expert_stream_layer(b, s, A, NKc, K, FF, N, (int) e.g.n_expert);
+                } else
 #endif
                 if (!mmq_did) e.pool.run([&](int shard) {
                     if (env_on("STRATA_KOLIBRI_EXPERT_GPU")) {   // A1: the expert products on the GPU, same three stages
@@ -6367,6 +6445,30 @@ int strata::kolibri::run(int argc, char** argv) {
     // The capture records ONE leg - the CPU pool over the pinned blobs, for every layer - because that is the work
     // the GPU arm must beat.  Any other leg would produce a capture that silently describes different work, so the
     // conflicts are enumerated here from the same switches forward_multi reads, and named.
+    // ---- streamed expert prefill (Tasks 5-7): refuse every configuration whose expert leg it cannot serve -------
+    // Enumerated from the same switches forward_multi reads, so a combination this arm does not cover fails here by
+    // name instead of quietly serving a different leg and calling it streamed.
+    if (expert_stream_on()) {
+        const char* why = nullptr;
+        const char* pool_all_env = std::getenv("STRATA_KOLIBRI_POOL_ALL");
+        if (prefill <= 0) why = "it serves the prefill's expert leg, so it needs --prefill";
+        else if (cpu_threads <= 0) why = "its CPU activation/quantization bridge runs on the coordinator, so it needs --cpu-threads";
+        else if (pool_all_env != nullptr && std::atoi(pool_all_env) != 1)
+            why = "STRATA_KOLIBRI_POOL_ALL must be unset or 1: other values send some layers to the GPU grouped leg";
+        else if (slots != 0) why = "--expert-slots moves expert rows between legs";
+        else if (grouped != 0) why = "--grouped serves picks on the GPU";
+        else if (env_on("STRATA_KOLIBRI_EXPERT_GPU")) why = "STRATA_KOLIBRI_EXPERT_GPU is the A1 arm; the two are exclusive";
+        else if (expert_f16_n() > 0) why = "the fp16 expert cache (STRATA_KOLIBRI_EXPERT_F16) serves rows on the GPU";
+        else if (pf_partial_on()) why = "STRATA_KOLIBRI_PF_PARTIAL publishes partial sums instead of ey_h";
+        else if (dec_res_on()) why = "STRATA_KOLIBRI_DEC_RES serves resident picks on the GPU";
+        else if (pf_mmq_on()) why = "the MMQ prompt arm replaces the pool's expert products";
+        else if (serve_mode) why = "the streamed arm serves prefill chunks, not a served request stream";
+        else if (stream_capture_on()) why = "the capture hook records the CPU pool's leg; the streamed arm is a different leg";
+        if (why != nullptr) {
+            std::fprintf(stderr, "kolibri: expert streaming refused: %s\n", why);
+            return 2;
+        }
+    }
     if (stream_capture_on()) {
         const char* why = nullptr;
         const char* pool_all_env = std::getenv("STRATA_KOLIBRI_POOL_ALL");

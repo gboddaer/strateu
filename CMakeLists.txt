@@ -1007,7 +1007,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   if(STRATA_ENABLE_HIP)
     set_source_files_properties(src/kolibri/decode_wait.cu PROPERTIES LANGUAGE HIP)
   endif()
-  add_library(strata_kolibri STATIC src/kolibri/kolibri_engine.cu src/kolibri/pf_combine.cu src/kolibri/decode_wait.cu)
+  add_library(strata_kolibri STATIC src/kolibri/kolibri_engine.cu src/kolibri/pf_combine.cu src/kolibri/decode_wait.cu
+                       src/kolibri/expert_stream.cu)
   # tools/kolibri: the streamed-prefill workload capture header (plan 2026-10-31-kolibri-gpu-streaming Task 1).
   # Host-only C++17, shared by the engine and the replay tool, so the record schema cannot drift between them.
   target_include_directories(strata_kolibri PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include

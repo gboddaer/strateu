@@ -14,6 +14,8 @@
 // lane accumulates in exactly the scalar order and no cross-lane reduction reorders anything. The final tree is
 // performed by lane 0 from its eight lane values (shuffle width 8 keeps it inside the row).
 #pragma once
+// `static`: two translation units of the same library include this header (kolibri_engine.cu for the A1 arm,
+// expert_stream.cu for its kernels), and a non-static __global__ in a header is a duplicate symbol at link time.
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
@@ -48,7 +50,7 @@ __device__ __forceinline__ float tree8(const float* a) {
 
 /// One warp per four rows. `w` holds `rows` contiguous rows of `nb` Q4_K blocks; `act` holds `nb` Q8_K blocks
 /// shared by every row (the activations of the token being multiplied). Results are written per row by lane 0.
-__global__ void kq_a1_dot_rows(const uint8_t* __restrict__ w, const uint8_t* __restrict__ act, int nb, int rows,
+static __global__ void kq_a1_dot_rows(const uint8_t* __restrict__ w, const uint8_t* __restrict__ act, int nb, int rows,
                               float* __restrict__ out) {
     const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int lane = threadIdx.x & 31;
@@ -119,7 +121,7 @@ __global__ void kq_a1_dot_rows(const uint8_t* __restrict__ w, const uint8_t* __r
 /// subtraction is applied per lane from the sub-block PAIR 2k, 2k+1 - a distribution that does not follow the
 /// values each lane actually holds.  The integer total is identical either way, but the float accumulation is
 /// per lane, so the distribution decides the rounding.  Reproducing it is the whole point of this file.
-__global__ void kq_a1_dot_rows_q6k(const uint8_t* __restrict__ w, const uint8_t* __restrict__ act, int nb, int rows,
+static __global__ void kq_a1_dot_rows_q6k(const uint8_t* __restrict__ w, const uint8_t* __restrict__ act, int nb, int rows,
                                    float* __restrict__ out) {
     const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int lane = threadIdx.x & 31;

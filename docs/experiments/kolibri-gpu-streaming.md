@@ -366,3 +366,37 @@ prefill/generation paths with the flag absent must stay byte-identical (Task 5's
 What is NOT claimed by this ruling: that the arm is faster on this card (it is 0.976 of the engine pool), that the plan's
 0.90 gate was met, or that the long-prompt distribution is viable here (Task 1's floor says it is not, at 10.33 GB/s
 required against 9.64 measured). The qualification in Task 6 and the numbers in Task 7 are what the reader must judge.
+
+## Task 5 (integration) and the first end-to-end result
+
+`STRATA_KOLIBRI_EXPERT_STREAM=1` now replaces exactly one thing in `kolibri_engine.cu`: the CPU pool's expert products
+of a prefill chunk-layer. The router, the weighting of `ey_h`, attention, the KV cache, the token graph, generation and
+every published buffer are untouched. With the variable absent or `0` the branch is not taken and no context, buffer or
+allocation exists. The configuration conflicts are enumerated from the same switches the forward pass reads and refused
+by name at startup (no prefill, no cpu threads, `POOL_ALL` other than 1, `--expert-slots`, `--grouped`, the A1 arm, the
+fp16 expert cache, `PF_PARTIAL`, `DEC_RES`, the MMQ prompt arm, a served request stream, and the capture hook, which
+records the pool's leg and not this one). A runtime refusal prints `kolibri: expert streaming refused: <reason>` and
+exits 2 - the arm never falls back to the CPU while claiming streamed coverage.
+
+`kq_a1.cuh`'s kernels became `static`: two translation units of the library now include that header, and a non-static
+`__global__` in a header was a duplicate symbol at link time (measured: `multiple definition of
+strata::kolibri::a1::kq_a1_dot_rows`).
+
+### Same-day end-to-end, ids511, `--n 8 --force 286,... --ctx 2048 --cpu-threads 14`
+
+| arm | prefill (engine's own `PFchunk 510/510`) | full logits |
+|---|---:|---|
+| `STRATA_KOLIBRI_EXPERT_STREAM` absent | **7,809 ms** | `logits-off-511.bin` |
+| `=1` | **4,979 ms** | `logits-on-511.bin` |
+| `cmp` | **1.57x** | **byte-identical** (4,608,000 bytes each) |
+
+This is better than the replay's paired gate predicted (0.976 of the engine's pool), and the reason is worth recording
+rather than celebrating: the replay's GPU arm and the engine's arm are the same pipeline, but the replay's CPU control
+is the 6858 ms *replay*, and its GPU arm streams blobs from a freshly loaded capture table while the engine copies from
+its own 42.9 GiB pinned table that was populated at load. The engine number is the one a user sees; the replay number is
+the one that isolates the leg. Both are recorded; neither is presented as the other.
+
+Task 6's remaining histories (16, de512, code512, 8191, 11000) and Task 7's full handoff are NOT run yet: the 8191 and
+11000 cases need the long-context path and hours of streaming, and the six-history sweep needs a driver that compares
+each dump byte for byte. The one history measured is byte-identical on the full 4.6 MB logits dump, which is the
+strongest form of the claim available.
