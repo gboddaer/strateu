@@ -1,6 +1,7 @@
 """Engine guard tests: invalid arm combinations must fail before model loading or GPU allocation.
 
-Run after building strata-kolibri. No model or GPU is used by these negative cases.
+Run after building strata-kolibri. Invalid-combination cases need no model or GPU.
+The automatic-fallback case needs a GPU to reach model I/O after its guards.
 """
 import os
 from pathlib import Path
@@ -59,6 +60,8 @@ def test_unsupported_config_with_no_request_runs_the_plain_path_instead_of_faili
     assert result.returncode == 1, result.stderr
     assert 'decode acceleration off' in result.stderr
     assert '--expert-slots' in result.stderr
+    if 'no CUDA-capable device is detected' in result.stderr:
+        pytest.skip('plain-path model I/O requires a CUDA device after the decode guards')
     assert 'cannot open' in result.stderr   # it reached model I/O: the arms stepped aside, they did not abort
 
 
