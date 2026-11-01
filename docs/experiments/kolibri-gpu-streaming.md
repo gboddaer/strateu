@@ -172,3 +172,69 @@ bound above is a property of *this* card's PCIe, not of the design. The card is 
 so the long arm is a hardware-independent test of the pipeline, and its verdict is recorded as "bound by this
 card's PCIe" with the rate it would need, not as a refutation of the design. Both arms are built and measured;
 neither the plan's gate nor this ruling is relaxed.
+
+## Task 2 — the tiled grouped products, gated by the CPU pool itself
+
+`src/kolibri/expert_stream_kernels.cuh` holds `q4k_tile` and `q6k_tile`. A CTA is 128 threads: four warps, four rows
+per warp, and one row's eight integer lanes per row are the eight threads of a shuffle group. A thread keeps
+`kTileTokens = 4` accumulators, one per token, so the row's weight bytes are loaded and decoded **once for four
+tokens** instead of once per token. The tile is the plan's 16 rows x 4 tokens.
+
+The arithmetic is A1's, which is the pool's: eight int32 lanes per row, the four-value groups at `64j + 4k` and
+`64j + 32 + 4k` scaled by `scales[2j]` and `scales[2j+1]`, one FMA per block, `dmin = -y.d * xdmin` for the minimum
+term, the final tree `((a0+a4)+(a2+a6)) + ((a1+a5)+(a3+a7))` and `((m0+m2)+(m1+m3))`. The one freedom taken is the
+integer part: four of those four-value products go through `__dp4a` in one instruction. That is legal because the
+integer sum is exact in int32 — the order inside a lane cannot change the result — and it is what makes sharing the
+decoded weight bytes across four tokens possible at all. The float sequence per token is untouched, so each token's
+bits are the single-token bits.
+
+### What the test proves
+
+`tests/kolibri/expert_stream_kernel_test.cu`, 94 cases, all bitwise (`--selftest`; `--tails-only` runs 72 tail cases
+for the sanitizers):
+
+| what | against |
+|---|---|
+| every `nb` in {1,2,10,32} at every row tail (1,15,16,17,512,2560), 4 tokens | `kq256_rows` (Q4_K), ggml-cpu `vec_dot` (Q6_K) |
+| every token count in {1,2,7,8,9,13,31,64,65} at 17 and 512 rows | same |
+| the model's geometries: gate/up (nb 10, 512 rows), down Q4_K and Q6_K (nb 2, 2,560 rows) | same |
+| largest finite fp16 scales, zero blocks, row starts at 144/210/7x144 bytes (unaligned) | same |
+| the whole expert: gate/up tile, CPU SwiGLU, `native_quant_h` **byte for byte**, down tile | `native_gu_rows` / `native_down_rows` |
+| tiled vs A1 on a subset | A1 **and** the CPU oracle (A1-only agreement is not a pass) |
+
+Sensitivity of the data itself (the test must be able to see the mistakes the campaign is about): flipping `dmin`'s
+sign in the weights (what a `+xdmin` kernel is equivalent to) changes the oracle's output, swapping adjacent Q6_K
+scale bytes changes it, and rotating `ql` by 32 bytes changes it. All three are required to differ, and all three do.
+
+The test is not vacuous: with `-(yd * xdmin)` turned into `(yd * xdmin)` in `q4k_tile`, 48 of 72 tail cases fail; with
+the `(c & 1) * 32` half of the Q6_K `ql` index removed, 24 of 72 fail. Both mutations were reverted before commit.
+
+Compute Sanitizer on `--tails-only`: memcheck 0 errors, racecheck 0 errors, synccheck 0 errors.
+
+### Compiler report (recorded, as the plan asks)
+
+| kernel | registers | spills | barriers | shared |
+|---|---:|---|---:|---:|
+| `q4k_tile` | 62 | 0 byte store, 0 byte load | 0 | 0 |
+| `q6k_tile` | 62 | 0 | 0 | 0 |
+| (A1, for comparison) | 61 / 64 | 0 | 0 | 0 |
+
+62 registers at 128 threads keeps eight CTAs resident per SM (1,024 threads, half of sm_75's 2,048): the kernels are
+byte-bound, not occupancy-bound, and 16x4 stays until parity says otherwise.
+
+### Rulings taken in Task 2
+
+- **No shared-memory staging.** The plan asks for cooperative CTA staging. It is not needed and would add the exact
+  hazard it warns about: the only data shared inside a tile is the four tokens' weight bytes, and those are read by
+  the four threads of one warp that hold the same integer lane — the same address, so one L1 transaction, no
+  barrier, no mask. The activation blocks (11.7 KB for four tokens) are read by every row's warp and stay in L1.
+  Cost if wrong: up to 16 duplicate activation reads per block from L1/L2 instead of shared memory; to be revisited
+  only if the pipeline's kernel time is the limiter, which the transfer floor says it will not be.
+- **Token pointers are kernel arguments, never a host array.** A kernel cannot dereference a host pointer array;
+  the first version did and memcheck named it immediately (invalid 8-byte read of a host address). Four pointers
+  fit in the kernel's constant bank, and a device pointer array would cost an upload per launch.
+- **Per-group shuffle masks.** A row's eight lanes are one shuffle group, and a partial row cannot occur, so the
+  group leaves and stays together; the mask is `0xff << 8*(lane>>3)`, not the whole warp. With the whole-warp mask
+  the row tail is undefined behaviour — the first version's second bug.
+- **`nt` is bounded to 1..1024 and split into tiles of four by the launcher**: a 64-token chunk is 16 launches, and
+  the token count is a kernel argument so the tail tile needs no separate code path.
