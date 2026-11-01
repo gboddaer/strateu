@@ -30,9 +30,9 @@ constexpr int kTileTokens = 4;
 const char* es_unsupported(int ggml_weight_type, int nb, int rows, const void* w, const void* acts);
 
 /// out[token * out_stride + row] = w_row . acts[token], for rows [0, rows) and tokens [0, nt).
-/// `w` points at `rows` rows of `nb` blocks; `acts` is a HOST array of DEVICE pointers to `nb` Q8_K blocks each.
-/// The launcher unpacks at most kTileTokens of those pointers into kernel arguments: a kernel must never read a
-/// host array, and a device pointer array would cost an upload per launch.
+/// `w` points at `rows` rows of `nb` blocks.  `acts` points at a CONTIGUOUS device buffer of `nt` quantized
+/// activation rows at `act_stride` bytes each, gathered in the caller's selection order.
+
 /// Returns 0 on success, non-zero when refused (nothing was launched and nothing was written).
 int es_q4k_rows(const uint8_t* w, int nb, int rows, const uint8_t* const* acts, int nt, float* out, int out_stride,
                 cudaStream_t st);
@@ -76,22 +76,22 @@ __device__ __forceinline__ void q4k_scales_mins(const uint8_t* xb, int* s, int* 
 
 /// Q4_K x Q8_K, four tokens per row.  Thread = one of the row's eight integer lanes; the four token groups of a
 /// warp are the same eight lanes, so every token keeps the CPU's own accumulation sequence in its own registers.
-__global__ void q4k_tile(const uint8_t* __restrict__ w, const uint8_t* __restrict__ a0, const uint8_t* __restrict__ a1,
-                         const uint8_t* __restrict__ a2, const uint8_t* __restrict__ a3, int nb, int rows, int tn,
-                         float* __restrict__ out, int out_stride) {
+__global__ void q4k_tile(const uint8_t* __restrict__ w, const uint8_t* __restrict__ acts, int act_stride, int nb,
+                         int rows, int nt, float* __restrict__ out, int out_stride) {
     const int warp = (int) (threadIdx.x >> 5);
     const int lane = (int) (threadIdx.x & 31);
     const int row = blockIdx.x * kTileRows + warp * 4 + (lane >> 3);
     const int k = lane & (a1::kLanesPerRow - 1);
     if (row >= rows) return;   // a row's eight lanes share the row, so a group leaves or stays together
     const unsigned gmask = 0xffu << (8 * (lane >> 3));
+    const int t0 = (int) blockIdx.y * kTileTokens;
 
     const uint8_t* xrow = w + (size_t) row * (size_t) nb * kQ4KBlock;
-    const uint8_t* yb[kTileTokens] = {a0, a1, a2, a3};
+    const uint8_t* yb[kTileTokens];
     float acc[kTileTokens], am[kTileTokens];
 #pragma unroll
     for (int t = 0; t < kTileTokens; ++t) {
-        if (t >= tn) yb[t] = nullptr;
+        yb[t] = (t0 + t < nt) ? acts + (size_t) (t0 + t) * (size_t) act_stride : nullptr;
         acc[t] = 0.f;
         am[t] = 0.f;
     }
@@ -153,27 +153,27 @@ __global__ void q4k_tile(const uint8_t* __restrict__ w, const uint8_t* __restric
         for (int j = 0; j < 8; ++j) a[j] = __shfl_sync(gmask, acc[t], j, a1::kLanesPerRow);
 #pragma unroll
         for (int j = 0; j < 4; ++j) m[j] = __shfl_sync(gmask, am[t], j, a1::kLanesPerRow);
-        if (k == 0) out[(size_t) t * out_stride + row] = __fadd_rn(tree8(a), (m[0] + m[2]) + (m[1] + m[3]));
+        if (k == 0) out[(size_t) (t0 + t) * out_stride + row] = __fadd_rn(tree8(a), (m[0] + m[2]) + (m[1] + m[3]));
     }
 }
 
 /// Q6_K x Q8_K, four tokens per row: A1's per-lane order, per block, per token.
-__global__ void q6k_tile(const uint8_t* __restrict__ w, const uint8_t* __restrict__ a0, const uint8_t* __restrict__ a1,
-                         const uint8_t* __restrict__ a2, const uint8_t* __restrict__ a3, int nb, int rows, int tn,
-                         float* __restrict__ out, int out_stride) {
+__global__ void q6k_tile(const uint8_t* __restrict__ w, const uint8_t* __restrict__ acts, int act_stride, int nb,
+                         int rows, int nt, float* __restrict__ out, int out_stride) {
     const int warp = (int) (threadIdx.x >> 5);
     const int lane = (int) (threadIdx.x & 31);
     const int row = blockIdx.x * kTileRows + warp * 4 + (lane >> 3);
     const int k = lane & (a1::kLanesPerRow - 1);
     if (row >= rows) return;   // a row's eight lanes share the row, so a group leaves or stays together
     const unsigned gmask = 0xffu << (8 * (lane >> 3));
+    const int t0 = (int) blockIdx.y * kTileTokens;
 
     const uint8_t* xrow = w + (size_t) row * (size_t) nb * kQ6KBlock;
-    const uint8_t* yb[kTileTokens] = {a0, a1, a2, a3};
+    const uint8_t* yb[kTileTokens];
     float acc[kTileTokens];
 #pragma unroll
     for (int t = 0; t < kTileTokens; ++t) {
-        if (t >= tn) yb[t] = nullptr;
+        yb[t] = (t0 + t < nt) ? acts + (size_t) (t0 + t) * (size_t) act_stride : nullptr;
         acc[t] = 0.f;
     }
 
@@ -225,7 +225,7 @@ __global__ void q6k_tile(const uint8_t* __restrict__ w, const uint8_t* __restric
         float a[8];
 #pragma unroll
         for (int j = 0; j < 8; ++j) a[j] = __shfl_sync(gmask, acc[t], j, a1::kLanesPerRow);
-        if (k == 0) out[(size_t) t * out_stride + row] = tree8(a);
+        if (k == 0) out[(size_t) (t0 + t) * out_stride + row] = tree8(a);
     }
 }
 
@@ -242,34 +242,32 @@ inline const char* es_unsupported(int ggml_weight_type, int nb, int rows, const 
 }
 
 /// out[token * out_stride + row] = w_row . acts[token], for rows [0, rows) and tokens [0, nt).
-inline int es_launch(int type, const uint8_t* w, int nb, int rows, const uint8_t* const* acts, int nt, float* out,
-                     int out_stride, cudaStream_t st) {
+inline int es_launch(int type, const uint8_t* w, int nb, int rows, const uint8_t* acts, int act_stride, int nt,
+                     float* out, int out_stride, cudaStream_t st) {
     if (es_unsupported(type, nb, rows, w, acts) != nullptr) return 1;
     if (nt < 1 || nt > 1024) return 1;
+    if (act_stride < (int) (nb * detail::kQ8KBlock)) return 1;
     if (out == nullptr || out_stride < rows) return 1;
-    const dim3 grid((unsigned) ((rows + kTileRows - 1) / kTileRows));
-    for (int t0 = 0; t0 < nt; t0 += kTileTokens) {
-        const int tn = (nt - t0 < kTileTokens) ? nt - t0 : kTileTokens;
-        const uint8_t* p[4] = {nullptr, nullptr, nullptr, nullptr};
-        for (int t = 0; t < tn; ++t) p[t] = acts[t0 + t];
-        float* o = out + (size_t) t0 * (size_t) out_stride;
-        if (type == 12) {
-            detail::q4k_tile<<<grid, 128, 0, st>>>(w, p[0], p[1], p[2], p[3], nb, rows, tn, o, out_stride);
-        } else {
-            detail::q6k_tile<<<grid, 128, 0, st>>>(w, p[0], p[1], p[2], p[3], nb, rows, tn, o, out_stride);
-        }
+    // Token tiles are a GRID dimension, not a host loop: with rows/16 CTAs alone a 1,024-row gate/up launch fills
+    // only 1.6 CTAs per SM on this card and measures 230 GFLOP/s (measured, kbench); the token tiles are what
+    // gives the card enough work in flight.
+    const dim3 grid((unsigned) ((rows + kTileRows - 1) / kTileRows), (unsigned) ((nt + kTileTokens - 1) / kTileTokens));
+    if (type == 12) {
+        detail::q4k_tile<<<grid, 128, 0, st>>>(w, acts, act_stride, nb, rows, nt, out, out_stride);
+    } else {
+        detail::q6k_tile<<<grid, 128, 0, st>>>(w, acts, act_stride, nb, rows, nt, out, out_stride);
     }
     return 0;
 }
 
-inline int es_q4k_rows(const uint8_t* w, int nb, int rows, const uint8_t* const* acts, int nt, float* out,
+inline int es_q4k_rows(const uint8_t* w, int nb, int rows, const uint8_t* acts, int act_stride, int nt, float* out,
                        int out_stride, cudaStream_t st) {
-    return es_launch(12, w, nb, rows, acts, nt, out, out_stride, st);
+    return es_launch(12, w, nb, rows, acts, act_stride, nt, out, out_stride, st);
 }
 
-inline int es_q6k_rows(const uint8_t* w, int nb, int rows, const uint8_t* const* acts, int nt, float* out,
+inline int es_q6k_rows(const uint8_t* w, int nb, int rows, const uint8_t* acts, int act_stride, int nt, float* out,
                        int out_stride, cudaStream_t st) {
-    return es_launch(14, w, nb, rows, acts, nt, out, out_stride, st);
+    return es_launch(14, w, nb, rows, acts, act_stride, nt, out, out_stride, st);
 }
 
 }  // namespace strata::kolibri::stream

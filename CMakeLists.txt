@@ -1057,7 +1057,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # Task 1's replay harness: the CPU control arm of the streamed-prefill comparison.  It reads a capture, replays
     # the expert leg through the engine's own native kernels and shard fan-out, and refuses to report a timing when
     # any output byte differs from the capture.  Task 4 adds its --gpu arm; nothing here needs a device yet.
-    add_executable(expert_stream_replay tools/kolibri/expert_stream_replay.cu)
+    add_executable(expert_stream_replay tools/kolibri/expert_stream_replay.cu src/kolibri/expert_stream.cu)
     target_include_directories(expert_stream_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
                                ${CMAKE_CURRENT_SOURCE_DIR}/tools/kolibri
                                ${CMAKE_CURRENT_SOURCE_DIR}/include)

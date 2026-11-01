@@ -298,3 +298,57 @@ Compute Sanitizer on `--tails-only`: memcheck, racecheck and synccheck all repor
   weights whose scales are unrelated to their nibbles and outputs up to 1e38: at that magnitude the first version of
   this test compared NaN against FLT_MAX and reported a difference that said nothing about the pipeline. Task 4
   replays the model's real captured weights through this same code, which is the fidelity check that matters.
+
+## Task 4 — the GPU arm measured, and why it is not yet a GO
+
+The replay tool gained `--gpu`: every captured record goes through the Task 3 pipeline and is compared byte for byte
+with the capture before its time is kept. First result, short capture, 100 records, 153,000 selections, one repeat
+(`/data4/kolibri-gpu-streaming/replay-gpu-short-r2.json`):
+
+| | value |
+|---|---:|
+| GPU arm, median | **5,917 ms** |
+| CPU replay control, same capture, same day | 6,858 ms |
+| **GPU / CPU replay** | **0.863** |
+| engine's own `CNT prefill pool`, same day | 6,060-6,155 ms |
+| **GPU / engine pool** | **0.976** |
+| all 100 records bit-identical to the capture | yes (a single differing float aborts the run) |
+| weights streamed | 27.90 GB (**4.72 GB/s** observed) |
+| activations / gate-up back / hidden up / output back | 447 MB / 627 MB / 89 MB / 1,567 MB |
+| pipeline create (first use, outside every timed repeat) | 31.5 ms |
+| CPU SwiGLU + `native_quant_h` | 4.2 ms per record |
+
+**The gate reads marginal, not GO.** 0.863 clears the plan's 0.90 against the replay control, and 0.976 fails it
+against the engine's own pool — and Task 1 recorded why the engine figure is the one that matters: the replay's CPU
+arm is 9-13 % slower than the pool, so a GO resting on it would be ~10 % optimistic. Neither number is a pass on both
+denominators, and the reason is measurable: the arm is **compute-bound, not transfer-bound**. It streams at
+4.72 GB/s of the 9.64 GB/s this card does, so the pipeline is not waiting on PCIe at all.
+
+Where the compute goes, measured with a standalone harness at the model's geometries (`/tmp/kbench.cu`, repeated
+twice, stable to <1 %):
+
+| launch | 4 tokens | 32 tokens | 64 tokens | 128 tokens |
+|---|---:|---:|---:|---:|
+| gate/up, 1,024 rows, before | 206 GFLOP/s | 230 | 230 | 230 |
+| gate/up, 1,024 rows, after the grid fix | 179-226 | 322-401 | 340-423 | 346-432 |
+| down, 2,560 rows, before | 292 | 306 | 307 | 306 |
+| down, 2,560 rows, after | 281-294 | 382 | 390 | 396 |
+
+The first version put the token tiles in a host loop, so a 1,024-row gate/up launch was 64 CTAs — 1.6 CTAs per SM,
+which is why the rate was flat in the token count: the card had nothing in flight. Moving the token tiles into the
+grid (and gathering the activations into one contiguous device buffer, so the kernel can index them by token instead
+of dereferencing a host pointer array) took gate/up from 230 to 340-432 GFLOP/s and down from 306 to 390. That fix is
+in the committed kernels and both parity suites were rerun after it (94 + 76 cases, still bit-exact).
+
+What is left, with the numbers that say so:
+- **~370-430 GFLOP/s against the ~600 GFLOP/s needed to hide under 9.6 GB/s.** Per record the arm spends ~33 ms of
+  kernel time against ~20 ms of weight transfer; only a faster kernel makes the arm transfer-bound.
+- The activation row is re-read once per output ROW (16 rows per CTA), i.e. ~16x: the plan's shared-memory staging is
+  what removes it, and Task 2's ruling against it is overturned by this measurement.
+- The counter bugs found here are fixed in the committed code and do NOT affect any timing above: the recorded JSON
+  sums `gpu_cpu_activation_ms` as a triangular total (per-record value is the 4.2 ms quoted), and `kernel_launches`
+  counted tiles rather than launches (the true count is two per expert per batch, ~92 per record).
+
+**Verdict recorded: NO-GO as of this measurement, on this card, for both denominators combined.** The next bounded
+step is the plan's own tuning list, continued: shared-memory staging of the four tokens' activations, then a 16x8
+tile, then the batch bound 4 vs 8 — one dimension at a time, parity first, and the same paired gate afterwards.

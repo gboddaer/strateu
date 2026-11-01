@@ -33,6 +33,7 @@
 #include <ggml-cpu.h>
 
 #include "expert_stream_capture.hpp"
+#include "kolibri/expert_stream.hpp"
 #include "kolibri/expert_stream_plan.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 
@@ -51,6 +52,9 @@ struct Options {
     bool pin = true;
     size_t blob_align = 2097152;   // 2 MiB: THP-backed like the engine's own (much larger) table
     bool blob_pinned = false;
+    bool gpu = false;          ///< Task 4: the streamed GPU arm, timed and gated
+    size_t device_budget = 256u << 20;
+    int experts_per_batch = 8;
 };
 
 /// The engine's prefill fan-out, same contract as `Pool` in kolibri_engine.cu: `run(f, n)` splits [0, n) over n
@@ -180,6 +184,36 @@ struct Buffers {
     }
 };
 
+/// The GPU arm copies each expert's blob from a table indexed by EXPERT ID at the model's stride, because that is
+/// the layout the engine's own pinned expert table has (LayerView::weights).  The CPU arm keeps its packed table:
+/// its measurements must not move.  Pinned, so the H2D is genuinely asynchronous; the engine's table is pinned too.
+struct ExpertTable {
+    uint8_t* table = nullptr;
+    size_t bytes = 0;
+    size_t stride = 0;
+    bool pinned = true;
+
+    void ensure(int experts, size_t stride_) {
+        const size_t need = (size_t) experts * stride_;
+        if (need <= bytes && stride_ == stride) return;
+        release();
+        void* p = nullptr;
+        cudaError_t e = pinned ? cudaHostAlloc(&p, need, cudaHostAllocDefault) : cudaMallocHost(&p, need);
+        if (e != cudaSuccess || p == nullptr) {   // a pinned table of ~1 GB can be refused; report it, don't fall back silently
+            throw std::runtime_error(std::string("replay: cannot allocate the expert table: ") + cudaGetErrorString(e));
+        }
+        table = (uint8_t*) p;
+        bytes = need;
+        stride = stride_;
+    }
+    void release() {
+        if (table != nullptr) cudaFreeHost(table);
+        table = nullptr;
+        bytes = 0;
+    }
+    ~ExpertTable() { release(); }
+};
+
 double ms_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
@@ -295,7 +329,10 @@ int usage() {
                  "  --repeat N       timed repeats after one untimed correctness pass (default 3)\n"
                  "  --blob-align N   alignment of the replayed blob table (default 2097152: 2 MiB, THP-backed)\n"
                  "  --blob-pinned    hold the replayed blobs in cudaHostAlloc memory, as the engine's table is\n"
-                 "  --json OUT       write the report to OUT (otherwise stdout)\n");
+                 "  --json OUT       write the report to OUT (otherwise stdout)\n"
+                 "  --gpu            replay the same records through the streamed GPU pipeline (Task 4's arm)\n"
+                 "  --experts-per-batch N  GPU arm: groups per slot batch (default 8)\n"
+                 "  --device-budget BYTES  GPU arm: cap on the pipeline's new device memory (default 256 MiB)\n");
     return 2;
 }
 
@@ -328,6 +365,12 @@ int main(int argc, char** argv) {
             opt.blob_align = (size_t) std::atoll(next().c_str());
         } else if (a == "--blob-pinned") {
             opt.blob_pinned = true;
+        } else if (a == "--gpu") {
+            opt.gpu = true;
+        } else if (a == "--experts-per-batch") {
+            opt.experts_per_batch = std::atoi(next().c_str());
+        } else if (a == "--device-budget") {
+            opt.device_budget = (size_t) std::atoll(next().c_str());
         } else if (a == "--help" || a == "-h") {
             return usage();
         } else {
@@ -335,8 +378,8 @@ int main(int argc, char** argv) {
             return usage();
         }
     }
-    if (opt.capture_dir.empty() || !opt.cpu) {
-        std::fprintf(stderr, "expert_stream_replay: --capture DIR and --cpu are required\n");
+    if (opt.capture_dir.empty() || (!opt.cpu && !opt.gpu)) {
+        std::fprintf(stderr, "expert_stream_replay: --capture DIR and --cpu or --gpu are required\n");
         return usage();
     }
     if (opt.cpu_threads < 2) {
@@ -350,6 +393,16 @@ int main(int argc, char** argv) {
     ggml_cpu_init();   // the ggml type traits the native kernels call
 
     // The engine's lane rule: the host lane plus one per pinnable physical core, capped by --cpu-threads.
+    if (opt.gpu) {
+        int dev = 0;
+        cudaDeviceProp prop{};
+        if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&prop, dev) != cudaSuccess ||
+            !(prop.major > 7 || (prop.major == 7 && prop.minor >= 5))) {
+            std::fprintf(stderr, "expert_stream_replay: --gpu needs a CUDA device with sm_75 or newer\n");
+            return 2;
+        }
+        std::printf("expert_stream_replay: GPU arm on %s, sm_%d%d\n", prop.name, prop.major, prop.minor);
+    }
     const std::vector<int> pf_cores = cpu::physical_cores(true);
     int lanes = opt.cpu_threads;
     const int lanes_cap = pf_cores.empty() ? opt.cpu_threads : (int) pf_cores.size() + 1;
@@ -369,6 +422,20 @@ int main(int argc, char** argv) {
     int records = 0;
     int64_t selections_total = 0;
     double load_total = 0.0;
+    // GPU arm state: one context for the whole capture (its creation is first-use cost, reported separately), one
+    // expert-indexed pinned table, and the per-repeat totals.
+    stream::Config gcfg;
+    gcfg.experts_per_batch = opt.experts_per_batch;
+    gcfg.device_budget_bytes = opt.device_budget;
+    std::unique_ptr<stream::Context> gctx;
+    double create_ms = 0.0;
+    ExpertTable gtable;
+    std::vector<float> gpu_out;
+    std::vector<std::vector<double>> gpu_record_ms;
+    std::vector<double> gpu_totals((size_t) opt.repeat, 0.0);
+    stream::Stats gstats{};
+    uint64_t gpu_records = 0;
+    double gpu_cpu_activation_ms = 0.0;
 
     // **RECORD-MAJOR REPEATS.**  Each record's blobs are read from the store ONCE and then replayed `repeat` times.
     // A pass-major loop would re-read the whole store per repeat (measured: 26 minutes of ZFS reads for three
@@ -380,27 +447,89 @@ int main(int argc, char** argv) {
         while (reader.next(rec)) {
             const cpu::NativeFmt fmt = rec.fmt.to_native();
             buf.ensure(rec);
+            if (opt.gpu) gtable.ensure(rec.experts, (size_t) rec.weight_stride);
             const auto load_t0 = std::chrono::steady_clock::now();
-            for (size_t i = 0; i < rec.blobs.size(); ++i)
-                reader.load_into(rec.blobs[i], const_cast<uint8_t*>(buf.blob(i)), (size_t) rec.weight_stride);
+            if (opt.cpu)
+                for (size_t i = 0; i < rec.blobs.size(); ++i)
+                    reader.load_into(rec.blobs[i], const_cast<uint8_t*>(buf.blob(i)), (size_t) rec.weight_stride);
+            if (opt.gpu)
+                for (size_t i = 0; i < rec.blobs.size(); ++i)
+                    reader.load_into(rec.blobs[i], gtable.table + (size_t) rec.blobs[i].expert * gtable.stride,
+                                     (size_t) rec.weight_stride);
             const double load_ms = ms_since(load_t0);
             load_total += load_ms;
-            std::fill(buf.out.begin(), buf.out.begin() + (size_t) rec.selections * (size_t) fmt.n_embd,
-                      std::numeric_limits<float>::quiet_NaN());
-            const int ns = std::min(rec.experts, lanes);
             std::vector<double> times((size_t) opt.repeat, 0.0);
-            for (int rep = 0; rep < opt.repeat; ++rep) {
-                const auto t0 = std::chrono::steady_clock::now();
-                build_groups(rec, buf);
-                pool.run([&](int lane) { replay_record(rec, fmt, lane, ns, buf); }, ns);
-                times[(size_t) rep] = ms_since(t0);
-                totals[(size_t) rep] += times[(size_t) rep];
-                std::string why;
-                if (!same_output(rec, buf.out, why)) {
-                    std::fprintf(stderr, "expert_stream_replay: CPU replay does not reproduce the capture: %s\n",
-                                 why.c_str());
-                    return 1;
+            if (opt.cpu) {
+                std::fill(buf.out.begin(), buf.out.begin() + (size_t) rec.selections * (size_t) fmt.n_embd,
+                          std::numeric_limits<float>::quiet_NaN());
+                const int ns = std::min(rec.experts, lanes);
+                for (int rep = 0; rep < opt.repeat; ++rep) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    build_groups(rec, buf);
+                    pool.run([&](int lane) { replay_record(rec, fmt, lane, ns, buf); }, ns);
+                    times[(size_t) rep] = ms_since(t0);
+                    totals[(size_t) rep] += times[(size_t) rep];
+                    std::string why;
+                    if (!same_output(rec, buf.out, why)) {
+                        std::fprintf(stderr, "expert_stream_replay: CPU replay does not reproduce the capture: %s\n",
+                                     why.c_str());
+                        return 1;
+                    }
                 }
+            }
+            std::vector<double> gtimes((size_t) opt.repeat, 0.0);
+            if (opt.gpu) {
+                stream::LayerView lv;
+                lv.fmt = fmt;
+                lv.weights = gtable.table;
+                lv.weight_stride = gtable.stride;
+                lv.expert_count = rec.experts;
+                lv.token_acts = rec.acts.data();
+                lv.expert_ids = rec.ids.data();
+                lv.selection_count = rec.selections;
+                lv.top_k = rec.top_k;
+                gpu_out.assign((size_t) rec.selections * (size_t) fmt.n_embd,
+                               std::numeric_limits<float>::quiet_NaN());
+                lv.output = gpu_out.data();
+                if (!gctx) {
+                    const auto c0 = std::chrono::steady_clock::now();
+                    gctx = stream::create(lv, gcfg);
+                    create_ms += ms_since(c0);   // first-use cost, reported, never inside a timed repeat
+                }
+                for (int rep = 0; rep < opt.repeat; ++rep) {
+                    // poison every element first: a selection the scatter forgets keeps NaN and fails the compare
+                    std::fill(gpu_out.begin(), gpu_out.end(), std::numeric_limits<float>::quiet_NaN());
+                    stream::Stats st{};
+                    const auto t0 = std::chrono::steady_clock::now();
+                    try {
+                        st = stream::run(*gctx, lv);
+                    } catch (const std::exception& ex) {
+                        std::fprintf(stderr, "expert_stream_replay: GPU replay failed: %s\n", ex.what());
+                        return 1;
+                    }
+                    gtimes[(size_t) rep] = ms_since(t0);
+                    gpu_totals[(size_t) rep] += gtimes[(size_t) rep];
+                    gstats.groups += st.groups;
+                    gstats.selections += st.selections;
+                    gstats.weight_h2d_bytes += st.weight_h2d_bytes;
+                    gstats.activation_h2d_bytes += st.activation_h2d_bytes;
+                    gstats.gu_d2h_bytes += st.gu_d2h_bytes;
+                    gstats.hidden_h2d_bytes += st.hidden_h2d_bytes;
+                    gstats.output_d2h_bytes += st.output_d2h_bytes;
+                    gstats.kernel_launches += st.kernel_launches;
+                    gstats.slot_waits += st.slot_waits;
+                    gstats.device_allocations += st.device_allocations;
+                    gstats.wall_ms += st.wall_ms;
+                    gstats.cpu_activation_ms += st.cpu_activation_ms / (double) opt.repeat;
+                    std::string why;
+                    if (!same_output(rec, gpu_out, why)) {
+                        std::fprintf(stderr, "expert_stream_replay: GPU replay does not reproduce the capture: %s\n",
+                                     why.c_str());
+                        return 1;
+                    }
+                }
+                gpu_cpu_activation_ms = gstats.cpu_activation_ms;   // the running total, not a sum of totals
+                ++gpu_records;
             }
             char line[256];
             std::snprintf(line, sizeof line,
@@ -409,11 +538,12 @@ int main(int argc, char** argv) {
                           (int) rec.fmt.d_type);
             record_lines.push_back(line);
             record_ms.push_back(times);
+            gpu_record_ms.push_back(gtimes);
             selections_total += rec.selections;
             ++records;
             if (records % 100 == 0)
-                std::fprintf(stderr, "expert_stream_replay: %d records replayed (%.0f ms so far)\n", records,
-                             totals[0]);
+                std::fprintf(stderr, "expert_stream_replay: %d records replayed (cpu %.0f ms, gpu %.0f ms so far)\n",
+                             records, totals[0], gpu_totals[0]);
         }
     }
 
@@ -425,7 +555,7 @@ int main(int argc, char** argv) {
     std::string json;
     json += "{\n";
     json += "  \"capture\": \"" + json_escape(opt.capture_dir) + "\",\n";
-    json += "  \"arm\": \"cpu\",\n";
+    json += "  \"arm\": \"" + std::string(opt.cpu && opt.gpu ? "cpu+gpu" : (opt.gpu ? "gpu" : "cpu")) + "\",\n";
     json += "  \"records\": " + std::to_string(records) + ",\n";
     json += "  \"selections\": " + std::to_string(selections_total) + ",\n";
     json += "  \"cpu_threads\": " + std::to_string(opt.cpu_threads) + ",\n";
@@ -435,9 +565,38 @@ int main(int argc, char** argv) {
     json += "  \"blob_memory\": \"" + std::string(opt.blob_pinned ? "pinned" : "pageable") + "\",\n";
     json += "  \"repeat\": " + std::to_string(opt.repeat) + ",\n";
     json += "  \"cpu_ms\": [";
-    for (size_t i = 0; i < totals.size(); ++i) json += (i ? ", " : "") + std::to_string(totals[i]);
+    for (size_t i = 0; i < totals.size(); ++i) json += (i ? ", " : "") + std::to_string(opt.cpu ? totals[i] : 0.0);
     json += "],\n";
-    json += "  \"cpu_ms_median\": " + std::to_string(median_of(totals)) + ",\n";
+    json += "  \"cpu_ms_median\": " + std::to_string(opt.cpu ? median_of(totals) : 0.0) + ",\n";
+    json += "  \"gpu\": " + std::string(opt.gpu ? "true" : "false") + ",\n";
+    json += "  \"experts_per_batch\": " + std::to_string(opt.experts_per_batch) + ",\n";
+    json += "  \"device_budget_bytes\": " + std::to_string(opt.device_budget) + ",\n";
+    json += "  \"gpu_ms\": [";
+    for (size_t i = 0; i < gpu_totals.size(); ++i) json += (i ? ", " : "") + std::to_string(gpu_totals[i]);
+    json += "],\n";
+    json += "  \"gpu_ms_median\": " + std::to_string(opt.gpu ? median_of(gpu_totals) : 0.0) + ",\n";
+    json += "  \"gpu_create_ms\": " + std::to_string(create_ms) + ",\n";
+    json += "  \"gpu_weight_h2d_bytes\": " + std::to_string((unsigned long long) gstats.weight_h2d_bytes) + ",\n";
+    json += "  \"gpu_activation_h2d_bytes\": " + std::to_string((unsigned long long) gstats.activation_h2d_bytes) +
+            ",\n";
+    json += "  \"gpu_hidden_h2d_bytes\": " + std::to_string((unsigned long long) gstats.hidden_h2d_bytes) + ",\n";
+    json += "  \"gpu_gu_d2h_bytes\": " + std::to_string((unsigned long long) gstats.gu_d2h_bytes) + ",\n";
+    json += "  \"gpu_output_d2h_bytes\": " + std::to_string((unsigned long long) gstats.output_d2h_bytes) + ",\n";
+    json += "  \"gpu_kernel_launches\": " + std::to_string((unsigned long long) gstats.kernel_launches) + ",\n";
+    json += "  \"gpu_slot_waits\": " + std::to_string((unsigned long long) gstats.slot_waits) + ",\n";
+    json += "  \"gpu_device_allocations_in_run\": " + std::to_string((unsigned long long) gstats.device_allocations) +
+            ",\n";
+    json += "  \"gpu_cpu_activation_ms\": " + std::to_string(gpu_cpu_activation_ms) + ",\n";
+    json += "  \"gpu_copy_gbps\": " +
+            std::to_string(median_of(gpu_totals) > 0
+                               ? (double) gstats.weight_h2d_bytes / (double) opt.repeat /
+                                     (median_of(gpu_totals) * 1.0e6)
+                               : 0.0) +
+            ",\n";
+    json += "  \"gpu_record_ms\": [";
+    for (size_t i = 0; i < gpu_record_ms.size(); ++i)
+        json += (i ? ", " : "") + std::to_string(opt.gpu ? median_of(gpu_record_ms[i]) : 0.0);
+    json += "],\n";
     json += "  \"load_ms_total\": " + std::to_string(load_total) + ",\n";
     json += "  \"record_ms\": [";
     for (size_t i = 0; i < record_ms.size(); ++i)
@@ -449,9 +608,15 @@ int main(int argc, char** argv) {
     json += "  \"manifest\": \"" + json_escape(reader.manifest()) + "\"\n";
     json += "}\n";
 
-    std::printf("expert_stream_replay: CPU control reproduces the capture bit for bit; %d records, %lld selections, "
-                "%d lanes, median %.1f ms over %d repeat(s)\n",
-                records, (long long) selections_total, lanes, median_of(totals), opt.repeat);
+    if (opt.cpu)
+        std::printf("expert_stream_replay: CPU control reproduces the capture bit for bit; %d records, %lld "
+                    "selections, %d lanes, median %.1f ms over %d repeat(s)\n",
+                    records, (long long) selections_total, lanes, median_of(totals), opt.repeat);
+    if (opt.gpu)
+        std::printf("expert_stream_replay: GPU arm reproduces the capture bit for bit; %d records, %llu unique-batch "
+                    "weight bytes, median %.1f ms over %d repeat(s), create %.1f ms, CPU activation %.1f ms total\n",
+                    (int) gpu_records, (unsigned long long) gstats.weight_h2d_bytes, median_of(gpu_totals),
+                    opt.repeat, create_ms, gpu_cpu_activation_ms);
     for (const std::string& line : record_lines) std::fputs(line.c_str(), stdout);
     if (!opt.json_out.empty()) {
         std::ofstream out(opt.json_out, std::ios::trunc);

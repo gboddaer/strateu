@@ -214,30 +214,22 @@ void run_case(const Case& c) {
     float* dout = nullptr;
     cudaError_t e = cudaMalloc((void**) &dw, host.size());
     if (e == cudaSuccess) e = cudaMalloc((void**) &dout, sizeof(float) * (size_t) c.rows * (size_t) c.nt);
-    std::vector<const uint8_t*> dacts((size_t) c.nt, nullptr);
-    if (e == cudaSuccess) {
-        std::vector<uint8_t*> tmp((size_t) c.nt, nullptr);
-        for (int t = 0; t < c.nt; ++t) {
-            if (cudaMalloc((void**) &dacts[(size_t) t], a.blk[(size_t) t].size()) != cudaSuccess) {
-                e = cudaGetLastError();
-                break;
-            }
-        }
-    }
+    const size_t astride = a.blk[0].size();
+    uint8_t* dacts = nullptr;
+    if (e == cudaSuccess) e = cudaMalloc((void**) &dacts, astride * (size_t) c.nt);
     if (e == cudaSuccess) {
         e = cudaMemcpy(dw, host.data(), host.size(), cudaMemcpyHostToDevice);
         for (int t = 0; t < c.nt && e == cudaSuccess; ++t)
-            e = cudaMemcpy((void*) dacts[(size_t) t], a.blk[(size_t) t].data(), a.blk[(size_t) t].size(),
-                           cudaMemcpyHostToDevice);
+            e = cudaMemcpy(dacts + (size_t) t * astride, a.blk[(size_t) t].data(), astride, cudaMemcpyHostToDevice);
     }
     bool refused = false;
     std::vector<float> got;
     if (e == cudaSuccess) {
         const int rc = c.type == kQ4K
-                           ? strata::kolibri::stream::es_q4k_rows(dw + c.offset, c.nb, c.rows, dacts.data(), c.nt,
-                                                                  dout, c.rows, nullptr)
-                           : strata::kolibri::stream::es_q6k_rows(dw + c.offset, c.nb, c.rows, dacts.data(), c.nt,
-                                                                  dout, c.rows, nullptr);
+                           ? strata::kolibri::stream::es_q4k_rows(dw + c.offset, c.nb, c.rows, dacts, (int) astride,
+                                                                  c.nt, dout, c.rows, nullptr)
+                           : strata::kolibri::stream::es_q6k_rows(dw + c.offset, c.nb, c.rows, dacts, (int) astride,
+                                                                  c.nt, dout, c.rows, nullptr);
         if (rc != 0) {
             std::printf("  FAIL %s: launcher refused (%d)\n", case_name(c).c_str(), rc);
             ++g_failures;
@@ -260,8 +252,7 @@ void run_case(const Case& c) {
         std::printf("  FAIL %s\n", case_name(c).c_str());
         ++g_failures;
     }
-    for (int t = 0; t < c.nt; ++t)
-        if (dacts[(size_t) t]) cudaFree((void*) dacts[(size_t) t]);
+    if (dacts) cudaFree(dacts);
     if (dout) cudaFree(dout);
     if (dw) cudaFree(dw);
 }
@@ -279,16 +270,18 @@ void run_a1_agreement(int type, int nb, int rows, int nt) {
     uint8_t* dw = nullptr;
     float* dtile = nullptr;
     float* da1 = nullptr;
-    std::vector<const uint8_t*> dacts((size_t) nt, nullptr);
+    const size_t astride = a.blk[0].size();
     std::vector<uint8_t*> dactp((size_t) nt, nullptr);
+    uint8_t* dacts = nullptr;
     bool ok = cudaMalloc((void**) &dw, w.size()) == cudaSuccess &&
               cudaMalloc((void**) &dtile, sizeof(float) * (size_t) rows * nt) == cudaSuccess &&
-              cudaMalloc((void**) &da1, sizeof(float) * (size_t) rows * nt) == cudaSuccess;
+              cudaMalloc((void**) &da1, sizeof(float) * (size_t) rows * nt) == cudaSuccess &&
+              cudaMalloc((void**) &dacts, astride * (size_t) nt) == cudaSuccess;
     for (int t = 0; ok && t < nt; ++t) {
-        ok = cudaMalloc((void**) &dactp[(size_t) t], a.blk[(size_t) t].size()) == cudaSuccess &&
-             cudaMemcpy(dactp[(size_t) t], a.blk[(size_t) t].data(), a.blk[(size_t) t].size(), cudaMemcpyHostToDevice) ==
+        ok = cudaMalloc((void**) &dactp[(size_t) t], astride) == cudaSuccess &&
+             cudaMemcpy(dactp[(size_t) t], a.blk[(size_t) t].data(), astride, cudaMemcpyHostToDevice) == cudaSuccess &&
+             cudaMemcpy(dacts + (size_t) t * astride, a.blk[(size_t) t].data(), astride, cudaMemcpyHostToDevice) ==
                  cudaSuccess;
-        dacts[(size_t) t] = dactp[(size_t) t];
     }
     ok = ok && cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice) == cudaSuccess;
     if (!ok) {
@@ -297,8 +290,9 @@ void run_a1_agreement(int type, int nb, int rows, int nt) {
         cudaGetLastError();
         return;
     }
-    const int rc = type == kQ4K ? strata::kolibri::stream::es_q4k_rows(dw, nb, rows, dacts.data(), nt, dtile, rows, nullptr)
-                                : strata::kolibri::stream::es_q6k_rows(dw, nb, rows, dacts.data(), nt, dtile, rows, nullptr);
+    const int rc = type == kQ4K
+                       ? strata::kolibri::stream::es_q4k_rows(dw, nb, rows, dacts, (int) astride, nt, dtile, rows, nullptr)
+                       : strata::kolibri::stream::es_q6k_rows(dw, nb, rows, dacts, (int) astride, nt, dtile, rows, nullptr);
     for (int t = 0; t < nt; ++t) {
         if (type == kQ4K) {
             strata::kolibri::a1::kq_a1_dot_rows<<<(rows + 15) / 16, 128>>>(dw, dactp[(size_t) t], nb, rows,
@@ -334,6 +328,7 @@ void run_a1_agreement(int type, int nb, int rows, int nt) {
     }
     for (int t = 0; t < nt; ++t)
         if (dactp[(size_t) t]) cudaFree(dactp[(size_t) t]);
+    if (dacts) cudaFree(dacts);
     if (da1) cudaFree(da1);
     if (dtile) cudaFree(dtile);
     if (dw) cudaFree(dw);
@@ -452,19 +447,20 @@ void run_expert_case(int d_type, int nt) {
     uint8_t* dblob = nullptr;
     float* dgu = nullptr;
     float* ddown = nullptr;
-    std::vector<const uint8_t*> dacts((size_t) nt, nullptr);
-    std::vector<const uint8_t*> dhq((size_t) nt, nullptr);
+    uint8_t* dacts = nullptr;
+    uint8_t* dhq = nullptr;
     bool ok = cudaMalloc((void**) &dblob, f.bytes) == cudaSuccess &&
               cudaMalloc((void**) &dgu, sizeof(float) * (size_t) nt * 2 * FF) == cudaSuccess &&
               cudaMalloc((void**) &ddown, sizeof(float) * (size_t) nt * H) == cudaSuccess &&
               cudaMemcpy(dblob, blob.data(), blob.size(), cudaMemcpyHostToDevice) == cudaSuccess;
-    for (int t = 0; ok && t < nt; ++t) {
-        uint8_t* p = nullptr;
-        ok = cudaMalloc((void**) &p, f.act_bytes) == cudaSuccess &&
-             cudaMemcpy(p, a[(size_t) t].data(), f.act_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
-        dacts[(size_t) t] = p;
-    }
-    int rc = ok ? strata::kolibri::stream::es_q4k_rows(dblob, 10, 2 * FF, dacts.data(), nt, dgu, 2 * FF, nullptr) : 9;
+    ok = ok && cudaMalloc((void**) &dacts, f.act_bytes * (size_t) nt) == cudaSuccess &&
+         cudaMalloc((void**) &dhq, f.h_bytes * (size_t) nt) == cudaSuccess;
+    for (int t = 0; ok && t < nt; ++t)
+        ok = cudaMemcpy(dacts + (size_t) t * f.act_bytes, a[(size_t) t].data(), f.act_bytes, cudaMemcpyHostToDevice) ==
+             cudaSuccess;
+    int rc = ok ? strata::kolibri::stream::es_q4k_rows(dblob, 10, 2 * FF, dacts, (int) f.act_bytes, nt, dgu, 2 * FF,
+                                                       nullptr)
+                : 9;
     std::vector<float> gu;
     if (rc == 0 && cudaDeviceSynchronize() == cudaSuccess) {
         gu.resize((size_t) nt * 2 * FF);
@@ -486,16 +482,15 @@ void run_expert_case(int d_type, int nt) {
     int hdiff = 0;
     for (int t = 0; ok && t < nt; ++t)
         hdiff += std::memcmp(hq2[(size_t) t].data(), hq[(size_t) t].data(), f.h_bytes) != 0;
-    for (int t = 0; ok && t < nt; ++t) {
-        uint8_t* p = nullptr;
-        ok = cudaMalloc((void**) &p, f.h_bytes) == cudaSuccess &&
-             cudaMemcpy(p, hq2[(size_t) t].data(), f.h_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
-        dhq[(size_t) t] = p;
-    }
+    for (int t = 0; ok && t < nt; ++t)
+        ok = cudaMemcpy(dhq + (size_t) t * f.h_bytes, hq2[(size_t) t].data(), f.h_bytes, cudaMemcpyHostToDevice) ==
+             cudaSuccess;
     if (ok) {
         rc = d_type == kQ4K
-                 ? strata::kolibri::stream::es_q4k_rows(dblob + f.down_off, 2, H, dhq.data(), nt, ddown, H, nullptr)
-                 : strata::kolibri::stream::es_q6k_rows(dblob + f.down_off, 2, H, dhq.data(), nt, ddown, H, nullptr);
+                 ? strata::kolibri::stream::es_q4k_rows(dblob + f.down_off, 2, H, dhq, (int) f.h_bytes, nt, ddown, H,
+                                                        nullptr)
+                 : strata::kolibri::stream::es_q6k_rows(dblob + f.down_off, 2, H, dhq, (int) f.h_bytes, nt, ddown, H,
+                                                        nullptr);
     }
     std::vector<float> got;
     if (rc == 0 && ok && cudaDeviceSynchronize() == cudaSuccess) {
@@ -516,10 +511,8 @@ void run_expert_case(int d_type, int nt) {
         std::printf("  FAIL %s\n", name);
         ++g_failures;
     }
-    for (int t = 0; t < nt; ++t) {
-        if (dhq[(size_t) t]) cudaFree((void*) dhq[(size_t) t]);
-        if (dacts[(size_t) t]) cudaFree((void*) dacts[(size_t) t]);
-    }
+    if (dhq) cudaFree(dhq);
+    if (dacts) cudaFree(dacts);
     if (ddown) cudaFree(ddown);
     if (dgu) cudaFree(dgu);
     if (dblob) cudaFree(dblob);

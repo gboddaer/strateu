@@ -251,7 +251,6 @@ Stats run(Context& ctx, const LayerView& view) {
     const size_t blob = f.fmt.bytes;
     const size_t weight_cap = m.weight_cap < need.weight_bytes_per_slot ? m.weight_cap : need.weight_bytes_per_slot;
     const std::vector<Batch> batches = make_batches(groups, m.cfg, weight_cap, blob);
-    const int rows_per_tile = kTileTokens;
 
     auto stage_gu = [&](const Batch& b, Slot& s) {
         size_t woff = 0, row = 0;
@@ -271,17 +270,16 @@ Stats run(Context& ctx, const LayerView& view) {
         ck(cudaMemcpyAsync(s.acts, s.acts_pin, b.rows * f.fmt.act_bytes, cudaMemcpyHostToDevice, s.st), "acts H2D");
         st.activation_h2d_bytes += b.rows * f.fmt.act_bytes;
         // one gate/up launch per expert: rows [gate | up] are contiguous at the same stride
-        std::vector<const uint8_t*> ap(b.rows, nullptr);
-        for (size_t r = 0; r < b.rows; ++r) ap[r] = s.acts + r * f.fmt.act_bytes;
         woff = 0;
         for (size_t i = 0; i < b.group.size(); ++i) {
             const Group& g = groups[(size_t) b.group[i]];
             const int ntok = (int) g.selections.size();
             const int rc = es_q4k_rows(s.weights + woff, (int) (f.fmt.n_embd / 256), (int) (2 * f.fmt.n_ff),
-                                       ap.data() + b.row[i], ntok, s.gu + b.row[i] * 2 * (size_t) f.fmt.n_ff,
-                                       (int) (2 * f.fmt.n_ff), s.st);
+                                       s.acts + b.row[i] * f.fmt.act_bytes, (int) f.fmt.act_bytes, ntok,
+                                       s.gu + b.row[i] * 2 * (size_t) f.fmt.n_ff, (int) (2 * f.fmt.n_ff), s.st);
             if (rc != 0) refuse("the gate/up product was refused");
-            st.kernel_launches += (uint64_t) ((ntok + rows_per_tile - 1) / rows_per_tile);
+            st.kernel_launches += 1;   // one launch per expert per product; the launcher tiles tokens in its grid
+
             woff += blob;
         }
         ck(cudaMemcpyAsync(s.gu_pin, s.gu, b.rows * 2 * (size_t) f.fmt.n_ff * sizeof(float), cudaMemcpyDeviceToHost,
@@ -311,8 +309,6 @@ Stats run(Context& ctx, const LayerView& view) {
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         ck(cudaMemcpyAsync(s.hidden, s.hidden_pin, b.rows * f.fmt.h_bytes, cudaMemcpyHostToDevice, s.st), "hidden H2D");
         st.hidden_h2d_bytes += b.rows * f.fmt.h_bytes;
-        std::vector<const uint8_t*> hp(b.rows, nullptr);
-        for (size_t r = 0; r < b.rows; ++r) hp[r] = s.hidden + r * f.fmt.h_bytes;
         // one down launch per expert, from the same packed slot layout as stage_gu()
         size_t woff = 0;
         for (size_t i = 0; i < b.group.size(); ++i) {
@@ -320,12 +316,15 @@ Stats run(Context& ctx, const LayerView& view) {
             const int ntok = (int) g.selections.size();
             const uint8_t* down = s.weights + woff + f.fmt.down_off;
             const int rc = f.fmt.d_type == kQ4K
-                               ? es_q4k_rows(down, (int) (f.fmt.n_ff / 256), m.n_embd, hp.data() + b.row[i], ntok,
+                               ? es_q4k_rows(down, (int) (f.fmt.n_ff / 256), m.n_embd,
+                                             s.hidden + b.row[i] * f.fmt.h_bytes, (int) f.fmt.h_bytes, ntok,
                                              s.out + b.row[i] * (size_t) m.n_embd, m.n_embd, s.st)
-                               : es_q6k_rows(down, (int) (f.fmt.n_ff / 256), m.n_embd, hp.data() + b.row[i], ntok,
+                               : es_q6k_rows(down, (int) (f.fmt.n_ff / 256), m.n_embd,
+                                             s.hidden + b.row[i] * f.fmt.h_bytes, (int) f.fmt.h_bytes, ntok,
                                              s.out + b.row[i] * (size_t) m.n_embd, m.n_embd, s.st);
             if (rc != 0) refuse("the down product was refused");
-            st.kernel_launches += (uint64_t) ((ntok + rows_per_tile - 1) / rows_per_tile);
+            st.kernel_launches += 1;   // one launch per expert per product; the launcher tiles tokens in its grid
+
             woff += blob;
             (void) g;
         }
