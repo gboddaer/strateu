@@ -2136,16 +2136,33 @@ static void stream_capture_record(const Engine& e, const LayerBlobs& b, Scratch&
 // (kq_a1.cuh's order) and its CPU SwiGLU is the pool's own expression, quantized by the pool's own native_quant_h.
 // A refusal is fatal (exit 2) and is named: this path never falls back to the CPU while claiming streamed coverage.
 // ------------------------------------------------------------------------------------------------------------------
-static inline bool expert_stream_on() {
+/// `STRATA_KOLIBRI_EXPERT_STREAM`: 0 = the release path unconditionally, unset = DEFAULT (serve the prefill's expert
+/// leg with the streamed pipeline wherever this build, model and device support it, otherwise the CPU pool with one
+/// notice), 1 = demand it (any refusal is fatal, exit 2).
+static inline int expert_stream_mode() {
+    static const int m = [] {
+        const char* v = std::getenv("STRATA_KOLIBRI_EXPERT_STREAM");
+        if (v == nullptr || v[0] == 0) return 1;
+        return std::atoi(v) == 0 ? 0 : 2;
+    }();
+    return m;
+}
+static inline bool expert_stream_on() { return expert_stream_mode() != 0; }
+static inline bool expert_stream_demanded() { return expert_stream_mode() == 2; }
+
+/// Set once when the default had to fall back, so the rest of the run does not re-probe every layer.
+static bool g_expert_stream_disabled = false;
+
+static inline bool expert_stream_usable() {
+    if (!expert_stream_on()) return false;   // an explicit 0 is the release path, not "unsupported"
 #if defined(__CUDACC__)
-    static const bool on = env_on("STRATA_KOLIBRI_EXPERT_STREAM");
-    return on;
+    return !g_expert_stream_disabled;
 #else
-    if (env_on("STRATA_KOLIBRI_EXPERT_STREAM")) {
+    if (expert_stream_demanded()) {
         std::fprintf(stderr, "kolibri: expert streaming refused: this binary is not a CUDA build\n");
         std::exit(2);
     }
-    return false;
+    return false;   // silently absent in a non-CUDA build: the release path is this build's path
 #endif
 }
 
@@ -2156,7 +2173,7 @@ static long long g_expert_stream_layers = 0;
 
 /// One prefill chunk-layer's expert leg on the GPU.  The context is created on the first layer (that cost is
 /// first-use, not per-layer) and sized for both down formats this model alternates between.
-static void expert_stream_layer(const LayerBlobs& b, Scratch& s, const ActSet& A, int NKc, int K, int FF, int N,
+static bool expert_stream_layer(const LayerBlobs& b, Scratch& s, const ActSet& A, int NKc, int K, int FF, int N,
                                 int experts) {
     strata::kolibri::stream::LayerView v;
     v.fmt = b.fmt;
@@ -2184,10 +2201,46 @@ static void expert_stream_layer(const LayerBlobs& b, Scratch& s, const ActSet& A
         g_expert_stream_stats.wall_ms += st.wall_ms;
         g_expert_stream_stats.cpu_activation_ms += st.cpu_activation_ms;
         ++g_expert_stream_layers;
+        return true;
     } catch (const std::exception& ex) {
-        std::fprintf(stderr, "kolibri: expert streaming refused: %s\n", ex.what());
-        std::fflush(stderr);
-        std::exit(2);
+        if (expert_stream_demanded()) {
+            std::fprintf(stderr, "kolibri: expert streaming refused: %s\n", ex.what());
+            std::fflush(stderr);
+            std::exit(2);
+        }
+        // The DEFAULT falls back here and says so once: an unsupported geometry, a device without room for the two
+        // slots, or a runtime refusal must not turn a working prefill into a failed one.  The pool recomputes this
+        // layer from scratch, so no partially published row survives.
+        g_expert_stream_disabled = true;
+        std::fprintf(stderr, "kolibri: expert streaming unavailable (%s); serving this run on the CPU pool\n",
+                     ex.what());
+        return false;
+    }
+}
+
+/// The cheap capability probe, before any allocation: the layer's own geometry against the supported formats.
+static bool expert_stream_can_serve(const LayerBlobs& b) {
+    if (!expert_stream_usable()) return false;
+    strata::kolibri::stream::LayerView probe;
+    probe.fmt = b.fmt;
+    probe.weights = b.table;
+    probe.weight_stride = b.stride;
+    probe.expert_count = 1;
+    probe.top_k = 1;             // geometry-only probe: no ids, no selections, nothing validated against them
+    probe.selection_count = 0;
+    try {
+        strata::kolibri::stream::required_capacity(probe, strata::kolibri::stream::Config{});
+        return true;
+    } catch (const std::exception& ex) {
+        if (expert_stream_demanded()) {
+            std::fprintf(stderr, "kolibri: expert streaming refused: %s\n", ex.what());
+            std::fflush(stderr);
+            std::exit(2);
+        }
+        g_expert_stream_disabled = true;
+        std::fprintf(stderr, "kolibri: expert streaming unavailable (%s); serving this run on the CPU pool\n",
+                     ex.what());
+        return false;
     }
 }
 #endif
@@ -4155,14 +4208,16 @@ static const int grp_max = [] {
                     }
                 }
 #endif
+                bool stream_served = false;
 #if defined(__CUDACC__)
-                if (!mmq_did && expert_stream_on()) {
-                    // Task 5: the streamed arm.  A.ey_h is published on the host before this returns, exactly where
-                    // the pool would have left it, so the weighting below is the same code on the same input.
-                    expert_stream_layer(b, s, A, NKc, K, FF, N, (int) e.g.n_expert);
-                } else
+                if (!mmq_did && expert_stream_can_serve(b)) {
+                    // The streamed arm.  A.ey_h is published on the host before this returns, exactly where the pool
+                    // would have left it, so the weighting below is the same code on the same input.
+                    stream_served = expert_stream_layer(b, s, A, NKc, K, FF, N, (int) e.g.n_expert);
+                }
 #endif
-                if (!mmq_did) e.pool.run([&](int shard) {
+                (void) stream_served;
+                if (!mmq_did && !stream_served) e.pool.run([&](int shard) {
                     if (env_on("STRATA_KOLIBRI_EXPERT_GPU")) {   // A1: the expert products on the GPU, same three stages
                         if (shard == 0) a1_run_selections(b, s, A, NKc, K, FF, N, (int) l, (int) e.g.n_expert);
                         return;
@@ -6465,8 +6520,12 @@ int strata::kolibri::run(int argc, char** argv) {
         else if (serve_mode) why = "the streamed arm serves prefill chunks, not a served request stream";
         else if (stream_capture_on()) why = "the capture hook records the CPU pool's leg; the streamed arm is a different leg";
         if (why != nullptr) {
-            std::fprintf(stderr, "kolibri: expert streaming refused: %s\n", why);
-            return 2;
+            if (expert_stream_demanded()) {
+                std::fprintf(stderr, "kolibri: expert streaming refused: %s\n", why);
+                return 2;
+            }
+            g_expert_stream_disabled = true;
+            std::fprintf(stderr, "kolibri: expert streaming unavailable (%s); serving this run on the CPU pool\n", why);
         }
     }
     if (stream_capture_on()) {

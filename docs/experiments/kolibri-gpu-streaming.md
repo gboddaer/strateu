@@ -453,3 +453,34 @@ end-to-end numbers are what a user sees, and both are printed above and in the l
 - Known headroom: the arm is compute-bound at ~370-430 GFLOP/s against the ~600 needed to hide under 9.64 GB/s of
   PCIe 3.0, so the next step (shared-memory staging of the four tokens' activations, then a 16x8 tile) is a speed
   change only, and must be re-qualified with this same six-history table.
+
+## The arm is the DEFAULT from this commit (operator's decision)
+
+`STRATA_KOLIBRI_EXPERT_STREAM` now has three states, and the two that matter are measured on ids512, same day, same
+binary, `--n 8 --force 286,... --ctx 2048 --cpu-threads 14 --prefill`, full logits compared with `cmp`:
+
+| value | path taken | prefill | full logits |
+|---|---|---:|---|
+| **unset (default)** | streamed pipeline | **5,005 ms** | identical to both others |
+| `1` (demand) | streamed pipeline, any refusal fatal | 5,003-5,159 ms | identical |
+| `0` (opt out) | the release CPU pool | 7,886 ms | identical to the pre-campaign dump |
+
+Two separate runs of every arm produced byte-identical logits (`logits-{off,on,default}-512.bin`), so switching the
+default changed the timing and nothing else.
+
+**The default falls back instead of refusing**, and that is a deliberate difference from the opt-in behaviour: with the
+variable unset, an unsupported geometry, a device without room for the two slots, or a conflicting experimental mode
+prints one line (`kolibri: expert streaming unavailable (<reason>); serving this run on the CPU pool`) and the pool
+recomputes that layer from scratch, so no partially published row survives. `=1` keeps the campaign's strict rule:
+any refusal is fatal, exit 2. Two bugs of my own were caught by exactly this path during the change and are recorded
+because they show the guard works: a geometry probe that left `top_k = 0` fell back to the pool with the notice
+instead of failing the run, and a mode check that ignored an explicit `0` made the opt-out run the streamed arm
+(7,886 ms vs 5,005 ms in the table is the fixed behaviour).
+
+What the default costs, stated so a reader can decide for themselves:
+- **Very short prompts are slower**: 15 tokens, 600 -> 803 ms (25.0 -> 18.7 tok/s). No automatic threshold: a silent
+  switch back to the pool would be the implicit fallback the design forbids for a *claimed* capability.
+- CUDA only. HIP/SYCL builds never compile `expert_stream.cu` (CMake guards it) and their default is the release path;
+  `=1` there exits 2 with the reason.
+- The supported geometry is narrow by design (Q4_K gate/up, Q4_K/Q6_K down, Q8_K, whole 256-value blocks, no NVFP4
+  tail, no rotated basis). Any other model falls back with the notice rather than running a different computation.
