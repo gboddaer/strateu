@@ -1008,7 +1008,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_source_files_properties(src/kolibri/decode_wait.cu PROPERTIES LANGUAGE HIP)
   endif()
   add_library(strata_kolibri STATIC src/kolibri/kolibri_engine.cu src/kolibri/pf_combine.cu src/kolibri/decode_wait.cu)
-  target_include_directories(strata_kolibri PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_strata_gpu_include_directories})
+  # tools/kolibri: the streamed-prefill workload capture header (plan 2026-10-31-kolibri-gpu-streaming Task 1).
+  # Host-only C++17, shared by the engine and the replay tool, so the record schema cannot drift between them.
+  target_include_directories(strata_kolibri PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                             PRIVATE ${_strata_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/tools/kolibri)
   target_link_libraries(strata_kolibri PRIVATE strata_prefill strata_kernels strata_warnings ${_strata_gpu_runtime_target})
   add_executable(strata-kolibri src/kolibri/kolibri_main.cpp)
   target_link_libraries(strata-kolibri PRIVATE strata_kolibri ${_strata_gpu_runtime_target})
@@ -1026,6 +1029,22 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_link_libraries(kolibri_kv_int8_test PRIVATE ${_strata_gpu_runtime_target})
       add_test(NAME kolibri_kv_int8_test COMMAND kolibri_kv_int8_test)
     endif()
+    # plan 2026-10-31-kolibri-gpu-streaming Task 1: the streamed expert prefill's grouping and capacity accounting.
+    # Host-only by design (no CUDA, no ggml, no model): it pins the numbers the slot allocation is derived from, and
+    # the refusal of every geometry this initial path does not support.
+    add_executable(kolibri_expert_stream_plan_test tests/kolibri/expert_stream_plan_test.cpp)
+    target_include_directories(kolibri_expert_stream_plan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                               ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME kolibri_expert_stream_plan_test COMMAND kolibri_expert_stream_plan_test)
+    set_tests_properties(kolibri_expert_stream_plan_test PROPERTIES TIMEOUT 60)
+    # Task 1's replay harness: the CPU control arm of the streamed-prefill comparison.  It reads a capture, replays
+    # the expert leg through the engine's own native kernels and shard fan-out, and refuses to report a timing when
+    # any output byte differs from the capture.  Task 4 adds its --gpu arm; nothing here needs a device yet.
+    add_executable(expert_stream_replay tools/kolibri/expert_stream_replay.cu)
+    target_include_directories(expert_stream_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                               ${CMAKE_CURRENT_SOURCE_DIR}/tools/kolibri
+                               ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(expert_stream_replay PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
     add_executable(kolibri_decode_rollover tests/kolibri/decode_rollover.cu
                    src/kolibri/pf_combine.cu src/kolibri/decode_wait.cu)
     target_include_directories(kolibri_decode_rollover PRIVATE $<TARGET_PROPERTY:strata_kolibri,INCLUDE_DIRECTORIES>)

@@ -18,6 +18,8 @@
 #include "strata/kolibri/engine.hpp"
 #include "strata/kolibri/decode_wait.hpp"
 #include "pf_combine.hpp"   // G1: the prefill MoE combiner (src/kolibri/pf_combine.cu)
+// plan 2026-10-31-kolibri-gpu-streaming Task 1: the streamed-prefill workload capture (host-only, no CUDA).
+#include "expert_stream_capture.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
@@ -2048,6 +2050,77 @@ struct Scratch {
 // S7: the router's token tile per thread (STRATA_KOLIBRI_ROUTER_TJ, default 32): 32 is the original shape;
 // smaller tiles give more CTAs (occupancy) and a shorter FMA dependency chain.  Bitwise-identical either way
 // (the per-token sum's order and the reduction tree are unchanged).
+// ------------------------------------------------------------------------------------------------------------------
+// Streamed-prefill WORKLOAD CAPTURE (plan 2026-10-31-kolibri-gpu-streaming, Task 1).
+//
+// `STRATA_KOLIBRI_STREAM_CAPTURE=<new-directory>` records the CPU expert leg of a prefill: per (chunk, layer) the
+// published expert ids, the already-quantized token activations, the unique touched expert blobs in the order the
+// pool dealt them, and the expert output rows BEFORE the router weight is applied.  A replay tool then reproduces
+// that work on its own and must match it byte for byte, so the CPU control the GPU arm is measured against is the
+// engine's own work and not a lookalike.
+//
+// Off by default and off in every timed run: with the variable unset there is no writer, no record and no file
+// operation anywhere in this file.  A capture run is instrumentation, never a measurement.
+// ------------------------------------------------------------------------------------------------------------------
+static const char* stream_capture_dir() {
+    static const char* const dir = []() -> const char* {
+        const char* v = std::getenv("STRATA_KOLIBRI_STREAM_CAPTURE");
+        return (v != nullptr && v[0] != 0) ? v : nullptr;
+    }();
+    return dir;
+}
+static inline bool stream_capture_on() { return stream_capture_dir() != nullptr; }
+
+static std::string g_stream_capture_manifest;      // set once at startup
+static std::unique_ptr<strata::kolibri::stream::capture::Writer> g_stream_capture_writer;
+static long long g_stream_capture_chunk = -1;      // (chunk, layer) records: the layer loop restarts at 0 per chunk
+
+static strata::kolibri::stream::capture::Writer& stream_capture_writer() {
+    if (!g_stream_capture_writer) {
+        uint64_t cap = strata::kolibri::stream::capture::kDefaultStoreCapBytes;
+        if (const char* gb = std::getenv("STRATA_KOLIBRI_STREAM_CAPTURE_GB")) {
+            const long long v = std::atoll(gb);
+            if (v > 0) cap = (uint64_t) v << 30;
+        }
+        g_stream_capture_writer = std::make_unique<strata::kolibri::stream::capture::Writer>(
+            stream_capture_dir(), g_stream_capture_manifest, cap);
+        std::fprintf(stderr, "kolibri: stream capture: writing %s (blob store cap %llu GiB)\n", stream_capture_dir(),
+                     (unsigned long long) (cap >> 30));
+    }
+    return *g_stream_capture_writer;
+}
+
+/// One (chunk, layer) record, written after the pool has drained and before the unweighted rows are shipped to the
+/// device.  Only the pool leg calls this; every other expert leg is refused at startup or here.
+static void stream_capture_record(const Engine& e, const LayerBlobs& b, Scratch& s, const ActSet& A, int NKc, int K,
+                                  int Tc, int l, const std::vector<int32_t>& pool_list) {
+    if (l == 0) ++g_stream_capture_chunk;
+    if (b.fmt.gu_type < 0 || b.fmt.bytes == 0) {
+        std::fprintf(stderr, "kolibri: stream capture refused: layer %d has no native expert format\n", l);
+        std::exit(2);
+    }
+    strata::kolibri::stream::capture::Record r;
+    r.layer = l;
+    r.chunk = g_stream_capture_chunk;
+    r.top_k = K;
+    r.selections = NKc;
+    r.tokens = Tc;
+    r.experts = (int) e.g.n_expert;
+    r.weight_stride = b.stride;
+    r.fmt = strata::kolibri::stream::capture::Fmt::from(b.fmt);
+    r.ids.resize((size_t) NKc);
+    for (int i = 0; i < NKc; ++i) r.ids[(size_t) i] = A.ids_h[i];
+    const size_t acts = (size_t) Tc * b.fmt.act_bytes;
+    r.acts.assign((const uint8_t*) s.act_cur, (const uint8_t*) s.act_cur + acts);
+    const size_t out = (size_t) NKc * (size_t) e.g.n_embd;
+    r.out.assign(A.ey_h, A.ey_h + out);
+    std::vector<strata::kolibri::stream::capture::BlobInput> blobs;
+    blobs.reserve(pool_list.size());
+    for (int x : pool_list)
+        blobs.push_back({x, b.table + (size_t) x * b.stride, b.stride});   // pool_list order = the deal order
+    stream_capture_writer().add(r, blobs);
+}
+
 static inline int router_tk() {
     // K31: DEFAULT 3 (three experts per block, TJ=8).  Measured at 32K, both sockets: TK=0 120.5, TK=2/TJ=16 141.8,
     // TK=2/TJ=32 143.3, **TK=3/TJ=8 147.6** (148.7/144.1/150.0); at 4K TK=3 161.0 against TK=0 120.7.  Bitwise: identical
@@ -4068,6 +4141,22 @@ static const int grp_max = [] {
                     for (int64_t q = 0; q < NKc * N; ++q) { const double v = std::fabs((double) A.ey_h[(size_t) q]); if (v > mx) mx = v; }
                     std::fprintf(stderr, "PFPOOL l=%d ey_h max|v|=%.6g first=%.6g %.6g pool_ran=%d NKc=%lld\n", (int) l, mx,
                                  (double) A.ey_h[0], (double) A.ey_h[1], (int) (!mmq_did), (long long) NKc);
+                }
+                // Task 1 of the streamed-prefill plan: with STRATA_KOLIBRI_STREAM_CAPTURE set, record this
+                // chunk-layer's expert leg.  Here the pool has returned (every shard done), so A.ey_h holds the
+                // unweighted expert rows, and the router weight has not been applied yet - which is exactly the
+                // boundary the replay reproduces.  Unset: nothing below runs.
+                if (stream_capture_on()) {
+                    if (mmq_did) {
+                        std::fprintf(stderr, "kolibri: stream capture refused: layer %d took the MMQ leg\n", (int) l);
+                        std::exit(2);
+                    }
+                    if (b.f16 || pf_partial_on()) {
+                        std::fprintf(stderr, "kolibri: stream capture refused: layer %d served resident rows\n",
+                                     (int) l);
+                        std::exit(2);
+                    }
+                    stream_capture_record(e, b, s, A, NKc, K, Tc, (int) l, pool_list);
                 }
                 if (e.counters && !mmq_did) {
                     const auto pf_t1 = std::chrono::steady_clock::now();
@@ -6273,6 +6362,40 @@ int strata::kolibri::run(int argc, char** argv) {
         // measured placement rule (pool_bench): ~24 workers on the GPU's socket; 48 on one socket collapse.
         e.epool = std::make_unique<strata::kernels::cpu::ExpertPool>(
             e.cpu_threads, true, true, strata::kernels::cpu::PoolAffinity::All);
+    }
+    // ---- streamed-prefill capture: refuse every configuration whose expert leg this hook does not record --------
+    // The capture records ONE leg - the CPU pool over the pinned blobs, for every layer - because that is the work
+    // the GPU arm must beat.  Any other leg would produce a capture that silently describes different work, so the
+    // conflicts are enumerated here from the same switches forward_multi reads, and named.
+    if (stream_capture_on()) {
+        const char* why = nullptr;
+        const char* pool_all_env = std::getenv("STRATA_KOLIBRI_POOL_ALL");
+        if (prefill <= 0) why = "it records the prefill's expert leg, so it needs --prefill";
+        else if (cpu_threads <= 0) why = "it records the CPU pool, so it needs --cpu-threads";
+        else if (pool_all_env != nullptr && std::atoi(pool_all_env) != 1)
+            why = "STRATA_KOLIBRI_POOL_ALL must be unset or 1: other values send some layers to the GPU grouped leg";
+        else if (slots != 0) why = "--expert-slots moves expert rows between legs";
+        else if (grouped != 0) why = "--grouped serves picks on the GPU";
+        else if (env_on("STRATA_KOLIBRI_EXPERT_GPU")) why = "STRATA_KOLIBRI_EXPERT_GPU is the A1 arm, not the pool";
+        else if (expert_f16_n() > 0) why = "the fp16 expert cache (STRATA_KOLIBRI_EXPERT_F16) serves rows on the GPU";
+        else if (pf_partial_on()) why = "STRATA_KOLIBRI_PF_PARTIAL publishes partial sums instead of ey_h";
+        else if (dec_res_on()) why = "STRATA_KOLIBRI_DEC_RES serves resident picks on the GPU";
+        else if (pf_mmq_on()) why = "the MMQ prompt arm replaces the pool's expert products";
+        else if (serve_mode) why = "a capture is one prefill from a fixed prompt, not a served request stream";
+        if (why != nullptr) {
+            std::fprintf(stderr, "kolibri: stream capture refused: %s\n", why);
+            return 2;
+        }
+        char manifest[512];
+        std::snprintf(manifest, sizeof manifest,
+                      "{\"kind\":\"kolibri-prefill-capture\",\"version\":1,\"model\":\"%s\","
+                      "\"experts\":%lld,\"top_k\":%d,\"n_embd\":%lld,\"n_ff\":%lld,\"chunk_tokens\":%d,"
+                      "\"cpu_threads\":%d,\"lanes\":%d,\"note\":\"instrumentation run, never a timing\"}",
+                      model.c_str(), (long long) e.g.n_expert, (int) e.g.n_expert_used, (long long) e.g.n_embd,
+                      (long long) e.g.n_ff, Scratch::kTmax, cpu_threads, e.pf_lanes);
+        g_stream_capture_manifest = manifest;
+        std::fprintf(stderr, "kolibri: stream capture on: %s (this run is instrumentation, not a timing)\n",
+                     stream_capture_dir());
     }
     // K25 instrument.  The 32K decode term is 12 full-attention layers x one k_attn launch at n_vis = pos+1,
     // and an end-to-end profiled run needs a ~55 minute prefill before the kernel of interest runs once.  This
