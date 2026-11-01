@@ -352,3 +352,17 @@ What is left, with the numbers that say so:
 **Verdict recorded: NO-GO as of this measurement, on this card, for both denominators combined.** The next bounded
 step is the plan's own tuning list, continued: shared-memory staging of the four tokens' activations, then a 16x8
 tile, then the batch bound 4 vs 8 — one dimension at a time, parity first, and the same paired gate afterwards.
+
+## Ruling overriding the Task 4 stopping rule (operator, this session)
+
+Taken after the 0.863 / 0.976 measurement above: **continue to Tasks 5-7 anyway**. The reasoning is the operator's and
+it is on the record: the measured wall-clock gain on THIS machine is marginal (5,917 ms against 6,060-6,155 ms of CPU
+pool), but the arm is compute-bound at 4.72 GB/s of a 9.64 GB/s PCIe 3.0 link, so on a PCIe 4.0 host (~22 GB/s) the
+same pipeline has ~2.3x more headroom before the copy rate matters and the ratio moves without a code change. The plan's
+"publish NO-GO and stop before Task 5" rule is therefore suspended for this campaign by the operator, not by the
+implementer, and the arm is built and qualified as OPT-IN only: the flag stays off, no default changes, and the
+prefill/generation paths with the flag absent must stay byte-identical (Task 5's own gate, which is not suspended).
+
+What is NOT claimed by this ruling: that the arm is faster on this card (it is 0.976 of the engine pool), that the plan's
+0.90 gate was met, or that the long-prompt distribution is viable here (Task 1's floor says it is not, at 10.33 GB/s
+required against 9.64 measured). The qualification in Task 6 and the numbers in Task 7 are what the reader must judge.
