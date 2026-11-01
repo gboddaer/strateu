@@ -400,3 +400,56 @@ Task 6's remaining histories (16, de512, code512, 8191, 11000) and Task 7's full
 11000 cases need the long-context path and hours of streaming, and the six-history sweep needs a driver that compares
 each dump byte for byte. The one history measured is byte-identical on the full 4.6 MB logits dump, which is the
 strongest form of the claim available.
+
+## Task 6 — full-logit qualification on six forced histories
+
+Every run is the same forced history on both arms, same day, same binary, `--n 8 --force 286,3515,310,262,14292,1343,1444,46`,
+`--cpu-threads 14`, `--prefill`, `numactl --cpunodebind=1 --membind=1`, `STRATA_GEMM_DETERMINISTIC=1`. `--dump-full-logits`
+writes every step's full logit vector (4,608,000 bytes = 8 steps x 144,000 vocab x 4 B), and the two arms' files are
+compared with `cmp`.
+
+| history | ctx | arm off prefill | arm on prefill | ratio | full logits |
+|---|---:|---:|---:|---:|---|
+| ids16 | 2,048 | 600 ms | 803 ms | **0.75x (slower)** | byte-identical |
+| ids512 | 2,048 | 8,220 ms | 5,003 ms | **1.64x** | byte-identical |
+| ids512_de | 2,048 | 7,988 ms | 6,006 ms | **1.33x** | byte-identical |
+| ids512_code | 2,048 | 7,112 ms | 6,391 ms | **1.11x** | byte-identical |
+| ids8191 | 16,384 | 115,245 ms | 104,832 ms | **1.10x** | byte-identical |
+| ids11000 | 16,384 | 154,742 ms | 113,830 ms | **1.36x** | byte-identical |
+
+Six of six histories are bit-identical over the whole logits dump, which is the strongest available form of "the arm
+computes the pool's answer": the router, the weighting, attention, the KV cache and the sampling all run on the same
+inputs and produce the same 4.6 MB.
+
+**The 16-token case is SLOWER with the arm, and that is recorded rather than smoothed over.** A two-chunk prefill of
+16 tokens has almost no expert work to accelerate while the pipeline still pays its fixed cost (context creation
+31 ms, pinned staging, eight launches per layer, two event waits per batch); 600 -> 803 ms. The flag is opt-in and
+there is deliberately no automatic threshold, because a silent switch back to the pool would be exactly the "CPU
+fallback while claiming streamed coverage" the design forbids. The handoff note says: do not enable it for very short
+prompts.
+
+The long distributions gain more than Task 1's floor arithmetic predicted (1.10x and 1.36x against a 0.96-of-the-pool
+floor). The floor compared the arm against the CPU POOL's time; the end-to-end gain also removes the pool's fan-out
+overhead, which the floor never modelled. The floor remains the honest statement about what PCIe allows; the measured
+end-to-end numbers are what a user sees, and both are printed above and in the ledger's earlier sections.
+
+## Task 7 — handoff
+
+- Flag: `STRATA_KOLIBRI_EXPERT_STREAM=1`. Absent or `0` is byte-identical to the release path (the branch is not
+  taken; no context, buffer or allocation exists). The only source change on the off path is a `static` on two A1
+  kernels, which cannot change their arithmetic.
+- Refusals (named, exit 2): no `--prefill`, no `--cpu-threads`, `STRATA_KOLIBRI_POOL_ALL` other than 1,
+  `--expert-slots`, `--grouped`, `STRATA_KOLIBRI_EXPERT_GPU` (A1), the fp16 expert cache, `PF_PARTIAL`, `DEC_RES`,
+  the MMQ prompt arm, a served request stream, the capture hook, and any non-CUDA build.
+- Supported geometry: Q4_K gate/up, Q4_K or Q6_K down, Q8_K activations, `n_embd`/`n_ff` whole 256-value blocks, no
+  NVFP4 tail, no rotated basis. Anything else is refused before work is published.
+- Binary under test: `strata-kolibri` sha256 `314a3ac9cf2012b4...` (Release, sm_75, CUDA 12.8, driver 580.196.07),
+  model `c2ac1301424441ef...`, evidence in `/data4/kolibri-gpu-streaming` (`qual-*.out/.err`, `logits-*-<history>.bin`,
+  `qual-summary.txt`, `replay-*.json`).
+- Tests: `ctest -R expert_stream` (plan, kernel, pipeline: 94 + 76 + plan cases) plus `python -m pytest
+  tools/kolibri/test_expert_stream_campaign.py`.
+- NOT RUN and not claimed: HIP and SYCL builds (the pipeline is CUDA-gated in CMake and refuses by name elsewhere),
+  any machine other than this T4 box, and a served request stream.
+- Known headroom: the arm is compute-bound at ~370-430 GFLOP/s against the ~600 needed to hide under 9.64 GB/s of
+  PCIe 3.0, so the next step (shared-memory staging of the four tokens' activations, then a 16x8 tile) is a speed
+  change only, and must be re-qualified with this same six-history table.

@@ -1007,8 +1007,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   if(STRATA_ENABLE_HIP)
     set_source_files_properties(src/kolibri/decode_wait.cu PROPERTIES LANGUAGE HIP)
   endif()
-  add_library(strata_kolibri STATIC src/kolibri/kolibri_engine.cu src/kolibri/pf_combine.cu src/kolibri/decode_wait.cu
-                       src/kolibri/expert_stream.cu)
+  add_library(strata_kolibri STATIC src/kolibri/kolibri_engine.cu src/kolibri/pf_combine.cu src/kolibri/decode_wait.cu)
+  # The streamed expert pipeline is CUDA-only: a HIP/SYCL build keeps its current path and, with the opt-in flag set,
+  # refuses by name (expert_stream_on() in kolibri_engine.cu).  Never add this file to a HIP target.
+  if(STRATA_ENABLE_CUDA)
+    target_sources(strata_kolibri PRIVATE src/kolibri/expert_stream.cu)
+  endif()
   # tools/kolibri: the streamed-prefill workload capture header (plan 2026-10-31-kolibri-gpu-streaming Task 1).
   # Host-only C++17, shared by the engine and the replay tool, so the record schema cannot drift between them.
   target_include_directories(strata_kolibri PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
