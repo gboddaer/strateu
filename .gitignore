@@ -8,6 +8,11 @@ bench/micro/*.obj
 bench/micro/*.bin
 bench/micro/*.dll
 bench/micro/*.txt
+# Local Kolibri probe executables; keep their .cu/.cpp sources.
+/probe/exp_parity
+/probe/q4k_parity
+/probe/q4k_speed
+/probe/stream_floor
 *.log
 build*/
 pack/

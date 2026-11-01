@@ -16,8 +16,11 @@
 // table - the GPU is the expert cache, the model is bigger than any PC's VRAM (Q4_K_M: 42.6 GiB of experts,
 // 3.5 GiB of dense).  --load-only runs just the load and reports.
 #include "strata/kolibri/engine.hpp"
+#include "expert_stream.hpp"   // plan 2026-10-31-kolibri-gpu-streaming: the opt-in streamed expert leg
 #include "strata/kolibri/decode_wait.hpp"
 #include "pf_combine.hpp"   // G1: the prefill MoE combiner (src/kolibri/pf_combine.cu)
+// plan 2026-10-31-kolibri-gpu-streaming Task 1: the streamed-prefill workload capture (host-only, no CUDA).
+#include "expert_stream_capture.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
@@ -48,6 +51,8 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/hipblaslt_policy.hpp"   // why the prompt MMQ path is off (pure, tested on CPU)
 #include <cuda_fp16.h>
+#include "kv_int8.cuh"
+#include "kq_a1.cuh"
 
 #include <algorithm>
 #include <atomic>
@@ -1943,6 +1948,10 @@ struct Scratch {
     __half* dec_att16 = nullptr;
     int* ids;
     std::vector<__half*> kc, vc;   // S3: FP16 KV -- half the bytes/token and half the prefill traffic
+    // Experimental Phase 2a: packed durable KV plus ONE shared FP16 attention workspace.
+    bool kv_int8 = false;
+    std::vector<strata::kolibri::experimental::Kv8Block*> k8, v8;
+    __half *kv8_stage_k = nullptr, *kv8_stage_v = nullptr;
     std::vector<__half*> kt;       // K27: the transposed K mirror for the sliding layers (STRATA_KOLIBRI_ATTN_KT)
     std::vector<__half*> vt;       // K27: and the transposed V mirror (the PV pass reads V the same way)
     std::vector<int64_t> kt_rows;  // K27: each mirror's row stride (min(rows, two_pass_max))
@@ -2043,6 +2052,200 @@ struct Scratch {
 // S7: the router's token tile per thread (STRATA_KOLIBRI_ROUTER_TJ, default 32): 32 is the original shape;
 // smaller tiles give more CTAs (occupancy) and a shorter FMA dependency chain.  Bitwise-identical either way
 // (the per-token sum's order and the reduction tree are unchanged).
+// ------------------------------------------------------------------------------------------------------------------
+// Streamed-prefill WORKLOAD CAPTURE (plan 2026-10-31-kolibri-gpu-streaming, Task 1).
+//
+// `STRATA_KOLIBRI_STREAM_CAPTURE=<new-directory>` records the CPU expert leg of a prefill: per (chunk, layer) the
+// published expert ids, the already-quantized token activations, the unique touched expert blobs in the order the
+// pool dealt them, and the expert output rows BEFORE the router weight is applied.  A replay tool then reproduces
+// that work on its own and must match it byte for byte, so the CPU control the GPU arm is measured against is the
+// engine's own work and not a lookalike.
+//
+// Off by default and off in every timed run: with the variable unset there is no writer, no record and no file
+// operation anywhere in this file.  A capture run is instrumentation, never a measurement.
+// ------------------------------------------------------------------------------------------------------------------
+static const char* stream_capture_dir() {
+    static const char* const dir = []() -> const char* {
+        const char* v = std::getenv("STRATA_KOLIBRI_STREAM_CAPTURE");
+        return (v != nullptr && v[0] != 0) ? v : nullptr;
+    }();
+    return dir;
+}
+static inline bool stream_capture_on() { return stream_capture_dir() != nullptr; }
+
+static std::string g_stream_capture_manifest;      // set once at startup
+static std::unique_ptr<strata::kolibri::stream::capture::Writer> g_stream_capture_writer;
+static long long g_stream_capture_chunk = -1;      // (chunk, layer) records: the layer loop restarts at 0 per chunk
+
+static strata::kolibri::stream::capture::Writer& stream_capture_writer() {
+    if (!g_stream_capture_writer) {
+        uint64_t cap = strata::kolibri::stream::capture::kDefaultStoreCapBytes;
+        if (const char* gb = std::getenv("STRATA_KOLIBRI_STREAM_CAPTURE_GB")) {
+            const long long v = std::atoll(gb);
+            if (v > 0) cap = (uint64_t) v << 30;
+        }
+        g_stream_capture_writer = std::make_unique<strata::kolibri::stream::capture::Writer>(
+            stream_capture_dir(), g_stream_capture_manifest, cap);
+        std::fprintf(stderr, "kolibri: stream capture: writing %s (blob store cap %llu GiB)\n", stream_capture_dir(),
+                     (unsigned long long) (cap >> 30));
+    }
+    return *g_stream_capture_writer;
+}
+
+/// One (chunk, layer) record, written after the pool has drained and before the unweighted rows are shipped to the
+/// device.  Only the pool leg calls this; every other expert leg is refused at startup or here.
+static void stream_capture_record(const Engine& e, const LayerBlobs& b, Scratch& s, const ActSet& A, int NKc, int K,
+                                  int Tc, int l, const std::vector<int32_t>& pool_list) {
+    if (l == 0) ++g_stream_capture_chunk;
+    if (b.fmt.gu_type < 0 || b.fmt.bytes == 0) {
+        std::fprintf(stderr, "kolibri: stream capture refused: layer %d has no native expert format\n", l);
+        std::exit(2);
+    }
+    strata::kolibri::stream::capture::Record r;
+    r.layer = l;
+    r.chunk = g_stream_capture_chunk;
+    r.top_k = K;
+    r.selections = NKc;
+    r.tokens = Tc;
+    r.experts = (int) e.g.n_expert;
+    r.weight_stride = b.stride;
+    r.fmt = strata::kolibri::stream::capture::Fmt::from(b.fmt);
+    r.ids.resize((size_t) NKc);
+    for (int i = 0; i < NKc; ++i) r.ids[(size_t) i] = A.ids_h[i];
+    const size_t acts = (size_t) Tc * b.fmt.act_bytes;
+    r.acts.assign((const uint8_t*) s.act_cur, (const uint8_t*) s.act_cur + acts);
+    const size_t out = (size_t) NKc * (size_t) e.g.n_embd;
+    r.out.assign(A.ey_h, A.ey_h + out);
+    std::vector<strata::kolibri::stream::capture::BlobInput> blobs;
+    blobs.reserve(pool_list.size());
+    for (int x : pool_list)
+        blobs.push_back({x, b.table + (size_t) x * b.stride, b.stride});   // pool_list order = the deal order
+    stream_capture_writer().add(r, blobs);
+}
+
+
+// ------------------------------------------------------------------------------------------------------------------
+// STREAMED EXPERT PREFILL (plan 2026-10-31-kolibri-gpu-streaming, Tasks 5-7).
+//
+// `STRATA_KOLIBRI_EXPERT_STREAM=1` replaces ONE thing: the CPU pool's expert products for a prefill chunk-layer
+// (native_gu_rows -> native_quant_h -> native_down_rows over the pinned blobs) with the two-slot CUDA pipeline in
+// expert_stream.cu.  Everything else - the router, the weighting of ey_h, attention, the KV cache, the token graph,
+// generation and every published buffer - is untouched, and with the variable absent or 0 the code below is not
+// entered at all: no context, no allocation, no branch taken.
+//
+// The arm's contract is bit equality, not closeness: the pipeline reproduces the pool's arithmetic lane by lane
+// (kq_a1.cuh's order) and its CPU SwiGLU is the pool's own expression, quantized by the pool's own native_quant_h.
+// A refusal is fatal (exit 2) and is named: this path never falls back to the CPU while claiming streamed coverage.
+// ------------------------------------------------------------------------------------------------------------------
+/// `STRATA_KOLIBRI_EXPERT_STREAM`: 0 = the release path unconditionally, unset = DEFAULT (serve the prefill's expert
+/// leg with the streamed pipeline wherever this build, model and device support it, otherwise the CPU pool with one
+/// notice), 1 = demand it (any refusal is fatal, exit 2).
+static inline int expert_stream_mode() {
+    static const int m = [] {
+        const char* v = std::getenv("STRATA_KOLIBRI_EXPERT_STREAM");
+        if (v == nullptr || v[0] == 0) return 1;
+        return std::atoi(v) == 0 ? 0 : 2;
+    }();
+    return m;
+}
+static inline bool expert_stream_on() { return expert_stream_mode() != 0; }
+static inline bool expert_stream_demanded() { return expert_stream_mode() == 2; }
+
+/// Set once when the default had to fall back, so the rest of the run does not re-probe every layer.
+static bool g_expert_stream_disabled = false;
+
+static inline bool expert_stream_usable() {
+    if (!expert_stream_on()) return false;   // an explicit 0 is the release path, not "unsupported"
+#if defined(__CUDACC__)
+    return !g_expert_stream_disabled;
+#else
+    if (expert_stream_demanded()) {
+        std::fprintf(stderr, "kolibri: expert streaming refused: this binary is not a CUDA build\n");
+        std::exit(2);
+    }
+    return false;   // silently absent in a non-CUDA build: the release path is this build's path
+#endif
+}
+
+#if defined(__CUDACC__)
+static std::unique_ptr<strata::kolibri::stream::Context> g_expert_stream;
+static strata::kolibri::stream::Stats g_expert_stream_stats;
+static long long g_expert_stream_layers = 0;
+
+/// One prefill chunk-layer's expert leg on the GPU.  The context is created on the first layer (that cost is
+/// first-use, not per-layer) and sized for both down formats this model alternates between.
+static bool expert_stream_layer(const LayerBlobs& b, Scratch& s, const ActSet& A, int NKc, int K, int FF, int N,
+                                int experts) {
+    strata::kolibri::stream::LayerView v;
+    v.fmt = b.fmt;
+    v.weights = b.table;
+    v.weight_stride = b.stride;
+    v.expert_count = experts;
+    v.token_acts = (const uint8_t*) s.act_cur;
+    v.expert_ids = A.ids_h;
+    v.selection_count = NKc;
+    v.top_k = K;
+    v.output = A.ey_h;
+    try {
+        if (!g_expert_stream) g_expert_stream = strata::kolibri::stream::create(v, strata::kolibri::stream::Config{});
+        const strata::kolibri::stream::Stats st = strata::kolibri::stream::run(*g_expert_stream, v);
+        g_expert_stream_stats.groups += st.groups;
+        g_expert_stream_stats.selections += st.selections;
+        g_expert_stream_stats.weight_h2d_bytes += st.weight_h2d_bytes;
+        g_expert_stream_stats.activation_h2d_bytes += st.activation_h2d_bytes;
+        g_expert_stream_stats.gu_d2h_bytes += st.gu_d2h_bytes;
+        g_expert_stream_stats.hidden_h2d_bytes += st.hidden_h2d_bytes;
+        g_expert_stream_stats.output_d2h_bytes += st.output_d2h_bytes;
+        g_expert_stream_stats.kernel_launches += st.kernel_launches;
+        g_expert_stream_stats.slot_waits += st.slot_waits;
+        g_expert_stream_stats.device_allocations += st.device_allocations;
+        g_expert_stream_stats.wall_ms += st.wall_ms;
+        g_expert_stream_stats.cpu_activation_ms += st.cpu_activation_ms;
+        ++g_expert_stream_layers;
+        return true;
+    } catch (const std::exception& ex) {
+        if (expert_stream_demanded()) {
+            std::fprintf(stderr, "kolibri: expert streaming refused: %s\n", ex.what());
+            std::fflush(stderr);
+            std::exit(2);
+        }
+        // The DEFAULT falls back here and says so once: an unsupported geometry, a device without room for the two
+        // slots, or a runtime refusal must not turn a working prefill into a failed one.  The pool recomputes this
+        // layer from scratch, so no partially published row survives.
+        g_expert_stream_disabled = true;
+        std::fprintf(stderr, "kolibri: expert streaming unavailable (%s); serving this run on the CPU pool\n",
+                     ex.what());
+        return false;
+    }
+}
+
+/// The cheap capability probe, before any allocation: the layer's own geometry against the supported formats.
+static bool expert_stream_can_serve(const LayerBlobs& b) {
+    if (!expert_stream_usable()) return false;
+    strata::kolibri::stream::LayerView probe;
+    probe.fmt = b.fmt;
+    probe.weights = b.table;
+    probe.weight_stride = b.stride;
+    probe.expert_count = 1;
+    probe.top_k = 1;             // geometry-only probe: no ids, no selections, nothing validated against them
+    probe.selection_count = 0;
+    try {
+        strata::kolibri::stream::required_capacity(probe, strata::kolibri::stream::Config{});
+        return true;
+    } catch (const std::exception& ex) {
+        if (expert_stream_demanded()) {
+            std::fprintf(stderr, "kolibri: expert streaming refused: %s\n", ex.what());
+            std::fflush(stderr);
+            std::exit(2);
+        }
+        g_expert_stream_disabled = true;
+        std::fprintf(stderr, "kolibri: expert streaming unavailable (%s); serving this run on the CPU pool\n",
+                     ex.what());
+        return false;
+    }
+}
+#endif
+
 static inline int router_tk() {
     // K31: DEFAULT 3 (three experts per block, TJ=8).  Measured at 32K, both sockets: TK=0 120.5, TK=2/TJ=16 141.8,
     // TK=2/TJ=32 143.3, **TK=3/TJ=8 147.6** (148.7/144.1/150.0); at 4K TK=3 161.0 against TK=0 120.7.  Bitwise: identical
@@ -2511,6 +2714,25 @@ static void seed_hot(Engine& e, Scratch& s) {
     KC(cudaStreamSynchronize(g_st));
 }
 
+// Restore only prior reachable rows. Newly prepared rows are packed once and rounded back
+// before attention, never recursively re-quantizing an old cache row.
+void kv8_restore_layer(const Engine& e, Scratch& s, int64_t l, int64_t pos, cudaStream_t st) {
+    if (!s.kv_int8 || pos == 0) return;
+    const int rows = strata::core::is_swa_layer(e.g,l) ? e.g.n_swa : s.ctx;
+    const int visible = (int) std::min<int64_t>(pos, rows);
+    const int blocks = e.g.n_head_kv * visible * (e.g.head_dim/64);
+    strata::kolibri::experimental::kv8_restore<<<blocks,64,0,st>>>(s.k8[l],s.kc[l],e.g.head_dim,rows,visible);
+    strata::kolibri::experimental::kv8_restore<<<blocks,64,0,st>>>(s.v8[l],s.vc[l],e.g.head_dim,rows,visible);
+}
+void kv8_pack_layer(const Engine& e, Scratch& s, int64_t l, int64_t pos, int count, cudaStream_t st) {
+    if (!s.kv_int8) return;
+    const bool sliding = strata::core::is_swa_layer(e.g,l);
+    const int rows = sliding ? e.g.n_swa : s.ctx;
+    const int blocks = e.g.n_head_kv * count * (e.g.head_dim/64);
+    strata::kolibri::experimental::kv8_pack<<<blocks,64,0,st>>>(s.kc[l],s.k8[l],e.g.n_head_kv,e.g.head_dim,rows,pos,count,sliding,s.kc[l]);
+    strata::kolibri::experimental::kv8_pack<<<blocks,64,0,st>>>(s.vc[l],s.v8[l],e.g.n_head_kv,e.g.head_dim,rows,pos,count,sliding,s.vc[l]);
+}
+
 void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t st, float* layers_host) {
     const auto& g = e.g;
     const int N = (int) g.n_embd, K = (int) e.top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
@@ -2558,6 +2780,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
         gemv_dec(e.dense.at(L(l, "attn_q.weight")), s.h, s.dec_h16, s.q, st);
         gemv_dec(e.dense.at(L(l, "attn_k.weight")), s.h, s.dec_h16, s.k, st);
         gemv_dec(e.dense.at(L(l, "attn_v.weight")), s.h, s.dec_h16, s.v, st);
+        kv8_restore_layer(e, s, l, s.pos, st);
         if (graph || steady || dec_attn_dp_on())
             k_attn_prep_p<<<H + HKV, kThreads, 0, st>>>(s.q, s.k, s.v, e.f32.at(L(l, "attn_q_norm.weight")),
                                            e.f32.at(L(l, "attn_k_norm.weight")), s.q, s.kc[l], s.vc[l], H, D, s.pos_d,
@@ -2566,6 +2789,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
             k_attn_prep<<<H + HKV, kThreads, 0, st>>>(s.q, s.k, s.v, e.f32.at(L(l, "attn_q_norm.weight")),
                                            e.f32.at(L(l, "attn_k_norm.weight")), s.q, s.kc[l], s.vc[l], H, D, s.pos,
                                            g.n_swa, s.ctx, e.rope_base, e.eps, sliding);
+        kv8_pack_layer(e, s, l, s.pos, 1, st);
         if (graph)
             k_attn_p<<<H, 512, (size_t) 4096 * sizeof(float), st>>>(
                 s.q, s.kc[l], s.vc[l], s.att, H, HKV, D, s.pos_d, g.n_swa, s.ctx, 1.0f / sqrtf((float) D), sliding);
@@ -2898,6 +3122,134 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
 }
 
 
+// A1 (STRATA_KOLIBRI_A1_CHECK=1): redo ONE selection's expert row on the GPU - gate/up dots, the CPU's SiLU,
+// the CPU's hidden quantisation, the down dots - and compare it bit for bit with the row the pool just produced.
+// One layer-chunk, one selection, real weights and real activations: this proves the plumbing before any arm is
+// wired into the default path. Returns false (with a printed reason) when the row differs.
+static bool a1_check_row(const strata::kernels::cpu::NativeFmt& f, const uint8_t* blob, const void* act,
+                         const float* pool_ff, const float* pool_ey, int64_t N, int64_t FF, int64_t K, int layer) {
+    namespace a1 = strata::kolibri::a1;
+    const int nb_gu = (int) (f.n_embd / a1::kQK), nb_dn = (int) (f.n_ff / a1::kQK);
+    const char* why = a1::unsupported(nb_gu, (int) FF, blob, act);
+    if (!why && f.gu_type != 12) why = "gate/up is not Q4_K on this layer";
+    if (!why && f.d_type != 14 && f.d_type != 12) why = "down is neither Q6_K nor Q4_K on this layer";
+    if (!why && (size_t) nb_gu * a1::kQ4KBlock != f.gu_row) why = "gate/up row stride is not nb * 144";
+    if (!why && (size_t) nb_dn * (f.d_type == 14 ? a1::kQ6KBlock : a1::kQ4KBlock) != f.d_row) why = "down row stride mismatch";
+    if (!why && f.act_bytes != (size_t) nb_gu * a1::kQ8KBlock) why = "activation is not Q8_K for gate/up";
+    if (!why && f.h_bytes < (size_t) nb_dn * a1::kQ8KBlock) why = "hidden is not Q8_K for down";
+    if (why) { std::fprintf(stderr, "A1CHECK layer %d: refused: %s\n", layer, why); return false; }
+
+    uint8_t *dw = nullptr, *da = nullptr, *dh = nullptr; float *dg = nullptr, *du = nullptr, *dout = nullptr;
+    bool ok = false;
+    std::vector<float> g((size_t) FF), u((size_t) FF), ff((size_t) FF), out((size_t) N);
+    std::vector<uint8_t> hq(f.h_bytes);
+    KC(cudaMalloc((void**) &dw, f.bytes));
+    KC(cudaMalloc((void**) &da, f.act_bytes));
+    KC(cudaMalloc((void**) &dh, f.h_bytes));
+    KC(cudaMalloc((void**) &dg, sizeof(float) * (size_t) FF));
+    KC(cudaMalloc((void**) &du, sizeof(float) * (size_t) FF));
+    KC(cudaMalloc((void**) &dout, sizeof(float) * (size_t) N));
+    KC(cudaMemcpy(dw, blob, f.bytes, cudaMemcpyHostToDevice));
+    KC(cudaMemcpy(da, act, f.act_bytes, cudaMemcpyHostToDevice));
+
+    const int threads = 128, rpb = (threads / 32) * a1::kRowsPerWarp;
+    const int ggrid = ((int) FF + rpb - 1) / rpb, dgrid = ((int) N + rpb - 1) / rpb;
+    a1::kq_a1_dot_rows<<<ggrid, threads>>>(dw, da, nb_gu, (int) FF, dg);                 // gate
+    a1::kq_a1_dot_rows<<<ggrid, threads>>>(dw + f.up_off, da, nb_gu, (int) FF, du);      // up
+    if (cudaDeviceSynchronize() != cudaSuccess || cudaGetLastError() != cudaSuccess) return false;
+    KC(cudaMemcpy(g.data(), dg, sizeof(float) * (size_t) FF, cudaMemcpyDeviceToHost));
+    KC(cudaMemcpy(u.data(), du, sizeof(float) * (size_t) FF, cudaMemcpyDeviceToHost));
+    // the CPU's own expression, character for character (native_expert.cpp: the x512_one branch)
+    for (int64_t r = 0; r < FF; ++r) ff[(size_t) r] = (g[(size_t) r] / (1.f + std::exp(-g[(size_t) r]))) * u[(size_t) r];
+
+    int64_t ff_bad = 0;
+    for (int64_t r = 0; r < FF; ++r) if (std::memcmp(&ff[(size_t) r], &pool_ff[r], 4) != 0) ++ff_bad;
+
+    strata::kernels::cpu::native_quant_h(f, ff.data(), hq.data());
+    KC(cudaMemcpy(dh, hq.data(), f.h_bytes, cudaMemcpyHostToDevice));
+    if (f.d_type == 14) a1::kq_a1_dot_rows_q6k<<<dgrid, threads>>>(dw + f.down_off, dh, nb_dn, (int) N, dout);
+    else                a1::kq_a1_dot_rows<<<dgrid, threads>>>(dw + f.down_off, dh, nb_dn, (int) N, dout);
+    if (cudaDeviceSynchronize() != cudaSuccess || cudaGetLastError() != cudaSuccess) return false;
+    KC(cudaMemcpy(out.data(), dout, sizeof(float) * (size_t) N, cudaMemcpyDeviceToHost));
+    int64_t ey_bad = 0;
+    for (int64_t r = 0; r < N; ++r) if (std::memcmp(&out[(size_t) r], &pool_ey[r], 4) != 0) ++ey_bad;
+
+    std::fprintf(stderr, "A1CHECK layer %d: hidden (gate/up + SwiGLU) %lld/%lld bit-identical; row (down) %lld/%lld bit-identical%s\n",
+                 layer, (long long) (FF - ff_bad), (long long) FF, (long long) (N - ey_bad), (long long) N,
+                 (ff_bad == 0 && ey_bad == 0) ? " -> PASS" : " -> FAIL");
+    ok = (ff_bad == 0 && ey_bad == 0);
+    cudaFree(dw); cudaFree(da); cudaFree(dh); cudaFree(dg); cudaFree(du); cudaFree(dout);
+    return ok;
+}
+
+// A1 arm (STRATA_KOLIBRI_EXPERT_GPU=1): the same three stages for every selection of the layer-chunk, with the
+// touched experts staged to the device once. Unset, none of this runs. A layer this cannot serve is REFUSED, never
+// quietly handed back to the pool: a silent fallback would make an A/B measure nothing.
+static void a1_run_selections(const LayerBlobs& b, Scratch& s, ActSet& A, int NKc, int K, int64_t FF, int64_t N,
+                              int layer, int n_expert) {
+    namespace a1 = strata::kolibri::a1;
+    const auto& f = b.fmt;
+    const int nb_gu = (int) (f.n_embd / a1::kQK), nb_dn = (int) (f.n_ff / a1::kQK);
+    const char* why = a1::unsupported(nb_gu, (int) FF, b.table, A.ey_h);
+    if (!why && f.gu_type != 12) why = "gate/up is not Q4_K";
+    if (!why && f.d_type != 14 && f.d_type != 12) why = "down is neither Q6_K nor Q4_K";
+    if (!why && (size_t) nb_gu * a1::kQ4KBlock != f.gu_row) why = "gate/up row stride is not nb * 144";
+    if (!why && (size_t) nb_dn * (f.d_type == 14 ? a1::kQ6KBlock : a1::kQ4KBlock) != f.d_row) why = "down row stride mismatch";
+    if (!why && f.act_bytes != (size_t) nb_gu * a1::kQ8KBlock) why = "activation is not Q8_K for gate/up";
+    if (!why && f.h_bytes < (size_t) nb_dn * a1::kQ8KBlock) why = "hidden is not Q8_K for down";
+    if (why) {
+        std::fprintf(stderr, "kolibri: STRATA_KOLIBRI_EXPERT_GPU refused on layer %d: %s\n", layer, why);
+        std::fflush(stderr);
+        std::exit(2);
+    }
+
+    std::vector<int> slot((size_t) n_expert, -1);
+    int n_slot = 0;
+    for (int sel = 0; sel < NKc; ++sel) {
+        const int id = A.ids_h[(size_t) sel];
+        if (slot[(size_t) id] < 0) slot[(size_t) id] = n_slot++;
+    }
+    uint8_t* dblob = nullptr; uint8_t* dact = nullptr; uint8_t* dh = nullptr;
+    float *dg = nullptr, *du = nullptr, *dout = nullptr;
+    KC(cudaMalloc((void**) &dblob, (size_t) n_slot * b.stride));
+    KC(cudaMalloc((void**) &dact, f.act_bytes));
+    KC(cudaMalloc((void**) &dh, f.h_bytes));
+    KC(cudaMalloc((void**) &dg, sizeof(float) * (size_t) FF));
+    KC(cudaMalloc((void**) &du, sizeof(float) * (size_t) FF));
+    KC(cudaMalloc((void**) &dout, sizeof(float) * (size_t) N));
+    std::vector<int> staged((size_t) n_slot, 0);
+    std::vector<float> g((size_t) FF), u((size_t) FF), ff((size_t) FF), out((size_t) N);
+    std::vector<uint8_t> hq(f.h_bytes);
+
+    const int threads = 128, rpb = (threads / 32) * a1::kRowsPerWarp;
+    const int ggrid = ((int) FF + rpb - 1) / rpb, dgrid = ((int) N + rpb - 1) / rpb;
+    for (int sel = 0; sel < NKc; ++sel) {
+        const int id = A.ids_h[(size_t) sel];
+        const int sl = slot[(size_t) id];
+        if (!staged[(size_t) sl]) {
+            KC(cudaMemcpy(dblob + (size_t) sl * b.stride, b.table + (size_t) id * b.stride, b.stride,
+                          cudaMemcpyHostToDevice));
+            staged[(size_t) sl] = 1;
+        }
+        const uint8_t* blob = dblob + (size_t) sl * b.stride;
+        KC(cudaMemcpy(dact, s.act_cur + (size_t) (sel / K) * f.act_bytes, f.act_bytes, cudaMemcpyHostToDevice));
+        a1::kq_a1_dot_rows<<<ggrid, threads>>>(blob, dact, nb_gu, (int) FF, dg);
+        a1::kq_a1_dot_rows<<<ggrid, threads>>>(blob + f.up_off, dact, nb_gu, (int) FF, du);
+        KC(cudaDeviceSynchronize());
+        KC(cudaMemcpy(g.data(), dg, sizeof(float) * (size_t) FF, cudaMemcpyDeviceToHost));
+        KC(cudaMemcpy(u.data(), du, sizeof(float) * (size_t) FF, cudaMemcpyDeviceToHost));
+        for (int64_t r = 0; r < FF; ++r)
+            ff[(size_t) r] = (g[(size_t) r] / (1.f + std::exp(-g[(size_t) r]))) * u[(size_t) r];   // the CPU expression
+        strata::kernels::cpu::native_quant_h(f, ff.data(), hq.data());
+        KC(cudaMemcpy(dh, hq.data(), f.h_bytes, cudaMemcpyHostToDevice));
+        if (f.d_type == 14) a1::kq_a1_dot_rows_q6k<<<dgrid, threads>>>(blob + f.down_off, dh, nb_dn, (int) N, dout);
+        else                a1::kq_a1_dot_rows<<<dgrid, threads>>>(blob + f.down_off, dh, nb_dn, (int) N, dout);
+        KC(cudaDeviceSynchronize());
+        KC(cudaMemcpy(A.ey_h + (size_t) sel * N, dout, sizeof(float) * (size_t) N, cudaMemcpyDeviceToHost));
+    }
+    cudaFree(dblob); cudaFree(dact); cudaFree(dh); cudaFree(dg); cudaFree(du); cudaFree(dout);
+}
+
 /// Chunked prompt processing (--prefill): T rows at once.  Dense projections run as GEMMs (FP16 activations, the
 /// weights dequantized to FP16 in the Gemm scratch - what llama.cpp's batched CUDA path does), the attention
 /// scores and P.V as batched FP16 GEMMs with the causal (and window) softmax in between, the routed experts as
@@ -3035,10 +3387,12 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
             else e.gemm.native((const uint16_t*) A.x16, wv.type, wv.d, A.v_m, Tc, HKV * D, N);
         }
         pp_mark(e.cnt.pf_dense_ns);
+        kv8_restore_layer(e, s, l, p0c, g_st);
         k_attn_prep_multi<<<dim3(H + HKV, Tc), kThreads>>>(A.q_m, A.k_m, A.v_m, e.f32.at(L(l, "attn_q_norm.weight")),
                                                           e.f32.at(L(l, "attn_k_norm.weight")), A.q_m, s.kc[l],
                                                           s.vc[l], H, HKV, D, p0c, g.n_swa, s.ctx, e.rope_base,
                                                           e.eps, sliding);
+        kv8_pack_layer(e, s, l, p0c, Tc, g_st);
         // the chunk reads positions 0..p0c+Tc-1 (full) or the ring's last n_vis (sliding)
         const int P = sliding ? (int) std::min<int64_t>(p0c + Tc, g.n_swa) : (int) (p0c + Tc);
         const int64_t first = sliding ? p0c + Tc - P : 0;
@@ -3301,6 +3655,25 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                          hits);
             std::fflush(stderr);
         }
+        // 2026-10-30, EXPERT_F16 correctness plan: an opt-in routing digest, one line per (chunk, layer), so "did the
+        // two arms route the same experts?" can be answered without going through a KL.  Default off.  No arithmetic
+        // changes and no extra synchronisation: `A.ids_h` is published by the PRE half and the event synchronised
+        // above is what makes it valid here, which is why this sits next to the SLOTTRACE block below.
+        if (std::getenv("STRATA_KOLIBRI_F16TRACE") != nullptr) {
+            static long long f16_tr_chunk = -1;
+            if (l == 0) ++f16_tr_chunk;
+            uint32_t h = 2166136261u;
+            int uniq = 0;
+            std::vector<char> seen((size_t) g.n_expert, 0);
+            for (int i = 0; i < NKc; ++i) {
+                const int id = A.ids_h[(size_t) i];
+                h = (h ^ (uint32_t) id) * 16777619u;
+                if (!seen[(size_t) id]) { seen[(size_t) id] = 1; ++uniq; }
+            }
+            std::fprintf(stderr, "F16TRACE chunk=%lld l=%d picks=%d uniq=%d ids=%08x\n", f16_tr_chunk, (int) l,
+                         NKc, uniq, h);
+            std::fflush(stderr);
+        }
         if (b.native_ok && !(pool_all && e.cpu_threads > 0)) {
             if (e.counters && e.slots > 0) {   // pricing only; --counters runs
                 const int* hid = A.ids_h;   // already published - this used to be a SECOND synchronous D2H of the same ids
@@ -3468,6 +3841,18 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                     }
                 } else {
                     for (int x : s.pf_touch) s.pf_miss.push_back(x);
+                }
+                // 2026-10-30, EXPERT_F16 correctness plan step 4: the cache-ownership invariant, measured rather than
+                // argued - every resident in this chunk owns its own slot, and no more residents than slots.  Opt-in
+                // (STRATA_KOLIBRI_F16TRACE), reads host state the loop already holds, changes no arithmetic.
+                if (std::getenv("STRATA_KOLIBRI_F16TRACE") != nullptr && b.f16) {
+                    std::vector<int> slots(s.pf_res_slot);
+                    std::sort(slots.begin(), slots.end());
+                    int dup = 0;
+                    for (size_t i = 1; i < slots.size(); ++i) if (slots[i] == slots[i - 1]) ++dup;
+                    std::fprintf(stderr, "F16SLOT chunk=%lld l=%d residents=%zu n_cached=%d res_eff=%d dup=%d\n",
+                                 s.pf_clock, (int) l, s.pf_res_slot.size(), b.n_cached, res_eff, dup);
+                    std::fflush(stderr);
                 }
                 // S7 increment C: resident GEMMs as ONE batched cublas call per slice per layer.  Each touched
                 // expert's tokens are cut into blocks of kResBlk rows (last block zero-padded via tok = -1); the
@@ -3828,7 +4213,20 @@ static const int grp_max = [] {
                     }
                 }
 #endif
-                if (!mmq_did) e.pool.run([&](int shard) {
+                bool stream_served = false;
+#if defined(__CUDACC__)
+                if (!mmq_did && expert_stream_can_serve(b)) {
+                    // The streamed arm.  A.ey_h is published on the host before this returns, exactly where the pool
+                    // would have left it, so the weighting below is the same code on the same input.
+                    stream_served = expert_stream_layer(b, s, A, NKc, K, FF, N, (int) e.g.n_expert);
+                }
+#endif
+                (void) stream_served;
+                if (!mmq_did && !stream_served) e.pool.run([&](int shard) {
+                    if (env_on("STRATA_KOLIBRI_EXPERT_GPU")) {   // A1: the expert products on the GPU, same three stages
+                        if (shard == 0) a1_run_selections(b, s, A, NKc, K, FF, N, (int) l, (int) e.g.n_expert);
+                        return;
+                    }
                     const auto sh_t0 = std::chrono::steady_clock::now();
                     const void* acts[64]; float* ffs[64]; const void* hqs[64]; float* eys[64];
                     for (size_t xi = (size_t) shard; xi < pool_list.size(); xi += (size_t) NS) {
@@ -3857,6 +4255,15 @@ static const int grp_max = [] {
                             const auto tC = std::chrono::steady_clock::now();
                             strata::kernels::cpu::native_down_rows(b.fmt, blob, hqs, mm, eys, 0, N);
                             const auto tD = std::chrono::steady_clock::now();
+                            if (std::getenv("STRATA_KOLIBRI_A1_CHECK") != nullptr && shard == 0 && lo + a == 0) {
+                                static bool checked = false;
+                                if (!checked) {
+                                    checked = true;
+                                    const bool good = a1_check_row(b.fmt, blob, acts[a], ffs[a], eys[a], N, FF, K, (int) l);
+                                    KC(cudaGetLastError());
+                                    std::exit(good ? 0 : 1);
+                                }
+                            }
                             if (e.counters) e.pf_rows += mm;   // the pool's real work: one row = gate/up + down over N
                             e.pf_gu_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(tB - tA).count();
                             e.pf_qh_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(tC - tB).count();
@@ -3872,6 +4279,22 @@ static const int grp_max = [] {
                     for (int64_t q = 0; q < NKc * N; ++q) { const double v = std::fabs((double) A.ey_h[(size_t) q]); if (v > mx) mx = v; }
                     std::fprintf(stderr, "PFPOOL l=%d ey_h max|v|=%.6g first=%.6g %.6g pool_ran=%d NKc=%lld\n", (int) l, mx,
                                  (double) A.ey_h[0], (double) A.ey_h[1], (int) (!mmq_did), (long long) NKc);
+                }
+                // Task 1 of the streamed-prefill plan: with STRATA_KOLIBRI_STREAM_CAPTURE set, record this
+                // chunk-layer's expert leg.  Here the pool has returned (every shard done), so A.ey_h holds the
+                // unweighted expert rows, and the router weight has not been applied yet - which is exactly the
+                // boundary the replay reproduces.  Unset: nothing below runs.
+                if (stream_capture_on()) {
+                    if (mmq_did) {
+                        std::fprintf(stderr, "kolibri: stream capture refused: layer %d took the MMQ leg\n", (int) l);
+                        std::exit(2);
+                    }
+                    if (b.f16 || pf_partial_on()) {
+                        std::fprintf(stderr, "kolibri: stream capture refused: layer %d served resident rows\n",
+                                     (int) l);
+                        std::exit(2);
+                    }
+                    stream_capture_record(e, b, s, A, NKc, K, Tc, (int) l, pool_list);
                 }
                 if (e.counters && !mmq_did) {
                     const auto pf_t1 = std::chrono::steady_clock::now();
@@ -4396,11 +4819,43 @@ void init_scratch(const Engine& e, Scratch& s) {
     // and nothing else.  Cost: 709.5 MiB of the ~4.5 GiB free.  The sliding layers keep their host ring (513 rows,
     // 26 MB in total).  STRATA_KOLIBRI_KV_DEV=1, default off until measured.
     const bool kv_dev = env_on("STRATA_KOLIBRI_KV_DEV");
+    s.kv_int8 = env_on("STRATA_KOLIBRI_KV_INT8");
+    if (s.kv_int8) {
+        // Existing per-layer transposed mirrors remain valid: restore and quantize this
+        // layer's stage BEFORE its full/incremental mirror copy. Keep their arithmetic.
+        // The cross-layer fingerprint diagnostic, however, assumes persistent FP16 kc/vc.
+        const char* prefix_diag = std::getenv("STRATA_KOLIBRI_PREFIX_FINGERPRINT");
+        if (g.head_dim % 64 || pf_pipe_on() || dec_graph_on() || e.grouped > 0 ||
+            env_on("STRATA_KOLIBRI_DEC_TOKEN_GRAPH") || (prefix_diag && *prefix_diag)) {
+            std::fprintf(stderr, "strata-kolibri: experimental KV_INT8 refuses pipelining, graphs, grouped decode, prefix fingerprints or head_dim not divisible by 64\n");
+            std::exit(2);
+        }
+        const size_t cap = (size_t) g.n_head_kv * std::max<int64_t>(s.ctx,g.n_swa) * g.head_dim;
+        KC(cudaMalloc((void**)&s.kv8_stage_k,cap*2));
+        KC(cudaMalloc((void**)&s.kv8_stage_v,cap*2));
+        std::fprintf(stderr,"kolibri: experimental KV_INT8 staged, 66 bytes/64 values; staging=%zu bytes; durable placement=%s (sliding stays host)\n",
+                     cap*4,kv_dev?"device":"host");
+    }
+    size_t kv_durable_bytes = 0;
     for (int64_t l = 0; l < g.n_layers; ++l) {
         const bool sliding = strata::core::is_swa_layer(g, l);
         const int64_t rows = sliding ? g.n_swa : s.ctx;
         const size_t elems = (size_t) g.n_head_kv * (size_t) rows * (size_t) g.head_dim;   // halves
-        if (kv_dev && !sliding) {
+        kv_durable_bytes += elems * (s.kv_int8 ? 66 : 128) / 32;
+        if (s.kv_int8) {
+            using strata::kolibri::experimental::Kv8Block;
+            Kv8Block *pk=nullptr, *pv=nullptr;
+            const size_t bytes=elems/64*sizeof(Kv8Block);
+            if (kv_dev && !sliding) {
+                KC(cudaMalloc((void**)&pk,bytes)); KC(cudaMalloc((void**)&pv,bytes));
+            } else {
+                KC(cudaHostAlloc((void**)&pk,bytes,cudaHostAllocDefault));
+                KC(cudaHostAlloc((void**)&pv,bytes,cudaHostAllocDefault));
+            }
+            KC(cudaMemset(pk,0,bytes)); KC(cudaMemset(pv,0,bytes));
+            s.k8.push_back(pk); s.v8.push_back(pv);
+            s.kc.push_back(s.kv8_stage_k); s.vc.push_back(s.kv8_stage_v);
+        } else if (kv_dev && !sliding) {
             void* pk = nullptr;
             void* pv = nullptr;
             KC(cudaMalloc(&pk, elems * 2));
@@ -4432,6 +4887,7 @@ void init_scratch(const Engine& e, Scratch& s) {
             s.vt.push_back(nullptr);
         }
     }
+    if (s.kv_int8) std::fprintf(stderr,"kolibri: KV_INT8 durable K+V allocation=%zu bytes\n",kv_durable_bytes);
 }
 
 /// Per-layer CUDA graphs (--grouped + graphs): a grouped layer's decode step is fully device-side (position and
@@ -4484,6 +4940,12 @@ void reset_state(Engine& e, Scratch& s) {
         const bool sliding = strata::core::is_swa_layer(e.g, (int64_t) l);
         const int64_t rows = sliding ? e.g.n_swa : s.ctx;
         const int64_t clear_rows = sliding ? rows : std::min<int64_t>(rows, used);
+        if (s.kv_int8) {
+            // Packed caches retain their per-head stride; clear all so reset cannot expose stale codes/scales.
+            const size_t packed_bytes=(size_t)e.g.n_head_kv*rows*e.g.head_dim/64*sizeof(strata::kolibri::experimental::Kv8Block);
+            KC(cudaMemset(s.k8[l],0,packed_bytes)); KC(cudaMemset(s.v8[l],0,packed_bytes));
+            continue;
+        }
         const size_t bytes = (size_t) e.g.n_head_kv * clear_rows * e.g.head_dim * 2;   // FP16 KV (S3)
         KC(cudaMemset(s.kc[l], 0, bytes));
         KC(cudaMemset(s.vc[l], 0, bytes));
@@ -6038,6 +6500,68 @@ int strata::kolibri::run(int argc, char** argv) {
         // measured placement rule (pool_bench): ~24 workers on the GPU's socket; 48 on one socket collapse.
         e.epool = std::make_unique<strata::kernels::cpu::ExpertPool>(
             e.cpu_threads, true, true, strata::kernels::cpu::PoolAffinity::All);
+    }
+    // ---- streamed-prefill capture: refuse every configuration whose expert leg this hook does not record --------
+    // The capture records ONE leg - the CPU pool over the pinned blobs, for every layer - because that is the work
+    // the GPU arm must beat.  Any other leg would produce a capture that silently describes different work, so the
+    // conflicts are enumerated here from the same switches forward_multi reads, and named.
+    // ---- streamed expert prefill (Tasks 5-7): refuse every configuration whose expert leg it cannot serve -------
+    // Enumerated from the same switches forward_multi reads, so a combination this arm does not cover fails here by
+    // name instead of quietly serving a different leg and calling it streamed.
+    if (expert_stream_on()) {
+        const char* why = nullptr;
+        const char* pool_all_env = std::getenv("STRATA_KOLIBRI_POOL_ALL");
+        if (prefill <= 0) why = "it serves the prefill's expert leg, so it needs --prefill";
+        else if (cpu_threads <= 0) why = "its CPU activation/quantization bridge runs on the coordinator, so it needs --cpu-threads";
+        else if (pool_all_env != nullptr && std::atoi(pool_all_env) != 1)
+            why = "STRATA_KOLIBRI_POOL_ALL must be unset or 1: other values send some layers to the GPU grouped leg";
+        else if (slots != 0) why = "--expert-slots moves expert rows between legs";
+        else if (grouped != 0) why = "--grouped serves picks on the GPU";
+        else if (env_on("STRATA_KOLIBRI_EXPERT_GPU")) why = "STRATA_KOLIBRI_EXPERT_GPU is the A1 arm; the two are exclusive";
+        else if (expert_f16_n() > 0) why = "the fp16 expert cache (STRATA_KOLIBRI_EXPERT_F16) serves rows on the GPU";
+        else if (pf_partial_on()) why = "STRATA_KOLIBRI_PF_PARTIAL publishes partial sums instead of ey_h";
+        else if (dec_res_on()) why = "STRATA_KOLIBRI_DEC_RES serves resident picks on the GPU";
+        else if (pf_mmq_on()) why = "the MMQ prompt arm replaces the pool's expert products";
+        else if (serve_mode) why = "the streamed arm serves prefill chunks, not a served request stream";
+        else if (stream_capture_on()) why = "the capture hook records the CPU pool's leg; the streamed arm is a different leg";
+        if (why != nullptr) {
+            if (expert_stream_demanded()) {
+                std::fprintf(stderr, "kolibri: expert streaming refused: %s\n", why);
+                return 2;
+            }
+            g_expert_stream_disabled = true;
+            std::fprintf(stderr, "kolibri: expert streaming unavailable (%s); serving this run on the CPU pool\n", why);
+        }
+    }
+    if (stream_capture_on()) {
+        const char* why = nullptr;
+        const char* pool_all_env = std::getenv("STRATA_KOLIBRI_POOL_ALL");
+        if (prefill <= 0) why = "it records the prefill's expert leg, so it needs --prefill";
+        else if (cpu_threads <= 0) why = "it records the CPU pool, so it needs --cpu-threads";
+        else if (pool_all_env != nullptr && std::atoi(pool_all_env) != 1)
+            why = "STRATA_KOLIBRI_POOL_ALL must be unset or 1: other values send some layers to the GPU grouped leg";
+        else if (slots != 0) why = "--expert-slots moves expert rows between legs";
+        else if (grouped != 0) why = "--grouped serves picks on the GPU";
+        else if (env_on("STRATA_KOLIBRI_EXPERT_GPU")) why = "STRATA_KOLIBRI_EXPERT_GPU is the A1 arm, not the pool";
+        else if (expert_f16_n() > 0) why = "the fp16 expert cache (STRATA_KOLIBRI_EXPERT_F16) serves rows on the GPU";
+        else if (pf_partial_on()) why = "STRATA_KOLIBRI_PF_PARTIAL publishes partial sums instead of ey_h";
+        else if (dec_res_on()) why = "STRATA_KOLIBRI_DEC_RES serves resident picks on the GPU";
+        else if (pf_mmq_on()) why = "the MMQ prompt arm replaces the pool's expert products";
+        else if (serve_mode) why = "a capture is one prefill from a fixed prompt, not a served request stream";
+        if (why != nullptr) {
+            std::fprintf(stderr, "kolibri: stream capture refused: %s\n", why);
+            return 2;
+        }
+        char manifest[512];
+        std::snprintf(manifest, sizeof manifest,
+                      "{\"kind\":\"kolibri-prefill-capture\",\"version\":1,\"model\":\"%s\","
+                      "\"experts\":%lld,\"top_k\":%d,\"n_embd\":%lld,\"n_ff\":%lld,\"chunk_tokens\":%d,"
+                      "\"cpu_threads\":%d,\"lanes\":%d,\"note\":\"instrumentation run, never a timing\"}",
+                      model.c_str(), (long long) e.g.n_expert, (int) e.g.n_expert_used, (long long) e.g.n_embd,
+                      (long long) e.g.n_ff, Scratch::kTmax, cpu_threads, e.pf_lanes);
+        g_stream_capture_manifest = manifest;
+        std::fprintf(stderr, "kolibri: stream capture on: %s (this run is instrumentation, not a timing)\n",
+                     stream_capture_dir());
     }
     // K25 instrument.  The 32K decode term is 12 full-attention layers x one k_attn launch at n_vis = pos+1,
     // and an end-to-end profiled run needs a ~55 minute prefill before the kernel of interest runs once.  This

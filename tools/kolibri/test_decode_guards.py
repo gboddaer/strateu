@@ -1,6 +1,7 @@
 """Engine guard tests: invalid arm combinations must fail before model loading or GPU allocation.
 
-Run after building strata-kolibri. No model or GPU is used by these negative cases.
+Run after building strata-kolibri. Invalid-combination cases need no model or GPU.
+The automatic-fallback case needs a GPU to reach model I/O after its guards.
 """
 import os
 from pathlib import Path
@@ -10,9 +11,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 BIN = Path(os.environ.get('KOLIBRI_BIN', ROOT / 'build-mmq/strata-kolibri'))
+pytestmark = pytest.mark.skipif(not BIN.is_file(), reason='build strata-kolibri first or set KOLIBRI_BIN')
 
 
-@pytest.mark.skipif(not BIN.exists(), reason='build strata-kolibri first')
 @pytest.mark.parametrize('arm', ['STRATA_KOLIBRI_DEC_HANDOFF', 'STRATA_KOLIBRI_DEC_STREAM'])
 @pytest.mark.parametrize('args,reason', [(['--cpu-threads', '0'], '--cpu-threads'),
                                        (['--cpu-threads', '8', '--grouped'], '--grouped'),
@@ -27,7 +28,6 @@ def test_unsupported_arm_fails_before_model_read(arm, args, reason):
     assert 'cannot open' not in result.stderr
 
 
-@pytest.mark.skipif(not BIN.exists(), reason='build strata-kolibri first')
 @pytest.mark.parametrize('budget', ['-1', '1000000001', '18446744073709551615', 'oops', '1junk', ''])
 def test_token_wait_budget_rejects_unbounded_or_malformed_values_before_model_read(budget):
     env = {k: v for k, v in os.environ.items() if not k.startswith('STRATA_KOLIBRI_DEC_')}
@@ -60,6 +60,8 @@ def test_unsupported_config_with_no_request_runs_the_plain_path_instead_of_faili
     assert result.returncode == 1, result.stderr
     assert 'decode acceleration off' in result.stderr
     assert '--expert-slots' in result.stderr
+    if 'no CUDA-capable device is detected' in result.stderr:
+        pytest.skip('plain-path model I/O requires a CUDA device after the decode guards')
     assert 'cannot open' in result.stderr   # it reached model I/O: the arms stepped aside, they did not abort
 
 
