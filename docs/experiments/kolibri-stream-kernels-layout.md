@@ -435,6 +435,80 @@ dumps byte-identical to the reference; `STRATA_KOLIBRI_STREAM_DEV_ACT=0` reprodu
 ids512). The library's `Config` defaults stay explicit (`device_activation = false`, `slots = 2`), so the test suite
 keeps covering the old path; the engine is what turns the measured-faster options on.
 
+## 14. The three "not bitwise" GPU kernels: what they are, what they buy, and what can be done
+
+Section 12 put them in one row. They are three different things, and the test that separates them from the `expf` case
+is one question: **can the difference be written as a different implementation of the same function, or is the
+difference the source of the speed?**
+
+- `expf`: a different implementation of the same function. Port glibc's and the speed is free - which is what section 10
+  did, and section 11 banked.
+- These three: the difference *is* the speed. Reproducing the reference's arithmetic reproduces the shape that was
+  slow, so there is nothing left to port.
+
+### `STRATA_Q8_SM60` - the Q8_0 decode GEMV for Pascal GP100
+
+`src/kernels/cuda/q8_sm60.cuh`, opt-in, GP100 only (the one Pascal chip without `__dp4a`). It reads the
+`STRATA_Q8_PACKED` planes - the same int8 values, row-major - with a warp owning a row, 16-byte weight loads through
+the read-only cache, the window's activations copied into shared memory once per workgroup, the 4-int dot on
+`STRATA_DP4A` (`vmad` on sm_60), and a shuffle reduction with **no barrier per row**.
+
+| PH402 SKU 200, 1050 MHz, Flash-Next IQ3_XXS, 32K, decode tok/s, mean of four prompts (`docs/OLDER_GPUS.md`) | |
+| --- | ---: |
+| the exact kernels (GSQ-RCO shard) | 28.3 |
+| `STRATA_Q8_PACKED=1` - bitwise, the same values in aligned planes | 31.1 (+9.9 %) |
+| `STRATA_Q8_SM60=1` | **38.9 (+25 % over the bitwise path, +37 % over the exact one)** |
+
+GPU time per verify window: dense projections 19.2 -> 11.2 ms, head 4.25 -> 2.1 ms.
+
+**Why it is not bitwise**, in the kernel's own header: "the per-32 products are added in another order than the exact
+kernels', so outputs are not bitwise theirs (float rounding only; the int8 dots are exact)". A warp owns a contiguous
+chunk of the row instead of the exact 8-lane, block-strided ownership, and that is what removes the `__syncthreads()`
+per row. **What can be done:** the memory half of the win is bitwise and already shipped separately (`Q8_PACKED`,
++10 %); the remaining 25 % cannot be had without the reordered reduction. No libm is involved, so the `expf` technique
+does not apply.
+
+### `STRATA_BF16_TC` - BF16 projections on the FP16 tensor cores
+
+Below sm_80 there are no BF16 tensor cores, so the BF16 projections (hyper-connection, router, indexer, PLE value
+matrix) are converted to FP16 and run on the FP16 tensor cores instead of cuBLAS BF16 or an FP32 SIMT kernel
+(`docs/NVIDIA_V100.md`). It runs by default below sm_75; `=1` forces it, `=0` turns it off on a V100.
+`src/prefill/gemm_bf16_parity.cu` measures it per shape against `cublasGemmEx` on the same BF16 inputs and reports
+agreement "within fp32-accumulation rounding" - i.e. not bitwise.
+
+**Why it is not bitwise:** "FP16 tensor-core sums round differently". That is the hardware's 4-element dot unit and its
+accumulation order, not a library call. **What can be done:** nothing bitwise. It is a change of arithmetic unit, so it
+is either kept off where an exact path exists or taken to an accuracy qualification. No end-to-end percentage is
+recorded for it in the docs, and inventing one is exactly what this ledger does not do; the harness times it per shape
+(`--bench`).
+
+### The HIP Q8 path - the AMD backend's MMQ
+
+Not a switch: the AMD backend's MMQ multiplies quantized weights with **Q8 activations**, and the note attached to it
+(`docs/AMD_HIP_PERFORMANCE.md`) is a *measured* distance rather than a claim: "Real quantized MMQ relative L2 error was
+approximately 0.0026 against raw-FP32/dequantized-weight reference, reflecting Q8 activation arithmetic; this is not
+bitwise numerical equivalence." Its gain is the backend existing at all.
+
+**Why it is not bitwise:** two layers - the activation format (Q8 rather than the reference's) and the AMD dot's
+accumulation order. **What can be done:** of the three, this is the one closest to a decision, because 0.0026 is already
+the kind of number an accuracy qualification needs, and the bar is known: the FP16 expert caches were rejected at KL
+0.0037 to 1.073 against a run-to-run floor of 0.0012.
+
+### What to do about the class, in order of cost
+
+1. **Take the bitwise-safe half.** Layout, alignment, vector width, staging, cache hints - none of it changes a value,
+   and it is most of what makes a kernel fast on an older card. `Q8_PACKED` is the proof (+10 %, bitwise), and both of
+   this campaign's wins (the gate/up pairing and the device-side activation) are of this kind: the arithmetic stayed
+   the pool's, only where the bytes came from changed.
+2. **Census the divergence before arguing about it.** For any candidate, count how many outputs differ and by how much
+   - the shape of `tools/kolibri/expf_bit_probe.cu`, and for a kernel, its parity harness. "Differs in 4 % of rows by
+   one ulp, only in the denormal tail" and "differs everywhere by 1e-3 relative" are different decisions, and the
+   difference between them is a measurement, not an opinion.
+3. **Only then the accuracy route.** A change of unit, format or reduction order is a numerical change: it needs a KL /
+   worst-|dlogit| study on the six forced histories and an explicit decision under
+   [KOLIBRI_ACCURACY_POLICY.md](../KOLIBRI_ACCURACY_POLICY.md). The FP16 arms show what a failing one looks like; the
+   HIP path's 0.0026 shows what an arguable one looks like.
+
 ## What the four add up to
 
 The streamed arm's remaining cost is not where the Qwen engine's wins are. Its wins are in VRAM-resident decode
