@@ -55,6 +55,7 @@ void* pin_alloc(size_t bytes) {
 
 struct Slot {
     uint8_t* weights = nullptr;    ///< packed blobs of the current batch
+    uint8_t* planes = nullptr;     ///< the same blobs' Q6_K down rows, block bytes split into four planes
     uint8_t* acts = nullptr;       ///< gathered Q8_K rows, one per selection of the batch
     float* gu = nullptr;           ///< gate/up rows, 2 * n_ff floats each
     uint8_t* hidden = nullptr;     ///< quantized hidden rows, one per selection
@@ -85,6 +86,8 @@ struct Context::Impl {
     int n_embd = 0, n_ff = 0, top_k_hint = 0;
     size_t act_bytes = 0, h_bytes = 0, gu_row = 0, up_off = 0;
     size_t weight_cap = 0;   ///< bytes for one batch's blobs (the plan's 32 MiB, or one blob if larger)
+    bool planes_on = false;  ///< STRATA_KOLIBRI_STREAM_PLANES: keep the Q6_K down rows in the plane layout
+    size_t plane_bytes = 0;  ///< bytes of one expert's plane region (rows * nb * 210, unchanged in size)
     Slot s[2];
     std::vector<float> ff;   ///< host scratch: one hidden row before quantization (n_ff floats)
 
@@ -93,7 +96,8 @@ struct Context::Impl {
             if (x.st) cudaStreamSynchronize(x.st);
             for (cudaEvent_t e : {x.ev_gu, x.ev_out})
                 if (e) cudaEventDestroy(e);
-            for (void* p : {(void*) x.weights, (void*) x.acts, (void*) x.gu, (void*) x.hidden, (void*) x.out})
+            for (void* p : {(void*) x.weights, (void*) x.planes, (void*) x.acts, (void*) x.gu, (void*) x.hidden,
+                            (void*) x.out})
                 if (p) cudaFree(p);
             for (void* p : {(void*) x.acts_pin, (void*) x.gu_pin, (void*) x.hidden_pin, (void*) x.out_pin})
                 if (p) cudaFreeHost(p);
@@ -125,7 +129,7 @@ Capacity max_capacity(const Capacity& a, const Capacity& b) {
 
 /// Per-slot buffer sizes, derived from the run geometry exactly as required_capacity() does.
 struct Sizes {
-    size_t weights, acts, gu, hidden, out;
+    size_t weights, acts, gu, hidden, out, planes;
 };
 
 Sizes slot_sizes(const LayerView& v, const Config& cfg, const Capacity& cap) {
@@ -135,7 +139,10 @@ Sizes slot_sizes(const LayerView& v, const Config& cfg, const Capacity& cap) {
     z.gu = (size_t) v.selection_count * 2 * (size_t) v.fmt.n_ff * sizeof(float);
     z.hidden = (size_t) v.selection_count * v.fmt.h_bytes;
     z.out = (size_t) v.selection_count * (size_t) v.fmt.n_embd * sizeof(float);
-    (void) cfg;
+    // One expert's Q6_K down rows in the plane layout: the same 210 bytes per block, so the same size as the blob.
+    z.planes = es_plane_layout() ? (size_t) v.fmt.n_embd * (size_t) (v.fmt.n_ff / 256) * 210u *
+                                       (size_t) cfg.experts_per_batch
+                                 : 0;
     return z;
 }
 
@@ -190,12 +197,15 @@ std::unique_ptr<Context> create(const LayerView& capacity_view, const Config& co
     m->gu_row = capacity_view.fmt.gu_row;
     m->up_off = capacity_view.fmt.up_off;
     m->weight_cap = m->cap.weight_bytes_per_slot;
+    m->planes_on = es_plane_layout();
+    m->plane_bytes = (size_t) m->n_embd * (size_t) (m->n_ff / 256) * 210u;
     m->ff.assign((size_t) m->n_ff, 0.f);
     const Sizes z = slot_sizes(capacity_view, config, m->cap);
     g_alloc_ordinal = 0;
     try {
         for (Slot& x : m->s) {
             x.weights = (uint8_t*) dev_alloc(z.weights);
+            if (z.planes) x.planes = (uint8_t*) dev_alloc(z.planes);
             x.acts = (uint8_t*) dev_alloc(z.acts);
             x.gu = (float*) dev_alloc(z.gu);
             x.hidden = (uint8_t*) dev_alloc(z.hidden);
@@ -269,14 +279,30 @@ Stats run(Context& ctx, const LayerView& view) {
         }
         ck(cudaMemcpyAsync(s.acts, s.acts_pin, b.rows * f.fmt.act_bytes, cudaMemcpyHostToDevice, s.st), "acts H2D");
         st.activation_h2d_bytes += b.rows * f.fmt.act_bytes;
+        // The Q6_K down rows, repacked into the plane layout on the device, right after they land: the copy is the
+        // same bytes and the packing runs on the idle copy stream, not on the host.
+        if (m.planes_on && f.fmt.d_type == kQ6K) {
+            for (size_t i = 0; i < b.group.size(); ++i) {
+                const int rcp = es_q6k_pack_planes(s.weights + i * blob + f.fmt.down_off, s.planes + i * m.plane_bytes,
+                                                   (int) (f.fmt.n_ff / 256), (int) m.n_embd, s.st);
+                if (rcp != 0) refuse("the Q6_K plane packing was refused");
+            }
+        }
         // one gate/up launch per expert: rows [gate | up] are contiguous at the same stride
         woff = 0;
         for (size_t i = 0; i < b.group.size(); ++i) {
             const Group& g = groups[(size_t) b.group[i]];
             const int ntok = (int) g.selections.size();
-            const int rc = es_q4k_rows(s.weights + woff, (int) (f.fmt.n_embd / 256), (int) (2 * f.fmt.n_ff),
-                                       s.acts + b.row[i] * f.fmt.act_bytes, (int) f.fmt.act_bytes, ntok,
-                                       s.gu + b.row[i] * 2 * (size_t) f.fmt.n_ff, (int) (2 * f.fmt.n_ff), s.st);
+            // The paired entry covers gate row k and up row k in one thread, so it is handed n_ff rows instead of
+            // 2 * n_ff and writes the same [gate | up] output; the whole-table launch stays the other choice.
+            const int rc = es_gu_pairing()
+                               ? es_q4k_gu_rows(s.weights + woff, (int) (f.fmt.n_embd / 256), (int) f.fmt.n_ff,
+                                                s.acts + b.row[i] * f.fmt.act_bytes, (int) f.fmt.act_bytes, ntok,
+                                                s.gu + b.row[i] * 2 * (size_t) f.fmt.n_ff,
+                                                (int) (2 * f.fmt.n_ff), s.st)
+                               : es_q4k_rows(s.weights + woff, (int) (f.fmt.n_embd / 256), (int) (2 * f.fmt.n_ff),
+                                             s.acts + b.row[i] * f.fmt.act_bytes, (int) f.fmt.act_bytes, ntok,
+                                             s.gu + b.row[i] * 2 * (size_t) f.fmt.n_ff, (int) (2 * f.fmt.n_ff), s.st);
             if (rc != 0) refuse("the gate/up product was refused");
             st.kernel_launches += 1;   // one launch per expert per product; the launcher tiles tokens in its grid
 
@@ -319,9 +345,15 @@ Stats run(Context& ctx, const LayerView& view) {
                                ? es_q4k_rows(down, (int) (f.fmt.n_ff / 256), m.n_embd,
                                              s.hidden + b.row[i] * f.fmt.h_bytes, (int) f.fmt.h_bytes, ntok,
                                              s.out + b.row[i] * (size_t) m.n_embd, m.n_embd, s.st)
-                               : es_q6k_rows(down, (int) (f.fmt.n_ff / 256), m.n_embd,
-                                             s.hidden + b.row[i] * f.fmt.h_bytes, (int) f.fmt.h_bytes, ntok,
-                                             s.out + b.row[i] * (size_t) m.n_embd, m.n_embd, s.st);
+                               : (m.planes_on ? es_q6k_plane_rows(s.planes + i * m.plane_bytes,
+                                                                  (int) (f.fmt.n_ff / 256), m.n_embd,
+                                                                  s.hidden + b.row[i] * f.fmt.h_bytes,
+                                                                  (int) f.fmt.h_bytes, ntok,
+                                                                  s.out + b.row[i] * (size_t) m.n_embd, m.n_embd, s.st)
+                                              : es_q6k_rows(down, (int) (f.fmt.n_ff / 256), m.n_embd,
+                                                            s.hidden + b.row[i] * f.fmt.h_bytes,
+                                                            (int) f.fmt.h_bytes, ntok,
+                                                            s.out + b.row[i] * (size_t) m.n_embd, m.n_embd, s.st));
             if (rc != 0) refuse("the down product was refused");
             st.kernel_launches += 1;   // one launch per expert per product; the launcher tiles tokens in its grid
 

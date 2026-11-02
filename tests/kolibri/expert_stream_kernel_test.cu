@@ -389,6 +389,77 @@ void sensitivity_checks() {
     }
 }
 
+/// The plane-split Q6_K layout: the same 210 bytes per block, packed on the device into four planes, run by the
+/// plane kernel.  Both the packed and the plain launch must match the CPU oracle bit for bit, so an error in the
+/// packing kernel or in the plane kernel is a failure - not a performance note.
+void run_plane_case(int nb, int rows, int nt) {
+    ++g_cases;
+    const int n = nb * kQK;
+    const size_t row_bytes = (size_t) nb * kQ6KBlock;
+    std::vector<uint8_t> wsrc(row_bytes * (size_t) rows);
+    fill_weights(wsrc, kQ6K, rows, nb, 9100u + (uint32_t) (rows * 13 + nb * 5 + nt), false, false);
+    const Acts a = make_acts(n, nt, 4242u + (uint32_t) nt);
+    std::vector<float> want;
+    cpu_oracle(kQ6K, wsrc.data(), row_bytes, n, a, nt, want, rows);
+    const size_t astride = a.blk[0].size();
+
+    uint8_t* dw = nullptr;
+    uint8_t* dp = nullptr;
+    float* dout = nullptr;
+    uint8_t* dacts = nullptr;
+    bool ok = cudaMalloc((void**) &dw, wsrc.size()) == cudaSuccess &&
+              cudaMalloc((void**) &dp, wsrc.size()) == cudaSuccess &&
+              cudaMalloc((void**) &dout, sizeof(float) * (size_t) rows * (size_t) nt) == cudaSuccess &&
+              cudaMalloc((void**) &dacts, astride * (size_t) nt) == cudaSuccess;
+    if (ok) ok = cudaMemcpy(dw, wsrc.data(), wsrc.size(), cudaMemcpyHostToDevice) == cudaSuccess;
+    for (int t = 0; ok && t < nt; ++t)
+        ok = cudaMemcpy(dacts + (size_t) t * astride, a.blk[(size_t) t].data(), astride, cudaMemcpyHostToDevice) ==
+             cudaSuccess;
+
+    std::vector<float> got_plain, got_plane;
+    int rc = ok ? strata::kolibri::stream::es_q6k_rows(dw, nb, rows, dacts, (int) astride, nt, dout, rows, nullptr) : 9;
+    if (rc == 0 && cudaDeviceSynchronize() == cudaSuccess) {
+        got_plain.resize(want.size());
+        ok = cudaMemcpy(got_plain.data(), dout, sizeof(float) * got_plain.size(), cudaMemcpyDeviceToHost) == cudaSuccess;
+    } else {
+        ok = false;
+    }
+
+    if (ok) {
+        rc = strata::kolibri::stream::es_q6k_pack_planes(dw, dp, nb, rows, nullptr);
+        if (rc == 0 && cudaDeviceSynchronize() == cudaSuccess) {
+            rc = strata::kolibri::stream::es_q6k_plane_rows(dp, nb, rows, dacts, (int) astride, nt, dout, rows, nullptr);
+        } else {
+            rc = 9;
+        }
+        if (rc == 0 && cudaDeviceSynchronize() == cudaSuccess) {
+            got_plane.resize(want.size());
+            ok = cudaMemcpy(got_plane.data(), dout, sizeof(float) * got_plane.size(), cudaMemcpyDeviceToHost) ==
+                 cudaSuccess;
+        } else {
+            ok = false;
+        }
+    }
+    char name[128];
+    std::snprintf(name, sizeof name, "q6k plane layout nb %d, %d row(s), %d token(s)", nb, rows, nt);
+    if (!ok || rc != 0) {
+        std::printf("  FAIL %s: setup or launch failed (rc %d, cuda %s)\n", name, rc,
+                    cudaGetErrorString(cudaGetLastError()));
+        ++g_failures;
+    } else if (!compare_bits(got_plain, want, rows, nt, "plane-case plain vs oracle")) {
+        std::printf("  FAIL %s\n", name);
+        ++g_failures;
+    } else if (std::memcmp(got_plane.data(), want.data(), sizeof(float) * want.size()) != 0) {
+        std::printf("  FAIL %s: the plane layout differs from the cpu oracle\n", name);
+        ++g_failures;
+    }
+    if (dacts) cudaFree(dacts);
+    if (dout) cudaFree(dout);
+    if (dp) cudaFree(dp);
+    if (dw) cudaFree(dw);
+    cudaGetLastError();
+}
+
 /// The whole expert, end to end, at Kolibri-1's own geometry: the tiled gate/up product, then the CPU's SwiGLU
 /// expression and native_quant_h, then the down product in whichever format the layer stores - compared with the
 /// pool's own native_gu_rows / native_down_rows, bit for bit, including the hidden's quantized BYTES.
@@ -469,6 +540,24 @@ void run_expert_case(int d_type, int nt) {
         ok = false;
     }
     // the CPU bridge: native_gu_rows' own SwiGLU expression, then native_quant_h
+    // Before it, the paired gate/up entry must reproduce the whole-table launch bit for bit: same blob, same
+    // activations, two rows per thread instead of one row per thread.
+    if (ok) {
+        float* dgu2 = nullptr;
+        if (cudaMalloc((void**) &dgu2, sizeof(float) * (size_t) nt * 2 * FF) == cudaSuccess) {
+            const int rcp = strata::kolibri::stream::es_q4k_gu_rows(dblob, 10, FF, dacts, (int) f.act_bytes, nt, dgu2,
+                                                                   2 * FF, nullptr);
+            std::vector<float> gu2((size_t) nt * 2 * FF);
+            const bool got2 = rcp == 0 && cudaDeviceSynchronize() == cudaSuccess &&
+                              cudaMemcpy(gu2.data(), dgu2, sizeof(float) * gu2.size(), cudaMemcpyDeviceToHost) ==
+                                  cudaSuccess;
+            if (!got2 || std::memcmp(gu2.data(), gu.data(), sizeof(float) * gu.size()) != 0) {
+                std::printf("  FAIL expert gate/up pairing, %d token(s): es_q4k_gu_rows differs from es_q4k_rows\n", nt);
+                ++g_failures;
+            }
+            cudaFree(dgu2);
+        }
+    }
     std::vector<std::vector<uint8_t>> hq2((size_t) nt, std::vector<uint8_t>(f.h_bytes));
     std::vector<std::vector<float>> ff2((size_t) nt, std::vector<float>((size_t) FF));
     for (int t = 0; ok && t < nt; ++t) {
@@ -561,6 +650,7 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        run_plane_case(2, 17, 3);
     } else {
         // (a) every nb at every row tail, four tokens
         for (int nb : {1, 2, 10, 32})
@@ -593,7 +683,12 @@ int main(int argc, char** argv) {
             run_expert_case(kQ4K, nt);
             run_expert_case(kQ6K, nt);
         }
-        // (g) the sensitivity of the data itself
+        // (g) the plane-split Q6_K copy: packing kernel, plane kernel, and both against the oracle
+        run_plane_case(2, 2560, 4);
+        run_plane_case(2, 2560, 64);
+        run_plane_case(1, 17, 5);
+        run_plane_case(10, 33, 3);
+        // (h) the sensitivity of the data itself
         sensitivity_checks();
     }
 

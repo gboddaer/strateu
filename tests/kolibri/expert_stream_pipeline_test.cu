@@ -10,6 +10,7 @@
 // Usage: expert_stream_pipeline_test [--selftest] [--tails-only]
 
 #include "../../src/kolibri/expert_stream.hpp"
+#include "../../src/kolibri/expert_stream_kernels.cuh"   // es_plane_layout decides the slot allocation count
 
 #include "ggml-cpu.h"
 
@@ -366,7 +367,9 @@ void failure_cases(const Layer& l, const Layer& l6) {
             threw = true;
         }
         strata::kolibri::stream::detail::fail_allocation_after(-1);
-        if (ord < 18) {   // nine allocations per slot, two slots
+        // nine allocations per slot, two slots; the Q6_K plane layout adds one device buffer per slot
+        const int per_slot = strata::kolibri::stream::es_plane_layout() ? 10 : 9;
+        if (ord < per_slot * 2) {
             if (!threw) {
                 std::printf("  FAIL alloc-fault: ordinal %d did not fail\n", ord);
                 ++g_failures;

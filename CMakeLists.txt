@@ -1054,6 +1054,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(kolibri_expert_stream_kernel_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
     add_test(NAME kolibri_expert_stream_kernel_test COMMAND kolibri_expert_stream_kernel_test)
     set_tests_properties(kolibri_expert_stream_kernel_test PROPERTIES TIMEOUT 1800)
+    # the kernel bench behind docs/experiments/kolibri-stream-kernels-layout.md: not a test, one launch per case
+    add_executable(kolibri_expert_stream_kbench tools/kolibri/expert_stream_kbench.cu)
+    target_include_directories(kolibri_expert_stream_kbench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(kolibri_expert_stream_kbench PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
     add_executable(kolibri_expert_stream_plan_test tests/kolibri/expert_stream_plan_test.cpp)
     target_include_directories(kolibri_expert_stream_plan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
                                ${CMAKE_CURRENT_SOURCE_DIR}/include)
