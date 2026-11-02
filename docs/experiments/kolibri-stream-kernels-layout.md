@@ -1,9 +1,9 @@
-# Streamed expert kernels: six layouts tried, one kept
+# Streamed expert kernels: seven changes tried, one kept
 
 The streamed expert prefill put the prefill's expert products on the GPU (`docs/experiments/kolibri-gpu-streaming.md`).
-This page records six changes tried on top of it - three kernel layouts, the tile in both of its dimensions, the
-pipeline's depth and its copy streams - one at a time, each behind its own switch, each required to return the same bits as the CPU pool
-before its speed was looked at. One is kept; the other five are negative results, recorded so nobody pays for them
+This page records seven changes tried on top of it - three kernel layouts, the tile in both of its dimensions, the
+pipeline's depth and its copy streams, and moving the SwiGLU and the quantization to the device - one at a time, each behind its own switch, each required to return the same bits as the CPU pool
+before its speed was looked at. One is kept; the other six are negative results, recorded so nobody pays for them
 again without new evidence. Section 5 gives where the streamed leg's time actually goes, which is why five of the six
 could not move it.
 
@@ -245,6 +245,42 @@ i's copy with batch i-1's compute, so the only thing the per-group split adds is
 
 So the engine's table shape costs 10 % of the copy rate, not the 35 % the pipeline loses: the arm's 2.60 ms per batch
 against a 1.84 ms copy floor is not a memory-placement problem either.
+
+## 8. SwiGLU + Q8_K quantization on the device — blocked: it is not bit-identical
+
+This is the change sections 6 and 7 pointed at. Per batch the host sits inside the critical path: the gate/up floats
+come back (D2H), the host computes the pool's SwiGLU expression, quantizes the hidden row with `native_quant_h`, and
+sends it back (H2D). Doing both on the device would delete two of the four round trips.
+
+`tools/kolibri/expert_stream_swiglu_probe.cu` answers whether the device can write the same bytes before anything is
+built. It runs random rows of the model's own width (`n_ff = 512`, two Q8_K blocks) through the host's path
+(`ff = (g / (1 + std::exp(-g))) * u`, then `q8k_quant_avx2`) and through three device variants of the same
+expression, with the quantizer transcribed operation for operation (the magic-add rounding, the low-byte sign
+extension, `d = 1 / iscale`, the 16 sums).
+
+20,000 rows per distribution; the input rows are normal with the σ given, because how often a one-ulp float
+difference crosses a quantizer boundary depends on the values' size:
+
+| device variant | σ = 1 | σ = 3 | σ = 10 |
+| --- | ---: | ---: | ---: |
+| `double` throughout, `exp(double)` | 52.2 % of rows | 53.9 % | 20.0 % |
+| `float`, `expf`, separate rounding — the host's own precision | 4.28 % | 0.13 % | **0.00 %** |
+| `float`, `__expf` | 7.95 % | 0.57 % | 0.00 % |
+
+The floats themselves differ in 12 % of values for the `expf` variant at every σ; what changes with the magnitude is
+only how often that lands on the other side of a Q8_K rounding boundary. At σ = 10 not one of 10.24 million codes
+moved, at σ = 1 about one row in twenty-three has a code that did. That is a rate, not a guarantee: the arm needs
+zero, and a prefill of 8,190 tokens contains 2.4 million hidden rows.
+
+The host's expression is `std::exp` on a float argument, which is `expf`, and CUDA's `expf` is not glibc's: the two
+agree to within an ulp but not bit for bit, so one value in nine lands on a different float, and about one hidden row
+in twenty-three then quantizes one Q8_K code differently. A different code is a different dot product; the arm's whole
+claim is that it is not.
+
+**So this is not an unchanged-arithmetic optimization and cannot be promoted under
+[KOLIBRI_ACCURACY_POLICY.md](../KOLIBRI_ACCURACY_POLICY.md) without its own accuracy qualification and an explicit
+decision.** It is left as a probe, not as a switch: the number above is what an approval would have to be argued
+against, and it would buy the two round trips (0.92 ms of a 2.60 ms batch at 8,190 tokens).
 
 ## What the four add up to
 
