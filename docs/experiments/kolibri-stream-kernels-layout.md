@@ -509,6 +509,61 @@ the kind of number an accuracy qualification needs, and the bar is known: the FP
    [KOLIBRI_ACCURACY_POLICY.md](../KOLIBRI_ACCURACY_POLICY.md). The FP16 arms show what a failing one looks like; the
    HIP path's 0.0026 shows what an arguable one looks like.
 
+## 15. Would an expert cache pay? Measured, and a bigger find behind it
+
+The question, after the streamed leg reached 74 s of work against a 64.6 s transfer floor: how much of that 751 GB is
+the *same* experts fetched again? A chunk is 256 tokens and a layer has 384 to 512 experts, so most of one chunk's
+experts come back in the next one.
+
+`STRATA_KOLIBRI_STREAM_ROUTE_DUMP=<file>` writes one line per (chunk, layer) with the DISTINCT expert ids the arm is
+about to fetch - measurement only, no arithmetic, no file when unset. On ids8191 (32 chunks x 50 layers, 315,690
+fetches):
+
+| | |
+| --- | ---: |
+| distinct experts per (chunk, layer) | median 201, max 299, of that layer's 384 |
+| overlap with the previous chunk's set | mean **79.8 %**, median 80.3 % |
+| distinct (layer, expert) pairs over the whole prefill | 16,604 of 50 x 384 = 19,200 |
+| ceiling for an infinite cache | **94.7 % of the fetches** |
+
+So the reuse is real and large. The obstacle is the *working set*, not the hit rate: one chunk's expert set across all
+50 layers is 50 x 200 x 2.38 MB = **23.8 GB**, and the card has 16. A per-layer LRU below that size thrashes - at 128
+entries per layer the hit rate is 0.9 %, because a layer's chunk needs ~200 entries before anything survives - and at
+256 per layer (30.5 GB) it jumps to 78.8 %. Allocating uniformly across layers is therefore useless on this card.
+
+Residency by *layer* rather than by recency works, and the arithmetic is simple: a resident expert of a layer is
+touched ~12 times over the prefill (6,400 fetches per layer for 384 experts), so **each GB of resident experts saves
+about 1.2 s at 8k tokens** - 8 GB of the card's spare capacity would buy ~9 to 10 s of the 89.4 s prefill (11 %), for
+a real cache implementation. Worth having, not worth mistaking for a step change.
+
+## 15b. A bigger find behind it: the prompt chunk size is worth 40 %, and it changes the answer
+
+The same route dump says something about the chunk size. Fetches are `chunks x distinct-per-chunk`, and
+distinct-per-chunk grows far slower than the token count: 201 at 256 tokens. So halving the chunk count halves most of
+the traffic. Tried, by returning the full chunk for short prefixes as well (`STRATA_KOLIBRI_PF_CHUNK_FULL=1`, since
+removed):
+
+| | chunks | prefill | logits against the reference |
+| --- | ---: | ---: | --- |
+| ids512, chunk 256 (today) | 2 | 4,073 ms | identical |
+| ids512, chunk 511 | 1 | **3,591 ms** | **115,200 of 1,152,000 differ, max \|d\| 3.37, 3 of 9 argmaxes flip** |
+| ids8191, chunk 256 (today) | 32 | 89,507 ms | identical |
+| ids8191, chunk 512 | 16 | **63,956 ms** | **1,152,000 of 1,152,000 differ, max \|d\| 3.37** |
+
+1.40x, and a different computation. This is not a rounding artefact: every logit moves, by up to 3.4 in absolute
+terms, and the greedy pick changes. The knob is gone rather than left as a trap.
+
+**What that means, and it is the most important line in this page:** the engine's own default changes its chunk size
+at an 8,192-token prefix (256 below, 512 above - `pf_chunk_at`), so as shipped the *same model on the same machine*
+computes a long prompt's rows with one arithmetic below that length and another above it. This ledger's whole bitwise
+discipline - and the K28 note in `kolibri_engine.cu` that "a chunked causal prefill computes each token's row and
+per-token softmax identically regardless of how the prompt is cut" - says that should not happen. Whichever of the two
+is wrong, the difference between a 256-token and a 512-token chunk is now known to be 1.13x to 1.40x of prefill time,
+so it is worth finding out which side is right before anything else is tuned on top of it.
+
+It is not this campaign's branch to fix (the chunking lives in the pool's prefill path, not in the streamed arm), but it
+belongs in the handoff: a reproducible 40 % waiting behind a correctness question.
+
 ## What the four add up to
 
 The streamed arm's remaining cost is not where the Qwen engine's wins are. Its wins are in VRAM-resident decode

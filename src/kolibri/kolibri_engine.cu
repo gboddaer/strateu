@@ -2014,6 +2014,9 @@ struct Scratch {
     int32_t *ent_dst = nullptr, *ent_tok = nullptr; char* xq8 = nullptr; char* scratch = nullptr; float* gout = nullptr;
     int* pos_d = nullptr; int* tok_d = nullptr;   // graph decode: position and token id on the device
     // --prefill: the chunk's rows (tmax tokens at once)
+    // 512 is the model's ceiling, not a tuning choice: n_swa is 513, and a chunk wider than the sliding ring would
+    // overwrite it (the engine refuses that outright).  The streamed arm's trade inside that ceiling is different from
+    // the pool's, which is what STRATA_KOLIBRI_PF_CHUNK_FULL measures below.
     static constexpr int kTmax = 512;
     int* toks_d = nullptr;
     float *x_m = nullptr, *h_m = nullptr, *y_m = nullptr, *q_m = nullptr, *k_m = nullptr, *v_m = nullptr;
@@ -2173,8 +2176,36 @@ static long long g_expert_stream_layers = 0;
 
 /// One prefill chunk-layer's expert leg on the GPU.  The context is created on the first layer (that cost is
 /// first-use, not per-layer) and sized for both down formats this model alternates between.
+/// STRATA_KOLIBRI_STREAM_ROUTE_DUMP=<file>: measurement only, for the question "would an expert cache pay?".  One
+/// line per (layer, chunk) call listing the DISTINCT expert ids the arm is about to fetch, which is exactly what an
+/// expert already resident in VRAM would not have to copy.  With the variable unset no file is opened and nothing is
+/// computed; it changes no arithmetic and is never on in a timed run.
+static bool stream_route_dump_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_KOLIBRI_STREAM_ROUTE_DUMP");
+        return v != nullptr && v[0] != 0;
+    }();
+    return on;
+}
+static void stream_route_dump(const int* ids, int n) {
+    if (!stream_route_dump_on() || ids == nullptr || n <= 0) return;
+    static FILE* const f = [] {
+        const char* v = std::getenv("STRATA_KOLIBRI_STREAM_ROUTE_DUMP");
+        FILE* p = std::fopen(v, "w");
+        if (p == nullptr) std::fprintf(stderr, "kolibri: route dump: cannot write %s\n", v);
+        return p;
+    }();
+    if (f == nullptr) return;
+    std::vector<int> u(ids, ids + n);
+    std::sort(u.begin(), u.end());
+    u.erase(std::unique(u.begin(), u.end()), u.end());
+    for (size_t i = 0; i < u.size(); ++i) std::fprintf(f, i ? " %d" : "%d", u[i]);
+    std::fputc('\n', f);
+}
+
 static bool expert_stream_layer(const LayerBlobs& b, Scratch& s, const ActSet& A, int NKc, int K, int FF, int N,
                                 int experts) {
+    stream_route_dump(A.ids_h, NKc);
     strata::kolibri::stream::LayerView v;
     v.fmt = b.fmt;
     v.weights = b.table;
@@ -2336,6 +2367,9 @@ static inline int pf_chunk_at(int64_t p0) {
         return (int) n;
     }();
     const int small = 256;
+    // The full chunk for a short prefix is FASTER (ids512 4,073 -> 3,591 ms, ids8191 89,507 -> 63,956 ms) and it is NOT
+    // the same computation: 100 % of the logits differed, max |d| 3.37, 3 of 9 argmaxes flipped.  The knob that measured
+    // that is gone rather than left as a trap; docs/experiments/kolibri-stream-kernels-layout.md, section 15, records it.
     // The rule keys on the PREFIX LENGTH, not on the position - K28.  Keyed on p0 it made a 32K prompt run the
     // small chunk for its first 8,192 tokens (32 of its 80 chunk-layers), even though the measurement behind the
     // rule was taken on long prefixes, where the full chunk wins (301.5 s at T=512 against 320.9 s at T=256).  A
