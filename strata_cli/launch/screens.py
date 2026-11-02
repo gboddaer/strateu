@@ -26,6 +26,7 @@ from strata_cli.launch import settings as S
 from strata_cli.launch import store
 from strata_control import dsv41_context
 from strata_cli.launch.widgets import (ACCENT, BAD, DARK, FG, LIGHT, MUTE, WARN, Cell, Item, Menu, bar)
+from strata_cli.render import display_width
 
 STEPS = (("model", "Model"), ("cards", "Cards"), ("folder", "Folder"), ("context", "Context"), ("pictures", "Pictures"),
          ("parallel", "Parallel"), ("tuning", "Tuning"), ("advanced", "Advanced"), ("access", "Access"), ("save", "Save"))
@@ -1595,8 +1596,14 @@ class SaveScreen(Base):
         s = self.ctx.settings
         lines = self.summary_lines()
         warnings = self.ctx.warnings()
-        body_h = self.query_one("#body").size.height
+        body = self.query_one("#body")
+        body_h = body.size.height
+        body_w = body.size.width or 100
         full_need = 2 + len(lines) + len(warnings) + 3 + 3
+        # A long value (a deep Windows storage path) would wrap into several rows and push the
+        # choices and their hints below the body, so every value line is cut to the row instead.
+        cut = (lambda text, keep: (text[:keep - 1] + "…") if keep > 4 and display_width(text) > keep else text)
+        value_w = max(40, body_w - 16)
         compact = bool(body_h) and full_need > body_h
         name = self.query_one("#name", Input)
         name.set_class(compact, "slim")
@@ -1609,9 +1616,9 @@ class SaveScreen(Base):
                     f"Access {s.access}, port {s.port}" + (f" \u00b7 Storage {s.data_dir}" if s.data_dir else "")]
             t.append("Save, then launch   name:\n" if tiny else "Save as preset, then launch   name:\n", style=f"bold {ACCENT}")
             for ln in rows[:2 if tiny else 3]:
-                t.append("  " + ln + "\n")
+                t.append("  " + cut(ln, body_w - 4) + "\n")
             if warnings and not tiny:
-                t.append(f"  ! {warnings[0]}" + (f"  (+{len(warnings) - 1} more)" if len(warnings) > 1 else "") + "\n", style=WARN)
+                t.append(f"  ! {cut(warnings[0], body_w - 6)}" + (f"  (+{len(warnings) - 1} more)" if len(warnings) > 1 else "") + "\n", style=WARN)
             t.rstrip()
         else:
             t = Text()
@@ -1619,9 +1626,9 @@ class SaveScreen(Base):
             t.append("  Name   ")
             t.append("(type below)\n", style=MUTE)
             for k, v in lines:
-                t.append(f"  {k:<10}{v}\n")
+                t.append(f"  {k:<10}{cut('' if v is None else str(v), value_w)}\n")
             for n in warnings:
-                t.append(f"  ! {n}\n", style=WARN)
+                t.append(f"  ! {cut(n, body_w - 6)}\n", style=WARN)
             t.rstrip()
         self.query_one("#summary", Static).update(t)
         if getattr(self, "_compact", None) != compact:       # the body's height changes with it: look again once the layout has settled

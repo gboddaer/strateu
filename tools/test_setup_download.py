@@ -40,7 +40,8 @@ class Server:
         self.data, self.ranges, self.length, self.redirect, self.delay = data, ranges, length, redirect, delay
         self.faults = faults
         self.lock = threading.Lock()
-        self.gets, self.heads, self.redirects = [], 0, 0           # gets: (start, end) of every ranged GET
+        self.gets, self.heads, self.redirects = [], 0, 0           # gets includes non-ranged metadata/stream GETs
+        self.ranged_gets = []                                    # only requests that actually supplied a Range header
         self.active = self.max_active = 0
         self.nth = {}
         outer = self
@@ -59,6 +60,12 @@ class Server:
         self.httpd.daemon_threads = True
         self.port = self.httpd.server_address[1]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+
+    def clear(self):
+        """Forget the recorded requests, for a test that inspects only what comes next."""
+        with self.lock:
+            self.gets.clear()
+            self.ranged_gets.clear()
 
     @property
     def url(self):
@@ -100,6 +107,8 @@ class Server:
             return
         with self.lock:
             self.gets.append((start, end) if rng and self.ranges else (0, size - 1))
+            if rng and self.ranges:
+                self.ranged_gets.append((start, end))
             key = (start, end)
             self.nth[key] = n = self.nth.get(key, 0) + 1
             self.active += 1
@@ -169,8 +178,8 @@ def run(server, d, pin="auto", name=NAME):
 
 
 def asked(srv):
-    """The pieces (indexes) the server was asked for, one entry per request; the one-byte probe is left out."""
-    return [s // CHUNK for s, e in srv.gets if (s, e) != (0, 0)]
+    """Payload range indexes, excluding the one-byte probe and urllib's HEAD-to-GET redirect metadata request."""
+    return [s // CHUNK for s, e in srv.ranged_gets if (s, e) != (0, 0)]
 
 
 def files(d):
@@ -188,6 +197,9 @@ class ParallelDownload(unittest.TestCase):
             self.assertGreater(srv.max_active, 1)
             self.assertLessEqual(srv.max_active, 4)
             self.assertEqual(sorted(asked(srv)), list(range(41)))           # every piece once, none twice
+            self.assertIn((0, 0), srv.ranged_gets)                           # the probe is still accounted for
+            payload = sorted(r for r in srv.ranged_gets if r != (0, 0))
+            self.assertEqual(payload, [(s, min(s + CHUNK - 1, len(DATA) - 1)) for s in range(0, len(DATA), CHUNK)])
             self.assertEqual(srv.redirects, 2)                              # HEAD and the one probe: the pieces use the CDN address
 
     def test_the_redirect_is_resolved_once(self):
@@ -287,7 +299,7 @@ class Resume(unittest.TestCase):
             saved = json.loads(side.read_text())
             done = {i for a, b in saved["done"] for i in range(a, b)}
             self.assertTrue(done and all(i < 20 for i in done), done)
-            srv.gets.clear()
+            srv.clear()
             broken["on"] = False
             code, out = run(srv, d)
             self.assertIsNone(code, out)
@@ -302,14 +314,16 @@ class Resume(unittest.TestCase):
             "import sys; sys.path[:0] = [%r, %r]\n"
             "import setup\n"
             "setup.DL_CHUNK = %d; setup.DL_MIN_PARALLEL = 0; setup.DL_SAVE_EVERY = 0.05; setup.DL_CONNECTIONS = 4\n"
+            "setup.DL_BACKOFF = 0.05\n"          # a transient failed request must not hold the child past the wait
             "pin = (%d, %r)\n"
             "setup.file_pin = lambda u: pin\n"
             "setup.download(sys.argv[1], __import__('pathlib').Path(sys.argv[2]) / %r, 'the model')\n"
             % (str(ROOT), str(ROOT / "tools"), CHUNK, len(DATA), hashlib.sha256(DATA).hexdigest(), NAME))
-        with small_pieces(), Server(delay=0.05) as srv, tempfile.TemporaryDirectory() as d:
+        with small_pieces(), Server(delay=0.05) as srv, tempfile.TemporaryDirectory() as notes_d, tempfile.TemporaryDirectory() as d:
             env = dict(os.environ, STRATA_SOURCE="huggingface")
+            notes = Path(notes_d) / "child.log"
             proc = subprocess.Popen([sys.executable, "-c", runner, srv.url, d], env=env,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                    stdout=subprocess.DEVNULL, stderr=notes.open("wb"))
             try:
                 deadline = time.time() + 60
                 side = Path(d) / (NAME + ".part.chunks")
@@ -323,11 +337,15 @@ class Resume(unittest.TestCase):
             finally:
                 proc.kill()
                 proc.wait()
-            self.assertTrue((Path(d) / (NAME + ".part")).exists(), "the download finished before it was killed")
+            child_log = notes.read_text(errors="replace") if notes.exists() and notes.stat().st_size else ""
+            self.assertTrue((Path(d) / (NAME + ".part")).exists(),
+                            "the download finished before it was killed\n" + child_log)
+            if not side.exists():
+                self.fail("the piece list never appeared: the child took another path or died\n" + child_log)
             saved = json.loads(side.read_text())
             done = {i for a, b in saved["done"] for i in range(a, b)}
-            self.assertGreaterEqual(len(done), 12)
-            srv.gets.clear()
+            self.assertGreaterEqual(len(done), 12, child_log)
+            srv.clear()
             code, out = run(srv, d)
             self.assertIsNone(code, out)
             self.assertEqual((Path(d) / NAME).read_bytes(), DATA)

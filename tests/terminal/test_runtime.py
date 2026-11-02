@@ -31,7 +31,7 @@ WINDOWS = os.name == "nt"
 class RuntimeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="strata-runtime-test-")
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(self._calm_cleanup)
         self.root = Path(self.temp.name)
         env = mock.patch.dict(os.environ, {"STRATA_PROFILE_DIR": str(self.root / "profiles"),
                                        "STRATA_RUNTIME_DIR": str(self.root / "runtime")})
@@ -79,12 +79,28 @@ class RuntimeTests(unittest.TestCase):
         profiles.create("local", str(self.config))
         self.addCleanup(self._stop)
 
+    def _calm_cleanup(self):
+        """The stop can lose an RPC answer under runner load, and the host's server keeps its log handle a
+        moment after; give Windows' shared-file locks time to clear before the last, honest removal."""
+        for _ in range(20):
+            try:
+                self.temp.cleanup()
+                return
+            except PermissionError:
+                time.sleep(0.5)
+        self.temp.cleanup()
+
     def _stop(self):
-        try:
-            if runtime._read_state("local") is not None:
-                runtime.stop("local", timeout=12)
-        except (OSError, profiles.ProfileError):
-            pass
+        # A lost stop answer under load still leaves the tree killable: the second call finds no live owner and
+        # ends the recorded server and engine by PID instead.
+        retried = False
+        for _ in range(2):
+            try:
+                if runtime._read_state("local") is not None or retried:
+                    runtime.stop("local", timeout=12)
+                return
+            except (OSError, profiles.ProfileError):
+                retried = True
 
     def _cli(self, *args):
         output = io.StringIO()

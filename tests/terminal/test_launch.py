@@ -16,6 +16,18 @@ from strata_cli.launch.catalog import Catalog, CatalogUnavailable, fit_on, verdi
 from strata_cli.launch.runner import Result, Runner, derive_config, desc_matches, tune_words
 from tests.terminal.launch_support import HW_12, HW_24, HW_2X16, Home, catalog, run_cli
 
+import contextlib
+
+@contextlib.contextmanager
+def only_ms_system(overrides):
+    """MSYSTEM alone: the Git Bash signs, without the rest of the machine's signs.  A CI runner sets
+    CI=true and GITHUB_*, and the CLI must refuse no-terminal runs there, so those names are kept out.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("CI", "GITHUB_"))}
+    env.update(overrides)
+    with mock.patch.dict(os.environ, env, clear=True):
+        yield
+
 
 class SettingsRules(unittest.TestCase):
     def test_parse_context(self):
@@ -903,7 +915,7 @@ class FlagsCommand(unittest.TestCase):
 
     def test_git_bash_without_a_tty_goes_on_in_plain_questions(self):
         fake = Result("launch-x", ["http://127.0.0.1:8080"], None, None, [], "/x")
-        with mock.patch.dict(os.environ, {"MSYSTEM": "MINGW64"}), mock.patch("builtins.input", return_value="y"),                 mock.patch.object(Runner, "run", return_value=fake) as run:
+        with only_ms_system({"MSYSTEM": "MINGW64"}), mock.patch("builtins.input", return_value="y"),                 mock.patch.object(Runner, "run", return_value=fake) as run:
             code, out, err = run_cli(["launch"])
         self.assertEqual(code, 0, err)
         run.assert_called_once()
@@ -911,13 +923,13 @@ class FlagsCommand(unittest.TestCase):
         self.assertIn("winpty strata launch", out + err)
 
     def test_git_bash_answering_no_changes_nothing(self):
-        with mock.patch.dict(os.environ, {"MSYSTEM": "MINGW64"}), mock.patch("builtins.input", return_value="n"),                 mock.patch.object(Runner, "run", side_effect=AssertionError("must not run")):
+        with only_ms_system({"MSYSTEM": "MINGW64"}), mock.patch("builtins.input", return_value="n"),                 mock.patch.object(Runner, "run", side_effect=AssertionError("must not run")):
             code, out, err = run_cli(["launch"])
         self.assertEqual(code, 0, err)
         self.assertIn("Nothing was changed", out + err)
 
     def test_a_pipe_with_nobody_to_answer_still_says_what_to_name(self):
-        with mock.patch.dict(os.environ, {"MSYSTEM": "MINGW64"}), mock.patch("builtins.input", side_effect=EOFError),                 mock.patch.object(Runner, "run", side_effect=AssertionError("must not run")):
+        with only_ms_system({"MSYSTEM": "MINGW64"}), mock.patch("builtins.input", side_effect=EOFError),                 mock.patch.object(Runner, "run", side_effect=AssertionError("must not run")):
             code, out, err = run_cli(["launch"])
         self.assertEqual(code, 2)
         self.assertIn("--preset NAME", err)

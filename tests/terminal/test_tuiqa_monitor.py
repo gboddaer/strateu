@@ -4,6 +4,7 @@ Connect that says what is vendor history and what is this server's live result, 
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import unittest
 from unittest import mock
@@ -259,14 +260,27 @@ class LightTheme(unittest.TestCase):
         self.assertGreaterEqual(contrast(LIGHT.accent, LIGHT.sel), 4.5)
         self.assertLess(contrast(DARK.accent, "#ffffff"), 3.0)                  # the old dark colours are what the report measured (1.92:1)
 
-    def run_app(self, coro, size=(120, 40)):
+    def run_app(self, coro, size=(120, 40), *, no_color=False):
         async def go():
             app = LaunchMonitor(Source(metrics("idle")), None, info=dict(INFO), interval=30, theme="light", color="always")
             async with app.run_test(size=size) as pilot:
                 await pilot.pause(0.4)
                 return await coro(app, pilot)
-        with Home():
+        with Home(), mock.patch.dict(os.environ):
+            # CI/agent runners often export NO_COLOR; colour tests control that input themselves.
+            os.environ.pop("NO_COLOR", None)
+            if no_color:
+                os.environ["NO_COLOR"] = "1"
             return asyncio.run(go())
+
+    def test_no_color_disables_the_light_palette_even_with_color_always(self):
+        async def case(app, pilot):
+            self.assertEqual(app.color_choice, "never")
+            self.assertFalse(app.has_class("theme-light"))
+            joined = " ".join(str(s.style) for s in app.connect_text(118).spans)
+            self.assertNotIn(LIGHT.accent, joined)
+            self.assertNotIn(LIGHT.mute, joined)
+        self.run_app(case, no_color=True)
 
     def test_connect_uses_the_light_colours_only(self):
         async def case(app, pilot):

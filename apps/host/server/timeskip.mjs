@@ -148,6 +148,7 @@ export function timeskipRevisionMessage(request) {
 function killTree(child) {
   try {
     if (process.platform === 'win32' && child.pid) spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+    else if (child.pid) process.kill(-child.pid, 'SIGTERM'); // startDetached owns a dedicated POSIX process group
     else child.kill('SIGTERM');
   } catch { /* already gone */ }
 }
@@ -452,7 +453,8 @@ export function createTimeSkip({ repoRoot, python, pythonArgs = [], timeoutMs = 
         '--attempts', String(Math.max(0, Math.min(10, Number(attempts) || 0))), '--output', 'json'];
       if (reviseCommand) args.push('--revise-command', reviseCommand);
       const child = spawn(python, [...pythonArgs, cli, ...args], {
-        cwd: repoRoot, windowsHide: true, env: { ...env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', ...extraEnv, STRATA_TIMESKIP_DIR: root }, stdio: ['ignore', 'pipe', 'pipe'],
+        cwd: repoRoot, windowsHide: true, detached: process.platform !== 'win32',
+        env: { ...env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', ...extraEnv, STRATA_TIMESKIP_DIR: root }, stdio: ['ignore', 'pipe', 'pipe'],
       });
       let out = '', err = '', closed = null;
       child.stdout.on('data', b => { out += b.toString(); });
@@ -475,7 +477,7 @@ export function createTimeSkip({ repoRoot, python, pythonArgs = [], timeoutMs = 
         await new Promise(r => setTimeout(r, 100));
       }
       if (!id) {
-        if (!closed) { try { child.kill('SIGTERM'); } catch { /* gone */ } return { ok: false, code: 6, error: 'the Time-skip job did not start in time' }; }
+        if (!closed) { killTree(child); return { ok: false, code: 6, error: 'the Time-skip job did not start in time' }; }
         let message = closed.error ?? '';
         try { const parsed = JSON.parse(out.trim().split('\n').filter(Boolean).pop() ?? ''); message = message || parsed?.error?.message || parsed?.error || ''; } catch { /* not JSON */ }
         return { ok: false, code: closed.code ?? 6, error: String(message || err.trim() || out.trim() || 'the Time-skip command ended without a run').slice(0, 600) };

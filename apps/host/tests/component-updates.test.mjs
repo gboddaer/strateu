@@ -313,10 +313,11 @@ test('packaged: an app update that ends the app is recorded as finished by the n
 });
 
 test('packaged: an update job an OLDER host left running is finished when the app program file is newer than the job', async () => {
-  const exe = new URL('../../strata-desktop.exe', import.meta.url);          // <install>/strata-desktop.exe as seen from <install>/host
+  const exe = new URL(`../../strata-desktop${isWin ? '.exe' : ''}`, import.meta.url); // the host platform's program name
   const f = fixture({ withApp: true });
   try {
     const { fileURLToPath } = await import('node:url');
+    assert.equal(existsSync(fileURLToPath(exe)), false, 'the fixture must not overwrite an existing program');
     const old = { id: 'old-1', kind: 'update-strata', state: 'running', startedAt: new Date(Date.now() - 60_000).toISOString(), summary: 'Starting…', result: null, error: null };
     writeFileSync(join(f.data, 'native-jobs.json'), JSON.stringify([old]));
     const mk = () => createNativeControl({ control: f.control, directory: f.data, spawnProcess: () => { throw new Error('no process'); }, fetcher: async () => Response.json({}), requests: () => [] });

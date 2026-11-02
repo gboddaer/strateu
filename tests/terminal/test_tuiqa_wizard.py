@@ -78,6 +78,25 @@ class SaveChoices(Base):
                 self.assertIn(part, shown)
         self.run_app(case)
 
+    def test_a_long_storage_value_cannot_push_the_choices_off_the_page(self):
+        # A Windows runner's temp folder is deep (C:\Users\RUNNER~1\AppData\Local\Temp\...): the
+        # value rows have to ellipsise, not wrap, or the choices fall below the body.
+        async def case(app, pilot, ctx):
+            await press(pilot, *("enter",) * 7)
+            ctx.settings.data_dir = ("C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\"
+                                     "strata-launch-test-r2ty5u1d\\Strata-data")
+            await press(pilot, "n", "enter")
+            for size in ((80, 24), (60, 20), (40, 15)):
+                await pilot.resize_terminal(*size)
+                await pilot.pause(0.3)
+                shown = text_of(app)
+                for choice in ("Save as a preset and launch", "Launch without saving",
+                               "Save the preset and stop here"):
+                    self.assertIn(choice, shown, (size, shown))
+                body = app.screen.query_one("#body")
+                self.assertLessEqual(app.screen.menu().region.bottom, body.region.bottom, size)
+        self.run_app(case)
+
 
 class AdvancedLayout(Base):
     HELP = "  --prefill N          prompt chunk size (default 2048)\n  --kv fp16|int8       KV storage\n"

@@ -134,12 +134,17 @@ export function createImageModels({ dataDir, modelsDir, real = false, changed = 
       const file = [join(directory(), 'image', v.id, v.file), join(directory(), v.file)].find(path => matchesGGUF(path, v.bytes, directory()));
       if (!file) { delete found[v.id]; continue; }
       const stat = statSync(file), cached = found[v.id];
-      if (!(cached?.file === file && cached?.mtimeMs === stat.mtimeMs && cached?.sha256 === v.sha256)) {
+      // Copies can retain mtime, and rapid rewrites can share a coarse change timestamp.
+      // Rehash recent files; unchanged older files keep the cheap cached-verification path.
+      const settled = Date.now() - stat.ctimeMs > 2000;
+      if (!(settled && cached?.file === file && cached?.mtimeMs === stat.mtimeMs && cached?.size === stat.size
+            && cached?.ctimeMs === stat.ctimeMs && cached?.sha256 === v.sha256)) {
         const hash = createHash('sha256');
         for await (const chunk of createReadStream(file)) hash.update(chunk);
         if (hash.digest('hex') !== v.sha256) { delete found[v.id]; continue; }
       }
-      found[v.id] = { simulated: false, file, mtimeMs: stat.mtimeMs, sha256: v.sha256, installedAt: cached?.installedAt ?? new Date().toISOString() };
+      found[v.id] = { simulated: false, file, mtimeMs: stat.mtimeMs, size: stat.size, ctimeMs: stat.ctimeMs,
+        sha256: v.sha256, installedAt: cached?.installedAt ?? new Date().toISOString() };
     }
     saved = { ...saved, installedByDirectory: { ...saved.installedByDirectory, [directory()]: found } };
     if (resetApplied || !catalog.variants.some(v => v.id === saved.applied && installed(v))) saved.applied = 'off';

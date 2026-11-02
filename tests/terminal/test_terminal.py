@@ -1036,10 +1036,13 @@ class HeadlessMonitorTests(unittest.TestCase):
         from strata_cli.dashboard import MonitorHistory, _spark, render_dashboard
         from strata_cli.monitor import choose_glyphs
 
-        self.assertEqual(choose_glyphs("auto", "utf-8", "xterm-256color"), "unicode")
-        self.assertEqual(choose_glyphs("auto", "ascii", "xterm-256color"), "ascii")
-        self.assertEqual(choose_glyphs("auto", "utf-8", "dumb"), "ascii")
-        self.assertEqual(choose_glyphs("braille", "ascii", "dumb"), "braille")
+        # The mapping of encoding+terminal to a look is what is asserted; which console this window
+        # has must not leak in (GitHub runners sit in the classic Windows console), so pin modern.
+        with mock.patch.dict(os.environ, {"STRATA_GLYPHS": "unicode"}):
+            self.assertEqual(choose_glyphs("auto", "utf-8", "xterm-256color"), "unicode")
+            self.assertEqual(choose_glyphs("auto", "ascii", "xterm-256color"), "ascii")
+            self.assertEqual(choose_glyphs("auto", "utf-8", "dumb"), "ascii")
+            self.assertEqual(choose_glyphs("braille", "ascii", "dumb"), "braille")
 
         sample = four_gpu_snapshot()
         sample["sampled_at"] = time.time()
@@ -1565,30 +1568,33 @@ class HeadlessMonitorTests(unittest.TestCase):
 
     def test_resize_keeps_selected_request_visible_in_tiny_serving_view(self):
         async def exercise():
-            snapshot = four_gpu_snapshot()
-            snapshot["work"]["requests"] = [
-                {"id": "selected-1", "state": "reading", "slot": 0,
-                 "group": 0, "prompt_read": 8, "prompt_tokens": 64}]
-            app = MonitorApp(Endpoint("http://127.0.0.1:18765"), snapshot, interval=30)
-            async with app.run_test(size=(110, 30)) as pilot:
-                await pilot.press("2", "tab", "enter")
-                await pilot.pause()
-                self.assertTrue(app.detail)
-                identity = app.selected_identity
-                for width, height in ((80, 24), (60, 16), (40, 12), (110, 30)):
-                    await pilot.resize_terminal(width, height)
-                    content = str(app.query_one("#content").render())
-                    self.assertEqual((app.screen.size.width, app.screen.size.height),
-                                     (width, height))
-                    self.assertIn("selected-1", content)
-                    self.assertEqual(app.selected_identity, identity)
+            # The MonitorApp reads the console family itself; on a runner in the classic Windows
+            # console it would swap the hints for the "full look" tip, so pin the modern console.
+            with mock.patch.dict(os.environ, {"STRATA_GLYPHS": "unicode"}):
+                snapshot = four_gpu_snapshot()
+                snapshot["work"]["requests"] = [
+                    {"id": "selected-1", "state": "reading", "slot": 0,
+                     "group": 0, "prompt_read": 8, "prompt_tokens": 64}]
+                app = MonitorApp(Endpoint("http://127.0.0.1:18765"), snapshot, interval=30)
+                async with app.run_test(size=(110, 30)) as pilot:
+                    await pilot.press("2", "tab", "enter")
+                    await pilot.pause()
                     self.assertTrue(app.detail)
-                    if (width, height) == (40, 12):
-                        self.assertIn("More: strata status --json", content)
-                        self.assertIn("q keeps server on", str(app.query_one("#message").render()))
-                    elif (width, height) == (110, 30):
-                        self.assertNotIn("More: strata status --json", content)
-                await pilot.press("q")
+                    identity = app.selected_identity
+                    for width, height in ((80, 24), (60, 16), (40, 12), (110, 30)):
+                        await pilot.resize_terminal(width, height)
+                        content = str(app.query_one("#content").render())
+                        self.assertEqual((app.screen.size.width, app.screen.size.height),
+                                         (width, height))
+                        self.assertIn("selected-1", content)
+                        self.assertEqual(app.selected_identity, identity)
+                        self.assertTrue(app.detail)
+                        if (width, height) == (40, 12):
+                            self.assertIn("More: strata status --json", content)
+                            self.assertIn("q keeps server on", str(app.query_one("#message").render()))
+                        elif (width, height) == (110, 30):
+                            self.assertNotIn("More: strata status --json", content)
+                    await pilot.press("q")
         asyncio.run(exercise())
 
     def test_request_detail_key_is_read_only(self):

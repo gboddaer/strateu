@@ -287,7 +287,10 @@ def stream_chat(target: Target, spec: dict, model: str | None, *, timeout_s: flo
         raw["interrupted"] = True
         raw["error"] = {"kind": "cancelled", "message": "cancelled by the operator"}
     except (OSError, http.client.HTTPException, ValueError) as exc:
-        if raw["timed_out"]:
+        # the deadline is watched twice: the timer thread sets the flag and the connection's own socket
+        # timeout raises TimeoutError; either way a request that outlived its budget failed as a timeout,
+        # not as a connection error (on a loaded runner the socket can raise before the timer thread runs)
+        if raw["timed_out"] or isinstance(exc, TimeoutError):
             raw["error"] = {"kind": "timeout", "message": f"no complete answer within {timeout_s:g} seconds"}
         else:
             raw["error"] = {"kind": "connection_" + type(exc).__name__, "message": str(exc)[:200] or type(exc).__name__}

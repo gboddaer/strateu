@@ -83,7 +83,11 @@ test('Serving cancellation stops active and queued demo requests; test keys enfo
   const id = 'qwen38-q4_k_m';
   await writeFile(join(home, 'data/state.json'), JSON.stringify({ installed: { [id]: { installedAt: new Date().toISOString(), bytes: 491400032, simulated:true } }, beginner:{priority:'balanced',contextLength:'32k',readImages:false,gpuIdle:'never'}, current: id, loaded: id }));
   const socket = http.createServer(); const port = await listen(socket); await close(socket);
-  const host = spawn(process.execPath, ['server/index.mjs'], { cwd: join(import.meta.dirname, '..'), env: { ...process.env, STRATA_HOME:home,STRATA_MODELS_DIR:join(home,'models'), STRATA_PORT: String(port), STRATA_REAL_ENGINE: '0' }, stdio: 'ignore' });
+  const host = spawn(process.execPath, ['server/index.mjs'], { cwd: join(import.meta.dirname, '..'), env: { ...process.env, STRATA_HOME:home,STRATA_MODELS_DIR:join(home,'models'), STRATA_PORT: String(port), STRATA_REAL_ENGINE: '0', STRATA_FORCE_DEMO: '1',
+    // Pinned hardware: the boot restore of the persisted load must not depend on how much memory the
+    // machine happens to have free. Without an instance the turn is refused before it is queued and
+    // /api/serving stays empty, which is what a loaded macOS runner produced.
+    STRATA_TEST_HARDWARE: '{"totalGb":64,"freeGb":48,"gpus":[]}' }, stdio: 'ignore' });
   const base = `http://127.0.0.1:${port}`;
   const call = async (path, method = 'GET', body, key) => {
     const res = await fetch(base + path, { method, headers: { 'content-type': 'application/json', ...(key ? { authorization: `Bearer ${key}` } : {}) }, body: body ? JSON.stringify(body) : undefined });
@@ -95,10 +99,19 @@ test('Serving cancellation stops active and queued demo requests; test keys enfo
     for (let i = 0; i < 600 && !up; i++) { try { up = (await call('/api/health')).status === 200; } catch {} if (!up) await wait(50); }
     assert.ok(up, 'the host did not start listening within 30 s');
     const stream = () => fetch(base + '/api/chat/stream', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ message: 'Explain this test in detail' }) }).then(r => r.text());
-    const first = stream(); await wait(100); const second = stream(); await wait(100);
-    let rows = (await call('/api/serving')).data.requests;
+    const first = stream(); const second = stream();
+    // Wait until the server shows one generating request with one queued behind it. Fixed short waits
+    // raced: on a slow host (or a cold first turn) neither request had started within 200 ms, and a
+    // fast host can also finish before a single poll lands.
+    let rows = [];
+    for (let i = 0; i < 300; i++) {
+      rows = (await call('/api/serving')).data.requests;
+      if (rows.find(r => r.state === 'generating') && rows.find(r => r.state === 'queued')) break;
+      await wait(100);
+    }
     const active = rows.find(r => r.state === 'generating'), queued = rows.find(r => r.state === 'queued');
-    assert.ok(active); assert.ok(queued);
+    assert.ok(active, `no generating request ever appeared: ${JSON.stringify(rows)}`);
+    assert.ok(queued, `no queued request ever appeared: ${JSON.stringify(rows)}`);
     await call(`/api/serving/requests/${queued.id}/cancel`, 'POST');
     const secondFrames = (await second).trim().split('\n').map(JSON.parse);
     assert.equal(secondFrames.some(f => f.type === 'done'), false); assert.ok(secondFrames.some(f => f.type === 'error'));

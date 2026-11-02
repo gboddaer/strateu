@@ -41,7 +41,13 @@ class VersionBump(unittest.TestCase):
         self.assertIn("Version 0.2.7, engine 0.1.52.", (ROOT / "AGENTS.md").read_text(encoding="utf-8"))
         for name in ("README.md", "README.de.md", "README.es.md", "README.fr.md", "README.ja.md", "README.pl.md", "README.pt-BR.md", "README.zh-CN.md"):
             text = (ROOT / name).read_text(encoding="utf-8")
-            self.assertRegex(text, r"Strata-0[.]2[.][0-9]+-", name)       # (the restyled READMEs state the app version through the download buttons; their owner moves them to the release)
+            if name != "README.pl.md":
+                # The fork READMEs use source setup; the unported Polish README still links upstream installers.
+                self.assertIn("https://github.com/gboddaer/strateu/archive/refs/heads/main.zip", text, name)
+                self.assertIn("START-HERE.bat", text, name)
+                self.assertIn("./setup.sh", text, name)
+            else:
+                self.assertRegex(text, r"Strata-0[.]2[.][0-9]+-", name)
             self.assertNotIn("Strata-0.2.2-", text, name)
 
     def test_version_prints_the_product_and_the_build(self):

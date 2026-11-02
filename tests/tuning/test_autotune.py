@@ -299,6 +299,35 @@ class TunerTest(unittest.TestCase):
         self.assertEqual(r.outcome, "inconclusive")
         self.assertIn("could not be tried", r.message)
 
+    def test_arms_that_die_at_start_are_not_reported_as_already_fastest(self):
+        """An arm whose engine stops before it is ready was never measured, so it cannot count as a comparison."""
+        # Seen on the Kolibri engine on an R9700 (2026-10-31): all nine restart arms died with SIGSEGV
+        # inside the HIP runtime, and the run still reported "already the fastest".
+        def fail(args, env):
+            return None if list(args) == BASE else StartFailed(
+                "FAIL_BOOT", "the engine process ended: killed by signal 11 (SIGSEGV, Segmentation fault)")
+        t, s, r = run_tuner(speed_with({}), opts=autotune.Options(per_request=False), session_kw={"fail": fail})
+        self.assertTrue(r.arms and all(a["status"] == "failed" for a in r.arms), [a["status"] for a in r.arms])
+        self.assertNotEqual(r.outcome, "default_confirmed")
+        self.assertNotIn("already the fastest", r.message)
+
+    def test_an_arm_whose_engine_dies_once_is_started_again(self):
+        """A start that dies is a start, not a measurement, so the arm gets one more try."""
+        seen = {"n": 0}
+
+        def fail(args, env):
+            if flag(args, "--kv-resident") == "65536":
+                seen["n"] += 1
+                if seen["n"] == 1:
+                    return StartFailed("FAIL_BOOT", "the engine process ended: killed by signal 11 (SIGSEGV, Segmentation fault)")
+            return None
+        ctx = make_ctx()
+        ctx.facts = {"workers": 6}
+        t, s, r = run_tuner(speed_with({}), ctx=ctx, session_kw={"fail": fail})
+        self.assertGreaterEqual(seen["n"], 2, "the arm was not started a second time after the engine died")
+        self.assertEqual([a for a in r.arms if a["status"] == "failed"], [], "the retried arm was still reported as failed")
+        self.assertTrue(any("started once more" in n for n in r.notes), r.notes)
+
     def test_first_oom_stops_the_search(self):
         def fail(args, env):
             return StartFailed("OOM", "out of memory") if flag(args, "--kv-resident") == "65536" else None
