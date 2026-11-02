@@ -188,7 +188,7 @@ bool compare_bits(const std::vector<float>& got, const std::vector<float>& want,
 
 /// Runs one pipeline case: quantize the activations with the pool's own quantizer, run the context, compare.
 void pipeline_case(const Layer& l, Run& r, int top_k, const char* name, int repeat = 1, int slots = 2,
-                   bool split_copy = false) {
+                   bool split_copy = false, bool dev_act = false) {
     using namespace strata::kolibri::stream;
     ++g_cases;
     const int tokens = (int) (r.ids.size() / (size_t) top_k);
@@ -216,6 +216,7 @@ void pipeline_case(const Layer& l, Run& r, int top_k, const char* name, int repe
         Config cfg;
         cfg.slots = slots;   // the schedule is N-deep; every depth must publish the same rows
         cfg.split_copy_stream = split_copy;   // a separate copy stream changes when bytes land, never what they are
+        cfg.device_activation = dev_act;      // the SwiGLU on the device must publish the host bridge's bytes
         ctx = create(v, cfg);
     } catch (const std::exception& ex) {
         std::printf("  FAIL %s: create threw: %s\n", name, ex.what());
@@ -445,10 +446,12 @@ int main(int argc, char** argv) {
             pipeline_case(l12, r, 6, "Q4_K down, 256 tokens x top_k 6");
             pipeline_case(l12, r, 6, "Q4_K down, 256 tokens x top_k 6, three slots", 1, 3);
             pipeline_case(l12, r, 6, "Q4_K down, 256 tokens x top_k 6, split copy stream", 1, 2, true);
+            pipeline_case(l12, r, 6, "Q4_K down, 256 tokens x top_k 6, device SwiGLU", 1, 2, false, true);
             Run r2 = make_run(2560, 256, 6, 384, 12);
             pipeline_case(l14, r2, 6, "Q6_K down, 256 tokens x top_k 6");
             pipeline_case(l14, r2, 6, "Q6_K down, 256 tokens x top_k 6, three slots", 1, 3);
             pipeline_case(l14, r2, 6, "Q6_K down, 256 tokens x top_k 6, split copy stream", 1, 2, true);
+            pipeline_case(l14, r2, 6, "Q6_K down, 256 tokens x top_k 6, device SwiGLU", 1, 2, false, true);
         }
         // (c) skewed: one expert holds 256 + 1 selections (more than three batches on its own)
         {

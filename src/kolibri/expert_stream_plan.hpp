@@ -79,6 +79,10 @@ struct Config {
     /// cannot start until the whole batch's copy has landed, which is the serialization the ledger's section 6
     /// points at.
     bool split_copy_stream = false;
+    /// Compute the SwiGLU and the Q8_K quantization of the hidden row on the device, from the gate/up floats that are
+    /// already there: no gate/up D2H, no host stall behind it, no hidden-row H2D.  The device reproduces this host's
+    /// expf and quantizer bit for bit (the kernel test compares the bytes over sigma 1, 3 and 10).
+    bool device_activation = false;
 };
 
 /// What create() must allocate.  Both slots are counted; every buffer is aligned to kBufferAlign.

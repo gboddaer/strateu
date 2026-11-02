@@ -88,6 +88,7 @@ struct Context::Impl {
     int n_embd = 0, n_ff = 0, top_k_hint = 0;
     size_t act_bytes = 0, h_bytes = 0, gu_row = 0, up_off = 0;
     size_t weight_cap = 0;   ///< bytes for one batch's blobs (the plan's 32 MiB, or one blob if larger)
+    bool dev_act = false;    ///< Config::device_activation: the SwiGLU and the hidden row's Q8_K stay on the device
     bool planes_on = false;  ///< STRATA_KOLIBRI_STREAM_PLANES: keep the Q6_K down rows in the plane layout
     size_t plane_bytes = 0;  ///< bytes of one expert's plane region (rows * nb * 210, unchanged in size)
     std::vector<Slot> s;   ///< cfg.slots reusable slots (two by default)
@@ -203,6 +204,7 @@ std::unique_ptr<Context> create(const LayerView& capacity_view, const Config& co
     m->gu_row = capacity_view.fmt.gu_row;
     m->up_off = capacity_view.fmt.up_off;
     m->weight_cap = m->cap.weight_bytes_per_slot;
+    m->dev_act = config.device_activation;
     m->planes_on = es_plane_layout();
     m->plane_bytes = (size_t) m->n_embd * (size_t) (m->n_ff / 256) * 210u;
     m->ff.assign((size_t) m->n_ff, 0.f);
@@ -328,14 +330,24 @@ Stats run(Context& ctx, const LayerView& view) {
 
             woff += blob;
         }
-        ck(cudaMemcpyAsync(s.gu_pin, s.gu, b.rows * 2 * (size_t) f.fmt.n_ff * sizeof(float), cudaMemcpyDeviceToHost,
-                           s.st),
-           "gate/up D2H");
-        st.gu_d2h_bytes += b.rows * 2 * (size_t) f.fmt.n_ff * sizeof(float);
-        ck(cudaEventRecord(s.ev_gu, s.st), "record gate/up");
+        if (!m.dev_act) {   // the floats stay on the device when the SwiGLU runs there
+            ck(cudaMemcpyAsync(s.gu_pin, s.gu, b.rows * 2 * (size_t) f.fmt.n_ff * sizeof(float), cudaMemcpyDeviceToHost,
+                               s.st),
+               "gate/up D2H");
+            st.gu_d2h_bytes += b.rows * 2 * (size_t) f.fmt.n_ff * sizeof(float);
+            ck(cudaEventRecord(s.ev_gu, s.st), "record gate/up");
+        }
     };
 
     auto stage_down = [&](const Batch& b, Slot& s) {
+        if (m.dev_act) {
+            // Gate/up, SwiGLU + Q8_K and down all run on this slot's stream, so nothing has to reach the host: no
+            // event wait, no host activation step, no hidden-row copy.
+            const int rc0 = es_swiglu_quant(s.gu, (int) f.fmt.n_ff, (int) b.rows, (int) f.fmt.h_bytes, s.hidden, s.st);
+            if (rc0 != 0) refuse("the device SwiGLU was refused");
+            st.kernel_launches += 1;
+            ++st.slot_waits;   // the schedule's shape is unchanged; this wait is the slot's own stream
+        } else {
         ck(cudaEventSynchronize(s.ev_gu), "wait gate/up");
         ++st.slot_waits;
         const auto t0 = std::chrono::steady_clock::now();
@@ -371,13 +383,14 @@ Stats run(Context& ctx, const LayerView& view) {
                "hidden H2D");
         }
         st.hidden_h2d_bytes += b.rows * f.fmt.h_bytes;
+        }
         // one down launch per expert, from the same packed slot layout as stage_gu()
         size_t woff = 0;
         for (size_t i = 0; i < b.group.size(); ++i) {
             const Group& g = groups[(size_t) b.group[i]];
             const int ntok = (int) g.selections.size();
             const uint8_t* down = s.weights + woff + f.fmt.down_off;
-            if (s.copy_st != nullptr) ck(cudaStreamWaitEvent(s.st, s.ev_fill[i], 0), "wait for hidden rows");
+            if (s.copy_st != nullptr && !m.dev_act) ck(cudaStreamWaitEvent(s.st, s.ev_fill[i], 0), "wait for hidden rows");
             const int rc = f.fmt.d_type == kQ4K
                                ? es_q4k_rows(down, (int) (f.fmt.n_ff / 256), m.n_embd,
                                              s.hidden + b.row[i] * f.fmt.h_bytes, (int) f.fmt.h_bytes, ntok,

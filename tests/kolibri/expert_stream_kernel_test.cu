@@ -17,6 +17,8 @@
 #include "../../src/kolibri/expert_stream_kernels.cuh"
 #include "../../src/kolibri/kq_a1.cuh"
 
+#include "strata/kernels/cpu/iq_avx2.hpp"
+
 #include "ggml-cpu.h"
 #include "ggml.h"
 
@@ -460,6 +462,73 @@ void run_plane_case(int nb, int rows, int nt) {
     cudaGetLastError();
 }
 
+/// The device's SwiGLU + Q8_K quantization against the host bridge's own bytes: the pool's expression in float with
+/// std::exp, then q8k_quant_avx2.  This is the gate for moving that step onto the device (STRATA_KOLIBRI_STREAM_DEV_ACT):
+/// one differing byte anywhere is a refusal, and the destinations are pre-filled with the same pattern so the bytes a
+/// zero block leaves alone are compared like any other.
+void run_swiglu_case(int rows, float sigma) {
+    ++g_cases;
+    const int H = 2560, FF = 512;
+    const size_t h_bytes = (size_t) ggml_row_size(GGML_TYPE_Q8_K, FF);
+    std::mt19937 g(777 + (uint32_t) (rows * 3 + (int) (sigma * 10)));
+    std::normal_distribution<float> nd(0.f, sigma);
+    std::vector<float> gu((size_t) rows * 2 * FF);
+    for (auto& v : gu) v = nd(g);
+    for (int r = 0; r < rows; r += 97)   // a block of zeros every so often: the quantizer's d = 0 path
+        for (int j = 0; j < 2 * FF; ++j) gu[(size_t) r * 2 * FF + j] = 0.f;
+
+    std::vector<uint8_t> want((size_t) rows * h_bytes, 0x5a);
+    std::vector<float> ff((size_t) FF);
+    for (int r = 0; r < rows; ++r) {
+        const float* row = gu.data() + (size_t) r * 2 * FF;
+        for (int j = 0; j < FF; ++j) {
+            const float gv = row[j], uv = row[FF + j];
+            ff[(size_t) j] = (gv / (1.f + std::exp(-gv))) * uv;   // the pool's expression, as the bridge writes it
+        }
+        strata::kernels::cpu::q8k_quant_avx2(ff.data(), want.data() + (size_t) r * h_bytes, FF);
+    }
+
+    float* dgu = nullptr;
+    uint8_t* dh = nullptr;
+    bool ok = cudaMalloc((void**) &dgu, gu.size() * sizeof(float)) == cudaSuccess &&
+              cudaMalloc((void**) &dh, want.size()) == cudaSuccess &&
+              cudaMemcpy(dgu, gu.data(), gu.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess &&
+              cudaMemset(dh, 0x5a, want.size()) == cudaSuccess;
+    int rc = ok ? strata::kolibri::stream::es_swiglu_quant(dgu, FF, rows, (int) h_bytes, dh, nullptr) : 9;
+    std::vector<uint8_t> got(want.size());
+    if (rc == 0 && cudaDeviceSynchronize() == cudaSuccess) {
+        ok = cudaMemcpy(got.data(), dh, got.size(), cudaMemcpyDeviceToHost) == cudaSuccess;
+    } else {
+        ok = false;
+    }
+    char name[128];
+    std::snprintf(name, sizeof name, "swiglu+Q8_K on the device, %d row(s), sigma %.0f", rows, (double) sigma);
+    if (!ok || rc != 0) {
+        std::printf("  FAIL %s: setup or launch failed (rc %d, cuda %s)\n", name, rc,
+                    cudaGetErrorString(cudaGetLastError()));
+        ++g_failures;
+    } else {
+        int bad_rows = 0;
+        size_t first_bad = 0, bad_bytes = 0;
+        for (int r = 0; r < rows; ++r) {
+            const int d = std::memcmp(got.data() + (size_t) r * h_bytes, want.data() + (size_t) r * h_bytes, h_bytes) != 0;
+            bad_rows += d;
+            if (d && !bad_rows) first_bad = (size_t) r;
+            if (d)
+                for (size_t k = 0; k < h_bytes; ++k)
+                    bad_bytes += got[(size_t) r * h_bytes + k] != want[(size_t) r * h_bytes + k];
+        }
+        if (bad_rows) {
+            std::printf("  FAIL %s: %d of %d rows differ, %zu bytes, first row %zu\n", name, bad_rows, rows, bad_bytes,
+                        first_bad);
+            ++g_failures;
+        }
+    }
+    if (dh) cudaFree(dh);
+    if (dgu) cudaFree(dgu);
+    cudaGetLastError();
+}
+
 /// The whole expert, end to end, at Kolibri-1's own geometry: the tiled gate/up product, then the CPU's SwiGLU
 /// expression and native_quant_h, then the down product in whichever format the layer stores - compared with the
 /// pool's own native_gu_rows / native_down_rows, bit for bit, including the hidden's quantized BYTES.
@@ -651,6 +720,7 @@ int main(int argc, char** argv) {
             }
         }
         run_plane_case(2, 17, 3);
+        run_swiglu_case(32, 1.f);
     } else {
         // (a) every nb at every row tail, four tokens
         for (int nb : {1, 2, 10, 32})
@@ -683,6 +753,10 @@ int main(int argc, char** argv) {
             run_expert_case(kQ4K, nt);
             run_expert_case(kQ6K, nt);
         }
+        // (f2) the device SwiGLU + Q8_K quantization against the host bridge's bytes
+        run_swiglu_case(512, 1.f);
+        run_swiglu_case(512, 3.f);
+        run_swiglu_case(64, 10.f);
         // (g) the plane-split Q6_K copy: packing kernel, plane kernel, and both against the oracle
         run_plane_case(2, 2560, 4);
         run_plane_case(2, 2560, 64);

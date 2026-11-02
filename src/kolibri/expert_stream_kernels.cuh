@@ -32,6 +32,16 @@ constexpr int kTileTokens = 4;
 /// per group is 64 CTAs at 16 rows, against 40 SMs that hold seven CTAs each, so the launch is CTA-starved and eight
 /// rows is the obvious thing to try.  More rows do the opposite.  No arithmetic changes, so every setting writes the
 /// same bits.
+/// STRATA_KOLIBRI_STREAM_DEV_ACT: compute the SwiGLU and the Q8_K quantization of the hidden row on the device
+/// instead of on the host, which removes the gate/up D2H, the host stall behind it and the hidden-row H2D from every
+/// batch.  The device reproduces this host's own expf bit for bit (tools/kolibri/expf_bit_probe.cu: 4,294,876,429 of
+/// 4,294,967,296 float patterns identical, the rest in the denormal tail and NaN payloads), so the bytes are the
+/// pool's.  0 or unset = the host bridge.
+inline bool es_device_activation() {
+    const char* v = std::getenv("STRATA_KOLIBRI_STREAM_DEV_ACT");
+    return v != nullptr && v[0] == '1';
+}
+
 inline int es_row_tile() {
     const char* v = std::getenv("STRATA_KOLIBRI_STREAM_ROWS");
     const int r = v != nullptr ? std::atoi(v) : 0;
@@ -90,6 +100,7 @@ namespace detail {
 using a1::kQ4KBlock;
 using a1::kQ6KBlock;
 using a1::kQ8KBlock;
+using a1::kQK;
 using a1::tree8;
 
 /// Four bytes at an arbitrary alignment (the block layouts put them at 4k inside 32- and 64-byte fields).
@@ -115,6 +126,97 @@ __device__ __forceinline__ void q4k_scales_mins(const uint8_t* xb, int* s, int* 
         s[j] = (xb[8 + j] & 0x0F) | ((xb[j] >> 6) << 4);
         mn[j] = (xb[8 + j] >> 4) | ((xb[4 + j] >> 6) << 4);
     }
+}
+
+// ---- the host's expf and its Q8_K quantizer, so the SwiGLU can be computed here without moving a bit --------------
+//
+// This is glibc 2.36's expf as this host runs it: the -mfma variant, whose disassembly keeps two fusions the C source
+// does not show (kd = fma(InvLn2N, xd, SHIFT) and r = fma(InvLn2N, xd, -k)).  tools/kolibri/expf_bit_probe.cu
+// compares it against the host's expf over every one of the 2^32 float patterns: 4,294,876,429 identical, and the
+// 90,853 that differ are all where exp underflows to a denormal float (|x| >= 103.2789) - a gate/up product that
+// large means the layer has already failed - plus the NaN payloads, which the two ISAs canonicalise differently.
+static __device__ __constant__ unsigned long long kExpfTab[32] = {
+    0x3ff0000000000000ull, 0x3fefd9b0d3158574ull, 0x3fefb5586cf9890full, 0x3fef9301d0125b51ull,
+    0x3fef72b83c7d517bull, 0x3fef54873168b9aaull, 0x3fef387a6e756238ull, 0x3fef1e9df51fdee1ull,
+    0x3fef06fe0a31b715ull, 0x3feef1a7373aa9cbull, 0x3feedea64c123422ull, 0x3feece086061892dull,
+    0x3feebfdad5362a27ull, 0x3feeb42b569d4f82ull, 0x3feeab07dd485429ull, 0x3feea47eb03a5585ull,
+    0x3feea09e667f3bcdull, 0x3fee9f75e8ec5f74ull, 0x3feea11473eb0187ull, 0x3feea589994cce13ull,
+    0x3feeace5422aa0dbull, 0x3feeb737b0cdc5e5ull, 0x3feec49182a3f090ull, 0x3feed503b23e255dull,
+    0x3feee89f995ad3adull, 0x3feeff76f2fb5e47ull, 0x3fef199bdd85529cull, 0x3fef3720dcef9069ull,
+    0x3fef5818dcfba487ull, 0x3fef7c97337b9b5full, 0x3fefa4afa2a490daull, 0x3fefd0765b6e4540ull};
+static __device__ __constant__ double kExpfShift = 0x1.8p+52;
+static __device__ __constant__ double kExpfInvLn2N = 0x1.71547652b82fep+0 * 32.0;
+static __device__ __constant__ double kExpfC0 = 0x1.c6af84b912394p-5 / 32.0 / 32.0 / 32.0;
+static __device__ __constant__ double kExpfC1 = 0x1.ebfce50fac4f3p-3 / 32.0 / 32.0;
+static __device__ __constant__ double kExpfC2 = 0x1.62e42ff0c52d6p-1 / 32.0;
+
+__device__ __forceinline__ float expf_glibc(float x) {
+    const uint32_t ux = __float_as_uint(x);
+    const uint32_t abstop = (ux >> 20) & 0x7ff;
+    if (abstop > 0x42a) {                      // > top12(88.0f), as the binary compares it
+        if (ux == 0xff800000u) return 0.0f;    // -inf
+        if (abstop > 0x7f7) return x + x;      // |x| >= inf, or nan
+        if (x > 0x1.62e42ep6f) return __int_as_float(0x7f800000);   // log(0x1p128): overflow
+        if (x < -0x1.9d1d9ep6f) return 0.0f;                        // log(0x1p-149): underflow
+    }
+    const double xd = (double) x;
+    const double kd = __fma_rn(kExpfInvLn2N, xd, kExpfShift);
+    const unsigned long long ki = __double_as_longlong(kd);
+    const double k = __dadd_rn(kd, -kExpfShift);
+    const double r = __fma_rn(kExpfInvLn2N, xd, -k);
+    unsigned long long t = kExpfTab[ki & 31];
+    t += ki << (52 - 5);
+    const double s = __longlong_as_double(t);
+    const double r2 = __dmul_rn(r, r);
+    const double z1 = __fma_rn(kExpfC0, r, kExpfC1);
+    const double y1 = __fma_rn(kExpfC2, r, 1.0);
+    const double y2 = __fma_rn(z1, r2, y1);
+    return (float) __dmul_rn(y2, s);
+}
+
+/// The pool's SwiGLU expression, in its own precision and order: (g / (1 + expf(-g))) * u, three rounded float
+/// operations and no fusion (src/kolibri/expert_stream.cu and native_gu_rows write it the same way).
+__device__ __forceinline__ float swiglu_glibc(float g, float u) {
+    return __fmul_rn(__fdiv_rn(g, __fadd_rn(1.f, expf_glibc(-g))), u);
+}
+
+/// One Q8_K block of 256 values from the pool's quantizer (src/kernels/cpu/iq_avx2.cpp q8k_quant_avx2), operation
+/// for operation: the block max, the FIRST value of that magnitude as mx, iscale = -127/mx, the magic-add rounding,
+/// the low byte sign-extended, the sixteen 16-value sums, and d = 1/iscale.  A block of zeros writes d = 0 and zero
+/// codes and leaves the sums alone, which is what the reference does.
+__device__ __forceinline__ void q8k_block_glibc(const float* __restrict__ x, uint8_t* __restrict__ out) {
+    float m = 0.f;
+    for (int j = 0; j < kQK; ++j) m = fmaxf(m, fabsf(x[j]));
+    float* d = (float*) out;
+    int8_t* qs = (int8_t*) (out + 4);
+    int16_t* bs = (int16_t*) (out + 4 + kQK);
+    if (m == 0.f) {
+        *d = 0.f;
+        for (int j = 0; j < kQK; ++j) qs[j] = 0;
+        return;   // the sums are left as they were, as the reference leaves them
+    }
+    // the first value whose magnitude is the block's max, in ascending order - the reference takes that one
+    int first = -1;
+    for (int j = 0; j < kQK; ++j)
+        if (fabsf(x[j]) == m) {
+            first = j;
+            break;
+        }
+    const float mx = x[first];
+    const float iscale = __fdiv_rn(-127.f, mx);
+    for (int j = 0; j < kQK; ++j) {
+        const float p = __fmul_rn(iscale, x[j]);
+        const float t = __fadd_rn(p, 12582912.f);
+        int v = (__float_as_int(t) & 0x007fffff) - 0x00400000;
+        v = v < 127 ? v : 127;
+        qs[j] = (int8_t) (v & 0xff);
+    }
+    for (int g = 0; g < 16; ++g) {
+        int s = 0;
+        for (int j = 0; j < 16; ++j) s += (int) qs[g * 16 + j];
+        bs[g] = (int16_t) s;
+    }
+    *d = __fdiv_rn(1.f, iscale);
 }
 
 /// Q4_K x Q8_K, four tokens per row.  Thread = one of the row's eight integer lanes; the four token groups of a
@@ -550,6 +652,68 @@ __global__ void q6k_plane_tile(const uint8_t* __restrict__ w, const uint8_t* __r
     }
 }
 
+/// The host's SwiGLU + Q8_K quantization for a batch of rows: one CTA per (row, block of 256 values), 256 threads.
+/// Every value goes through swiglu_glibc and q8k_block_glibc, i.e. the same float operations in the same order as the
+/// host bridge, so the bytes it writes are the bytes the pool would have quantized.
+static __global__ void swiglu_quant_kernel(const float* __restrict__ gu, int n_ff, int rows,
+                                           uint8_t* __restrict__ hidden) {   // static: this header is in several TUs
+    __shared__ float v[kQK];
+    __shared__ int8_t q[kQK];
+    __shared__ float s_warp[8];
+    __shared__ float s_amax;
+    __shared__ int s_first;
+    __shared__ float s_iscale;
+    __shared__ int s_bsum[16];
+    const int b = (int) blockIdx.x, row = (int) blockIdx.y, j = (int) threadIdx.x;
+    const int nb = n_ff / kQK;
+    const float* grow = gu + (size_t) row * 2 * (size_t) n_ff;
+    const int idx = b * kQK + j;
+    v[j] = swiglu_glibc(grow[idx], grow[n_ff + idx]);
+    if (j < 16) s_bsum[j] = 0;
+    __syncthreads();
+
+    float mv = fabsf(v[j]);
+    for (int off = 16; off > 0; off >>= 1) mv = fmaxf(mv, __shfl_xor_sync(0xffffffffu, mv, off));
+    if ((j & 31) == 0) s_warp[j >> 5] = mv;
+    if (j == 0) s_first = 0x7fffffff;
+    __syncthreads();
+    if (j == 0) {
+        float m = s_warp[0];
+        for (int w = 1; w < 8; ++w) m = fmaxf(m, s_warp[w]);
+        s_amax = m;
+        s_iscale = 0.f;
+    }
+    __syncthreads();
+    uint8_t* blk = hidden + (size_t) row * (size_t) nb * kQ8KBlock + (size_t) b * kQ8KBlock;
+    if (s_amax == 0.f) {   // the reference writes d = 0 and zero codes, and leaves the sums as they were
+        if (j == 0) *(float*) blk = 0.f;
+        q[j] = 0;
+    } else {
+        if (fabsf(v[j]) == s_amax) atomicMin(&s_first, j);   // the first value of that magnitude, as the reference
+        __syncthreads();
+        if (j == 0) s_iscale = __fdiv_rn(-127.f, v[s_first]);
+        __syncthreads();
+        const float p = __fmul_rn(s_iscale, v[j]);
+        const float t = __fadd_rn(p, 12582912.f);
+        int iv = (__float_as_int(t) & 0x007fffff) - 0x00400000;
+        iv = iv < 127 ? iv : 127;
+        const int8_t c = (int8_t) (iv & 0xff);
+        q[j] = c;
+        atomicAdd(&s_bsum[j >> 4], (int) c);
+        if (j == 0) *(float*) blk = __fdiv_rn(1.f, s_iscale);
+    }
+    __syncthreads();
+    if (j < kQK / 4) {   // four codes at a time, coalesced
+        int packed;
+        __builtin_memcpy(&packed, &q[4 * j], 4);
+        __builtin_memcpy(blk + 4 + 4 * j, &packed, 4);
+    }
+    if (j < 16 && s_amax != 0.f) {   // a zero block leaves the sums as they were, like the reference
+        int16_t sum = (int16_t) s_bsum[j];
+        __builtin_memcpy(blk + 4 + kQK + 2 * j, &sum, 2);
+    }
+}
+
 /// The packing half of the plane layout: one thread per Q6_K block, 105 16-bit words, same bytes, four destinations.
 /// Byte-neutral (128 + 64 + 16 + 2 = 210), so the PCIe traffic is unchanged.  `static`: this header is included by
 /// more than one translation unit of the library (as kq_a1.cuh is), and a non-static __global__ would be a duplicate.
@@ -701,6 +865,16 @@ inline int es_q6k_plane_rows(const uint8_t* w, int nb, int rows, const uint8_t* 
     if (act_stride < (int) (nb * detail::kQ8KBlock)) return 1;
     if (out == nullptr || out_stride < rows) return 1;
     return detail::launch_plane(w, nb, rows, acts, act_stride, nt, out, out_stride, st);
+}
+
+/// hidden[token][block] = Q8_K of the SwiGLU of gu[token][gate, up], bit for bit what the host bridge writes.
+inline int es_swiglu_quant(const float* gu, int n_ff, int rows, int h_bytes, uint8_t* hidden, cudaStream_t st) {
+    if (gu == nullptr || hidden == nullptr) return 1;
+    if (rows < 1 || n_ff < detail::kQK || n_ff % detail::kQK != 0) return 1;
+    if (h_bytes < (n_ff / detail::kQK) * detail::kQ8KBlock) return 1;
+    const dim3 grid((unsigned) (n_ff / detail::kQK), (unsigned) rows);
+    detail::swiglu_quant_kernel<<<grid, (unsigned) detail::kQK, 0, st>>>(gu, n_ff, rows, hidden);
+    return 0;
 }
 
 /// Packs one expert's block-interleaved Q6_K rows into the planes q6k_plane_tile reads.  Same bytes in, same bytes

@@ -1,4 +1,4 @@
-# Streamed expert kernels: seven changes tried, one kept
+# Streamed expert kernels: eight changes tried, two kept
 
 The streamed expert prefill put the prefill's expert products on the GPU (`docs/experiments/kolibri-gpu-streaming.md`).
 This page records seven changes tried on top of it - three kernel layouts, the tile in both of its dimensions, the
@@ -349,6 +349,52 @@ the kernel test compares the quantized bytes on the model's own distribution rat
 
 So the device can compute the pool's SwiGLU exactly, and the change is an unchanged-arithmetic optimization: the same
 bytes, produced from `(float)exp((double)x)`-free code, with no libm difference left in it.
+
+## 11. The SwiGLU and the Q8_K quantization on the device — kept, and on by default
+
+Section 10 removed the obstacle: the device reproduces this host's `expf` on 4,294,876,429 of 4,294,967,296 float
+patterns. This is the change that buys.
+
+**The kernel.** `es_swiglu_quant`: one CTA per (row, block of 256 values), 256 threads. Each value goes through the
+pool's expression (`__fmul_rn(__fdiv_rn(g, __fadd_rn(1.f, expf_glibc(-g))), u)`) and the pool's quantizer, transcribed
+operation for operation from `q8k_quant_avx2` - the block max, the FIRST value of that magnitude as `mx`,
+`iscale = -127/mx`, the magic-add rounding, the low byte sign-extended, the sixteen 16-value sums, `d = 1/iscale`, and
+a zero block writes `d = 0` and zero codes and leaves the sums alone, as the reference does.
+
+**Correctness, before any timing.** The kernel test compares the bytes against the host bridge (`std::exp`, then
+`q8k_quant_avx2`) over 1,088 rows at σ = 1, 3 and 10, with a zero block every 97th row and both destinations
+pre-filled with the same pattern: **0 differing bytes** (101 cases). The pipeline test runs the model-geometry cases
+with the device activation as well: 82 cases, bit-identical. And the engine's six forced histories, full 4.6 MB logit
+dumps compared with `cmp`: byte-identical at the new default.
+
+**The engine**, medians of the prefill's own `PFchunk` line:
+
+| | host bridge | device | ratio |
+| --- | ---: | ---: | ---: |
+| ids512 (511 tokens), 3 reps | 4,839 ms | **4,031 ms** | **1.200x** |
+| ids8191 (8,190 tokens), 2 reps | 102,343 ms | **89,419 ms** | **1.145x** |
+| ids11000 (10,999 tokens), 1 rep | 109,979 ms | **88,644 ms** | **1.241x** |
+| ids16 (15 tokens) | 803 ms | 778 ms | 1.03x |
+| ids512_de | 6,022 ms | 5,196 ms | 1.159x |
+| ids512_code | 6,419 ms | 5,343 ms | 1.200x |
+
+**Why it is that large.** `--counters` on ids8191, same run shape as section 5's:
+
+| | host bridge (section 5) | device |
+| --- | ---: | ---: |
+| gate/up D2H | 10.1 GB | **0.0 GB** |
+| hidden-row H2D | 1.43 GB | **0.00 GB** |
+| host SwiGLU + quantization | 9,998 ms | **0 ms** |
+| launches | 631,380 | 671,542 |
+| the streamed leg's wall | 130,915 ms | **74,362 ms** |
+
+The two round trips were not just bytes: the host had to *wait* for the gate/up results before it could compute the
+hidden row, and that stall was inside every batch. With both steps on the card, a batch is gate/up -> SwiGLU+Q8_K ->
+down on one stream, and the host only waits for the down results. The streamed leg is now 74 s of work against a 64.6 s
+transfer floor, instead of 131 s.
+
+This is the second change of the seven kept (the first was the gate/up pairing), and the only one that removed work
+from the critical path rather than rearranging it.
 
 ## What the four add up to
 
