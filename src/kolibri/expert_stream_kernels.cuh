@@ -27,6 +27,17 @@ namespace strata::kolibri::stream {
 constexpr int kTileRows = 16;
 constexpr int kTileTokens = 4;
 
+/// STRATA_KOLIBRI_STREAM_ROWS: rows per CTA (8, 16 or 32; the CTA is rows/4 warps of four rows each).  16 is the
+/// shipped tile.  Fewer rows cost weight re-reads per token and buy CTAs: a 1,024-row gate/up launch at eight tokens
+/// per group is 64 CTAs at 16 rows, against 40 SMs that hold seven CTAs each, so the launch is CTA-starved and eight
+/// rows is the obvious thing to try.  More rows do the opposite.  No arithmetic changes, so every setting writes the
+/// same bits.
+inline int es_row_tile() {
+    const char* v = std::getenv("STRATA_KOLIBRI_STREAM_ROWS");
+    const int r = v != nullptr ? std::atoi(v) : 0;
+    return (r == 8 || r == 32) ? r : 16;
+}
+
 /// STRATA_KOLIBRI_STREAM_SMEM: stage the tile's Q8_K activation blocks in shared memory once per CTA per block.
 ///
 /// The sixteen rows of a CTA read the SAME 292 activation bytes for a given block and token, four tokens at a time,
@@ -58,7 +69,7 @@ inline bool es_plane_layout() {
     return v != nullptr && v[0] == '1';
 }
 
-/// Why this geometry cannot run here, or nullptr when it can.  Checked before anything is allocated or launched.
+
 const char* es_unsupported(int ggml_weight_type, int nb, int rows, const void* w, const void* acts);
 
 /// out[token * out_stride + row] = w_row . acts[token], for rows [0, rows) and tokens [0, nt).
@@ -113,13 +124,13 @@ __device__ __forceinline__ void q4k_scales_mins(const uint8_t* xb, int* s, int* 
 /// __syncthreads(), so a thread whose row is past `rows` still copies and still synchronises, and only its own
 /// weight loads and its store are skipped.  `sact` is one byte (not one tile) where SMEM is off, so the two
 /// instantiations use the same registers and occupancy and the A/B measures the staging and nothing else.
-template <bool SMEM>
+template <int ROWS, bool SMEM>
 __global__ void q4k_tile(const uint8_t* __restrict__ w, const uint8_t* __restrict__ acts, int act_stride, int nb,
                          int rows, int nt, float* __restrict__ out, int out_stride) {
     __shared__ uint8_t sact[SMEM ? kTileTokens * kQ8KBlock : 1];
     const int warp = (int) (threadIdx.x >> 5);
     const int lane = (int) (threadIdx.x & 31);
-    const int row = blockIdx.x * kTileRows + warp * 4 + (lane >> 3);
+    const int row = blockIdx.x * ROWS + warp * 4 + (lane >> 3);
     const int k = lane & (a1::kLanesPerRow - 1);
     const bool active = row < rows;   // a row's eight lanes share the row, so a group leaves or stays together
     const unsigned gmask = 0xffu << (8 * (lane >> 3));
@@ -214,13 +225,13 @@ __global__ void q4k_tile(const uint8_t* __restrict__ w, const uint8_t* __restric
 }
 
 /// Q6_K x Q8_K, four tokens per row: A1's per-lane order, per block, per token.  SMEM as in q4k_tile.
-template <bool SMEM>
+template <int ROWS, bool SMEM>
 __global__ void q6k_tile(const uint8_t* __restrict__ w, const uint8_t* __restrict__ acts, int act_stride, int nb,
                          int rows, int nt, float* __restrict__ out, int out_stride) {
     __shared__ uint8_t sact[SMEM ? kTileTokens * kQ8KBlock : 1];
     const int warp = (int) (threadIdx.x >> 5);
     const int lane = (int) (threadIdx.x & 31);
-    const int row = blockIdx.x * kTileRows + warp * 4 + (lane >> 3);
+    const int row = blockIdx.x * ROWS + warp * 4 + (lane >> 3);
     const int k = lane & (a1::kLanesPerRow - 1);
     const bool active = row < rows;   // a row's eight lanes share the row, so a group leaves or stays together
     const unsigned gmask = 0xffu << (8 * (lane >> 3));
@@ -310,13 +321,13 @@ __global__ void q6k_tile(const uint8_t* __restrict__ w, const uint8_t* __restric
 /// rows multiply are loaded once and used for four dp4a instead of two.  The blob keeps its [gate rows | up rows]
 /// order - no weight byte moves - the kernel only maps a tile's rows to `kk` and `rows + kk`.  Each row keeps its own
 /// accumulation sequence, FMA and tree, so the outputs are bit-identical to q4k_tile's for the same rows.
-template <bool SMEM>
+template <int ROWS, bool SMEM>
 __global__ void q4k_gu_tile(const uint8_t* __restrict__ w, const uint8_t* __restrict__ acts, int act_stride, int nb,
                             int rows, int nt, float* __restrict__ out, int out_stride) {
     __shared__ uint8_t sact[SMEM ? kTileTokens * kQ8KBlock : 1];
     const int warp = (int) (threadIdx.x >> 5);
     const int lane = (int) (threadIdx.x & 31);
-    const int kk = blockIdx.x * kTileRows + warp * 4 + (lane >> 3);
+    const int kk = blockIdx.x * ROWS + warp * 4 + (lane >> 3);
     const int k = lane & (a1::kLanesPerRow - 1);
     const bool active = kk < rows;
     const unsigned gmask = 0xffu << (8 * (lane >> 3));
@@ -443,13 +454,13 @@ __global__ void q4k_gu_tile(const uint8_t* __restrict__ w, const uint8_t* __rest
 /// In the planes, block i's ql is at 128 * i (128-aligned), its qh at 64 * i (64-aligned), its scales at 16 * i and
 /// its d at 2 * i.  No byte moves between planes that changes a value and the per-row arithmetic is q6k_tile's own, so
 /// the outputs are bit-identical; the kernel test compares this entry against es_q6k_rows on the packed copy.
-template <bool SMEM>
+template <int ROWS, bool SMEM>
 __global__ void q6k_plane_tile(const uint8_t* __restrict__ w, const uint8_t* __restrict__ acts, int act_stride,
                                int nb, int rows, int nt, float* __restrict__ out, int out_stride) {
     __shared__ uint8_t sact[SMEM ? kTileTokens * kQ8KBlock : 1];
     const int warp = (int) (threadIdx.x >> 5);
     const int lane = (int) (threadIdx.x & 31);
-    const int row = blockIdx.x * kTileRows + warp * 4 + (lane >> 3);
+    const int row = blockIdx.x * ROWS + warp * 4 + (lane >> 3);
     const int k = lane & (a1::kLanesPerRow - 1);
     const bool active = row < rows;
     const unsigned gmask = 0xffu << (8 * (lane >> 3));
@@ -562,6 +573,88 @@ static __global__ void q6k_pack_planes(const uint8_t* __restrict__ src, uint8_t*
 
 }  // namespace detail
 
+namespace detail {
+
+/// Token tiles are a GRID dimension, not a host loop: with rows/16 CTAs alone a 1,024-row gate/up launch fills only
+/// 1.6 CTAs per SM on this card and measures 230 GFLOP/s (measured, kbench); the token tiles are what gives the card
+/// enough work in flight.  The row tile reaches the kernel as a template argument - its CTA is rows/4 warps - so its
+/// dispatch lives here once instead of at every launch site.
+template <int ROWS>
+inline int launch_rows_t(int type, const uint8_t* w, int nb, int rows, const uint8_t* acts, int act_stride, int nt,
+                         float* out, int out_stride, cudaStream_t st) {
+    const dim3 grid((unsigned) ((rows + ROWS - 1) / ROWS), (unsigned) ((nt + kTileTokens - 1) / kTileTokens));
+    const int threads = (ROWS / 4) * 32;
+    if (type == 12) {
+        if (es_smem_staging()) {
+            q4k_tile<ROWS, true><<<grid, threads, 0, st>>>(w, acts, act_stride, nb, rows, nt, out, out_stride);
+        } else {
+            q4k_tile<ROWS, false><<<grid, threads, 0, st>>>(w, acts, act_stride, nb, rows, nt, out, out_stride);
+        }
+    } else {
+        if (es_smem_staging()) {
+            q6k_tile<ROWS, true><<<grid, threads, 0, st>>>(w, acts, act_stride, nb, rows, nt, out, out_stride);
+        } else {
+            q6k_tile<ROWS, false><<<grid, threads, 0, st>>>(w, acts, act_stride, nb, rows, nt, out, out_stride);
+        }
+    }
+    return 0;
+}
+
+inline int launch_rows(int type, const uint8_t* w, int nb, int rows, const uint8_t* acts, int act_stride, int nt,
+                       float* out, int out_stride, cudaStream_t st) {
+    switch (es_row_tile()) {
+        case 8: return launch_rows_t<8>(type, w, nb, rows, acts, act_stride, nt, out, out_stride, st);
+        case 32: return launch_rows_t<32>(type, w, nb, rows, acts, act_stride, nt, out, out_stride, st);
+        default: return launch_rows_t<kTileRows>(type, w, nb, rows, acts, act_stride, nt, out, out_stride, st);
+    }
+}
+
+template <int ROWS>
+inline int launch_gu_t(const uint8_t* w, int nb, int rows, const uint8_t* acts, int act_stride, int nt, float* out,
+                       int out_stride, cudaStream_t st) {
+    const dim3 grid((unsigned) ((rows + ROWS - 1) / ROWS), (unsigned) ((nt + kTileTokens - 1) / kTileTokens));
+    const int threads = (ROWS / 4) * 32;
+    if (es_smem_staging()) {
+        q4k_gu_tile<ROWS, true><<<grid, threads, 0, st>>>(w, acts, act_stride, nb, rows, nt, out, out_stride);
+    } else {
+        q4k_gu_tile<ROWS, false><<<grid, threads, 0, st>>>(w, acts, act_stride, nb, rows, nt, out, out_stride);
+    }
+    return 0;
+}
+
+inline int launch_gu(const uint8_t* w, int nb, int rows, const uint8_t* acts, int act_stride, int nt, float* out,
+                     int out_stride, cudaStream_t st) {
+    switch (es_row_tile()) {
+        case 8: return launch_gu_t<8>(w, nb, rows, acts, act_stride, nt, out, out_stride, st);
+        case 32: return launch_gu_t<32>(w, nb, rows, acts, act_stride, nt, out, out_stride, st);
+        default: return launch_gu_t<kTileRows>(w, nb, rows, acts, act_stride, nt, out, out_stride, st);
+    }
+}
+
+template <int ROWS>
+inline int launch_plane_t(const uint8_t* w, int nb, int rows, const uint8_t* acts, int act_stride, int nt, float* out,
+                          int out_stride, cudaStream_t st) {
+    const dim3 grid((unsigned) ((rows + ROWS - 1) / ROWS), (unsigned) ((nt + kTileTokens - 1) / kTileTokens));
+    const int threads = (ROWS / 4) * 32;
+    if (es_smem_staging()) {
+        q6k_plane_tile<ROWS, true><<<grid, threads, 0, st>>>(w, acts, act_stride, nb, rows, nt, out, out_stride);
+    } else {
+        q6k_plane_tile<ROWS, false><<<grid, threads, 0, st>>>(w, acts, act_stride, nb, rows, nt, out, out_stride);
+    }
+    return 0;
+}
+
+inline int launch_plane(const uint8_t* w, int nb, int rows, const uint8_t* acts, int act_stride, int nt, float* out,
+                        int out_stride, cudaStream_t st) {
+    switch (es_row_tile()) {
+        case 8: return launch_plane_t<8>(w, nb, rows, acts, act_stride, nt, out, out_stride, st);
+        case 32: return launch_plane_t<32>(w, nb, rows, acts, act_stride, nt, out, out_stride, st);
+        default: return launch_plane_t<kTileRows>(w, nb, rows, acts, act_stride, nt, out, out_stride, st);
+    }
+}
+
+}  // namespace detail
+
 /// Why this geometry cannot run here, or nullptr when it can.  Checked before anything is allocated or launched.
 inline const char* es_unsupported(int ggml_weight_type, int nb, int rows, const void* w, const void* acts) {
     if (w == nullptr) return "null weights";
@@ -582,21 +675,7 @@ inline int es_launch(int type, const uint8_t* w, int nb, int rows, const uint8_t
     // Token tiles are a GRID dimension, not a host loop: with rows/16 CTAs alone a 1,024-row gate/up launch fills
     // only 1.6 CTAs per SM on this card and measures 230 GFLOP/s (measured, kbench); the token tiles are what
     // gives the card enough work in flight.
-    const dim3 grid((unsigned) ((rows + kTileRows - 1) / kTileRows), (unsigned) ((nt + kTileTokens - 1) / kTileTokens));
-    if (type == 12) {
-        if (es_smem_staging()) {
-            detail::q4k_tile<true><<<grid, 128, 0, st>>>(w, acts, act_stride, nb, rows, nt, out, out_stride);
-        } else {
-            detail::q4k_tile<false><<<grid, 128, 0, st>>>(w, acts, act_stride, nb, rows, nt, out, out_stride);
-        }
-    } else {
-        if (es_smem_staging()) {
-            detail::q6k_tile<true><<<grid, 128, 0, st>>>(w, acts, act_stride, nb, rows, nt, out, out_stride);
-        } else {
-            detail::q6k_tile<false><<<grid, 128, 0, st>>>(w, acts, act_stride, nb, rows, nt, out, out_stride);
-        }
-    }
-    return 0;
+    return detail::launch_rows(type, w, nb, rows, acts, act_stride, nt, out, out_stride, st);
 }
 
 inline int es_q4k_rows(const uint8_t* w, int nb, int rows, const uint8_t* acts, int act_stride, int nt, float* out,
@@ -621,14 +700,7 @@ inline int es_q6k_plane_rows(const uint8_t* w, int nb, int rows, const uint8_t* 
     if (nt < 1 || nt > 1024) return 1;
     if (act_stride < (int) (nb * detail::kQ8KBlock)) return 1;
     if (out == nullptr || out_stride < rows) return 1;
-    const dim3 grid((unsigned) ((rows + kTileRows - 1) / kTileRows),
-                    (unsigned) ((nt + kTileTokens - 1) / kTileTokens));
-    if (es_smem_staging()) {
-        detail::q6k_plane_tile<true><<<grid, 128, 0, st>>>(w, acts, act_stride, nb, rows, nt, out, out_stride);
-    } else {
-        detail::q6k_plane_tile<false><<<grid, 128, 0, st>>>(w, acts, act_stride, nb, rows, nt, out, out_stride);
-    }
-    return 0;
+    return detail::launch_plane(w, nb, rows, acts, act_stride, nt, out, out_stride, st);
 }
 
 /// Packs one expert's block-interleaved Q6_K rows into the planes q6k_plane_tile reads.  Same bytes in, same bytes
@@ -649,14 +721,7 @@ inline int es_q4k_gu_rows(const uint8_t* w, int nb, int rows, const uint8_t* act
     if (nt < 1 || nt > 1024) return 1;
     if (act_stride < (int) (nb * detail::kQ8KBlock)) return 1;
     if (out == nullptr || out_stride < 2 * rows) return 1;
-    const dim3 grid((unsigned) ((rows + kTileRows - 1) / kTileRows),
-                    (unsigned) ((nt + kTileTokens - 1) / kTileTokens));
-    if (es_smem_staging()) {
-        detail::q4k_gu_tile<true><<<grid, 128, 0, st>>>(w, acts, act_stride, nb, rows, nt, out, out_stride);
-    } else {
-        detail::q4k_gu_tile<false><<<grid, 128, 0, st>>>(w, acts, act_stride, nb, rows, nt, out, out_stride);
-    }
-    return 0;
+    return detail::launch_gu(w, nb, rows, acts, act_stride, nt, out, out_stride, st);
 }
 
 }  // namespace strata::kolibri::stream

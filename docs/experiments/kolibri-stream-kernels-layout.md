@@ -1,9 +1,10 @@
-# Streamed expert kernels: three layouts tried, one kept
+# Streamed expert kernels: four layouts tried, one kept
 
-The streamed expert prefill put the prefill's expert products on the GPU (`docs/experiments/kolibri-gpu-streaming.md`). This page
-records three kernel-level layout changes tried on top of it, one at a time, each behind its own switch, each required to
-return the same bits as the CPU pool before its speed was looked at. One of the three is kept; the other two are
-negative results, recorded so nobody tries them again without new evidence.
+The streamed expert prefill put the prefill's expert products on the GPU (`docs/experiments/kolibri-gpu-streaming.md`).
+This page records four kernel-level layout changes tried on top of it, one at a time, each behind its own switch, each
+required to return the same bits as the CPU pool before its speed was looked at. One is kept; the other three are
+negative results, recorded so nobody pays for them again without new evidence, and the last section says where the
+streamed leg's time actually goes, which is why three of the four could not move it.
 
 Environment for every number here: Tesla T4 16 GB (sm_75, driver 580.196.07), CUDA 12.8, 2 x E5-2690 v4 with
 `numactl --cpunodebind=1 --membind=1`, Kolibri-1-Q4_K_M, Release build, branch `kolibri-sram-activation` off
@@ -109,14 +110,79 @@ and a multiply per block. The Q8_0 case that motivated the Qwen copy is differen
 run at a different 2-byte offset and their kernel reads 8-byte runs, which an unaligned pair of 16-bit loads really
 does cost.
 
-## What the three add up to
+## 4. The tile itself: tokens per tile 8 and 16, rows per CTA 8 and 32 — none kept
+
+The token tile was measured behind a temporary `STRATA_KOLIBRI_STREAM_TOKENS` switch, which is not in the tree: it
+lost on the bench and was inside the noise in the engine, so it did not earn a permanent switch. The row tile is
+`STRATA_KOLIBRI_STREAM_ROWS` and stays, defaulting to the shipped 16.
+
+**The idea.** A CTA reads its rows' weight blocks once and uses them for `kTileTokens` (4) tokens, and each of its 16
+rows re-reads the same activation bytes. A wider token tile reads each weight block once for 8 or 16 tokens instead
+of once for 4; fewer rows per CTA re-read the weights more often per token but hand the card more CTAs, which a
+1,024-row gate/up launch at eight tokens per group needs: 64 CTAs against 40 SMs that hold seven each.
+
+**The kernel bench says no to the wider token tile.** `tok8 / tok4`, and `tok16 / tok4` in brackets:
+
+| case | nt=1 | nt=4 | nt=8 | nt=16 | nt=32 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q4_K gate/up | 1.417 | 1.301 | 1.517 | 0.974 | 1.097 |
+| Q4_K gate/up pair | 1.783 | 1.329 | 1.738 | 1.257 | 0.994 |
+| Q6_K down | 1.085 | 0.833 | 1.065 | 1.098 | — |
+
+The reason is registers, and it is worth writing down because it decides the direction of any further tiling.
+`ptxas` on this card: `q4k_tile<4>` 70 registers → 7 CTAs/SM (44 % occupancy), `<8>` 96 → 5 (31 %), `<16>` 173 → 2
+(12 %); `q6k_tile<4>` 57 → 8 (50 %), `<8>` 128 → 4 (25 %). The kernel waits on its weight load every block, so
+occupancy is what fills that wait, and eight live token accumulators cost more than the second read of a weight byte
+buys. 16 threads more per row do not exist to give: the 8 integer lanes of a row are fixed by the pool's arithmetic.
+
+**The row tile is the direction that helps the kernel a little.** `rows8 / rows16`, then `rows32 / rows16`:
+
+| case | nt=1 | nt=4 | nt=8 | nt=16 | nt=32 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q4_K gate/up, 8 rows | 0.973 | 0.992 | 0.907 | 0.908 | 1.021 |
+| Q4_K gate/up pair, 8 rows | 0.976 | — | 0.976 | 0.933 | 0.966 |
+| Q6_K down, 8 rows | 0.994 | 1.005 | 0.985 | 0.988 | — |
+| Q4_K gate/up, 32 rows | 1.055 | 1.023 | 1.050 | 1.049 | 1.062 |
+
+**In the engine all of it is inside a percent**, which is the real answer:
+
+| prefill ms, medians | 4 tokens | 8 tokens | 16 tokens | 8 rows | 16 rows | 32 rows |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ids512 (511 tokens), 3 reps | 4,822 | 4,830 | 4,891 | 4,868 | 4,822 | 4,972 |
+| ids8191 (8,190 tokens), 2 reps | 102,639 | 102,387 | 102,388 | 102,417 | 102,639 | 102,803 |
+| ids11000 (10,999 tokens), 1 rep | 109,491 | 109,941 | — | 110,175 | 109,491 | 109,678 |
+
+Every run's full-logit dump is byte-identical (`cmp`, 4,608,000 bytes) to the arm without the switch, on all six
+forced histories.
+
+## 5. Why a percent is the ceiling here: what the streamed leg actually spends
+
+`--counters` now prints the split the arm accumulates (`CNT expert-stream:`). On ids8191, 1,600 layer-chunks:
+
+| | |
+| --- | ---: |
+| wall, streamed leg | 130.9 s (a `--counters` run; the same prefill takes 102.4 s without it) |
+| weights H2D | 751.1 GB, i.e. 77.9 s at this box's measured 9.64 GB/s |
+| gate/up + down results D2H | 35.3 GB |
+| activations + hidden rows H2D | 8.6 GB |
+| host SwiGLU + quantization | 10.0 s (7.6 % of wall) |
+| launches / slot waits | 631,380 / 80,324 |
+
+The weight transfer alone is 76 % of the plain prefill, so at most a quarter of it is anything a kernel can win, and
+half of the kernels' work is hidden behind the copies. That is why every tile in section 4 lands within 1 %.
+
+The pipeline, not the tile, is where the rest sits. Per batch the order is weights H2D (1.97 ms at 9.64 GB/s,
+eight groups) → gate/up (1.04 ms) → gate/up D2H → host activation → hidden H2D → down (0.25 ms) → result D2H, and
+`stage_gu(i+1)` is only issued after `stage_down(i-1)` has returned, i.e. after batch i-1's results are on the host.
+So the next batch's transfer hides behind one down product (a quarter of a millisecond) instead of behind the
+previous batch's gate/up kernels (a whole millisecond). A third slot, or issuing the next batch's H2D before the
+previous batch's event wait, is the change with the size of the remaining gap in it: 102.4 s against a 77.9 s floor.
+
+## What the four add up to
 
 The streamed arm's remaining cost is not where the Qwen engine's wins are. Its wins are in VRAM-resident decode
 kernels that reload the same weights every token, where an instruction saved per weight is a token time saved. Here
 the weights arrive over PCIe and each is touched once per batch, so bytes and alignment barely matter, and what is
 left is issue count per weight. The gate/up pairing removes a quarter of the activation loads and is worth 1.7 to
-3.3 %; the two layout changes that only redistribute bytes are worth nothing or less.
-
-Not attempted here, and still the largest item: 32 threads per (row, block) with `kTileRows = 16` fixed, and the
-8-row `kTileTokens = 4` tile. A 16x8 tile (rows x tokens) would halve the weight re-reads per token at 8 or more
-tokens per group, which is the long-prompt case that is still 25 % short of the PCIe floor.
+3.3 %; the two layout changes that only redistribute bytes are worth nothing or less; and the tile, in either
+dimension, is inside the noise because the tile is not what the prefill waits on.

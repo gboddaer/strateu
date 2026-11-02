@@ -74,15 +74,23 @@ int main(int argc, char** argv) {
         ck(cudaMemcpy(dw, hw.data(), wbytes, cudaMemcpyHostToDevice), "copy w");
         ck(cudaMemcpy(da, ha.data(), ha.size(), cudaMemcpyHostToDevice), "copy a");
 
-        double best[2] = {1e30, 1e30};
-        for (int m = 0; m < 2; ++m) {
-            setenv("STRATA_KOLIBRI_STREAM_SMEM", m ? "1" : "0", 1);
+        // four settings per case: the row tile at 8, 16 (the shipped one) and 32, and the shipped tile with the
+        // shared-memory staging (the switch that lost)
+        struct Setting { int rows; int smem; };
+        const Setting kSet[4] = {{8, 0}, {16, 0}, {32, 0}, {16, 1}};
+        double best[4] = {1e30, 1e30, 1e30, 1e30};
+        for (int m = 0; m < 4; ++m) {
+            char rows[4], sm[2];
+            std::snprintf(rows, sizeof rows, "%d", kSet[m].rows);
+            std::snprintf(sm, sizeof sm, "%d", kSet[m].smem);
+            setenv("STRATA_KOLIBRI_STREAM_ROWS", rows, 1);
+            setenv("STRATA_KOLIBRI_STREAM_SMEM", sm, 1);
+            setenv("STRATA_KOLIBRI_STREAM_GU", c.gu ? "1" : "0", 1);
             for (int r = 0; r < reps; ++r) {
                 cudaEvent_t a, b;
                 ck(cudaEventCreate(&a), "ev");
                 ck(cudaEventCreate(&b), "ev");
                 ck(cudaEventRecord(a), "rec");
-                setenv("STRATA_KOLIBRI_STREAM_GU", c.gu ? "1" : "0", 1);
                 const int rc = c.gu ? es_q4k_gu_rows(dw, c.nb, c.rows, da, kActBytes, c.nt, dout, 2 * c.rows, nullptr)
                                     : (c.type == 12 ? es_q4k_rows(dw, c.nb, c.rows, da, kActBytes, c.nt, dout, c.rows,
                                                                  nullptr)
@@ -101,10 +109,10 @@ int main(int argc, char** argv) {
                 ck(cudaEventDestroy(b), "ev");
             }
         }
-        const double flops = 2.0 * c.rows * c.nb * 256.0 * c.nt;   // MACs x 2
-        const double gp0 = flops / (best[0] * 1e6), gp1 = flops / (best[1] * 1e6);
-        std::printf("%s  nt=%-2d direct %8.3f ms %6.1f GFLOP/s | smem %8.3f ms %6.1f GFLOP/s | smem/direct %.3f\n",
-                    c.name, c.nt, best[0], gp0, best[1], gp1, best[1] / best[0]);
+        std::printf("%s nt=%-2d | rows8 %7.3f ms (%5.3f) | rows16 %7.3f ms | rows32 %7.3f ms (%5.3f) | "
+                    "rows16+smem %7.3f ms (%5.3f)\n",
+                    c.name, c.nt, best[0], best[0] / best[1], best[1], best[2], best[2] / best[1], best[3],
+                    best[3] / best[1]);
         cudaFree(dw);
         cudaFree(da);
         cudaFree(dout);
