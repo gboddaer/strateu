@@ -781,6 +781,42 @@ answer changed because two kernels - the dense projection GEMM and the flash att
 those is now fixed for good (the GEMM, bit-neutral, verified), the other is located to a single kernel and priced at
 0.8-1.2 %.
 
+## 20. Where the chunk size still enters: after the k projection, before the attention
+
+Section 19 retracted a bad measurement and pointed at the K cache. This is the bisection, done with the knob that
+actually works (`STRATA_KOLIBRI_PF_CHUNK_FULL=1`), on layer 0 where the input (the embeddings) is identical by
+construction:
+
+| tensor, layer 0, tokens 0..255, chunk 511 against chunk 256 | result |
+| --- | --- |
+| raw k projection (`A.k_m`, fp32, before norm/RoPE) | **IDENTICAL** |
+| the K cache rows (`s.kc[0]`, after norm/RoPE, as stored) | **193,532 of 262,144 bytes differ, first at token 64** |
+
+and layer 1, whose input is layer 0's output (already different), differs from token 0 - which is what a downstream
+divergence looks like, so layer 0 is where the primary one is.
+
+So the chunk size enters **between the k projection and the K cache**, i.e. in the per-token norm + RoPE + write
+(`k_attn_prep_multi`) or in the ring gather that both attention kernels read (`k_kv_ring`). Reading
+`k_attn_prep_multi` line by line, its per-token work is `pos = p0 + t`, `slot = pos % swa`, a D-wide sum, a per-element
+scale and a RoPE rotate - all per token, with no reference to `Tc`. That leaves the ring gather, which is the one piece
+of the path that takes `P` and `first`, i.e. `p0c + Tc`.
+
+**What that means for the 40 %, stated plainly.** The chain is now: dense projections (fixed, section 18) -> k
+projection (verified identical) -> **the norm/RoPE/ring step, which is where it still breaks** -> both attention kernels
+-> logits. The fix is not another instrument, it is one of two edits, and both are small:
+
+1. **Dump `A.k16`** (the gathered ring slice the attention actually reads) at both chunk sizes: if it differs, the fix
+   is in `k_kv_ring`'s slice arithmetic (`P`, `first`); if it matches, the fix is in `k_attn_prep_multi`'s write, and
+   the "first at token 64" is the clue (64 = 512/8, and the only 64s in that path are block sizes).
+2. **Or make the whole per-layer block chunk-invariant by construction**: run the norm/RoPE/ring step and the attention
+   in 256-row sub-tiles of the chunk, exactly as section 18 now does for the dense projections. Then any chunk size
+   produces the same sequence of 256-row operations the reference was taken on - no dependence left to find - and the
+   expert leg keeps the big chunk's 1.38x.
+
+Option 2 is the one that is guaranteed to end this, because it removes the question instead of answering it. It is also
+the larger edit: a loop around the prep/ring/attention block with `p0c + t0` and `m = min(256, Tc - t0)` threaded
+through, and the buffer bounds checked for the sub-tile case.
+
 ## What the four add up to
 
 The streamed arm's remaining cost is not where the Qwen engine's wins are. Its wins are in VRAM-resident decode
