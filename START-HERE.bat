@@ -14,7 +14,7 @@ if exist ".venv\Scripts\python.exe" goto run
 call :findpy
 if defined PY goto venv
 echo.
-echo  Python 3.10 or newer is not installed. Installing Python 3.12 for your user account ...
+echo  Python 3.11 or newer is not installed. Installing Python 3.12 for your user account ...
 where winget >nul 2>nul
 if errorlevel 1 goto pyorg
 winget install -e --id Python.Python.3.12 --scope user --silent --source winget --accept-package-agreements --accept-source-agreements --disable-interactivity
@@ -50,6 +50,13 @@ if errorlevel 1 pause
 exit /b
 
 :run
+".venv\Scripts\python.exe" -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) and sys.maxsize > 2**32 else 1)" >nul 2>nul
+if errorlevel 1 (
+  echo This .venv needs 64-bit Python 3.11 or newer. Rename .venv and run START-HERE.bat again.
+  echo No files were removed.
+  pause
+  exit /b 2
+)
 ".venv\Scripts\python.exe" setup.py %*
 if errorlevel 1 pause
 exit /b
@@ -57,9 +64,9 @@ exit /b
 :findpy
 rem the py launcher first, then python on PATH (not the Microsoft Store stub), then the usual per-user folders
 set "PY="
-py -3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) and sys.maxsize > 2**32 else 1)" >nul 2>nul
+py -3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) and sys.maxsize > 2**32 else 1)" >nul 2>nul
 if not errorlevel 1 set "PY=py -3" & goto :eof
-python -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) and sys.maxsize > 2**32 else 1)" >nul 2>nul
+python -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) and sys.maxsize > 2**32 else 1)" >nul 2>nul
 if not errorlevel 1 set "PY=python" & goto :eof
-for %%V in (313 312 311 310) do if exist "%LOCALAPPDATA%\Programs\Python\Python%%V\python.exe" set "PY="%LOCALAPPDATA%\Programs\Python\Python%%V\python.exe"" & goto :eof
+for %%V in (313 312 311) do if exist "%LOCALAPPDATA%\Programs\Python\Python%%V\python.exe" set "PY="%LOCALAPPDATA%\Programs\Python\Python%%V\python.exe"" & goto :eof
 goto :eof

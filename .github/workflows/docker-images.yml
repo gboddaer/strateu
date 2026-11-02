@@ -49,9 +49,10 @@ jobs:
     outputs:
       flavors: ${{ steps.list.outputs.flavors }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.source_ref || inputs.release_tag }}
+          persist-credentials: false
       - name: Which flavors does the release have a package for
         id: list
         env:
@@ -80,9 +81,10 @@ jobs:
       matrix:
         flavor: ${{ fromJSON(needs.plan.outputs.flavors) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.source_ref || inputs.release_tag }}
+          persist-credentials: false
       - name: Free disk space (the runner has about 14 GB; a package plus its image needs about 10 GB)
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
