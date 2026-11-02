@@ -817,6 +817,66 @@ Option 2 is the one that is guaranteed to end this, because it removes the quest
 the larger edit: a loop around the prep/ring/attention block with `p0c + t0` and `m = min(256, Tc - t0)` threaded
 through, and the buffer bounds checked for the sub-tile case.
 
+## 21. The bug, fixed: the shared expert's projections
+
+Section 20 had narrowed the last chunk dependence to "somewhere after the k projection". Two more checkpoints did it:
+
+| layer 0, tokens 0..255, chunk 511 against chunk 256 | result |
+| --- | --- |
+| FFN norm's output (`A.h_m`) - the router's and the experts' common input | **IDENTICAL** |
+| everything before it (attention, sub-tiled in 256-row blocks) | identical |
+
+With everything up to the FFN's input identical, the divergence was inside the FFN block, and the one shape-dependent
+GEMM left there was the **shared expert**: `ffn_gate_shexp`, `ffn_up_shexp` and `ffn_down_shexp`, launched with
+`Tc` rows and added straight into the layer's output. Tiling them into the same fixed 256-row calls (`shx_gemm`)
+finished it:
+
+| ids512 | chunk 256 (2 chunks) | chunk 511 (1 chunk) |
+| --- | ---: | ---: |
+| logits | 3,998 ms | 3,420 ms, **IDENTICAL** |
+
+**And the same at the lengths that matter:**
+
+| | two 256-token chunks | one 512-token chunk | |
+| --- | ---: | ---: | --- |
+| ids8191 (8,190 tokens) | 90,372 ms | **64,023 ms (1.41x)** | **IDENTICAL** |
+| ids11000 (10,999 tokens) | 122,143 ms | **89,396 ms (1.37x)** | **IDENTICAL** |
+
+So the chunk size is now a pure speed knob, and the whole adaptive apparatus is unnecessary: `pf_chunk_at` returns the
+full chunk at every prefix length. Three shape-dependent kernels were behind the 40 %, all of them "the same function,
+computed with a different tile": the attention projections (q/k/v), the attention output projection, the shared
+expert's three projections - plus, earlier in the campaign, the dense projections. Every one is now launched in fixed
+256-row tiles.
+
+## 21b. Every accuracy-retaining knob on: prefill and generation
+
+The defaults now are: the streamed arm, the gate/up pairing, the device-side SwiGLU + Q8_K, the 256-row projection
+tiling, and the full 512-token chunk. Everything else the campaign measured (`SMEM`, `PLANES`, `ROWS`, `SLOTS`,
+`COPY_STREAM`) stays off because it measured slower.
+
+Prefill, `--n 8 --force ... --cpu-threads 14` on the T4, medians of one run per history (the arms were stable to ~1 %):
+
+| history | tokens | pool (the release path) | arm at `19c8c92f` | **all knobs on** | vs the pool |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ids16 | 15 | 600 ms | 803 ms | **770 ms** | 0.78x (slower, recorded) |
+| ids512 | 511 | 7,878 ms | 5,005 ms | **3,392 ms** | **2.32x** |
+| ids512_de | 511 | 7,988 ms | 5,883 ms | **3,839 ms** | 2.08x |
+| ids512_code | 511 | 7,112 ms | 6,071 ms | **4,086 ms** | 1.74x |
+| ids8191 | 8,190 | 115,245 ms | 104,613 ms | **63,847 ms** | **1.80x** |
+| ids11000 | 10,999 | 154,742 ms | 114,225 ms | **89,396 ms** | **1.73x** |
+
+In token rates: **151 tok/s** on a 511-token prompt, **128 tok/s** at 8,190, **123 tok/s** at 10,999, against 62-71
+tok/s through the pool.
+
+Generation (greedy, the two-N delta so the model load and the prefill cancel out): **27.4 tok/s** at 2,048 tokens of
+context and **15.1 tok/s** at 16,384. The decode path is untouched by all of this - the arm replaces only the prefill's
+expert rows, and the generated ids are byte-identical between the arms - so those numbers are the release's decode
+with a prefill that is 1.7-2.3x faster in front of it.
+
+Every full-logit dump above is byte-identical to its reference. (`ids11000`'s stored dump was taken on the pre-fix
+build; the proof that the new answer is right is the pair of runs that differ only in chunk size - 256 chunks at
+122,143 ms against 512 at 89,396 ms - which are byte-identical to each other.)
+
 ## What the four add up to
 
 The streamed arm's remaining cost is not where the Qwen engine's wins are. Its wins are in VRAM-resident decode

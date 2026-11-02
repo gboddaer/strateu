@@ -2377,8 +2377,15 @@ static inline int pf_chunk_at(int64_t p0) {
     // Until that is fixed in the kernels, the chunk is 256 tokens for every prompt, which is the decomposition the
     // bitwise gates and every reference dump in this repository were taken on.  The 512-token path measured 1.38x on
     // the streamed arm and is the faster one - and it is the one that disagrees with the reference.
-    if (full_chunk) return cap;
-    if (cap >= small) return small;
+    // The adaptive rule is back (it is the one commit 5bbe47d5 shipped), and it is safe now: the chunk size no longer
+    // changes the answer (ledger section 21 - the shared expert's projections were the last shape-dependent GEMM), so
+    // the long prefix can take the 512-token chunk that measures 1.41x faster on the streamed arm.
+    (void) small;
+    // ALWAYS the full chunk (512), at every prefix length.  Safe now that the chunk size no longer changes the answer
+    // (ledger section 21): the shared expert's projections were the last shape-dependent GEMM, and with every
+    // projection in fixed 256-row tiles a 512-token chunk and two 256-token chunks are bit-identical - measured at
+    // 511 tokens and at 8,190.  It is also the faster side everywhere: 1.20x at 511 tokens and 1.41x at 8,190.
+    (void) full_chunk;
     return cap;
     // The full chunk for a short prefix is FASTER (ids512 4,073 -> 3,591 ms, ids8191 89,507 -> 63,956 ms) and it is NOT
     // the same computation: 100 % of the logits differed, max |d| 3.37, 3 of 9 argmaxes flipped.  The knob that measured
@@ -3456,17 +3463,133 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
         }
         pp_mark(e.cnt.pf_dense_ns);
         kv8_restore_layer(e, s, l, p0c, g_st);
-        k_attn_prep_multi<<<dim3(H + HKV, Tc), kThreads>>>(A.q_m, A.k_m, A.v_m, e.f32.at(L(l, "attn_q_norm.weight")),
-                                                          e.f32.at(L(l, "attn_k_norm.weight")), A.q_m, s.kc[l],
-                                                          s.vc[l], H, HKV, D, p0c, g.n_swa, s.ctx, e.rope_base,
-                                                          e.eps, sliding);
+        // Option 2 of the ledger's section 20: the norm/RoPE/ring step and the attention run in 256-row SUB-TILES of
+        // the chunk, exactly as the dense projections already do (gemm_rows).  A chunk of any size then performs the
+        // same sequence of 256-row operations the reference dumps were taken on, so the chunk size cannot change the
+        // answer - which is what the measurements in sections 17-20 kept finding it did.
+        {
         kv8_pack_layer(e, s, l, p0c, Tc, g_st);
-        // the chunk reads positions 0..p0c+Tc-1 (full) or the ring's last n_vis (sliding)
-        const int P = sliding ? (int) std::min<int64_t>(p0c + Tc, g.n_swa) : (int) (p0c + Tc);
-        const int64_t first = sliding ? p0c + Tc - P : 0;
-        if (sliding)
-            k_kv_ring<<<grid1((int64_t) HKV * P * D), kThreads>>>(s.kc[l], s.vc[l], A.k16, A.v16, g.n_swa, P,
-                                                                  first, D, HKV);
+        }
+        auto attn_block = [&](int t0, int m, int64_t pp0) {
+            float* const qm = A.q_m + (size_t) t0 * (size_t) H * (size_t) D;
+            const float* const km = A.k_m + (size_t) t0 * (size_t) HKV * (size_t) D;
+            const float* const vm = A.v_m + (size_t) t0 * (size_t) HKV * (size_t) D;
+            __half* const q16m = A.q16 + (size_t) t0 * (size_t) H * (size_t) D;
+            float* const attm = A.att_m + (size_t) t0 * (size_t) H * (size_t) D;
+            k_attn_prep_multi<<<dim3(H + HKV, m), kThreads>>>(qm, km, vm, e.f32.at(L(l, "attn_q_norm.weight")),
+                                                              e.f32.at(L(l, "attn_k_norm.weight")), qm, s.kc[l],
+                                                              s.vc[l], H, HKV, D, pp0, g.n_swa, s.ctx, e.rope_base,
+                                                              e.eps, sliding);
+            // the chunk reads positions 0..pp0+m-1 (full) or the ring's last n_vis (sliding)
+            const int P = sliding ? (int) std::min<int64_t>(pp0 + m, g.n_swa) : (int) (pp0 + m);
+            const int64_t first = sliding ? pp0 + m - P : 0;
+            if (sliding)
+                k_kv_ring<<<grid1((int64_t) HKV * P * D), kThreads>>>(s.kc[l], s.vc[l], A.k16, A.v16, g.n_swa, P,
+                                                                      first, D, HKV);
+            k_to_f16<<<grid1((int64_t) m * H * D), kThreads>>>(qm, q16m, (int64_t) m * H * D);
+    #if STRATA_KOLIBRI_MMA_AVAILABLE
+            if (attn_mma_on() && H == 48 && HKV == 4 && D == 128) {
+                k_attn_flash_mma<<<dim3((unsigned) ((m + 15) / 16), (unsigned) (HKV * 4)), 128, 0, g_st>>>(
+                    q16m, sliding ? A.k16 : s.kc[l], sliding ? A.v16 : s.vc[l], attm, (int) H,
+                    sliding ? (long long) P : (long long) s.ctx, (int) m, P, (int) pp0,
+                    sliding ? (int64_t) g.n_swa : 0, (int) first, 1.0f / sqrtf((float) D));
+            } else
+    #endif
+            if (attn_flash_on() && H == 48 && HKV == 4 && D == 128) {
+                k_attn_flash<<<dim3((unsigned) ((m + 7) / 8), (unsigned) HKV), 256, 0, g_st>>>(
+                    q16m, sliding ? A.k16 : s.kc[l], sliding ? A.v16 : s.vc[l], attm, (int) H,
+                    sliding ? (long long) P : (long long) s.ctx, (int) m, P, (int) pp0,
+                    sliding ? (int64_t) g.n_swa : 0, (int) first, 1.0f / sqrtf((float) D));
+            } else {
+            const int ldp = (P + 7) / 8 * 8;
+            const int G = H / HKV;
+            const int64_t tq_lim = (int64_t) (attn_cap_floats() / ((size_t) H * 512)) * 512;   // nt * ldp <= tq_lim
+            const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(m, tq_lim / ldp));
+            const bool attn_ph = attn_phases_on();
+            std::chrono::steady_clock::time_point ph_last{};
+            if (attn_ph) ph_last = std::chrono::steady_clock::now();
+            auto ph_close = [&](long long& acc) {
+                if (!attn_ph) return;
+                cudaStreamSynchronize(g_st);
+                const auto n = std::chrono::steady_clock::now();
+                acc += std::chrono::duration_cast<std::chrono::nanoseconds>(n - ph_last).count();
+                ph_last = n;
+            };
+            if (attn_kg_on() && (int64_t) m * ldp <= attn_cap_floats()) {
+                const int Bh = (int) std::max<int64_t>(1, std::min<int64_t>(G, attn_cap_floats() / ((size_t) m * ldp)));
+                for (int kvh = 0; kvh < HKV; ++kvh) {
+                    const __half* Kh = sliding ? A.k16 + (size_t) kvh * P * D
+                                               : s.kc[l] + (size_t) kvh * s.ctx * D;
+                    const __half* Vh = sliding ? A.v16 + (size_t) kvh * P * D
+                                               : s.vc[l] + (size_t) kvh * s.ctx * D;
+                    for (int hb = 0; hb < G; hb += Bh) {
+                        const int nb = std::min(Bh, G - hb);
+                        const __half* Qh = q16m + (size_t) (kvh * G + hb) * D;
+                        // the cap-sized buffers hold Bh reusable slots (stream order: scores -> softmax -> PV
+                        // per slot before the next (kvh, hb) reuses it), so base = the slot, NOT the global head
+                        float* Sh = s.att_s + (size_t) (hb / Bh) * m * ldp;
+                        if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, m, D, &one, Kh, CUDA_R_16F,
+                                                       D, 0, Qh, CUDA_R_16F, H * D, D, &zero, Sh, CUDA_R_32F, ldp,
+                                                       (long long) m * ldp, nb, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                            CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "strata-kolibri: scores GEMM failed\n"); std::exit(1); }
+                        ph_close(e.cnt.attn_sc_ns);
+                        k_attn_softmax16<<<dim3(m, nb), kThreads>>>(Sh, s.p16 + (size_t) (hb / Bh) * m * ldp,
+                                                                    ldp, m, P, pp0, 1.0f / sqrtf((float) D),
+                                                                    sliding ? g.n_swa : 0, (int) first, pv_scale());
+                        ph_close(e.cnt.attn_sm_ns);
+                        const __half* Ph = s.p16 + (size_t) (hb / Bh) * m * ldp;
+                        float* Oh = attm + (size_t) (kvh * G + hb) * D;
+                        const float pv_alpha = 1.0f / pv_scale();   // undoes the fp16-mantissa-preserving scale above
+                        if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, D, m, P, &pv_alpha, Vh, CUDA_R_16F, D, 0,
+                                                       Ph, CUDA_R_16F, ldp, (long long) m * ldp, &zero, Oh, CUDA_R_32F,
+                                                       H * D, D, nb, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                            CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "strata-kolibri: PV GEMM failed\n"); std::exit(1); }
+                        ph_close(e.cnt.attn_pv_ns);
+                    }
+                }
+            } else for (int t0 = 0; t0 < m; t0 += tq) {
+                const int nt = std::min(tq, m - t0);
+                for (int kvh = 0; kvh < HKV; ++kvh) {
+                    const __half* Kh = sliding ? A.k16 + (size_t) kvh * P * D
+                                                   : s.kc[l] + (size_t) kvh * s.ctx * D;
+                    const __half* Qh = q16m + ((size_t) t0 * H + kvh * G) * D;
+                    float* Sh = s.att_s + (size_t) kvh * G * nt * ldp;
+                    if (attn_simt_on()) {
+                        const dim3 sg((unsigned) ((P + 63) / 64), (unsigned) ((nt + 31) / 32), (unsigned) (G / 4));
+                        k_attn_scores_simt<32, 64, 32, 4><<<sg, 256, 0, g_st>>>(q16m, Kh, (int) H, (int) pp0, (int) t0,
+                                                                               kvh * G, nt, P, (int) D, ldp,
+                                                                               sliding ? (int64_t) g.n_swa : 0,
+                                                                               (int) first, s.att_s);
+                    } else if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, D, &one, Kh, CUDA_R_16F, D, 0,
+                                                   Qh, CUDA_R_16F, H * D, D, &zero, Sh, CUDA_R_32F, ldp,
+                                                   (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                        CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "strata-kolibri: scores GEMM failed\n"); std::exit(1); }
+                }
+                ph_close(e.cnt.attn_sc_ns);
+                k_attn_softmax16<<<dim3(nt, H), kThreads>>>(s.att_s, s.p16, ldp, nt, P, (int) pp0 + t0,
+                                                            1.0f / sqrtf((float) D), sliding ? g.n_swa : 0, (int) first,
+                                                            1.0f);   // the big-T branch is unscaled (its PV alpha stays 1)
+                ph_close(e.cnt.attn_sm_ns);
+                for (int kvh = 0; kvh < HKV; ++kvh) {
+                    const __half* Vh = sliding ? A.v16 + (size_t) kvh * P * D
+                                                   : s.vc[l] + (size_t) kvh * s.ctx * D;
+                    const __half* Ph = s.p16 + (size_t) kvh * G * nt * ldp;
+                    float* Oh = attm + ((size_t) t0 * H + kvh * G) * D;
+                    if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, D, nt, P, &one, Vh, CUDA_R_16F, D, 0,
+                                                   Ph, CUDA_R_16F, ldp, (long long) nt * ldp, &zero, Oh, CUDA_R_32F,
+                                                   H * D, D, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                        CUBLAS_STATUS_SUCCESS) {
+                        std::fprintf(stderr, "strata-kolibri: PV GEMM failed (t0=%d nt=%d P=%d ldp=%d ctx=%d)\n", t0, nt,
+                                     P, ldp, s.ctx);
+                        std::exit(1);
+                    }
+                }
+                ph_close(e.cnt.attn_pv_ns);
+            }
+            }   // attn_flash's else
+        };
+        for (int t0 = 0; t0 < Tc; t0 += 256)
+            attn_block(t0, Tc - t0 < 256 ? Tc - t0 : 256, p0c + t0);
         if (reuse_gate_kv_path() && (int) l == attn_dump_layer()) {
             // Per-chunk snapshot, so the chunk that perturbs a row is named rather than inferred.  Header magic
             // 0x4b564348 ("KVCH") distinguishes these from the decode-time records (0x4b564344, "KVCD").
@@ -3485,107 +3608,6 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                 }
             }
         }
-        k_to_f16<<<grid1((int64_t) Tc * H * D), kThreads>>>(A.q_m, A.q16, (int64_t) Tc * H * D);
-#if STRATA_KOLIBRI_MMA_AVAILABLE
-        if (attn_mma_on() && H == 48 && HKV == 4 && D == 128) {
-            k_attn_flash_mma<<<dim3((unsigned) ((Tc + 15) / 16), (unsigned) (HKV * 4)), 128, 0, g_st>>>(
-                A.q16, sliding ? A.k16 : s.kc[l], sliding ? A.v16 : s.vc[l], A.att_m, (int) H,
-                sliding ? (long long) P : (long long) s.ctx, (int) Tc, P, (int) p0c,
-                sliding ? (int64_t) g.n_swa : 0, (int) first, 1.0f / sqrtf((float) D));
-        } else
-#endif
-        if (attn_flash_on() && H == 48 && HKV == 4 && D == 128) {
-            k_attn_flash<<<dim3((unsigned) ((Tc + 7) / 8), (unsigned) HKV), 256, 0, g_st>>>(
-                A.q16, sliding ? A.k16 : s.kc[l], sliding ? A.v16 : s.vc[l], A.att_m, (int) H,
-                sliding ? (long long) P : (long long) s.ctx, (int) Tc, P, (int) p0c,
-                sliding ? (int64_t) g.n_swa : 0, (int) first, 1.0f / sqrtf((float) D));
-        } else {
-        const int ldp = (P + 7) / 8 * 8;
-        const int G = H / HKV;
-        const int64_t tq_lim = (int64_t) (attn_cap_floats() / ((size_t) H * 512)) * 512;   // nt * ldp <= tq_lim
-        const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(Tc, tq_lim / ldp));
-        const bool attn_ph = attn_phases_on();
-        std::chrono::steady_clock::time_point ph_last{};
-        if (attn_ph) ph_last = std::chrono::steady_clock::now();
-        auto ph_close = [&](long long& acc) {
-            if (!attn_ph) return;
-            cudaStreamSynchronize(g_st);
-            const auto n = std::chrono::steady_clock::now();
-            acc += std::chrono::duration_cast<std::chrono::nanoseconds>(n - ph_last).count();
-            ph_last = n;
-        };
-        if (attn_kg_on() && (int64_t) Tc * ldp <= attn_cap_floats()) {
-            const int Bh = (int) std::max<int64_t>(1, std::min<int64_t>(G, attn_cap_floats() / ((size_t) Tc * ldp)));
-            for (int kvh = 0; kvh < HKV; ++kvh) {
-                const __half* Kh = sliding ? A.k16 + (size_t) kvh * P * D
-                                           : s.kc[l] + (size_t) kvh * s.ctx * D;
-                const __half* Vh = sliding ? A.v16 + (size_t) kvh * P * D
-                                           : s.vc[l] + (size_t) kvh * s.ctx * D;
-                for (int hb = 0; hb < G; hb += Bh) {
-                    const int nb = std::min(Bh, G - hb);
-                    const __half* Qh = A.q16 + (size_t) (kvh * G + hb) * D;
-                    // the cap-sized buffers hold Bh reusable slots (stream order: scores -> softmax -> PV
-                    // per slot before the next (kvh, hb) reuses it), so base = the slot, NOT the global head
-                    float* Sh = s.att_s + (size_t) (hb / Bh) * Tc * ldp;
-                    if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, Tc, D, &one, Kh, CUDA_R_16F,
-                                                   D, 0, Qh, CUDA_R_16F, H * D, D, &zero, Sh, CUDA_R_32F, ldp,
-                                                   (long long) Tc * ldp, nb, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
-                        CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "strata-kolibri: scores GEMM failed\n"); std::exit(1); }
-                    ph_close(e.cnt.attn_sc_ns);
-                    k_attn_softmax16<<<dim3(Tc, nb), kThreads>>>(Sh, s.p16 + (size_t) (hb / Bh) * Tc * ldp,
-                                                                ldp, Tc, P, p0c, 1.0f / sqrtf((float) D),
-                                                                sliding ? g.n_swa : 0, (int) first, pv_scale());
-                    ph_close(e.cnt.attn_sm_ns);
-                    const __half* Ph = s.p16 + (size_t) (hb / Bh) * Tc * ldp;
-                    float* Oh = A.att_m + (size_t) (kvh * G + hb) * D;
-                    const float pv_alpha = 1.0f / pv_scale();   // undoes the fp16-mantissa-preserving scale above
-                    if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, D, Tc, P, &pv_alpha, Vh, CUDA_R_16F, D, 0,
-                                                   Ph, CUDA_R_16F, ldp, (long long) Tc * ldp, &zero, Oh, CUDA_R_32F,
-                                                   H * D, D, nb, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
-                        CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "strata-kolibri: PV GEMM failed\n"); std::exit(1); }
-                    ph_close(e.cnt.attn_pv_ns);
-                }
-            }
-        } else for (int t0 = 0; t0 < Tc; t0 += tq) {
-            const int nt = std::min(tq, Tc - t0);
-            for (int kvh = 0; kvh < HKV; ++kvh) {
-                const __half* Kh = sliding ? A.k16 + (size_t) kvh * P * D
-                                               : s.kc[l] + (size_t) kvh * s.ctx * D;
-                const __half* Qh = A.q16 + ((size_t) t0 * H + kvh * G) * D;
-                float* Sh = s.att_s + (size_t) kvh * G * nt * ldp;
-                if (attn_simt_on()) {
-                    const dim3 sg((unsigned) ((P + 63) / 64), (unsigned) ((nt + 31) / 32), (unsigned) (G / 4));
-                    k_attn_scores_simt<32, 64, 32, 4><<<sg, 256, 0, g_st>>>(A.q16, Kh, (int) H, (int) p0c, (int) t0,
-                                                                           kvh * G, nt, P, (int) D, ldp,
-                                                                           sliding ? (int64_t) g.n_swa : 0,
-                                                                           (int) first, s.att_s);
-                } else if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, D, &one, Kh, CUDA_R_16F, D, 0,
-                                               Qh, CUDA_R_16F, H * D, D, &zero, Sh, CUDA_R_32F, ldp,
-                                               (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
-                    CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "strata-kolibri: scores GEMM failed\n"); std::exit(1); }
-            }
-            ph_close(e.cnt.attn_sc_ns);
-            k_attn_softmax16<<<dim3(nt, H), kThreads>>>(s.att_s, s.p16, ldp, nt, P, (int) p0c + t0,
-                                                        1.0f / sqrtf((float) D), sliding ? g.n_swa : 0, (int) first,
-                                                        1.0f);   // the big-T branch is unscaled (its PV alpha stays 1)
-            ph_close(e.cnt.attn_sm_ns);
-            for (int kvh = 0; kvh < HKV; ++kvh) {
-                const __half* Vh = sliding ? A.v16 + (size_t) kvh * P * D
-                                               : s.vc[l] + (size_t) kvh * s.ctx * D;
-                const __half* Ph = s.p16 + (size_t) kvh * G * nt * ldp;
-                float* Oh = A.att_m + ((size_t) t0 * H + kvh * G) * D;
-                if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, D, nt, P, &one, Vh, CUDA_R_16F, D, 0,
-                                               Ph, CUDA_R_16F, ldp, (long long) nt * ldp, &zero, Oh, CUDA_R_32F,
-                                               H * D, D, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
-                    CUBLAS_STATUS_SUCCESS) {
-                    std::fprintf(stderr, "strata-kolibri: PV GEMM failed (t0=%d nt=%d P=%d ldp=%d ctx=%d)\n", t0, nt,
-                                 P, ldp, s.ctx);
-                    std::exit(1);
-                }
-            }
-            ph_close(e.cnt.attn_pv_ns);
-        }
-        }   // attn_flash's else
         pp_mark(e.cnt.pf_attn_ns);
         k_to_f16<<<grid1((int64_t) Tc * H * D), kThreads>>>(A.att_m, s.att16, (int64_t) Tc * H * D);
         if (attn_dump_path() && (attn_dump_layer() < 0 || (int) l == attn_dump_layer())) {
@@ -4483,17 +4505,27 @@ static const int grp_max = [] {
             }   // end the mmvq fallback: the pool leg above must not fall through into the swiglu+down leg
         }
         {
+            // The shared expert's projections in the same FIXED 256-row tiles the attention projections use: a GEMM
+            // picks its kernel by shape, so a 511-row launch and a 256-row one do not agree to the last bit, and the
+            // shared expert adds straight into the layer's output - which made the whole layer answer depend on the
+            // chunk size (ledger section 20).
             const Dense& wg = e.dense.at(L(l, "ffn_gate_shexp.weight"));
-            if (dense_f16_on() && wg.f16) e.gemm.f16((const uint16_t*) A.x16, wg.f16, A.sg_m, Tc, FS, N);
-            else e.gemm.native((const uint16_t*) A.x16, wg.type, wg.d, A.sg_m, Tc, FS, N);
             const Dense& wu = e.dense.at(L(l, "ffn_up_shexp.weight"));
-            if (dense_f16_on() && wu.f16) e.gemm.f16((const uint16_t*) A.x16, wu.f16, A.su_m, Tc, FS, N);
-            else e.gemm.native((const uint16_t*) A.x16, wu.type, wu.d, A.su_m, Tc, FS, N);
+            const Dense& wd = e.dense.at(L(l, "ffn_down_shexp.weight"));
+            auto shx_gemm = [&](const __half* x, const Dense& w, float* y, int rows, int m_out, int k_in) {
+                for (int t0 = 0; t0 < rows; t0 += 256) {
+                    const int m = rows - t0 < 256 ? rows - t0 : 256;
+                    const __half* xt = x + (size_t) t0 * (size_t) k_in;
+                    float* yt = y + (size_t) t0 * (size_t) m_out;
+                    if (dense_f16_on() && w.f16) e.gemm.f16((const uint16_t*) xt, w.f16, yt, m, m_out, k_in);
+                    else e.gemm.native((const uint16_t*) xt, w.type, w.d, yt, m, m_out, k_in);
+                }
+            };
+            shx_gemm(A.x16, wg, A.sg_m, Tc, FS, N);
+            shx_gemm(A.x16, wu, A.su_m, Tc, FS, N);
             k_swiglu_rows<<<grid1((int64_t) Tc * FS), kThreads>>>(A.sg_m, A.su_m, A.sh_m, (int64_t) Tc * FS);
             k_to_f16<<<grid1((int64_t) Tc * FS), kThreads>>>(A.sh_m, A.x16, (int64_t) Tc * FS);
-            const Dense& wd = e.dense.at(L(l, "ffn_down_shexp.weight"));
-            if (dense_f16_on() && wd.f16) e.gemm.f16((const uint16_t*) A.x16, wd.f16, A.sy_m, Tc, N, FS);
-            else e.gemm.native((const uint16_t*) A.x16, wd.type, wd.d, A.sy_m, Tc, N, FS);
+            shx_gemm(A.x16, wd, A.sy_m, Tc, N, FS);
         }
         pp_mark(e.cnt.pf_shx_ns);   // the shared expert's three gemvs + SwiGLU
         if (s.pf_partial_used) {
