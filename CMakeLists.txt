@@ -1059,6 +1059,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(kolibri_expert_stream_kbench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(kolibri_expert_stream_kbench PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
     # feasibility probe: can the host's SwiGLU + Q8_K quantization be reproduced on the device, byte for byte?
+    add_executable(kolibri_expf_bit_probe tools/kolibri/expf_bit_probe.cu)
+    target_link_libraries(kolibri_expf_bit_probe PRIVATE ${_strata_gpu_runtime_target} Threads::Threads)
     add_executable(kolibri_expert_stream_swiglu_probe tools/kolibri/expert_stream_swiglu_probe.cu)
     target_include_directories(kolibri_expert_stream_swiglu_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
                                ${CMAKE_CURRENT_SOURCE_DIR}/include)

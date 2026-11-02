@@ -282,6 +282,43 @@ claim is that it is not.
 decision.** It is left as a probe, not as a switch: the number above is what an approval would have to be argued
 against, and it would buy the two round trips (0.92 ms of a 2.60 ms batch at 8,190 tokens).
 
+## 9. The expf question, settled exhaustively over all 2^32 floats
+
+Section 8 left a rate. The domain is finite, so this is a proof. `tools/kolibri/expf_bit_probe.cu` walks **every one of
+the 4,294,967,296 float bit patterns** and compares four definitions of `exp` bit for bit - glibc's `expf` (what the
+pool calls), `(float)exp((double)x)` on the host, and the same two on the device:
+
+| pair | differing patterns (of 4,294,967,296) |
+| --- | ---: |
+| `(float)exp((double)x)` **device** vs the same **host** | **0** |
+| `(float)exp((double)x)` host vs glibc `expf` | 170,648 (1 in 25,163) |
+| CUDA device `expf` vs glibc `expf` | 176,674,308 (4.1 %) |
+
+Three things follow, and they decide the option:
+
+1. **There is a definition both sides compute identically**: the double-precision one, exactly, on every float. So the
+   device *can* compute a SwiGLU the host also computes - the "mimic" route is possible.
+2. **It is not glibc's.** 170,648 patterns differ by one ulp (first: x = 3.0457e-05, host double path 1.0000304,
+   glibc 1.00003052). Adopting it means the pool's SwiGLU changes for one input in 25,163 - a numerical change, small
+   but not zero, so it is not an unchanged-arithmetic optimization either.
+3. **CUDA's own `expf` is the worst of the three** against glibc (4.1 % of floats), which is why section 8's probe saw
+   one hidden row in twenty-three move.
+
+So the honest options, in the order this ledger would recommend them:
+
+- **Port glibc's `expf` to the device** and prove it with this same sweep: the target is "0 differing patterns", the
+  probe already measures exactly that, and nothing numerical moves. This is the only route to the device-side SwiGLU
+  that keeps the pool's bits.
+- **Adopt `(float)exp((double)x)` on both sides** (host pool, host bridge and device), which is exact by construction
+  and removes the two round trips, but changes 1 exponent value in 25,163 and therefore needs an accuracy
+  qualification and an explicit decision under [KOLIBRI_ACCURACY_POLICY.md](../KOLIBRI_ACCURACY_POLICY.md).
+- Keep the host bridge, as the branch does today.
+
+**Integers do not help here.** The quantization is already integer arithmetic (the magic-add rounding, the sign
+extension, `d = 1 / iscale`); the only non-integer step is the exponential itself, and no integer expression reproduces
+a libm's rounding of it. What the integer idea does buy is the insight that the definition has to be *stated*, not
+inherited - which is what the double-precision row above is: a statement whose two implementations agree on every float.
+
 ## What the four add up to
 
 The streamed arm's remaining cost is not where the Qwen engine's wins are. Its wins are in VRAM-resident decode
