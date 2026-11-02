@@ -2367,14 +2367,19 @@ static inline int pf_chunk_at(int64_t p0) {
         return (int) n;
     }();
     const int small = 256;
+    // ONE chunk size, at every prefix length.  The adaptive rule below (256 below 8,192 tokens, 512 above) was tuned on
+    // the CPU pool, and it makes the engine compute the same prompt two ways depending on its length: the dense
+    // projections and the attention do not agree to the last bit between a 256-row and a 512-row launch, and the
+    // difference reached 11 in absolute logit terms (docs/experiments/kolibri-stream-kernels-layout.md, section 17).
+    // Until that is fixed in the kernels, the chunk is 256 tokens for every prompt, which is the decomposition the
+    // bitwise gates and every reference dump in this repository were taken on.  The 512-token path measured 1.38x on
+    // the streamed arm and is the faster one - and it is the one that disagrees with the reference.
+    (void) small;
+    if (cap >= small) return small;
+    return cap;
     // The full chunk for a short prefix is FASTER (ids512 4,073 -> 3,591 ms, ids8191 89,507 -> 63,956 ms) and it is NOT
     // the same computation: 100 % of the logits differed, max |d| 3.37, 3 of 9 argmaxes flipped.  The knob that measured
     // that is gone rather than left as a trap; docs/experiments/kolibri-stream-kernels-layout.md, section 15, records it.
-    // The rule keys on the PREFIX LENGTH, not on the position - K28.  Keyed on p0 it made a 32K prompt run the
-    // small chunk for its first 8,192 tokens (32 of its 80 chunk-layers), even though the measurement behind the
-    // rule was taken on long prefixes, where the full chunk wins (301.5 s at T=512 against 320.9 s at T=256).  A
-    // genuinely short prefix (< 8192 tokens in total) keeps the 256 it was tuned for.
-    if ((g_pf_total > 0 && pf_chunk_key_total() ? g_pf_total : p0) < 8192 && cap >= 256) return small < cap ? small : cap;
     return cap;
 }
 
@@ -3423,16 +3428,28 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
         k_rms_rows<<<T, kThreads>>>(A.x_m, e.f32.at(L(l, "attn_norm.weight")), A.h_m, N, e.eps);
         strata::kernels::native_quantize_q8_1(A.h_m, A.xq8_m, N * Tc, 1, g_st);   // Tc contiguous rows = one column (q36)
         k_to_f16<<<grid1((int64_t) Tc * N), kThreads>>>((const float*) A.h_m, A.x16, (int64_t) Tc * N);
+        // A dense projection over the chunk's rows, in FIXED 256-row tiles.  cuBLAS picks its kernel (and with it the
+        // accumulation order) by shape, so a 511-row call and a 256-row call do not agree to the last bit - measured:
+        // the q projection itself differs in 97 % of its values by up to 2.0e-5, and the logits by up to 11 (ledger
+        // section 17).  Tiling every projection to 256 rows makes the arithmetic identical to the 256-token chunk's,
+        // which is the decomposition the bitwise gates were taken on, at any chunk size.
+        auto gemm_rows = [&](const __half* x, const Dense& w, float* y, int rows, int m_out, int k_in) {
+            const int kTile = 256;
+            for (int t0 = 0; t0 < rows; t0 += kTile) {
+                const int m = rows - t0 < kTile ? rows - t0 : kTile;
+                const __half* xt = x + (size_t) t0 * (size_t) k_in;
+                float* yt = y + (size_t) t0 * (size_t) m_out;
+                if (dense_f16_on() && w.f16) e.gemm.f16((const uint16_t*) xt, w.f16, yt, m, m_out, k_in);
+                else e.gemm.native((const uint16_t*) xt, w.type, w.d, yt, m, m_out, k_in);
+            }
+        };
         {
             const Dense& wq = e.dense.at(L(l, "attn_q.weight"));
-            if (dense_f16_on() && wq.f16) e.gemm.f16((const uint16_t*) A.x16, wq.f16, A.q_m, Tc, H * D, N);
-            else e.gemm.native((const uint16_t*) A.x16, wq.type, wq.d, A.q_m, Tc, H * D, N);
+            gemm_rows(A.x16, wq, A.q_m, Tc, H * D, N);
             const Dense& wk = e.dense.at(L(l, "attn_k.weight"));
-            if (dense_f16_on() && wk.f16) e.gemm.f16((const uint16_t*) A.x16, wk.f16, A.k_m, Tc, HKV * D, N);
-            else e.gemm.native((const uint16_t*) A.x16, wk.type, wk.d, A.k_m, Tc, HKV * D, N);
+            gemm_rows(A.x16, wk, A.k_m, Tc, HKV * D, N);
             const Dense& wv = e.dense.at(L(l, "attn_v.weight"));
-            if (dense_f16_on() && wv.f16) e.gemm.f16((const uint16_t*) A.x16, wv.f16, A.v_m, Tc, HKV * D, N);
-            else e.gemm.native((const uint16_t*) A.x16, wv.type, wv.d, A.v_m, Tc, HKV * D, N);
+            gemm_rows(A.x16, wv, A.v_m, Tc, HKV * D, N);
         }
         pp_mark(e.cnt.pf_dense_ns);
         kv8_restore_layer(e, s, l, p0c, g_st);
@@ -3585,8 +3602,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
         }
         {
             const Dense& wo = e.dense.at(L(l, "attn_output.weight"));
-            if (dense_f16_on() && wo.f16) e.gemm.f16((const uint16_t*) s.att16, wo.f16, A.y_m, Tc, N, H * D);
-            else e.gemm.native((const uint16_t*) s.att16, wo.type, wo.d, A.y_m, Tc, N, H * D);
+            gemm_rows(s.att16, wo, A.y_m, Tc, N, H * D);
         }
         k_rms_rows<<<Tc, kThreads>>>(A.y_m, e.f32.at(L(l, "post_attention_norm.weight")), A.y_m, N, e.eps);
         k_add_rows<<<grid1((int64_t) Tc * N), kThreads>>>(A.x_m, A.y_m, (int64_t) Tc * N);

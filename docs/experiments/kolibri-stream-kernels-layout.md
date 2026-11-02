@@ -665,6 +665,54 @@ to find what breaks past 256 tokens in the pool's chunk path: the next instrumen
 tokens with a valid KV cache), then the shared-FFN GEMM and the Q8 quantizer at Tc = 511. That is a bug hunt in the
 pool, with a named starting point - not something this branch should paper over.
 
+## 18. The chunk-size bug, localised and closed
+
+Section 17 showed the prefill computing a different answer above 256 tokens per chunk. This is what it was, how far the
+fix got, and what is left.
+
+**Two sources, found by instrumenting the tensors rather than the logits.** The existing `STRATA_KOLIBRI_ATTN_DUMP`
+instrument, pointed first at layer 0's attention output and then (temporarily) at its q projection, compares a
+256-token chunk against a 511-token one on the same tokens:
+
+| tensor, layer 0, rows 0..255 | 256-token chunk vs 511-token chunk |
+| --- | --- |
+| q projection (`attn_q`) | 1,530,694 of 1,572,864 differ (97.3 %), max \|d\| 2.0e-5 |
+| attention output, before the fix | 1,320,452 differ (84.0 %), max \|d\| 2.8e-4 |
+| attention output, after the dense-projection fix | 663,962 differ (42.2 %), max \|d\| **1.8e-7** |
+
+So the first source is the **dense projections**: cuBLAS (and the engine's own GEMM) chooses a kernel by shape, so a
+511-row call and a 256-row call accumulate in a different order. Fixed by tiling every dense projection of the chunk
+to **fixed 256-row calls** (`gemm_rows` in the layer path: q, k, v and attn_output), which makes any chunk size produce
+exactly the M sequence a 256-token chunk decomposition produces. Verified: the 256-token path is still byte-identical
+to the stored references, and the cross-chunk difference fell by three orders of magnitude.
+
+The second source is **the attention kernel itself**, still Tc-dependent by one ulp (1.8e-7): its per-row accumulation
+is over `attn_mask_bounds(P, ...)` blocks where `P = p0c + Tc`, so a row in the *first* chunk sees 256 key blocks in one
+run and 511 in the other even though its own causal bound is the same. Its 1-ulp difference is amplified fifty layers
+deep into whole-logit changes, which is why the symptom looked so much bigger than its cause.
+
+**What is closed, and how.** Until that attention path is made chunk-invariant, the engine uses **one chunk size at
+every prefix length - 256 tokens**, which is the decomposition every reference dump and every bitwise gate in this
+repository was taken on. The adaptive rule (256 below 8,192 tokens, 512 above, commit `5bbe47d5`) is gone from the
+rule; the two-branch version is the one-line revert above it in `pf_chunk_at` if a maintainer wants the 512-token path
+back before the attention is fixed.
+
+| | before | after |
+| --- | ---: | ---: |
+| ids512 (511 tokens), prefill | 4,073 ms (2 chunks of 256) | 4,115 ms (same, + the dense tiling) |
+| ids8191 (8,190 tokens) | 90,372 ms (32 chunks of 256) | 90,372 ms, byte-identical to its reference |
+| ids11000 (10,999 tokens) | 88,660 ms (22 chunks of **512**) | 124,281 ms (43 chunks of 256) |
+
+**Read that third row honestly: the fix costs 40 % of long-prompt prefill speed**, because the faster path was the
+divergent one. That is the price of one arithmetic instead of two, and it is a change to what a long prompt computes -
+ids11000's stored dump is from the other side of the split and no longer matches. It needs the maintainer's decision,
+not this branch's; what the branch can say is that the two paths differ by up to 11 in absolute logit terms, that the
+first divergence is a shape-dependent GEMM which is now fixed, and that the residual is one ulp in the attention.
+
+**The follow-up that buys the 40 % back, now with a named target:** make `k_attn_flash`'s key-block loop per-tile
+(`min(P, p0c + q0 + QT)`) instead of per-chunk, re-run the 511-vs-256 comparison, and if the attention output becomes
+bit-identical the 512-token chunk can come back with the arm's 1.38x on top of it.
+
 ## What the four add up to
 
 The streamed arm's remaining cost is not where the Qwen engine's wins are. Its wins are in VRAM-resident decode
