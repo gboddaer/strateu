@@ -758,6 +758,17 @@ A third way, and the cheapest if someone has a day: find the Tc dependence insid
 the bounds are ruled out above, so it is in the body - the staging loops or the warp-liveness path are the places to
 look), and keep flash's 1.2 % with full consistency.
 
+**How far option 3 got, and the one input left.** Reading the body against the same absolute positions rules out the
+rest of the mask arithmetic as well: `nmax` and `nn` come from `attn_mask_bounds(P, p0, ..)`, and for non-sliding layers
+`P = p0c + Tc`, `first = 0`, so a row's bound is `min(pos + 1, P)` - its own position, chunk-independent; for sliding
+layers `first = max(0, p0c + Tc - n_swa)` and the same holds. Every use of `T` in the kernel is `min(q0 + 7, T - 1)`
+and `warp_live = q0 + warp < T`, both per absolute position. So a deterministic kernel with identical inputs cannot be
+producing the two answers, and the inputs are therefore not identical: `q` was verified after the tiling and `k`/`v`
+are its siblings, which leaves **`A.q16`, the fp16 conversion the kernel reads** (`k_to_f16(A.q_m, A.q16, Tc * H * D)`)
+as the last unchecked input, or a body path that reads `T` indirectly. Dumping `q16` at layer 0 for both chunk sizes -
+one more use of the `ATTN_DUMP` instrument, pointed at `A.q16` instead of `A.att_m` - is the next measurement, and it is
+the one that decides between those two.
+
 **The honest summary of the 40 %:** it was never free. It came from a chunk size that changed the answer, and the
 answer changed because two kernels - the dense projection GEMM and the flash attention - are shape-dependent. One of
 those is now fixed for good (the GEMM, bit-neutral, verified), the other is located to a single kernel and priced at
