@@ -42,11 +42,12 @@ inline bool es_smem_staging() {
 
 /// STRATA_KOLIBRI_STREAM_GU: run the gate/up product through es_q4k_gu_rows - one thread holds the gate row and the
 /// up row of the same k, so a token's activation bytes are loaded once for four dp4a instead of twice for two - rather
-/// than es_q4k_rows over the whole [gate | up] table.  1 = paired, 0 or unset = the whole-table launch.  Both write
-/// the same bits: the kernel test runs the two entries on one blob and compares them.
+/// than es_q4k_rows over the whole [gate | up] table.  On by default: measured 1.033x on a 511-token prompt and
+/// 1.017x on an 8,190-token one (docs/experiments/kolibri-stream-kernels-layout.md).  0 = the whole-table launch.
+/// Both write the same bits: the kernel test runs the two entries on one blob and compares them.
 inline bool es_gu_pairing() {
     const char* v = std::getenv("STRATA_KOLIBRI_STREAM_GU");
-    return v != nullptr && v[0] == '1';
+    return v == nullptr || v[0] != '0';
 }
 
 /// STRATA_KOLIBRI_STREAM_PLANES: hold each Q6_K down blob a second time in the plane-split layout (q6k_plane_tile)
