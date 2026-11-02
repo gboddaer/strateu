@@ -564,6 +564,63 @@ so it is worth finding out which side is right before anything else is tuned on 
 It is not this campaign's branch to fix (the chunking lives in the pool's prefill path, not in the streamed arm), but it
 belongs in the handoff: a reproducible 40 % waiting behind a correctness question.
 
+## 16. The 8,192-token chunk switch: who put it there, and which leg differs
+
+Section 15b left the question of which side is wrong. The history answers the first half. `git log -S "const int small
+= 256"` and `git blame` on `pf_chunk_at`:
+
+| commit | date | what it did |
+| --- | --- | --- |
+| `5bbe47d5` | 2026-10-21 | "S7 chunk tuning - an ADAPTIVE prefill chunk (T=256 while p0 < 8K, else 512)": pp512 4,845/4,856 ms at T=256 against 5,133/5,781 ms at T=512, 32K 307.2 s at 512 against 320.9 s at 256. Also states "oracle BITWISE, T <= n_swa-1 holds". |
+| `4a81fd58d` | 2026-10-21 | K28: keys the rule on the prefix length instead of the position, and records the claim that "a chunked causal prefill computes each token's row and per-token softmax identically regardless of how the prompt is cut". |
+
+Both are the maintainer's, and both were tuned on the **pool** - which is the point, because the two legs respond to the
+chunk size in opposite ways. Measured on ids11000 (11,000 tokens), a forced cap of 256 against the default 512, all
+four combinations run in one build:
+
+| leg | 43 chunks (cap 256) | 22 chunks (cap 512) | |
+| --- | ---: | ---: | --- |
+| streamed arm | 122,176 ms | **88,660 ms** | **1.38x for the bigger chunk** |
+| CPU pool (`STRATA_KOLIBRI_EXPERT_STREAM=0`) | 158,333 ms | 156,569 ms | 1.01x, i.e. flat |
+
+and the dumps, compared byte for byte:
+
+| | |
+| --- | --- |
+| pool, 256 vs pool, 512 | **DIFFER** |
+| arm, 256 vs pool, 256 | **identical** |
+| arm, 512 vs pool, 512 | **identical** |
+
+So the divergence is **not the streamed arm's**: at any one chunk size the arm reproduces the pool exactly, which is the
+contract it was built to keep. The chunk-size dependence is in the pool's own prefill path, and it predates this
+branch. What this branch adds is the price tag: the arm pays 1.38x in transfer for the 256-token chunk while the pool
+pays nothing, because the pool reads its experts from its own RAM and the arm reads them over PCIe once per chunk.
+
+Two things follow, and they are for the maintainer rather than for this branch:
+
+- as shipped, the engine's arithmetic changes at an 8,192-token prefix, so the same prompt 10 tokens either side of it
+  is computed two ways;
+- the streamed arm would be 1.38x faster on the chunk the pool prefers for long prompts, which is where it already
+  runs (>= 8192 tokens), and 1.38x slower on the chunk the pool prefers below it.
+
+Localising *where* the pool diverges (which layer, which kernel) is the next investigation, not a tuning step: a
+chunk-layer hash comparison between the two chunk sizes would name the first layer that moves, exactly as the PFHASH
+work did for the residency bug.
+
+## 16b. What llama.cpp does in the mode those numbers come from
+
+`--cpu-moe` (`-cmoe`) assigns the routed experts' **tensors to the CPU**, so the expert weights are read and multiplied
+in host RAM - no PCIe traffic for experts at all - while the GPU does attention and the shared expert. Its MoE is
+grouped per micro-batch exactly as ours is (`build_moe_ffn` gathers the tokens of each expert), with `n_ubatch = 512`
+as the physical batch for prompt processing, and the same `n_swa` sliding-window constraint.
+
+So the published 723 tok/s on a 512-token prompt is the *same design* as the streamed arm with the experts read from
+DDR5 instead of over PCIe 3.0. This branch's counters say one 511-token prompt moves 27.9 GB of expert weights (11,712
+fetches x 2.38 MB): 0.33 s at DDR5's ~85 GB/s, 2.6 s at this box's measured 10.6 GB/s. Our measured 4,031 ms against
+their 0.71 s is a 5.7x gap on a link that differs by roughly 8x - which is the whole of it. Their decode, where the
+weights must be re-read per token, is 18.0 tok/s (`--cpu-moe`) and 11.7 at 32K context; this branch's arm keeps
+experts in VRAM for decode and measured ~33 tok/s at 512 context.
+
 ## What the four add up to
 
 The streamed arm's remaining cost is not where the Qwen engine's wins are. Its wins are in VRAM-resident decode
