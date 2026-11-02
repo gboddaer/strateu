@@ -396,6 +396,45 @@ transfer floor, instead of 131 s.
 This is the second change of the seven kept (the first was the gate/up pairing), and the only one that removed work
 from the critical path rather than rearranging it.
 
+## 12. Which rejections were the float effect, and which were not
+
+Eight things were stopped on accuracy grounds in this repo's Kolibri work, or in the campaign before it. The ported
+`expf` makes it worth asking which of them were the *libm* difference - a fixable last-bit artefact - rather than a
+real change in the arithmetic.
+
+| stopped | what was recorded | cause | verdict now |
+| --- | --- | --- | --- |
+| **the SwiGLU on the device** (`kolibri-perf-gap.md`, "The hazard that can still sink it — SwiGLU"; and section 8 here) | "CUDA's `expf` and glibc's `expf` are not guaranteed to agree to the last bit … the first thing the probe must measure" | **this effect**: CUDA's `expf` differs from this host's on 4.1 % of all floats | **explained and fixed**: glibc's expf ported and proven over 2^32 patterns (section 10), the change is now an unchanged-arithmetic one and is the default (section 11), worth 1.145x to 1.241x |
+| **FP16 expert caches** (branch `e5f4815c`, `kolibri-t4-f16-correctness.md`) | mean KL 0.0037 to 1.073, worst \|dlogit\| up to 11.27, top-1 agreement down to 0.556 | **not** this effect: fp16 halves the weight mantissa, which moves a product by ~1e-3 relative - four orders above the ~1e-7 an ulp of a libm call can move it, and the KL floor for that comparison was 0.0012 | rejection **stands** |
+| **prompt chunk above 8192 / 16384 on CUDA** (`DETAILS.md`) | "not bit-exact on CUDA, so the default stays 8192" | **not** this effect: a bigger chunk changes the *order the blocks are accumulated in*, not a transcendental | rejection **stands** |
+| `STRATA_Q8_SM60`, `STRATA_BF16_TC`, the HIP Q8 path | "not bitwise the exact kernels" | different arithmetic by design (no `dp4a`, tensor cores, HIP's Q8) | unchanged; opt-in variants, not accuracy losses |
+
+So exactly one of them was the float effect, it was the largest of them in prospect, and it is now closed. The lesson
+that generalises: a "1 ulp" rejection is a *claim about a libm*, and it is testable exhaustively - `tools/kolibri/
+expf_bit_probe.cu` answers it for `expf` in three minutes of GPU time, and the same shape of probe would answer it for
+`logf`, `tanhf` or `powf` if one of them ever appears on a hot path.
+
+## 13. The switches, and what each one is set to
+
+Every measurement above is a switch. This is the state they are in, and it is the state the numbers in sections 4 to 11
+describe:
+
+| switch | default | measured |
+| --- | --- | --- |
+| `STRATA_KOLIBRI_EXPERT_STREAM` (the streamed arm itself) | unset = streamed | 1.10x to 1.64x over the CPU pool (section 5 of the prefill ledger) |
+| `STRATA_KOLIBRI_STREAM_GU` — gate/up pairing | **on** | **1.017x / 1.033x** |
+| `STRATA_KOLIBRI_STREAM_DEV_ACT` — SwiGLU + Q8_K on the device | **on** | **1.145x / 1.200x / 1.241x** |
+| `STRATA_KOLIBRI_STREAM_SMEM` — shared-memory staging | off | 2 to 3 % slower |
+| `STRATA_KOLIBRI_STREAM_PLANES` — plane-split Q6_K | off | 1 to 3 % slower |
+| `STRATA_KOLIBRI_STREAM_ROWS` — rows per CTA | 16 | 8 and 32 both within a percent, 8 slightly better at kernel level |
+| `STRATA_KOLIBRI_STREAM_SLOTS` — pipeline depth | 2 | 3 and 4 slower |
+| `STRATA_KOLIBRI_STREAM_COPY_STREAM` — split copy stream | off | 3 % slower at 8k |
+
+Verified with nothing set in the environment: ids512 prefill **4,140 ms** and ids8191 **89,528 ms**, with full-logit
+dumps byte-identical to the reference; `STRATA_KOLIBRI_STREAM_DEV_ACT=0` reproduces the host bridge (4,807 ms on
+ids512). The library's `Config` defaults stay explicit (`device_activation = false`, `slots = 2`), so the test suite
+keeps covering the old path; the engine is what turns the measured-faster options on.
+
 ## What the four add up to
 
 The streamed arm's remaining cost is not where the Qwen engine's wins are. Its wins are in VRAM-resident decode

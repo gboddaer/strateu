@@ -2200,9 +2200,10 @@ static bool expert_stream_layer(const LayerBlobs& b, Scratch& s, const ActSet& A
             if (const char* ccopy = std::getenv("STRATA_KOLIBRI_STREAM_COPY_STREAM")) cfg.split_copy_stream = ccopy[0] == '1';
             // STRATA_KOLIBRI_STREAM_DEV_ACT=1 keeps the gate/up floats on the card: the SwiGLU and the hidden row's
             // Q8_K are computed there, in the pool's own arithmetic (the kernel test compares the bytes).
-            if (const char* da = std::getenv("STRATA_KOLIBRI_STREAM_DEV_ACT")) {
-                cfg.device_activation = da[0] != '0';   // 0 sends the SwiGLU back to the host; anything else keeps it here
-            }
+            // On by default: measured 1.200x / 1.145x / 1.241x (ids512 / ids8191 / ids11000) against the host bridge,
+            // with byte-identical full-logit dumps.  STRATA_KOLIBRI_STREAM_DEV_ACT=0 sends the step back to the host.
+            cfg.device_activation = true;
+            if (const char* da = std::getenv("STRATA_KOLIBRI_STREAM_DEV_ACT")) cfg.device_activation = da[0] != '0';
             g_expert_stream = strata::kolibri::stream::create(v, cfg);
         }
         const strata::kolibri::stream::Stats st = strata::kolibri::stream::run(*g_expert_stream, v);
