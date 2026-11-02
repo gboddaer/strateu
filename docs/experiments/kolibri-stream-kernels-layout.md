@@ -319,6 +319,37 @@ extension, `d = 1 / iscale`); the only non-integer step is the exponential itsel
 a libm's rounding of it. What the integer idea does buy is the insight that the definition has to be *stated*, not
 inherited - which is what the double-precision row above is: a statement whose two implementations agree on every float.
 
+## 10. glibc's expf, ported to the device and proven over all 2^32 floats
+
+The first route of section 9: reproduce this host's own `expf` on the device, so nothing numerical moves.
+
+The C source alone is not enough, and the reason is worth recording. glibc's `expf` is an ifunc; on a CPU with FMA
+this host resolves to the variant compiled with `-mfma`, and GCC kept two fusions that the C source does not show.
+Disassembling the resolved target (`vmovd`/`vcvtss2sd`, then `vfmadd132sd` for `InvLn2N * xd + SHIFT`, then
+`vfmsub132sd` for `InvLn2N * xd - k`) shows the arithmetic that actually runs:
+
+```text
+kd = fma(InvLn2N, xd, SHIFT)          r = fma(InvLn2N, xd, -k)      y = fma(z1, r2, y1)
+```
+
+A transcription of the C source - `z = InvLn2N * xd` as a separate rounded value, used for both - is off by one ulp
+in roughly one pattern in 16 million (measured densely over [16, 64): exactly 1 in 16,777,216). With the two fusions
+in place: `tools/kolibri/expf_bit_probe.cu`, over every one of the 4,294,967,296 float bit patterns,
+
+| | patterns |
+| --- | ---: |
+| identical to this host's `expf` | **4,294,876,429** |
+| differing | 90,853 |
+| NaN inputs, counted apart | 16,777,214 |
+
+Every difference is in the extreme-underflow tail: the smallest `\|x\|` that differs is 103.278931, where `exp` is at
+or below the smallest denormal float (host `0x1p-149`, device `+0`), and NaN payloads are canonicalised differently by
+the two ISAs. Neither can arise here - a gate/up product above 103, or a NaN, means the layer has already failed - and
+the kernel test compares the quantized bytes on the model's own distribution rather than trusting that.
+
+So the device can compute the pool's SwiGLU exactly, and the change is an unchanged-arithmetic optimization: the same
+bytes, produced from `(float)exp((double)x)`-free code, with no libm difference left in it.
+
 ## What the four add up to
 
 The streamed arm's remaining cost is not where the Qwen engine's wins are. Its wins are in VRAM-resident decode

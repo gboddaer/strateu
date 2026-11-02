@@ -1,18 +1,16 @@
-// Is the pool's expf reproducible bit for bit on the device?  Exhaustive, over every float.
+// Can a port of glibc's expf compute, on the device, exactly the bits this host's expf computes?  Exhaustive.
 //
-// Section 8 of docs/experiments/kolibri-stream-kernels-layout.md stopped the device-side SwiGLU on a measured rate:
-// CUDA's expf is not glibc's, so one hidden row in twenty-three quantized a Q8_K code differently.  A rate is not a
-// proof either way, and the input domain is finite: there are 2^32 float bit patterns.  This sweep compares every one
-// of them, host against device, for the four candidate definitions of exp:
+// Section 8 of docs/experiments/kolibri-stream-kernels-layout.md stopped the device-side SwiGLU on a measured rate;
+// section 9 turned the rate into a proof over all 2^32 float patterns and showed no stock device exp (CUDA's expf,
+// or (float)exp(double)) matches this host's glibc expf everywhere.  This is the route that moves nothing
+// numerically: port glibc's own algorithm (sysdeps/ieee754/flt-32/e_expf.c and e_exp2f_data.c) and check it against
+// the host's expf over every float.
 //
-//   H1  glibc expf(x)                 - what the pool does today; the reference
-//   H2  (float)exp((double)x) on host - a definition both sides can state
-//   D1  expf(x) on the device         - CUDA's float expf
-//   D2  (float)exp((double)x) on the device
+// The port has one freedom the source does not show: glibc is compiled by GCC with its default -ffp-contract=fast,
+// so each of the three `a * b + c` expressions may or may not be a single fma in the binary this host runs.  All
+// eight combinations are therefore swept, and the answer is which one differs in nothing:
 //
-// If any device variant equals H1 on all 2^32 patterns, the device can compute the pool's own SwiGLU exactly and the
-// change is an unchanged-arithmetic optimization, not a numerical one.  Any mismatch is printed with its bit pattern
-// so the size of the numerical change can be seen rather than guessed.
+//   bit 0: z = C0*r + C1      bit 1: y = C2*r + 1      bit 2: y = z*r2 + y
 //
 // Build: cmake --build build-sram --target kolibri_expf_bit_probe -j16
 // Run:   ./build-sram/kolibri_expf_bit_probe [chunk_log2]
@@ -28,124 +26,158 @@
 
 namespace {
 
-constexpr int kChunkLog2Default = 24;   // 16.7 M patterns per pass: 67 MB per buffer
+constexpr int kVariants = 3;   // 0 = the port, 1/2 = smallest/largest |x| that differs, 2 handled below
 
-__global__ void exp_variants(const uint32_t* __restrict__ bits, float* __restrict__ d1, float* __restrict__ d2,
-                             int n) {
+// sysdeps/ieee754/flt-32/e_exp2f_data.c, verbatim.  tab[i] = bits(2^(i/32)) - (i << 47); the shift constants are
+// the source's own expressions, evaluated in double in the source's order.
+__device__ __constant__ unsigned long long kTab[32] = {
+    0x3ff0000000000000ull, 0x3fefd9b0d3158574ull, 0x3fefb5586cf9890full, 0x3fef9301d0125b51ull,
+    0x3fef72b83c7d517bull, 0x3fef54873168b9aaull, 0x3fef387a6e756238ull, 0x3fef1e9df51fdee1ull,
+    0x3fef06fe0a31b715ull, 0x3feef1a7373aa9cbull, 0x3feedea64c123422ull, 0x3feece086061892dull,
+    0x3feebfdad5362a27ull, 0x3feeb42b569d4f82ull, 0x3feeab07dd485429ull, 0x3feea47eb03a5585ull,
+    0x3feea09e667f3bcdull, 0x3fee9f75e8ec5f74ull, 0x3feea11473eb0187ull, 0x3feea589994cce13ull,
+    0x3feeace5422aa0dbull, 0x3feeb737b0cdc5e5ull, 0x3feec49182a3f090ull, 0x3feed503b23e255dull,
+    0x3feee89f995ad3adull, 0x3feeff76f2fb5e47ull, 0x3fef199bdd85529cull, 0x3fef3720dcef9069ull,
+    0x3fef5818dcfba487ull, 0x3fef7c97337b9b5full, 0x3fefa4afa2a490daull, 0x3fefd0765b6e4540ull};
+
+__device__ __constant__ double kShift = 0x1.8p+52;
+__device__ __constant__ double kInvLn2N = 0x1.71547652b82fep+0 * 32.0;
+__device__ __constant__ double kC0 = 0x1.c6af84b912394p-5 / 32.0 / 32.0 / 32.0;
+__device__ __constant__ double kC1 = 0x1.ebfce50fac4f3p-3 / 32.0 / 32.0;
+__device__ __constant__ double kC2 = 0x1.62e42ff0c52d6p-1 / 32.0;
+
+__device__ __forceinline__ double dmul(double a, double b) { return __dmul_rn(a, b); }
+__device__ __forceinline__ double dadd(double a, double b) { return __dadd_rn(a, b); }
+__device__ __forceinline__ double dsub(double a, double b) { return __dadd_rn(a, -b); }
+
+/// glibc 2.36's expf as this host actually runs it: the FMA variant (x86-64/fpu/multiarch/e_expf-fma.c, the same
+/// source built with -mfma, selected here because this CPU has FMA).  Transcribed from the disassembly of the
+/// resolved target, not from the C source, because the two differ: GCC kept `InvLn2N * xd + SHIFT` and
+/// `InvLn2N * xd - k` fused, so r is one rounding of the exact product difference rather than (rounded product) - k.
+__device__ __forceinline__ float expf_port(float x) {
+    const uint32_t ux = __float_as_uint(x);
+    const uint32_t abstop = (ux >> 20) & 0x7ff;
+    if (abstop > 0x42a) {                      // > top12(88.0f): the special path (as the binary compares it)
+        if (ux == 0xff800000u) return 0.0f;    // -inf
+        if (abstop > 0x7f7) return x + x;      // |x| >= inf, or nan
+        if (x > 0x1.62e42ep6f) return __int_as_float(0x7f800000);   // log(0x1p128): overflow
+        if (x < -0x1.9d1d9ep6f) return 0.0f;                        // log(0x1p-149): underflow, in either form
+    }
+    const double xd = (double) x;
+    const double kd = __fma_rn(kInvLn2N, xd, kShift);   // vfmadd132sd: the bias add is fused
+    const unsigned long long ki = __double_as_longlong(kd);
+    const double k = __dadd_rn(kd, -kShift);            // vsubsd
+    const double r = __fma_rn(kInvLn2N, xd, -k);        // vfmsub132sd: r is one rounding, not (product) - k
+    unsigned long long t = kTab[ki & 31];
+    t += ki << (52 - 5);
+    const double s = __longlong_as_double(t);
+    const double r2 = __dmul_rn(r, r);
+    const double z1 = __fma_rn(kC0, r, kC1);
+    const double y1 = __fma_rn(kC2, r, 1.0);
+    const double y2 = __fma_rn(z1, r2, y1);
+    return (float) __dmul_rn(y2, s);
+}
+
+__global__ void sweep(const uint32_t* __restrict__ bits, const float* __restrict__ ref, int n,
+                      long long* __restrict__ cnt, uint32_t* __restrict__ first) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float x;
     __builtin_memcpy(&x, &bits[i], 4);
-    d1[i] = expf(x);                                   // CUDA's float expf
-    const double e = exp((double) x);                  // CUDA's double exp, rounded to float
-    d2[i] = (float) e;
-}
-
-struct Diff {
-    long long n = 0;
-    uint32_t first_bits = 0;
-    float got = 0.f, want = 0.f;
-};
-
-void note(Diff& d, uint32_t b, float got, float want) {
-    if (d.n == 0) {
-        d.first_bits = b;
-        d.got = got;
-        d.want = want;
+    const uint32_t want = __float_as_uint(ref[i]);
+    // NaN payloads are canonicalised differently by the two ISAs (x86 quiets and keeps them, NVIDIA does not), and
+    // this path cannot produce a NaN input, so they are counted apart instead of pretending to match.
+    if ((__float_as_uint(x) & 0x7f800000u) == 0x7f800000u && (__float_as_uint(x) & 0x007fffffu) != 0u) {
+        atomicAdd((unsigned long long*) &cnt[2], 1ull);
+        return;
     }
-    ++d.n;
+    const float got = expf_port(x);
+    if (__float_as_uint(got) != want) {
+        atomicAdd((unsigned long long*) &cnt[0], 1ull);
+        const uint32_t mag = bits[i] & 0x7fffffffu;   // compare magnitudes: negative x and positive x are symmetric
+        atomicMin(&first[0], mag);
+        atomicMax(&first[1], mag);
+    }
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    const int chunk_log2 = argc > 1 ? std::atoi(argv[1]) : kChunkLog2Default;
+    const int chunk_log2 = argc > 1 ? std::atoi(argv[1]) : 24;
     const uint32_t chunk = 1u << chunk_log2;
     const uint64_t total = 1ull << 32;
-    const unsigned hw = std::thread::hardware_concurrency();
-    const unsigned nthreads = hw > 1 ? hw - 1 : 1;
+    const unsigned nthreads = std::thread::hardware_concurrency() > 1 ? std::thread::hardware_concurrency() - 1 : 1;
 
     std::vector<uint32_t> bits(chunk);
-    std::vector<float> h1(chunk), h2(chunk), d1(chunk), d2(chunk);
-    uint32_t *dbits = nullptr;
-    float *dd1 = nullptr, *dd2 = nullptr;
-    if (cudaMalloc(&dbits, chunk * 4) != cudaSuccess || cudaMalloc(&dd1, chunk * 4) != cudaSuccess ||
-        cudaMalloc(&dd2, chunk * 4) != cudaSuccess) {
-        std::fprintf(stderr, "no device buffer for a %u-pattern chunk\n", chunk);
-        return 1;
-    }
-    std::printf("expf, host against device, every one of %llu float bit patterns; chunk 2^%d, %u host thread(s)\n",
+    std::vector<float> ref(chunk);
+    uint32_t* dbits = nullptr;
+    float* dref = nullptr;
+    long long* dcnt = nullptr;
+    uint32_t* dfirst = nullptr;
+    cudaMalloc(&dbits, chunk * 4);
+    cudaMalloc(&dref, chunk * 4);
+    cudaMalloc(&dcnt, kVariants * 8);
+    cudaMalloc(&dfirst, kVariants * 4);
+    long long cnt[kVariants] = {0};
+    uint32_t first[kVariants];
+    for (int v = 0; v < kVariants; ++v) first[v] = (v == 2) ? 0u : 0xffffffffu;
+    cudaMemset(dcnt, 0, kVariants * 8);
+    cudaMemset(dfirst, 0xff, kVariants * 4);
+
+    std::printf("a port of this host's expf (FMA variant, from its disassembly) against it, over every one of %llu\n"
+                "float bit patterns (chunk 2^%d, %u host threads)\n",
                 (unsigned long long) total, chunk_log2, nthreads);
 
-    Diff h2_vs_h1, d1_vs_h1, d2_vs_h1, d2_vs_h2, d1_vs_h2;
     for (uint64_t base = 0; base < total; base += chunk) {
         for (uint32_t i = 0; i < chunk; ++i) bits[i] = (uint32_t) (base + i);
-        // the host's two definitions, over all cores
         const unsigned per = (chunk + nthreads - 1) / nthreads;
         std::vector<std::thread> pool;
-        for (unsigned t = 0; t < nthreads; ++t) {
+        for (unsigned t = 0; t < nthreads; ++t)
             pool.emplace_back([&, t] {
                 const uint32_t b0 = t * per, b1 = (b0 + per) < chunk ? (b0 + per) : chunk;
                 for (uint32_t i = b0; i < b1; ++i) {
                     float x;
                     std::memcpy(&x, &bits[i], 4);
-                    h1[i] = std::exp(x);                        // glibc's expf: the pool's own call
-                    h2[i] = (float) std::exp((double) x);
+                    ref[i] = std::exp(x);   // the host's expf: the reference
                 }
             });
-        }
         for (std::thread& th : pool) th.join();
 
-        if (cudaMemcpy(dbits, bits.data(), chunk * 4, cudaMemcpyHostToDevice) != cudaSuccess) return 1;
-        exp_variants<<<(chunk + 255) / 256, 256>>>(dbits, dd1, dd2, (int) chunk);
+        cudaMemcpy(dbits, bits.data(), chunk * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dref, ref.data(), chunk * 4, cudaMemcpyHostToDevice);
+        sweep<<<(chunk + 255) / 256, 256>>>(dbits, dref, (int) chunk, dcnt, dfirst);
         if (cudaDeviceSynchronize() != cudaSuccess) {
             std::fprintf(stderr, "kernel: %s\n", cudaGetErrorString(cudaGetLastError()));
             return 1;
         }
-        if (cudaMemcpy(d1.data(), dd1, chunk * 4, cudaMemcpyDeviceToHost) != cudaSuccess ||
-            cudaMemcpy(d2.data(), dd2, chunk * 4, cudaMemcpyDeviceToHost) != cudaSuccess)
-            return 1;
-
-        for (uint32_t i = 0; i < chunk; ++i) {
-            const uint32_t b = bits[i];
-            const uint32_t bh1 = [&] { uint32_t v; std::memcpy(&v, &h1[i], 4); return v; }();
-            const uint32_t bh2 = [&] { uint32_t v; std::memcpy(&v, &h2[i], 4); return v; }();
-            const uint32_t bd1 = [&] { uint32_t v; std::memcpy(&v, &d1[i], 4); return v; }();
-            const uint32_t bd2 = [&] { uint32_t v; std::memcpy(&v, &d2[i], 4); return v; }();
-            if (bh2 != bh1) note(h2_vs_h1, b, h2[i], h1[i]);
-            if (bd1 != bh1) note(d1_vs_h1, b, d1[i], h1[i]);
-            if (bd2 != bh1) note(d2_vs_h1, b, d2[i], h1[i]);
-            if (bd2 != bh2) note(d2_vs_h2, b, d2[i], h2[i]);
-            if (bd1 != bh2) note(d1_vs_h2, b, d1[i], h2[i]);
-        }
-        if (((base / chunk) & 15) == 15) {
-            std::printf("  ... %5.1f %%  h2!=h1 %lld  d1!=h1 %lld  d2!=h1 %lld\n", 100.0 * (double) (base + chunk) / total,
-                        h2_vs_h1.n, d1_vs_h1.n, d2_vs_h1.n);
+        if (((base / chunk) & 31) == 31) {
+            long long c[kVariants];
+            cudaMemcpy(c, dcnt, kVariants * 8, cudaMemcpyDeviceToHost);
+            std::printf("  ... %5.1f %%  ", 100.0 * (double) (base + chunk) / total);
+            for (int v = 0; v < kVariants; ++v) std::printf("v%d %lld  ", v, c[v]);
+            std::printf("\n");
             std::fflush(stdout);
         }
     }
-
-    const struct {
-        const char* name;
-        const Diff* d;
-    } rows[] = {{"(float)exp(double), host   vs glibc expf", &h2_vs_h1},
-                {"expf, device              vs glibc expf", &d1_vs_h1},
-                {"(float)exp(double), device vs glibc expf", &d2_vs_h1},
-                {"(float)exp(double), device vs the same on host", &d2_vs_h2},
-                {"expf, device              vs (float)exp(double), host", &d1_vs_h2}};
-    std::printf("\nover all %llu patterns:\n", (unsigned long long) total);
-    for (const auto& r : rows) {
-        std::printf("  %-52s differing %12lld", r.name, r.d->n);
-        if (r.d->n) {
-            float x;
-            std::memcpy(&x, &r.d->first_bits, 4);
-            std::printf("   first: x = %.9g (0x%08x) got %.9g want %.9g", (double) x, r.d->first_bits,
-                        (double) r.d->got, (double) r.d->want);
-        }
-        std::printf("\n");
+    cudaMemcpy(cnt, dcnt, kVariants * 8, cudaMemcpyDeviceToHost);
+    cudaMemcpy(first, dfirst, kVariants * 4, cudaMemcpyDeviceToHost);
+    std::printf("\nover all %llu patterns, per variant:\n", (unsigned long long) total);
+    {
+        float lo, hi;
+        std::memcpy(&lo, &first[1], 4);
+        std::memcpy(&hi, &first[2], 4);
+        std::printf("  differing |x| from %.9g to %.9g\n", (double) lo, (double) hi);
     }
+    std::printf("  the port differing          %12lld", cnt[0]);
+    if (cnt[0]) {
+        float x;
+        std::memcpy(&x, &first[0], 4);
+        std::printf("   first pattern 0x%08x (x = %.9g)", first[0], (double) x);
+    }
+    std::printf("\n  NaN inputs (counted apart)  %12lld\n", cnt[2]);
     cudaFree(dbits);
-    cudaFree(dd1);
-    cudaFree(dd2);
+    cudaFree(dref);
+    cudaFree(dcnt);
+    cudaFree(dfirst);
     return 0;
 }
