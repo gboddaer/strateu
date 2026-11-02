@@ -6756,6 +6756,25 @@ int strata::kolibri::run(int argc, char** argv) {
             slots_tick(e, "chunk", (long long) i);   // a round every --expert-slots-reselect-every positions
         }
         if (pf_host_prev.valid) strata::kernels::cpu::restore_thread_affinity(pf_host_prev);
+        // --counters: what the streamed expert leg spent, and on what.  The arm's wall time is the only number that
+        // reaches the user, but whether a kernel change can move it depends on the split: the host's SwiGLU +
+        // quantization (cpu_activation_ms) runs beside the copies, the kernel launches run behind them, and the
+        // weights alone are the PCIe floor.  Measurement only, no numerics effect.
+        if (e.counters && g_expert_stream_layers > 0) {
+            const strata::kolibri::stream::Stats& c = g_expert_stream_stats;
+            const double gb = 1e-9;
+            std::fprintf(stderr,
+                         "CNT expert-stream: %lld layer-chunk(s), %llu groups, %llu selections, wall %.0f ms, "
+                         "cpu-activation %.0f ms (%.1f%% of wall), weights %.1f GB H2D, acts %.2f GB, gu %.1f GB, "
+                         "hidden %.2f GB, out %.1f GB D2H, %llu launches, %llu slot wait(s)\n",
+                         g_expert_stream_layers, (unsigned long long) c.groups, (unsigned long long) c.selections,
+                         c.wall_ms, c.cpu_activation_ms,
+                         c.wall_ms > 0.0 ? 100.0 * c.cpu_activation_ms / c.wall_ms : 0.0,
+                         c.weight_h2d_bytes * gb, c.activation_h2d_bytes * gb, c.gu_d2h_bytes * gb,
+                         c.hidden_h2d_bytes * gb, c.output_d2h_bytes * gb, (unsigned long long) c.kernel_launches,
+                         (unsigned long long) c.slot_waits);
+            std::fflush(stderr);
+        }
         tok = ids.back();
     } else
     for (size_t t = 1; t < ids.size(); ++t) {
