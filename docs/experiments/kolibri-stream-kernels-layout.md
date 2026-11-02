@@ -551,7 +551,8 @@ removed):
 | ids8191, chunk 512 | 16 | **63,956 ms** | **1,152,000 of 1,152,000 differ, max \|d\| 3.37** |
 
 1.40x, and a different computation. This is not a rounding artefact: every logit moves, by up to 3.4 in absolute
-terms, and the greedy pick changes. The knob is gone rather than left as a trap.
+terms, and the greedy pick changes. The knob is gone rather than left as a trap. Section 17 localises it further: the
+path is right at 256 tokens and wrong above it.
 
 **What that means, and it is the most important line in this page:** the engine's own default changes its chunk size
 at an 8,192-token prefix (256 below, 512 above - `pf_chunk_at`), so as shipped the *same model on the same machine*
@@ -620,6 +621,49 @@ fetches x 2.38 MB): 0.33 s at DDR5's ~85 GB/s, 2.6 s at this box's measured 10.6
 their 0.71 s is a 5.7x gap on a link that differs by roughly 8x - which is the whole of it. Their decode, where the
 weights must be re-read per token, is 18.0 tok/s (`--cpu-moe`) and 11.7 at 32K context; this branch's arm keeps
 experts in VRAM for decode and measured ~33 tok/s at 512 context.
+
+## 17. Localised: the prefill's chunk path is right at 256 tokens and wrong above it
+
+Section 16 left the question open: is the chunk-size dependence a rounding artefact (a numerical change to argue about)
+or something else? Measuring the boundary answers it.
+
+With a temporary knob that returns the full chunk for a short prefix (not committed), ids512 - 511 tokens, reference
+dump from the default 256-token chunk:
+
+| forced chunk | chunks | logits against the 256-token reference |
+| ---: | ---: | --- |
+| 256 | 2 | **identical** |
+| 320 | 2 | 1,151,999 of 1,152,000 differ, max \|d\| **8.16** |
+| 384 | 2 | 1,151,996 differ, max \|d\| **11.05** |
+| 448 | 2 | 1,151,999 differ, max \|d\| **11.29** |
+| 511 | 1 | 1,152,000 differ, max \|d\| **9.79** |
+
+So it is not a threshold near the sliding window (511 against n_swa 513) and it is not a drift: it switches on the
+moment the chunk passes 256 tokens, and the difference is up to 11 in absolute logit terms - a different computation,
+not a last-bit one. A rounding artefact from a changed GEMM or reduction order would show ~1e-6 relative; this is a
+model that computes something else.
+
+Where it starts, measured with the existing `STRATA_KOLIBRI_ATTN_DUMP` instrument (layer 0's attention output, the
+first 256 tokens x 48 heads): **bit-identical** between a 256-token chunk and a 511-token one, and no row is left
+unwritten. So the first 256 rows' attention is right, the divergence is after it - later rows, or later in the layer
+(the routed experts, the shared FFN, or the Q8 quantizer that feeds them).
+
+What that means for the branch, and it matters for how section 15 and 16 should be read:
+
+- the 1.38x that the bigger chunk measured is **the wrong answer** being 1.38x faster. The 512-token path is the
+  suspicious one, not the 256-token one;
+- the engine's default takes the 512-token path for every prompt of 8,192 tokens or more (`pf_chunk_at`), so a
+  long-prompt prefill runs the path that this measurement says computes something else - and the campaign's bitwise
+  gates never compared the two sides, because each was checked against itself;
+- the streamed arm is not implicated: at a fixed chunk size it reproduces the pool bit for bit (section 16), which is
+  exactly what it was built to do.
+
+**So the fix is not a chunk-rule change.** Making every prompt use 256 tokens would restore consistency at the cost of
+the speed, and making every prompt use 512 would standardise on the path that disagrees with the reference. The fix is
+to find what breaks past 256 tokens in the pool's chunk path: the next instrument is the same one, taken on rows
+256-510 (compare a 511-token chunk's rows 256+ against the 256-token run's second chunk, which computes the same
+tokens with a valid KV cache), then the shared-FFN GEMM and the Q8 quantizer at Tc = 511. That is a bug hunt in the
+pool, with a named starting point - not something this branch should paper over.
 
 ## What the four add up to
 
