@@ -2016,7 +2016,7 @@ struct Scratch {
     // --prefill: the chunk's rows (tmax tokens at once)
     // 512 is the model's ceiling, not a tuning choice: n_swa is 513, and a chunk wider than the sliding ring would
     // overwrite it (the engine refuses that outright).  The streamed arm's trade inside that ceiling is different from
-    // the pool's, which is what STRATA_KOLIBRI_PF_CHUNK_FULL measures below.
+    // the pool's, which is why the chunk is not prefix-dependent (see pf_chunk_at).
     static constexpr int kTmax = 512;
     int* toks_d = nullptr;
     float *x_m = nullptr, *h_m = nullptr, *y_m = nullptr, *q_m = nullptr, *k_m = nullptr, *v_m = nullptr;
@@ -2350,18 +2350,20 @@ __global__ void k_scatter_rows(const float* __restrict__ src, const int32_t* __r
     if (d < 0) return;   // padding row: the group was padded to a minimum rows-per-expert
     dst[(size_t) d * (size_t) ld + (size_t) c] = src[i];
 }
-static inline bool pf_chunk_key_total() {
-    const char* v = std::getenv("STRATA_KOLIBRI_PF_CHUNK_KEY");
-    return v == nullptr || (v[0] != 0 && std::atoi(v) != 0);
-}
+/// The prefill's chunk size: one size at every prefix length.
+///
+/// STRATA_KOLIBRI_PF_CHUNK caps it; the default is Scratch::kTmax (512), which is also the model's ceiling - n_swa is
+/// 513, so a wider chunk would overwrite the whole sliding ring and the engine refuses it outright.
+///
+/// It is deliberately not prefix-dependent any more.  The chunk used to run 256 tokens below an 8,192-token prefix and
+/// 512 above it (commit 5bbe47d5, tuned on the CPU pool's L2 behaviour), which made the same prompt compute two
+/// different answers depending on its length: every projection and the attention is launched by shape, and a 511-row
+/// launch does not accumulate like a 256-row one.  With each of them now in fixed 256-row tiles the chunk size no
+/// longer changes a bit - verified at 511 tokens and at 8,190 - and the full chunk is the faster side of the pair
+/// (1.20x at 511 tokens, 1.41x at 8,190 through the streamed arm).
+/// docs/experiments/kolibri-stream-kernels-layout.md, sections 17-21.
 static inline int pf_chunk_at(int64_t p0) {
-    // The env value CAPS the chunk; the default is prefix-dependent: a short prefix runs a SMALL chunk (the
-    // router's x matrix then fits the T4's L2 - the 384 expert GEMVs re-read it, and at T=512 it is 5.2 MB vs
-    // the 4 MB L2: pp512 4.73 s at T=256 vs 5.13 s at T=512), while a long prefix runs the full 512 (more chunks
-    // mean more per-chunk overheads: at 32K, T=256 measured 320.9 s vs T=512's 301.5 s).
-    // STRATA_KOLIBRI_PF_CHUNK_FULL=1 returns the cap itself, so the chunk-size A/Bs of the ledger's sections 15-19 can
-    // be run at a fixed size; it is a measurement switch and off by default.
-    static const bool full_chunk = env_on("STRATA_KOLIBRI_PF_CHUNK_FULL");
+    (void) p0;
     static const int cap = [] {
         const char* v = std::getenv("STRATA_KOLIBRI_PF_CHUNK");
         int64_t n = v ? (int64_t) std::atoi(v) : (int64_t) Scratch::kTmax;
@@ -2369,27 +2371,6 @@ static inline int pf_chunk_at(int64_t p0) {
         if (n > (int64_t) Scratch::kTmax) n = (int64_t) Scratch::kTmax;
         return (int) n;
     }();
-    const int small = 256;
-    // ONE chunk size, at every prefix length.  The adaptive rule below (256 below 8,192 tokens, 512 above) was tuned on
-    // the CPU pool, and it makes the engine compute the same prompt two ways depending on its length: the dense
-    // projections and the attention do not agree to the last bit between a 256-row and a 512-row launch, and the
-    // difference reached 11 in absolute logit terms (docs/experiments/kolibri-stream-kernels-layout.md, section 17).
-    // Until that is fixed in the kernels, the chunk is 256 tokens for every prompt, which is the decomposition the
-    // bitwise gates and every reference dump in this repository were taken on.  The 512-token path measured 1.38x on
-    // the streamed arm and is the faster one - and it is the one that disagrees with the reference.
-    // The adaptive rule is back (it is the one commit 5bbe47d5 shipped), and it is safe now: the chunk size no longer
-    // changes the answer (ledger section 21 - the shared expert's projections were the last shape-dependent GEMM), so
-    // the long prefix can take the 512-token chunk that measures 1.41x faster on the streamed arm.
-    (void) small;
-    // ALWAYS the full chunk (512), at every prefix length.  Safe now that the chunk size no longer changes the answer
-    // (ledger section 21): the shared expert's projections were the last shape-dependent GEMM, and with every
-    // projection in fixed 256-row tiles a 512-token chunk and two 256-token chunks are bit-identical - measured at
-    // 511 tokens and at 8,190.  It is also the faster side everywhere: 1.20x at 511 tokens and 1.41x at 8,190.
-    (void) full_chunk;
-    return cap;
-    // The full chunk for a short prefix is FASTER (ids512 4,073 -> 3,591 ms, ids8191 89,507 -> 63,956 ms) and it is NOT
-    // the same computation: 100 % of the logits differed, max |d| 3.37, 3 of 9 argmaxes flipped.  The knob that measured
-    // that is gone rather than left as a trap; docs/experiments/kolibri-stream-kernels-layout.md, section 15, records it.
     return cap;
 }
 
