@@ -187,7 +187,7 @@ bool compare_bits(const std::vector<float>& got, const std::vector<float>& want,
 }
 
 /// Runs one pipeline case: quantize the activations with the pool's own quantizer, run the context, compare.
-void pipeline_case(const Layer& l, Run& r, int top_k, const char* name, int repeat = 1) {
+void pipeline_case(const Layer& l, Run& r, int top_k, const char* name, int repeat = 1, int slots = 2) {
     using namespace strata::kolibri::stream;
     ++g_cases;
     const int tokens = (int) (r.ids.size() / (size_t) top_k);
@@ -213,6 +213,7 @@ void pipeline_case(const Layer& l, Run& r, int top_k, const char* name, int repe
     std::unique_ptr<Context> ctx;
     try {
         Config cfg;
+        cfg.slots = slots;   // the schedule is N-deep; every depth must publish the same rows
         ctx = create(v, cfg);
     } catch (const std::exception& ex) {
         std::printf("  FAIL %s: create threw: %s\n", name, ex.what());
@@ -367,9 +368,10 @@ void failure_cases(const Layer& l, const Layer& l6) {
             threw = true;
         }
         strata::kolibri::stream::detail::fail_allocation_after(-1);
-        // nine allocations per slot, two slots; the Q6_K plane layout adds one device buffer per slot
+        // nine allocations per slot (the Q6_K plane layout adds one per slot), times the configured slot count
         const int per_slot = strata::kolibri::stream::es_plane_layout() ? 10 : 9;
-        if (ord < per_slot * 2) {
+        const int slots_here = strata::kolibri::stream::Config{}.slots;
+        if (ord < per_slot * slots_here) {
             if (!threw) {
                 std::printf("  FAIL alloc-fault: ordinal %d did not fail\n", ord);
                 ++g_failures;
@@ -439,8 +441,10 @@ int main(int argc, char** argv) {
         {
             Run r = make_run(2560, 256, 6, 384, 11);
             pipeline_case(l12, r, 6, "Q4_K down, 256 tokens x top_k 6");
+            pipeline_case(l12, r, 6, "Q4_K down, 256 tokens x top_k 6, three slots", 1, 3);
             Run r2 = make_run(2560, 256, 6, 384, 12);
             pipeline_case(l14, r2, 6, "Q6_K down, 256 tokens x top_k 6");
+            pipeline_case(l14, r2, 6, "Q6_K down, 256 tokens x top_k 6, three slots", 1, 3);
         }
         // (c) skewed: one expert holds 256 + 1 selections (more than three batches on its own)
         {

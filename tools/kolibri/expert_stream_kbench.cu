@@ -11,6 +11,7 @@
 #include "kolibri/expert_stream_kernels.cuh"
 
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <random>
@@ -162,6 +163,43 @@ int main(int argc, char** argv) {
         cudaFree(dp);
         cudaFree(da);
         cudaFree(dout);
+    }
+    // What the arm's weight transfer does between the kernels: eight 2.38 MiB blobs per batch out of pinned host
+    // memory, eight cudaMemcpyAsync calls on one stream.  This times that pattern on its own, so the pipeline's
+    // effective rate can be told apart from the box's single-large-copy rate.
+    {
+        const size_t blob = 2380 * 1024;   // one expert's [gate|up|down] blob at Q4_K/Q6_K on this model
+        const int n_experts = 8;
+        std::vector<uint8_t> hblob(blob * n_experts, 0x5a);
+        uint8_t* pin = nullptr;
+        uint8_t* dst = nullptr;
+        ck(cudaHostAlloc((void**) &pin, blob * n_experts, cudaHostAllocDefault), "pinned");
+        ck(cudaMalloc(&dst, blob * n_experts), "dev");
+        std::memcpy(pin, hblob.data(), hblob.size());
+        cudaStream_t st = nullptr;
+        ck(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "stream");
+        double best = 1e30;
+        for (int r = 0; r < 20; ++r) {
+            cudaEvent_t a, b;
+            ck(cudaEventCreate(&a), "ev");
+            ck(cudaEventCreate(&b), "ev");
+            ck(cudaEventRecord(a, st), "rec");
+            for (int e = 0; e < n_experts; ++e)
+                ck(cudaMemcpyAsync(dst + (size_t) e * blob, pin + (size_t) e * blob, blob, cudaMemcpyHostToDevice, st),
+                   "h2d");
+            ck(cudaEventRecord(b, st), "rec");
+            ck(cudaEventSynchronize(b), "sync");
+            float ms = 0.f;
+            ck(cudaEventElapsedTime(&ms, a, b), "el");
+            if (ms < best) best = ms;
+            ck(cudaEventDestroy(a), "ev");
+            ck(cudaEventDestroy(b), "ev");
+        }
+        std::printf("weight-transfer pattern: %d x %.2f MiB per batch, %.3f ms -> %.2f GB/s (pinned source, one stream)\n",
+                    n_experts, blob / 1048576.0, best, (double) blob * n_experts / (best * 1e6));
+        cudaFreeHost(pin);
+        cudaFree(dst);
+        cudaStreamDestroy(st);
     }
     return 0;
 }

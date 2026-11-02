@@ -88,7 +88,7 @@ struct Context::Impl {
     size_t weight_cap = 0;   ///< bytes for one batch's blobs (the plan's 32 MiB, or one blob if larger)
     bool planes_on = false;  ///< STRATA_KOLIBRI_STREAM_PLANES: keep the Q6_K down rows in the plane layout
     size_t plane_bytes = 0;  ///< bytes of one expert's plane region (rows * nb * 210, unchanged in size)
-    Slot s[2];
+    std::vector<Slot> s;   ///< cfg.slots reusable slots (two by default)
     std::vector<float> ff;   ///< host scratch: one hidden row before quantization (n_ff floats)
 
     ~Impl() {
@@ -203,6 +203,7 @@ std::unique_ptr<Context> create(const LayerView& capacity_view, const Config& co
     const Sizes z = slot_sizes(capacity_view, config, m->cap);
     g_alloc_ordinal = 0;
     try {
+        m->s.resize((size_t) config.slots);
         for (Slot& x : m->s) {
             x.weights = (uint8_t*) dev_alloc(z.weights);
             if (z.planes) x.planes = (uint8_t*) dev_alloc(z.planes);
@@ -378,15 +379,20 @@ Stats run(Context& ctx, const LayerView& view) {
         }
     };
 
-    // ---- the two-slot schedule --------------------------------------------------------------------------------
-    // Batch i loads and computes gate/up on slot i%2 while the host finishes batch i-1 on the other slot.  The slot
-    // reused by batch i was released by batch i-2's scatter, which happened in the previous iteration.
+    // ---- the slot schedule ------------------------------------------------------------------------------------
+    // Batch i issues its weight copy and gate/up on slot i%NS, and the host then finishes the batch NS-1 behind it.
+    // With NS = 2 that is batch i-1 on the other slot: the next copy waits until the older batch's results are on
+    // the host.  With NS = 3 the batch finished here is i-2, so batch i's copy is already in flight while the host
+    // does that batch's SwiGLU and its down product runs - the transfer hides behind a kernel instead of behind the
+    // host.  A slot reused at batch i was released by batch i-NS's scatter, which ran NS-1 iterations ago.
+    const size_t NS = m.s.size();
+    const size_t lag = NS - 1;
     for (size_t i = 0; i < batches.size(); ++i) {
-        Slot& s = m.s[i % 2];
-        stage_gu(batches[i], s);
-        if (i >= 1) stage_down(batches[i - 1], m.s[(i - 1) % 2]);
+        stage_gu(batches[i], m.s[i % NS]);
+        if (i >= lag) stage_down(batches[i - lag], m.s[(i - lag) % NS]);
     }
-    stage_down(batches.back(), m.s[(batches.size() - 1) % 2]);
+    for (size_t k = batches.size() > lag ? batches.size() - lag : 0; k < batches.size(); ++k)
+        stage_down(batches[k], m.s[k % NS]);
 
     st.wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
     st.device_allocations = 0;   // nothing is allocated after create()

@@ -2186,7 +2186,17 @@ static bool expert_stream_layer(const LayerBlobs& b, Scratch& s, const ActSet& A
     v.top_k = K;
     v.output = A.ey_h;
     try {
-        if (!g_expert_stream) g_expert_stream = strata::kolibri::stream::create(v, strata::kolibri::stream::Config{});
+        if (!g_expert_stream) {
+            strata::kolibri::stream::Config cfg;
+            // STRATA_KOLIBRI_STREAM_SLOTS: the pipeline's slot count, 2 (the shipped depth) or up to kMaxSlots.  More
+            // slots let this layer's copy go out before the host blocks on an older batch, which is where a
+            // transfer-bound pipeline gains (docs/experiments/kolibri-stream-kernels-layout.md, section 5).
+            if (const char* sl = std::getenv("STRATA_KOLIBRI_STREAM_SLOTS")) {
+                const int n = std::atoi(sl);
+                if (n >= 2 && n <= strata::kolibri::stream::kMaxSlots) cfg.slots = n;
+            }
+            g_expert_stream = strata::kolibri::stream::create(v, cfg);
+        }
         const strata::kolibri::stream::Stats st = strata::kolibri::stream::run(*g_expert_stream, v);
         g_expert_stream_stats.groups += st.groups;
         g_expert_stream_stats.selections += st.selections;

@@ -1,10 +1,11 @@
-# Streamed expert kernels: four layouts tried, one kept
+# Streamed expert kernels: five layouts tried, one kept
 
 The streamed expert prefill put the prefill's expert products on the GPU (`docs/experiments/kolibri-gpu-streaming.md`).
-This page records four kernel-level layout changes tried on top of it, one at a time, each behind its own switch, each
-required to return the same bits as the CPU pool before its speed was looked at. One is kept; the other three are
-negative results, recorded so nobody pays for them again without new evidence, and the last section says where the
-streamed leg's time actually goes, which is why three of the four could not move it.
+This page records five changes tried on top of it - three kernel layouts, the tile in both of its dimensions, and the
+pipeline's depth - one at a time, each behind its own switch, each required to return the same bits as the CPU pool
+before its speed was looked at. One is kept; the other four are negative results, recorded so nobody pays for them
+again without new evidence. Section 5 gives where the streamed leg's time actually goes, which is why four of the five
+could not move it.
 
 Environment for every number here: Tesla T4 16 GB (sm_75, driver 580.196.07), CUDA 12.8, 2 x E5-2690 v4 with
 `numactl --cpunodebind=1 --membind=1`, Kolibri-1-Q4_K_M, Release build, branch `kolibri-sram-activation` off
@@ -168,15 +169,49 @@ forced histories.
 | host SwiGLU + quantization | 10.0 s (7.6 % of wall) |
 | launches / slot waits | 631,380 / 80,324 |
 
-The weight transfer alone is 76 % of the plain prefill, so at most a quarter of it is anything a kernel can win, and
-half of the kernels' work is hidden behind the copies. That is why every tile in section 4 lands within 1 %.
+The 9.64 GB/s there is the campaign's single-large-copy figure. The bench now times the pattern the arm actually
+issues - eight 2.32 MiB blobs out of pinned host memory, eight `cudaMemcpyAsync` calls on one stream - at **1.676 ms
+per batch, 11.63 GB/s**, so the transfer floor is 64.6 s, not 77.9 s. That still leaves 38 s (0.92 ms per batch) of
+the plain prefill that is not transfer, and about half the kernels' own work hidden behind the copies. This is why
+every tile in section 4 lands within 1 %.
 
 The pipeline, not the tile, is where the rest sits. Per batch the order is weights H2D (1.97 ms at 9.64 GB/s,
 eight groups) → gate/up (1.04 ms) → gate/up D2H → host activation → hidden H2D → down (0.25 ms) → result D2H, and
 `stage_gu(i+1)` is only issued after `stage_down(i-1)` has returned, i.e. after batch i-1's results are on the host.
 So the next batch's transfer hides behind one down product (a quarter of a millisecond) instead of behind the
-previous batch's gate/up kernels (a whole millisecond). A third slot, or issuing the next batch's H2D before the
-previous batch's event wait, is the change with the size of the remaining gap in it: 102.4 s against a 77.9 s floor.
+previous batch's gate/up kernels (a whole millisecond). Section 6 tests whether a third slot closes that, and the
+answer is no.
+
+## 6. Pipeline depth: three and four slots (`STRATA_KOLIBRI_STREAM_SLOTS`) — not kept
+
+**The idea.** Section 5's arithmetic said the host gates the pipeline: `stage_gu(i+1)` is only issued after
+`stage_down(i-1)` returned, so the next batch's copy cannot hide behind the previous batch's gate/up kernels. With
+three slots the batch finished in the same iteration is i-2, and `stage_gu(i)`'s copy is already in flight while the
+host works, so the copy should hide behind a kernel instead of behind the host. `Config::slots` and the schedule are
+N-deep (`lag = slots - 1`), every depth publishes the same rows, and the pipeline test now runs its two model-geometry
+cases at three slots as well (78 cases).
+
+**It is consistently slower**, in every history and at every depth above two:
+
+| prefill ms, medians | 2 slots (shipped) | 3 slots | 4 slots |
+| --- | ---: | ---: | ---: |
+| ids512 (511 tokens), 3 reps | 4,852 | 4,899 (+1.0 %) | 4,930 (+1.6 %) |
+| ids8191 (8,190 tokens), 2 reps | 102,965 | 105,431 (+2.4 %) | 105,522 (+2.5 %) |
+| ids11000 (10,999 tokens), 1 rep | 109,820 | 111,263 (+1.3 %) | — |
+
+Full-logit dumps byte-identical at three slots on all six forced histories.
+
+**Why the arithmetic in section 5 was wrong.** Two slots were already enough. `stage_gu(i)` returns as soon as it has
+issued its copies and its kernel launches, so `stage_gu(i+1)`'s copy is issued about one host-stage later - and the
+host stage is short - which is early enough to start while batch i's gate/up kernels are still running. The host was
+not the gate; adding a slot only put a third stream's copies in flight against the same DMA engines and the same
+VRAM, which is the 1 to 2.5 %.
+
+So the residual is not depth and not the tile. It is inside one slot's stream: a batch's own copy (1.676 ms) and its
+own gate/up kernels (1.30 ms) are serialized by the dependency, so a batch costs copy + the part of its kernels that
+the *next* batch's copy cannot cover. Splitting the copy per expert group and alternating two weight sub-buffers
+inside a slot - a group's copy on a copy stream while the previous group's kernels run, joined by an event per group
+- is the change that attacks that, and it is a different design from this one.
 
 ## What the four add up to
 
