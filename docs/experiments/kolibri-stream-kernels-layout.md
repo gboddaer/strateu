@@ -726,16 +726,23 @@ the bounds are invariant, so the per-tile key-bound change this section set out 
 **And it is not a race.** Two identical 511-token runs produced byte-identical attention dumps and byte-identical
 logits.
 
-**The discriminator that settles it: swap the attention kernel, keep everything else.** With
-`STRATA_KOLIBRI_ATTN_FLASH=0` (the cuBLAS attention) instead of the flash kernel:
+**RETRACTED: "the non-flash attention is chunk-invariant".** That measurement was taken after the A/B knob had been
+removed from `pf_chunk_at`, so `STRATA_KOLIBRI_PF_CHUNK=511` did nothing and *both* arms ran 256-token chunks - the
+comparison was a run against itself. Re-run with the knob back (`STRATA_KOLIBRI_PF_CHUNK_FULL=1`, committed as a
+measurement switch), the truth is the opposite:
 
-| ids512, non-flash attention | chunk 256 | chunk 511 | |
-| --- | ---: | ---: | --- |
-| logits | 4,163 ms | 4,127 ms | **IDENTICAL** |
+| ids512, forced chunk 511 against 256 | logits |
+| --- | --- |
+| `STRATA_KOLIBRI_ATTN_FLASH=0` (cuBLAS attention) | **DIFFER**, and 511 is 3.45 s against 3.98 s |
+| `STRATA_KOLIBRI_ATTN_FLASH=1` (flash attention) | **DIFFER**, and 511 is 3.62 s against 4.17 s |
 
-So with the dense projections tiled to 256 rows (section 18) and the non-flash attention, **the chunk size stops
-mattering at all** - 511 tokens in one chunk and 256+255 in two produce the same output bit for bit. The whole
-remaining dependence is inside `k_attn_flash`.
+So both attention paths are chunk-dependent, and the last source is *upstream of the kernel choice*. The KV dump
+(`STRATA_KOLIBRI_KV_DUMP`) on layer 0 - a sliding layer, stride 513 - says where: the **K cache rows differ from token
+64 onward** (193,532 of 262,144 bytes in rows 0..255, first difference at token 64), with identical headers and
+identical rows 0..63. That is the next place to look: whatever writes K for a sliding layer above 64 tokens per chunk.
+
+The retraction is recorded here rather than deleted because the lesson is the one this ledger keeps relearning: a
+measurement whose switch is inert is not a measurement, and it read as a clean result.
 
 **What that costs, measured so the choice can be made:**
 

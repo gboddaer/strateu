@@ -2359,6 +2359,9 @@ static inline int pf_chunk_at(int64_t p0) {
     // router's x matrix then fits the T4's L2 - the 384 expert GEMVs re-read it, and at T=512 it is 5.2 MB vs
     // the 4 MB L2: pp512 4.73 s at T=256 vs 5.13 s at T=512), while a long prefix runs the full 512 (more chunks
     // mean more per-chunk overheads: at 32K, T=256 measured 320.9 s vs T=512's 301.5 s).
+    // STRATA_KOLIBRI_PF_CHUNK_FULL=1 returns the cap itself, so the chunk-size A/Bs of the ledger's sections 15-19 can
+    // be run at a fixed size; it is a measurement switch and off by default.
+    static const bool full_chunk = env_on("STRATA_KOLIBRI_PF_CHUNK_FULL");
     static const int cap = [] {
         const char* v = std::getenv("STRATA_KOLIBRI_PF_CHUNK");
         int64_t n = v ? (int64_t) std::atoi(v) : (int64_t) Scratch::kTmax;
@@ -2374,7 +2377,7 @@ static inline int pf_chunk_at(int64_t p0) {
     // Until that is fixed in the kernels, the chunk is 256 tokens for every prompt, which is the decomposition the
     // bitwise gates and every reference dump in this repository were taken on.  The 512-token path measured 1.38x on
     // the streamed arm and is the faster one - and it is the one that disagrees with the reference.
-    (void) small;
+    if (full_chunk) return cap;
     if (cap >= small) return small;
     return cap;
     // The full chunk for a short prefix is FASTER (ids512 4,073 -> 3,591 ms, ids8191 89,507 -> 63,956 ms) and it is NOT
