@@ -1,10 +1,10 @@
-# Streamed expert kernels: five layouts tried, one kept
+# Streamed expert kernels: six layouts tried, one kept
 
 The streamed expert prefill put the prefill's expert products on the GPU (`docs/experiments/kolibri-gpu-streaming.md`).
-This page records five changes tried on top of it - three kernel layouts, the tile in both of its dimensions, and the
-pipeline's depth - one at a time, each behind its own switch, each required to return the same bits as the CPU pool
-before its speed was looked at. One is kept; the other four are negative results, recorded so nobody pays for them
-again without new evidence. Section 5 gives where the streamed leg's time actually goes, which is why four of the five
+This page records six changes tried on top of it - three kernel layouts, the tile in both of its dimensions, the
+pipeline's depth and its copy streams - one at a time, each behind its own switch, each required to return the same bits as the CPU pool
+before its speed was looked at. One is kept; the other five are negative results, recorded so nobody pays for them
+again without new evidence. Section 5 gives where the streamed leg's time actually goes, which is why five of the six
 could not move it.
 
 Environment for every number here: Tesla T4 16 GB (sm_75, driver 580.196.07), CUDA 12.8, 2 x E5-2690 v4 with
@@ -212,6 +212,39 @@ own gate/up kernels (1.30 ms) are serialized by the dependency, so a batch costs
 the *next* batch's copy cannot cover. Splitting the copy per expert group and alternating two weight sub-buffers
 inside a slot - a group's copy on a copy stream while the previous group's kernels run, joined by an event per group
 - is the change that attacks that, and it is a different design from this one.
+
+## 7. A copy stream with a per-group event (`STRATA_KOLIBRI_STREAM_COPY_STREAM=1`) — not kept
+
+**The idea.** On one stream a batch's kernels cannot start until the batch's last byte has landed, so the copy and the
+compute of one batch never overlap with each other. Send the weight and hidden-row copies on their own stream, record
+an event per expert group, and let each group's kernel wait for its own blob: group g's gate/up then starts while
+group g+1 is still arriving. `Config::split_copy_stream`, the pipeline test's two model-geometry cases also run with it
+(80 cases, all bit-identical).
+
+**It is slower, and a self-inflicted regression is recorded with it.** The first version of the change also split the
+hidden-row copy per group in the *unsplit* path - eight 2 KB copies instead of one - and that alone cost 3.8 % on the
+baseline (102,965 → 106,940 ms on ids8191). The numbers below are from the fixed build, where the unsplit path is
+byte-for-byte the previous one:
+
+| prefill ms, medians | one stream (shipped) | split copy stream |
+| --- | ---: | ---: |
+| ids512 (511 tokens), 2 reps | 4,957 | 4,889 |
+| ids8191 (8,190 tokens), 3 reps | 102,496 | 105,520 (+3.0 %) |
+| ids11000 (10,999 tokens), 1 rep | 109,096 | 109,820 |
+
+Bit-identical on all six forced histories. The reason is the same as section 6's: the two slots already overlap batch
+i's copy with batch i-1's compute, so the only thing the per-group split adds is sixteen event handoffs per batch
+(eight weight, eight hidden), and a handoff costs more than the overlap it buys.
+
+**Two copy-rate measurements that rule out the source memory** (both in the bench, one stream, eight 2.32 MiB blobs):
+
+| source | per batch | rate |
+| --- | ---: | ---: |
+| a hot 19 MiB pinned buffer | 1.652 ms | 11.81 GB/s |
+| a 43 GiB pinned table, scattered experts (the engine's shape) | 1.839 ms | 10.60 GB/s |
+
+So the engine's table shape costs 10 % of the copy rate, not the 35 % the pipeline loses: the arm's 2.60 ms per batch
+against a 1.84 ms copy floor is not a memory-placement problem either.
 
 ## What the four add up to
 

@@ -201,5 +201,49 @@ int main(int argc, char** argv) {
         cudaFree(dst);
         cudaStreamDestroy(st);
     }
+    // The same pattern out of a table the size of the model's own: 43 GiB of pinned host memory, each batch's eight
+    // blobs taken from scattered experts.  The engine's table is that shape, and if this is slower than the hot
+    // 19 MiB source above, the arm is bounded by the source memory and not by its kernels or its pipeline.
+    {
+        const size_t blob = 2380 * 1024;
+        const int n_experts = 8;
+        const size_t table = (size_t) 43 << 30;
+        uint8_t* big = nullptr;
+        if (cudaHostAlloc((void**) &big, table, cudaHostAllocDefault) != cudaSuccess) {
+            std::printf("weight-transfer pattern: no 43 GiB of pinned memory here, the large-table case is skipped\n");
+            cudaGetLastError();
+            return 0;
+        }
+        std::memset(big, 0x11, table);   // touch it once: the pages must exist, as the engine's table's do
+        uint8_t* dst = nullptr;
+        ck(cudaMalloc(&dst, blob * n_experts), "dev");
+        cudaStream_t st = nullptr;
+        ck(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "stream");
+        std::mt19937 r2(99);
+        std::uniform_int_distribution<size_t> pick(0, table / blob - 1);
+        double best = 1e30;
+        for (int r = 0; r < 20; ++r) {
+            cudaEvent_t a, b;
+            ck(cudaEventCreate(&a), "ev");
+            ck(cudaEventCreate(&b), "ev");
+            ck(cudaEventRecord(a, st), "rec");
+            for (int e = 0; e < n_experts; ++e)
+                ck(cudaMemcpyAsync(dst + (size_t) e * blob, big + pick(r2) * blob, blob, cudaMemcpyHostToDevice, st),
+                   "h2d");
+            ck(cudaEventRecord(b, st), "rec");
+            ck(cudaEventSynchronize(b), "sync");
+            float ms = 0.f;
+            ck(cudaEventElapsedTime(&ms, a, b), "el");
+            if (ms < best) best = ms;
+            ck(cudaEventDestroy(a), "ev");
+            ck(cudaEventDestroy(b), "ev");
+        }
+        std::printf("weight-transfer pattern: %d x %.2f MiB per batch out of a 43 GiB pinned table, %.3f ms -> "
+                    "%.2f GB/s\n",
+                    n_experts, blob / 1048576.0, best, (double) blob * n_experts / (best * 1e6));
+        cudaFreeHost(big);
+        cudaFree(dst);
+        cudaStreamDestroy(st);
+    }
     return 0;
 }

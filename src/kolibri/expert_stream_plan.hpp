@@ -74,6 +74,11 @@ struct Config {
     /// i-1.  More slots let the host issue the next batch's copy before it blocks on an older batch's results, which
     /// is where a transfer-bound pipeline gains - see docs/experiments/kolibri-stream-kernels-layout.md, section 5.
     int slots = 2;
+    /// Send the weight and hidden-row copies on a stream of their own instead of the slot's compute stream, with an
+    /// event per expert group so each group's kernel waits only for its own blob.  On one stream a batch's kernels
+    /// cannot start until the whole batch's copy has landed, which is the serialization the ledger's section 6
+    /// points at.
+    bool split_copy_stream = false;
 };
 
 /// What create() must allocate.  Both slots are counted; every buffer is aligned to kBufferAlign.

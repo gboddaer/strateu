@@ -2195,6 +2195,9 @@ static bool expert_stream_layer(const LayerBlobs& b, Scratch& s, const ActSet& A
                 const int n = std::atoi(sl);
                 if (n >= 2 && n <= strata::kolibri::stream::kMaxSlots) cfg.slots = n;
             }
+            // STRATA_KOLIBRI_STREAM_COPY_STREAM=1 sends the weight and hidden-row copies on a stream of their own with
+            // an event per expert group, so a group's kernel waits for its own blob instead of the batch's last one.
+            if (const char* ccopy = std::getenv("STRATA_KOLIBRI_STREAM_COPY_STREAM")) cfg.split_copy_stream = ccopy[0] == '1';
             g_expert_stream = strata::kolibri::stream::create(v, cfg);
         }
         const strata::kolibri::stream::Stats st = strata::kolibri::stream::run(*g_expert_stream, v);

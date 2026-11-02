@@ -65,6 +65,8 @@ struct Slot {
     uint8_t* hidden_pin = nullptr;
     float* out_pin = nullptr;
     cudaStream_t st = nullptr;
+    cudaStream_t copy_st = nullptr;         ///< the split copy stream (Config::split_copy_stream)
+    std::vector<cudaEvent_t> ev_fill;       ///< per group: this group's copy has landed
     cudaEvent_t ev_gu = nullptr;    ///< gate/up results are on the host
     cudaEvent_t ev_out = nullptr;   ///< down results are on the host
 };
@@ -94,6 +96,10 @@ struct Context::Impl {
     ~Impl() {
         for (Slot& x : s) {
             if (x.st) cudaStreamSynchronize(x.st);
+            if (x.copy_st) cudaStreamSynchronize(x.copy_st);
+            for (cudaEvent_t e : x.ev_fill)
+                if (e) cudaEventDestroy(e);
+            if (x.copy_st) cudaStreamDestroy(x.copy_st);
             for (cudaEvent_t e : {x.ev_gu, x.ev_out})
                 if (e) cudaEventDestroy(e);
             for (void* p : {(void*) x.weights, (void*) x.planes, (void*) x.acts, (void*) x.gu, (void*) x.hidden,
@@ -216,6 +222,12 @@ std::unique_ptr<Context> create(const LayerView& capacity_view, const Config& co
             x.hidden_pin = (uint8_t*) pin_alloc(z.hidden);
             x.out_pin = (float*) pin_alloc(z.out);
             ck(cudaStreamCreateWithFlags(&x.st, cudaStreamNonBlocking), "cudaStreamCreate");
+            if (m->cfg.split_copy_stream) {
+                ck(cudaStreamCreateWithFlags(&x.copy_st, cudaStreamNonBlocking), "cudaStreamCreate");
+                x.ev_fill.assign((size_t) config.experts_per_batch, nullptr);
+                for (cudaEvent_t& e : x.ev_fill)
+                    ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "cudaEventCreate");
+            }
             ck(cudaEventCreateWithFlags(&x.ev_gu, cudaEventDisableTiming), "cudaEventCreate");
             ck(cudaEventCreateWithFlags(&x.ev_out, cudaEventDisableTiming), "cudaEventCreate");
         }
@@ -264,11 +276,16 @@ Stats run(Context& ctx, const LayerView& view) {
     const std::vector<Batch> batches = make_batches(groups, m.cfg, weight_cap, blob);
 
     auto stage_gu = [&](const Batch& b, Slot& s) {
+        // Where a copy runs: the slot's own stream, or its copy stream when they are split.  Split, each group's
+        // blob gets its own event so that group's kernel waits for its own bytes and not for the batch's last one;
+        // the copy stream then runs ahead while the compute stream multiplies.
+        cudaStream_t cs = s.copy_st != nullptr ? s.copy_st : s.st;
         size_t woff = 0, row = 0;
-        for (int gi : b.group) {
-            const Group& g = groups[(size_t) gi];
+        for (size_t i = 0; i < b.group.size(); ++i) {
+            const Group& g = groups[(size_t) b.group[i]];
             const uint8_t* src = view.weights + (size_t) g.expert * view.weight_stride;
-            ck(cudaMemcpyAsync(s.weights + woff, src, blob, cudaMemcpyHostToDevice, s.st), "weights H2D");
+            ck(cudaMemcpyAsync(s.weights + woff, src, blob, cudaMemcpyHostToDevice, cs), "weights H2D");
+            if (s.copy_st != nullptr) ck(cudaEventRecord(s.ev_fill[i], cs), "record weights");
             st.weight_h2d_bytes += blob;
             // gather this group's activations (one Q8_K row per selection, in its original order)
             for (int sel : g.selections) {
@@ -284,6 +301,7 @@ Stats run(Context& ctx, const LayerView& view) {
         // same bytes and the packing runs on the idle copy stream, not on the host.
         if (m.planes_on && f.fmt.d_type == kQ6K) {
             for (size_t i = 0; i < b.group.size(); ++i) {
+                if (s.copy_st != nullptr) ck(cudaStreamWaitEvent(s.st, s.ev_fill[i], 0), "wait for weights");
                 const int rcp = es_q6k_pack_planes(s.weights + i * blob + f.fmt.down_off, s.planes + i * m.plane_bytes,
                                                    (int) (f.fmt.n_ff / 256), (int) m.n_embd, s.st);
                 if (rcp != 0) refuse("the Q6_K plane packing was refused");
@@ -294,6 +312,7 @@ Stats run(Context& ctx, const LayerView& view) {
         for (size_t i = 0; i < b.group.size(); ++i) {
             const Group& g = groups[(size_t) b.group[i]];
             const int ntok = (int) g.selections.size();
+            if (s.copy_st != nullptr) ck(cudaStreamWaitEvent(s.st, s.ev_fill[i], 0), "wait for weights");
             // The paired entry covers gate row k and up row k in one thread, so it is handed n_ff rows instead of
             // 2 * n_ff and writes the same [gate | up] output; the whole-table launch stays the other choice.
             const int rc = es_gu_pairing()
@@ -334,7 +353,23 @@ Stats run(Context& ctx, const LayerView& view) {
         }
         st.cpu_activation_ms +=
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        ck(cudaMemcpyAsync(s.hidden, s.hidden_pin, b.rows * f.fmt.h_bytes, cudaMemcpyHostToDevice, s.st), "hidden H2D");
+        // One hidden-row copy per group, on the copy stream when it is split, with the group's own event: the first
+        // group's down kernel no longer waits for the last group's row to reach the card.
+        if (s.copy_st != nullptr) {
+            cudaStream_t cs = s.copy_st;
+            size_t hrow = 0;
+            for (size_t i = 0; i < b.group.size(); ++i) {
+                const size_t rows_i = groups[(size_t) b.group[i]].selections.size();
+                ck(cudaMemcpyAsync(s.hidden + hrow * f.fmt.h_bytes, s.hidden_pin + hrow * f.fmt.h_bytes,
+                                   rows_i * f.fmt.h_bytes, cudaMemcpyHostToDevice, cs),
+                   "hidden H2D");
+                ck(cudaEventRecord(s.ev_fill[i], cs), "record hidden rows");
+                hrow += rows_i;
+            }
+        } else {
+            ck(cudaMemcpyAsync(s.hidden, s.hidden_pin, b.rows * f.fmt.h_bytes, cudaMemcpyHostToDevice, s.st),
+               "hidden H2D");
+        }
         st.hidden_h2d_bytes += b.rows * f.fmt.h_bytes;
         // one down launch per expert, from the same packed slot layout as stage_gu()
         size_t woff = 0;
@@ -342,6 +377,7 @@ Stats run(Context& ctx, const LayerView& view) {
             const Group& g = groups[(size_t) b.group[i]];
             const int ntok = (int) g.selections.size();
             const uint8_t* down = s.weights + woff + f.fmt.down_off;
+            if (s.copy_st != nullptr) ck(cudaStreamWaitEvent(s.st, s.ev_fill[i], 0), "wait for hidden rows");
             const int rc = f.fmt.d_type == kQ4K
                                ? es_q4k_rows(down, (int) (f.fmt.n_ff / 256), m.n_embd,
                                              s.hidden + b.row[i] * f.fmt.h_bytes, (int) f.fmt.h_bytes, ntok,
