@@ -713,6 +713,56 @@ first divergence is a shape-dependent GEMM which is now fixed, and that the resi
 (`min(P, p0c + q0 + QT)`) instead of per-chunk, re-run the 511-vs-256 comparison, and if the attention output becomes
 bit-identical the 512-token chunk can come back with the arm's 1.38x on top of it.
 
+## 19. The follow-up: the attention kernel is the last source, and it is priced
+
+Section 18 left one ulp of chunk dependence in `k_attn_flash` and named it. This is what it costs to chase, and what the
+chase found.
+
+**The mask is not the cause.** `attn_mask_bounds` gives a row `n = min(pos + 1, P)` with `P = p0c + Tc`, so a row's
+visible key count is its own position plus one at any chunk length; the block bound uses `min(q0 + 7, T - 1)`, which for
+the same absolute positions is the same number whether the chunk is 256 or 511 tokens. Checked against the source:
+the bounds are invariant, so the per-tile key-bound change this section set out to make has nothing to bite on.
+
+**And it is not a race.** Two identical 511-token runs produced byte-identical attention dumps and byte-identical
+logits.
+
+**The discriminator that settles it: swap the attention kernel, keep everything else.** With
+`STRATA_KOLIBRI_ATTN_FLASH=0` (the cuBLAS attention) instead of the flash kernel:
+
+| ids512, non-flash attention | chunk 256 | chunk 511 | |
+| --- | ---: | ---: | --- |
+| logits | 4,163 ms | 4,127 ms | **IDENTICAL** |
+
+So with the dense projections tiled to 256 rows (section 18) and the non-flash attention, **the chunk size stops
+mattering at all** - 511 tokens in one chunk and 256+255 in two produce the same output bit for bit. The whole
+remaining dependence is inside `k_attn_flash`.
+
+**What that costs, measured so the choice can be made:**
+
+| | flash (today's default) | non-flash |
+| --- | ---: | ---: |
+| ids512 prefill | 4,115 ms | 4,163 ms (+1.2 %) |
+| ids8191 prefill | 90,372 ms | 91,059 ms (+0.8 %) |
+
+**So the 40 % is recoverable, and this is the shape of the trade, not a recommendation this branch can take alone.**
+Two ways to spend it:
+
+1. **Keep flash, keep one chunk size** (what the branch ships): every prompt computes the same way, no reference dump
+   changes, and long prompts pay the 40 % that the divergent 512-token path used to hide.
+2. **Take the non-flash attention, then restore the 512-token chunk for long prompts**: chunk-invariance is restored by
+   measurement, the streamed arm gets its 1.38x back (88.7 s at 11k instead of 124.3 s), and the price is a different
+   attention kernel - which changes *every* prompt's logits by one to a few ulps and so needs re-baselining every
+   reference dump and the maintainer's decision, not a silent default change.
+
+A third way, and the cheapest if someone has a day: find the Tc dependence inside `k_attn_flash` itself (the mask and
+the bounds are ruled out above, so it is in the body - the staging loops or the warp-liveness path are the places to
+look), and keep flash's 1.2 % with full consistency.
+
+**The honest summary of the 40 %:** it was never free. It came from a chunk size that changed the answer, and the
+answer changed because two kernels - the dense projection GEMM and the flash attention - are shape-dependent. One of
+those is now fixed for good (the GEMM, bit-neutral, verified), the other is located to a single kernel and priced at
+0.8-1.2 %.
+
 ## What the four add up to
 
 The streamed arm's remaining cost is not where the Qwen engine's wins are. Its wins are in VRAM-resident decode
