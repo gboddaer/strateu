@@ -5984,7 +5984,7 @@ int serve(Engine& e, Scratch& s) {
             std::printf("RESUME %lld\n", (long long) reuse);
             std::fflush(stdout);
         }
-        if (e.prefill > 0) {   // chunked prefill: 512 rows per pass, progress per chunk
+        if (e.prefill > 0) {   // chunked prefill: one 512-row pass, progress per chunk
             int64_t i = reuse;
             const int64_t n = pf_end - reuse;   // the tokens still to read (== ids.size()-1 when reuse is 0)
             e.hot_pos_at_last = s.pos;   // the request's own position count, so a reuse does not inherit the last one
@@ -6479,6 +6479,21 @@ int strata::kolibri::run(int argc, char** argv) {
     // CUDA-graph decode rides the grouped path (device-side expert pointers); the slots/pool paths read host
     // ids per layer and are not capturable.  --no-graph keeps the plain launches.
     e.graphs = grouped && !no_graph && slots == 0 && cpu_threads == 0 ? 1 : 0;
+    // A served request reads its prompt through the CHUNKED prefill by default.  That is the path every reference and
+    // every measurement in this repository was taken on, it reads a prompt 2.3x faster than the per-token loop (479
+    // tokens: 7,197 ms against 16,272 ms, measured through /v1/chat/completions), and it is where the streamed expert
+    // arm lives - the per-token loop never reaches it.  It has to be decided here, before the arm's guard below reads
+    // `prefill`.  STRATA_KOLIBRI_SERVE_TOKENS=1 restores the per-token read for an A/B.
+    if (serve_mode && prefill <= 0) {
+        static const bool per_token = [] {
+            const char* v = std::getenv("STRATA_KOLIBRI_SERVE_TOKENS");
+            return v != nullptr && v[0] != 0 && std::atoi(v) != 0;
+        }();
+        if (!per_token) {
+            prefill = 1;     // the arm's guard below reads this
+            e.prefill = 1;   // and this is what serve() runs on (copied at `e.prefill = prefill` far above)
+        }
+    }
     e.prefill = prefill;
     // The CPU pool is OPT-IN (--cpu-threads) and its absence is SILENT: with no pool every routed expert falls
     // through to the per-expert GPU mmvq loop (measured on 2026-10-21: 364,350 mmvq launches = 26.8 s of 35 s
@@ -6610,7 +6625,10 @@ int strata::kolibri::run(int argc, char** argv) {
         else if (pf_partial_on()) why = "STRATA_KOLIBRI_PF_PARTIAL publishes partial sums instead of ey_h";
         else if (dec_res_on()) why = "STRATA_KOLIBRI_DEC_RES serves resident picks on the GPU";
         else if (pf_mmq_on()) why = "the MMQ prompt arm replaces the pool's expert products";
-        else if (serve_mode) why = "the streamed arm serves prefill chunks, not a served request stream";
+        // A served request is not a reason to refuse.  The arm is consulted from forward_multi's chunked prefill
+        // expert leg and from nothing else: a served request's DECODE still goes through the plain path and the
+        // pool/slots, exactly as the CLI's does.  With the chunked prefill on (prefill = 1 below, which serve mode
+        // now sets) a served 479-token prompt runs the same arm a CLI --prefill run does.
         else if (stream_capture_on()) why = "the capture hook records the CPU pool's leg; the streamed arm is a different leg";
         if (why != nullptr) {
             if (expert_stream_demanded()) {

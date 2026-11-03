@@ -931,6 +931,44 @@ rewrite from scratch - a patch-shaped instruction ("fix these errors, change not
 no characters appear, `Ctrl+Q` does not exit, `Ctrl+S` writes no file. Compiles, starts, and is functionally broken -
 the honest end state of this test, and the reason the interface notes above matter more than the program itself.
 
+## 23. Why the API could not reach the arm's 150 tok/s, and the three things that blocked it
+
+Section 22 measured the served path at 24-29 tok/s and put it down to "the streamed prefill arm does not serve". That was
+the symptom. Driving the engine's own request protocol and tee-ing the pipe it talks over through the server found three
+causes, in the order they bite:
+
+1. **Serve never ran the chunked prefill.** `--prefill` is a flag, the server's config did not pass it, and `serve()`
+   branches on `e.prefill`: with 0 it reads the prompt **one token at a time** through `forward()` (measured 16,272 ms
+   for 479 tokens = 29 tok/s) instead of through `forward_multi` (7,197 ms = 66 tok/s, pool). The streamed arm is called
+   from `forward_multi`'s chunked expert leg and from nowhere else, so the per-token loop could never reach it.
+2. **The arm refused serve mode outright**: `expert_stream_usable` listed `serve_mode` among the configurations it
+   cannot serve ("the streamed arm serves prefill chunks, not a served request stream"). That is a caution, not an
+   incompatibility - a served request's *decode* still goes through the plain path and the pool, exactly as the CLI's
+   does - so the line is gone.
+3. **`prefill` had to be decided before everything that reads it.** Setting it after the parse (which is where it was
+   first put) crashed the engine on the first request: `prefill gemm: scratch too small for K=2560`, exit 1, which the
+   server reported as "the engine stopped unexpectedly (exit code 1)" and the client as HTTP 503. The prompt GEMM handle
+   and its dequant scratch are initialised under `if (e.prefill > 0)` and the pool's pinned staging is sized from it,
+   so the default now lands immediately before `e.prefill = prefill`.
+
+With the three fixed, the same three-turn conversation through `/v1/chat/completions`:
+
+| | turn 1 | turn 2 | turn 3 |
+| --- | ---: | ---: | ---: |
+| prompt tokens / of which cached | 479 / 0 | 518 / **475** | 558 / **512** |
+| prefill | **3,474 ms (137.9 tok/s)** | 1,213 ms | 1,209 ms |
+| wall clock for the whole turn | 4.3 s | 2.0 s | 2.0 s |
+
+Turn 1 is 4.6x the per-token path (16,272 -> 3,474 ms) and lands on the CLI's own number (145 tok/s measured through the
+engine's protocol). `STRATA_KOLIBRI_SERVE_TOKENS=1` restores the per-token read for an A/B.
+
+**Correctness, which was the point of switching:** the served text is **identical on all three turns** to the
+pool-served, chunked run of section 22 - i.e. the arm serving a served request's prefill produces the same tokens the
+CPU pool does, which is the parity the whole campaign rests on. It is *not* identical to the per-token run, and that is
+expected: `forward_multi`'s comment already says "bitwise vs the per-token plain path is not expected (FP16 GEMM
+scores)". The CLI path is unchanged and still byte-identical on the six histories (ids512 re-checked after the change:
+3,541 ms, dump identical), and the kernel and pipeline suites still pass.
+
 ## What the four add up to
 
 The streamed arm's remaining cost is not where the Qwen engine's wins are. Its wins are in VRAM-resident decode
