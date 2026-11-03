@@ -5624,16 +5624,31 @@ class Service:
                                   f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
                                   "instruction (reasoning_loop_recovery)", flush=True)
                             continue
-                        if (self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
+                        # #606/#728: the reply was ended inside its thinking by a degenerate-output guard, not by the
+                        # model closing the thinking: it has no answer either, so the same one retry applies.
+                        degenerate = bool(repeated or looped)
+                        if (self.reasoning_close_retry and thinking
+                                and (finish == "stop" or (finish == "length" and degenerate)) and not close_retried
                                 and not answered and not wrap and not opens and parser.state == "reasoning"
                                 and parser.buf != THINK_END         # #537: not after a held </think>, the end
                                 and (stops is None or stops.hit is None) and not cancel.is_set()):
                             # #1053: the model wrote its reasoning and stopped before </think>: the client would get
                             # an empty answer.  Close the thinking once and let it answer.
                             close_retried = True
+                            if degenerate:
+                                # The loop's own words are in the context, so answering at the settings that looped
+                                # would loop again: raise the two that keep the same words from coming back (as
+                                # reasoning_loop_recovery does; a client's top_p, top_k and seed are never touched),
+                                # and give the repeat guard a fresh count for the pass that answers.
+                                want = (max(1.0, float((sampling or {}).get("temperature") or 0)),
+                                        max(1.5, float((sampling or {}).get("presence_penalty") or 0)))
+                                sampling = {**(sampling or {}), "temperature": want[0],
+                                            "presence_penalty": want[1]}
+                                run_tok, run_len, repeated, looped = None, 0, False, False
                             extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
                             if max_new - n - len(extra) >= 1:
-                                print("[strata] the reply ended inside its thinking with no answer: closing the "
+                                print("[strata] the reply ended inside its thinking with no answer"
+                                      + (" (a repeated token, #606)" if degenerate else "") + ": closing the "
                                       "thinking once and continuing (reasoning_close_retry)", flush=True)
                                 for t in extra:
                                     n += 1

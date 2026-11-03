@@ -4138,6 +4138,79 @@ class EndsInsideThinkingEngine(ThinkingEngine):
             yield t
 
 
+class LoopsInThinkingEngine(ThinkingEngine):
+    """A degenerate thinking reply (#606): one token repeated past the guard, so the reply ends as "length" inside
+    the thinking with no answer.  A prompt that ends the thinking gets the answer, as the model continues after
+    ``.  Records the sampler each pass was given."""
+    LOOP_TOKEN = ord("!")
+    ANSWER = "The answer is 4."
+
+    def __init__(self, tok):
+        super().__init__(tok)
+        self.samplings = []
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        self.samplings.append(dict(sampling or {}))
+        done = self.tok.decode(ids).endswith("</think>" + chr(10) + chr(10))
+        out = self.tok.encode(self.ANSWER) if done else self.tok.encode("Thinking") + [self.LOOP_TOKEN] * 400
+        for t in (out + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
+            if cancel.is_set():
+                return
+            yield t
+
+
+class ReasoningCloseRetryAfterRepeatGuard(unittest.TestCase):
+    """#1053 extended: a reply ended inside its thinking by the repeat guard (finish "length", #606) is continued
+    once with the thinking closed, the way a reply that stopped there (#1053) is.  A client that asked for thinking
+    and got a degenerate loop then has its answer from one request, not an empty reply."""
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = LoopsInThinkingEngine(self.tok)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def chat(self, **extra):
+        body = {"model": "m", "messages": [{"role": "user", "content": "2+2?"}], "max_tokens": 300, **extra}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read().decode())["choices"][0]
+
+    def test_off_by_default_the_reply_stays_empty(self):
+        c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 1)
+        self.assertFalse(c["message"].get("content"))
+        self.assertEqual(c["finish_reason"], "length")
+
+    def test_on_it_closes_the_thinking_once_and_answers(self):
+        self.svc.reasoning_close_retry = True
+        c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 2)
+        self.assertTrue(self.tok.decode(self.engine.prompts[1]).endswith("</think>" + chr(10) + chr(10)))
+        self.assertEqual(c["message"]["content"], LoopsInThinkingEngine.ANSWER)
+        self.assertEqual(c["finish_reason"], "stop")
+
+    def test_the_retry_raises_only_the_two_settings_that_keep_the_words_coming(self):
+        self.svc.reasoning_close_retry = True
+        self.chat(temperature=.2, presence_penalty=0, top_p=.95, top_k=64, seed=2)
+        self.assertEqual(len(self.engine.samplings), 2)
+        second = self.engine.samplings[1]
+        self.assertEqual((second["temperature"], second["presence_penalty"]), (1.0, 1.5))
+        self.assertEqual((second["top_p"], second["top_k"], second["seed"]), (.95, 64, 2))
+
+    def test_a_sampler_already_at_the_recovery_values_is_left_alone(self):
+        self.svc.reasoning_close_retry = True
+        self.chat(temperature=1.0, presence_penalty=1.5, top_p=.95, top_k=20, seed=2)
+        self.assertEqual(self.engine.samplings[0], self.engine.samplings[1])
+
+
 class ReasoningCloseRetry(unittest.TestCase):
     """#1053 (opt-in): a reply that ends inside <think> with no answer is continued once with the thinking closed."""
 

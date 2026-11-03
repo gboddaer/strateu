@@ -969,6 +969,62 @@ expected: `forward_multi`'s comment already says "bitwise vs the per-token plain
 scores)". The CLI path is unchanged and still byte-identical on the six histories (ids512 re-checked after the change:
 3,541 ms, dump identical), and the kernel and pipeline suites still pass.
 
+## 24. The served path against llama.cpp on the same weights, and why the coding agent needed two phase
+
+Same GGUF (`Kolibri-1-Q4_K_M.gguf`, 47.45 GB), same box (Tesla T4 16 GB, 2 x E5-2690 v4, 14 threads), same chat template
+file, same sampling, one prompt set through both APIs. llama.cpp is build 11693 with the `kolibri1` patch and
+`-ngl 99 --n-cpu-moe 50`; this engine runs its streamed arm with `--ctx 131072`.
+
+**The two templates are the same.** `usage.prompt_tokens` is equal on all five probe prompts (66, 68, 76, 68, 83), so
+the rendering, not the prompt, is what any difference below comes from.
+
+**Prompt rates.** Cold prefill of a 479-token prompt: **133.0 tok/s here against 109.3** through llama.cpp. Decode, same
+conversation: **24.7-26.4 against 17.2-20.6 tok/s**. The served fixes of section 23 are what put this side ahead; before
+them the same path ran 29 tok/s.
+
+**Greedy head-to-head (`temperature 0`, `top_k 1`, prompts with no system message).** llama.cpp stays coherent on all
+five; this engine degenerates on two of them (`code-fn` reasoning becomes "I will use as a is the result of the standard
+definition of the user's", and the termios question answers "and and and ..."). Repeating one prompt three times gives
+the same text through llama.cpp and *different* text through this engine, and at `max_tokens 700` one of three runs
+collapsed into a 255-token run of one token. So neither path is a reproducible argmax at `temperature 0`, but only this
+one falls off the cliff, and it does so often enough to matter.
+
+**That is what forced the two-phase trick.** With thinking on, the model loops ("and and", "1 1 1", " * * *") a few
+hundred tokens in; `repeat_stop_tokens` (#606) ends the reply as `length`, and the client gets **no answer at all** —
+measured: 588 tokens, 23 s, `finish=length`, `content` empty. The recovery for that shape existed only for a reply that
+ended on its *stop token* (#1053 `reasoning_close_retry`, opt-in), so the degenerate end was a dead end. An exercise that
+needs an answer therefore had to ask twice: once for the thinking, once for the code with thinking off.
+
+**The fix** (`serve/server.py`, the #1053 block): the one close-and-continue retry now also fires when the reply was ended
+inside its thinking by a degenerate-output guard (`repeat_stop_tokens`, or `reasoning_loop_recovery: "stop"`), not only
+when the model stopped there by itself. On that path it also raises the two settings that keep the same words coming
+(`temperature` to at least 1.0, `presence_penalty` at least 1.5, exactly as `reasoning_loop_recovery` does; a client's
+`top_p`, `top_k` and `seed` are never touched) and gives the guard a fresh count for the pass that answers. It stays
+opt-in: with `reasoning_close_retry` off, which is the default, the path is byte-identical to before.
+
+**Measured, one request each, thinking on, the notepad task of section 23** (`max_tokens` 8192, the desktop agent's
+default):
+
+| | answer in one request | wall | tokens | finish | file |
+| --- | --- | ---: | ---: | --- | --- |
+| before the fix | no | 23 s | 588 | `length` | none |
+| after the fix | **yes** | 90 s | 2,030 | `stop` | 166 lines, complete, code fence closed |
+| llama.cpp, same task | yes | 82 s | 1,425 | `stop` | 154 lines, complete |
+
+The 166-line file compiles after 5 lines are fixed (`std::next`, `string::erase`/`insert` overloads, one missing
+declaration); llama.cpp's 154-line file needs 12. So one request on this path now delivers what llama.cpp delivers in
+one request, at the same wall clock.
+
+**What is still not like llama.cpp.** At `max_tokens 4000` the answer still truncates: `answer_room` gives a 4,000 cap a
+3,000-token thinking budget and 1,000 tokens for the answer, and a 1,400-token file does not fit. 8,192 does fit. A
+client that wants the old shape asks for `reasoning_budget_tokens` explicitly, or turns thinking off. Also, this engine
+leaves the opening ` thinking` marker **inside** `reasoning_content` where llama.cpp strips it - harmless for the tests
+here, visible to any client that shows the reasoning text.
+
+**Not measured.** Any card but this T4; a second quantisation; whether the degeneration is a sampling-order defect or the
+streamed expert accumulation drifting the logits (no per-token logprobs from the engine were compared, so this is
+unattributed); the same comparison at 128K context on the llama.cpp side (32K there, VRAM-bound).
+
 ## What the four add up to
 
 The streamed arm's remaining cost is not where the Qwen engine's wins are. Its wins are in VRAM-resident decode
