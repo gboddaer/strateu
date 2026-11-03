@@ -5884,16 +5884,19 @@ int serve(Engine& e, Scratch& s) {
             const char* v = std::getenv("STRATA_KOLIBRI_REUSE");
             return v == nullptr || std::atoi(v) != 0;
         }();
-        // STRATA_KOLIBRI_REUSE_PREFIX=1 reuses the LONGEST COMMON PREFIX instead of demanding that the whole held
-        // prefix match.  Measured reason: real clients re-render the conversation as TEXT, and a BPE merge across
-        // the turn boundary rewrites the prompt's last token or two - through /v1/chat/completions, turn 2 agreed
-        // with turn 1 on 57 of 59 ids, so the strict check reset and the turn read all 72 tokens (cache_n 0).
-        // Rows 0..reuse-1 belong to the tokens that DO match, so reusing them is exactly as safe as the strict
-        // case, and the rewind below re-derives the chunk the same way.  OPT-IN and off by default, because the
-        // strict rule is the documented contract and the default path must stay byte-identical.
+        // The LONGEST COMMON PREFIX is the default rule, because the strict whole-prefix rule effectively never fires
+        // on real traffic: clients re-render the conversation as TEXT, and a BPE merge across the turn boundary
+        // rewrites the prompt's last token or two, so the strict check resets and the turn reads its whole prompt.
+        // Measured through /v1/chat/completions on a three-turn conversation sharing a 479-token system prompt
+        // (docs/experiments/kolibri-stream-kernels-layout.md, section 22):
+        //   strict rule:        turn 2 cached_tokens 0, prompt 18,106 ms; turn 3 cached 0, 19,959 ms
+        //   longest prefix:     turn 2 cached_tokens 475, prompt 1,846 ms; turn 3 cached 512, 2,230 ms
+        // and the generated text was identical on all three turns.  Rows 0..match-1 belong to the tokens that DO
+        // match, so reusing them is exactly as safe as the strict case, and the rewind below re-derives the chunk the
+        // same way.  STRATA_KOLIBRI_REUSE_PREFIX=0 restores the strict rule for an A/B.
         const bool prefix_reuse = [] {
             const char* v = std::getenv("STRATA_KOLIBRI_REUSE_PREFIX");
-            return v != nullptr && v[0] != 0 && std::atoi(v) != 0;
+            return v == nullptr || v[0] == 0 || std::atoi(v) != 0;
         }();
         // The prefill never feeds the last prompt token - the decode step does - so that is the most a request can
         // reuse however long the held prefix is.

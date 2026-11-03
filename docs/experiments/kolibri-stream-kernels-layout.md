@@ -877,6 +877,60 @@ Every full-logit dump above is byte-identical to its reference. (`ids11000`'s st
 build; the proof that the new answer is right is the pair of runs that differ only in chunk size - 256 chunks at
 122,143 ms against 512 at 89,396 ms - which are byte-identical to each other.)
 
+## 22. Served requests: prefix reuse was on paper only, and that is what makes a coding agent usable
+
+A coding agent talks to this engine through `serve/server.py` (`/v1/chat/completions`, `/v1/messages`,
+`/v1/responses`), and every turn re-sends the whole conversation. The engine has had prefix reuse for a while -
+`STRATA_KOLIBRI_REUSE`, on by default - but its rule is the **strict** one: reuse only if the *entire* held prefix
+matches and `held < ids.size()`. Real clients re-render the conversation as text, a BPE merge across the turn boundary
+rewrites the last token or two, and the strict check then resets. Measured on a three-turn conversation sharing a
+479-token system prompt:
+
+| | turn 1 | turn 2 | turn 3 |
+| --- | ---: | ---: | ---: |
+| strict rule (the default until now): `cached_tokens` | 0 | **0** | **0** |
+| strict rule: prefill | 16,671 ms | **18,106 ms** | **19,959 ms** |
+| `STRATA_KOLIBRI_REUSE_PREFIX=1` (longest common prefix): `cached_tokens` | 0 | **475** | **512** |
+| longest common prefix: prefill | 16,280 ms | **1,846 ms** | **2,230 ms** |
+
+So the feature was present and inert: every turn read its whole prompt, ~18-20 s of prefill for a conversation that had
+not changed. With the longest common prefix rule the second turn prefills 51 new tokens in 1.8 s - **9.9x less prefill
+per turn** - and the generated text was **identical on all three turns** in both runs, and against a third run after the
+switch. `STRATA_KOLIBRI_REUSE_PREFIX` is therefore the default now; `=0` restores the strict rule.
+
+Two other things about the served path, measured in the same session:
+
+- **The streamed prefill arm does not serve** (`expert_stream_can_serve`: "the streamed arm serves prefill chunks, not a
+  served request stream"). Served prefill therefore runs on the CPU pool: **24-29 tok/s** measured on 40-590-token
+  prompts, against the CLI's 150 tok/s at 511 tokens with the arm. The prefix reuse above is what keeps that out of the
+  per-turn cost; the arm is not, and moving it there would be its own piece of work.
+- **Thinking is on by default and eats the budget.** A 4,096-token coding request spent ~2,800 tokens on
+  `reasoning_content` and returned a truncated file (`content` 3,310 chars, `reasoning` 12,290 chars). With
+  `chat_template_kwargs: {"enable_thinking": false}` the same task returns a complete file in the budget. Served decode
+  is 19-27 tok/s and decays with context (12.6 tok/s reported at ~4k tokens).
+
+### 22b. Driving a coding program through the API
+
+The interface test: ask the model, through the API, for a notepad clone in C++, compile it, feed the compiler's output
+back, repeat - the loop a coding agent runs.
+
+| round | lines | g++ errors |
+| --- | ---: | ---: |
+| X11 notepad, round 1 | 326 | 12 |
+| X11 notepad, round 2 | 264 | 21 (rewrote it, lost what it had fixed) |
+| terminal notepad, round 1 (150-line scope) | 251 | 6 |
+| terminal notepad, round 2 | 259 | 1 |
+| terminal notepad, round 3 | 146 | 1 (`TIOCGWINSIZE` for `TIOCGWINSZ`) |
+| terminal notepad, round 4 | 146 | **0 - compiled** |
+
+So the API carries a real agent loop end to end, and the model converges on a 146-line terminal program after four
+rounds (each ~2-4 minutes). It does **not** converge on the 350-line X11 version, and it regressed once when asked to
+rewrite from scratch - a patch-shaped instruction ("fix these errors, change nothing else") is what worked.
+
+**And the compiled program does not work.** Run under a pty it emits its clear-screen sequence and then does nothing:
+no characters appear, `Ctrl+Q` does not exit, `Ctrl+S` writes no file. Compiles, starts, and is functionally broken -
+the honest end state of this test, and the reason the interface notes above matter more than the program itself.
+
 ## What the four add up to
 
 The streamed arm's remaining cost is not where the Qwen engine's wins are. Its wins are in VRAM-resident decode
