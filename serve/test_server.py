@@ -23,6 +23,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
 from serve.server import (ANSWER_RESERVE_MIN, CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite, GpuBusy, MockEngine,  # noqa: E402
+                          answer_reserve,
                           PP_DONE_TAIL, Service,
                           StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
                           prompt_tokens_seen,
@@ -201,7 +202,7 @@ class MaxTokens(unittest.TestCase):
                 text = out.getvalue()
                 self.assertIn(f"shortened to {room}", text)
                 if api != "anthropic":          # Anthropic thinks only when asked (#278)
-                    cap = room - min(max(ANSWER_RESERVE_MIN, room // 4), room // 2)
+                    cap = room - answer_reserve(room)
                     self.assertIn(f"thinking limited to {cap} of max_tokens {room}", text)
 
     def test_strict_mode_keeps_the_llama_cpp_400(self):
@@ -4183,7 +4184,14 @@ class ReasoningCloseRetryAfterRepeatGuard(unittest.TestCase):
         with urllib.request.urlopen(req, timeout=60) as r:
             return json.loads(r.read().decode())["choices"][0]
 
-    def test_off_by_default_the_reply_stays_empty(self):
+    def test_on_by_default_the_reply_answers_from_one_request(self):
+        c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 2)
+        self.assertEqual(c["message"]["content"], LoopsInThinkingEngine.ANSWER)
+        self.assertEqual(c["finish_reason"], "stop")
+
+    def test_the_config_turns_it_off_and_the_reply_stays_empty(self):
+        self.svc.reasoning_close_retry = False
         c = self.chat()
         self.assertEqual(len(self.engine.prompts), 1)
         self.assertFalse(c["message"].get("content"))
@@ -4232,10 +4240,18 @@ class ReasoningCloseRetry(unittest.TestCase):
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.loads(r.read().decode())["choices"][0]
 
-    def test_off_by_default_the_reply_stays_empty(self):
+    def test_the_default_does_not_rescue_a_reply_the_model_ended_itself(self):
+        # "degenerate" (the default) covers only the ends a guard caused; a model that stopped inside its thinking is
+        # the opt-in case of #1053
         c = self.chat()
         self.assertEqual(self.engine.prompts.__len__(), 1)
         self.assertFalse(c["message"].get("content"))
+
+    def test_true_rescues_it_and_false_never_does(self):
+        self.svc.reasoning_close_retry = True
+        c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 2)
+        self.assertEqual(c["message"]["content"], EndsInsideThinkingEngine.ANSWER)
 
     def test_on_it_closes_the_thinking_once_and_answers(self):
         self.svc.reasoning_close_retry = True
@@ -4261,6 +4277,22 @@ class ReasoningCloseRetry(unittest.TestCase):
         self.assertEqual(len(self.engine.prompts), 1)
         self.assertFalse(c["message"].get("content"))
         self.assertEqual(c["message"]["reasoning_content"], 'two plus two is "4"')
+
+
+class AnswerReserve(unittest.TestCase):
+    """The share of a cap kept for the answer, which is what a code-sized answer needs at a small cap."""
+
+    def test_a_modest_cap_gets_a_code_sized_answer(self):
+        from serve.server import answer_reserve, ANSWER_RESERVE_TARGET
+        self.assertEqual(answer_reserve(4000), 2000)        # was 1,000: a 1,400-token file truncated mid-function
+        self.assertEqual(answer_reserve(4096), ANSWER_RESERVE_TARGET)
+        self.assertEqual(answer_reserve(8192), 2048)        # a quarter of the cap, as before
+        self.assertEqual(answer_reserve(32768), 8192)       # ... unchanged at the sizes the desktop agent sends
+        self.assertEqual(answer_reserve(2048), 1024)        # never more than half
+        self.assertEqual(answer_reserve(1024), 512)         # ... and never less than ANSWER_RESERVE_MIN
+        for cap in (1024, 1500, 2048, 4000, 4096, 8192, 32768, 65536):
+            self.assertGreaterEqual(answer_reserve(cap), 512, cap)
+            self.assertLessEqual(answer_reserve(cap), cap // 2, cap)
 
 
 class ThinkingBudget(unittest.TestCase):

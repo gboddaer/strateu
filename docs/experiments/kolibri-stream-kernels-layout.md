@@ -1015,6 +1015,39 @@ The 166-line file compiles after 5 lines are fixed (`std::next`, `string::erase`
 declaration); llama.cpp's 154-line file needs 12. So one request on this path now delivers what llama.cpp delivers in
 one request, at the same wall clock.
 
+### 24b. The three fixes, and the same comparison again
+
+**On by default now** (the user asked for it; `docs/DETAILS.md` records both switches):
+
+- `reasoning_close_retry` defaults to `"degenerate"`: a reply a degenerate-output guard ended inside its thinking is
+  continued once with the thinking closed. `true` still covers the model's own stop inside its thinking (#1053), `false`
+  turns both off. `reasoning_loop_recovery: "stop"` is honoured: an explicit "end it here" is not overridden.
+- `answer_room` keeps at least 2,048 tokens for the answer (`ANSWER_RESERVE_TARGET`): a 4,000-token cap now gives the
+  answer 2,000 tokens instead of 1,000. Caps of 8,192 and up are unchanged (a quarter).
+- The opening `\u003cthink\u003e` the model writes as its first token is dropped instead of being sent inside `reasoning_content`
+  (`serve/frontend.py`; llama.cpp's parser drops it too). A marker split across deltas is held back, and a quoted tag
+  further into the reply is still the model's own text.
+
+**Greedy, again (same five prompts).** `reasoning_content` now starts where llama.cpp's does: the two agree for the first
+131 characters on the `17 * 23` prompt and 298 on the `std::string::npos` one before the logits drift apart, where before
+the marker made the first character differ. Both still answer `391`. The degeneration itself is unchanged and still
+unattributed: this engine still loops on two of the five prompts where llama.cpp does not, and at `max_tokens 700` the
+reply is cut at the cap in both.
+
+**One request, thinking on, the notepad task** (the two-phase trick is gone; same prompt, same sampling, same template):
+
+| `max_tokens` | llama.cpp | this engine |
+| --- | --- | --- |
+| 4,000 | 235 s, 4,000 tokens, **no answer at all** (15,734 chars of reasoning) | **201 s, 3,452 tokens, complete 150-line file**, fence closed (5 compile errors) |
+| 8,192 | 459 s, 8,192 tokens, **no answer at all** (32,693 chars of reasoning) | 112 s, 2,240 tokens, an answer - but the model had already broken into a 256-token run of `;` inside its thinking, so the recovered answer starts mid-file (162 lines, 57 compile errors) |
+
+So the rescue is a rescue, not a cure: it turns "no answer" into "an answer", good in one of the two runs above. The
+0.4 cap and the 8,192 cap differ only in what the model chose to do; the guard fired in both.
+
+**Passed:** the whole serve suite, 1,253 tests (31 skipped), including 7 new parser tests for the opening marker, a unit
+test of the reserve rule, and the retry tests rewritten for the new default. **Not run:** the engine suites (no C++ in
+these changes), a rebuild, and any card other than this T4.
+
 **What is still not like llama.cpp.** At `max_tokens 4000` the answer still truncates: `answer_room` gives a 4,000 cap a
 3,000-token thinking budget and 1,000 tokens for the answer, and a 1,400-token file does not fit. 8,192 does fit. A
 client that wants the old shape asks for `reasoning_budget_tokens` explicitly, or turns thinking off. Also, this engine
