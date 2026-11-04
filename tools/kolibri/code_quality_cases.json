@@ -1,0 +1,49 @@
+[
+  {
+    "tag": "insert-char",
+    "system": "Write correct C++17 code. Return code only, no prose. Follow the requested function names and signatures exactly.",
+    "user": "Write void put(std::string& s, std::size_t pos, char c) to insert one character at index pos, without replacing existing characters. pos is between 0 and s.size(), inclusive. Assume <string> and <cstddef> are already included. Function only.",
+    "prefix": "#include <string>\n#include <cstddef>\n#include <cassert>\n",
+    "suffix": "\nint main(){std::string s;put(s,0,'a');assert(s==\"a\");put(s,0,'b');assert(s==\"ba\");put(s,2,'c');assert(s==\"bac\");put(s,1,'x');assert(s==\"bxac\");}\n",
+    "reference": "void put(std::string& s,std::size_t pos,char c){s.insert(pos,1,c);}",
+    "run": true,
+    "cap": 1000
+  },
+  {
+    "tag": "line-edit",
+    "system": "Write correct C++17 code. Return code only, no prose. Follow the requested function names and signatures exactly.",
+    "user": "Implement two C++17 functions for a terminal editor: void enter(std::vector<std::string>& lines, std::size_t& row, std::size_t& col) and void backspace(std::vector<std::string>& lines, std::size_t& row, std::size_t& col). lines is nonempty and cursor valid. enter splits the current line at col, inserts its suffix as the next line, and moves cursor to column zero of that line. backspace deletes the character to the left; at column zero it joins the current line to the previous one and positions the cursor at the join. At row=col=0 do nothing. Preserve empty lines, including a trailing empty line. Assume <vector>, <string>, <cstddef> are included. Functions only.",
+    "prefix": "#include <vector>\n#include <string>\n#include <cstddef>\n#include <cassert>\n",
+    "suffix": "\nint main(){std::vector<std::string> a={\"abcd\"};std::size_t r=0,c=2;enter(a,r,c);assert((a==std::vector<std::string>{\"ab\",\"cd\"}));assert(r==1&&c==0);backspace(a,r,c);assert((a==std::vector<std::string>{\"abcd\"}));assert(r==0&&c==2);backspace(a,r,c);assert(a[0]==\"acd\"&&c==1);r=0;c=3;enter(a,r,c);assert((a==std::vector<std::string>{\"acd\",\"\"}));assert(r==1&&c==0);r=0;c=0;backspace(a,r,c);assert(a[0]==\"acd\"&&r==0&&c==0);}\n",
+    "reference": "void enter(std::vector<std::string>& a,std::size_t& r,std::size_t& c){auto tail=a[r].substr(c);a[r].erase(c);a.insert(a.begin()+r+1,tail);++r;c=0;} void backspace(std::vector<std::string>& a,std::size_t& r,std::size_t& c){if(c){a[r].erase(c-1,1);--c;}else if(r){auto n=a[r-1].size();a[r-1]+=a[r];a.erase(a.begin()+r);--r;c=n;}}",
+    "run": true,
+    "cap": 1800
+  },
+  {
+    "tag": "raw-mode",
+    "system": "Write correct C++17 code. Return code only, no prose. Follow the requested function names and signatures exactly.",
+    "user": "Write termios editor_raw(termios original) for a Linux terminal editor that reads one byte at a time using blocking read. Return a modified copy, with canonical mode, echo and signal generation off, VMIN=1, VTIME=0. Ctrl+S and Ctrl+Q must arrive as ordinary input bytes so the editor can handle save and quit, rather than controlling terminal output flow. Do not perform any syscalls. Assume <termios.h> is included. Function only.",
+    "prefix": "#include <termios.h>\n#include <cassert>\n#include <pty.h>\n#include <poll.h>\n#include <unistd.h>\n",
+    "suffix": "\nint main(){int m,s;assert(openpty(&m,&s,nullptr,nullptr,nullptr)==0);termios a{};assert(tcgetattr(s,&a)==0);a.c_lflag|=ICANON|ECHO|ISIG;a.c_iflag|=IXON;a.c_cc[VSTART]=17;a.c_cc[VSTOP]=19;auto b=editor_raw(a);assert((b.c_lflag&(ICANON|ECHO|ISIG))==0);assert(b.c_cc[VMIN]==1&&b.c_cc[VTIME]==0);assert(tcsetattr(s,TCSANOW,&b)==0);unsigned char keys[2]={19,17};assert(write(m,keys,2)==2);unsigned char got[2]={};int n=0;while(n<2){pollfd p{s,POLLIN,0};if(poll(&p,1,500)<=0)break;auto r=read(s,got+n,2-n);if(r<=0)break;n+=r;}assert(n==2&&got[0]==19&&got[1]==17);close(m);close(s);}\n",
+    "reference": "termios editor_raw(termios a){a.c_lflag&=~(ICANON|ECHO|ISIG);a.c_iflag&=~IXON;a.c_cc[VMIN]=1;a.c_cc[VTIME]=0;return a;}",
+    "run": true,
+    "cap": 1000
+  },
+  {
+    "tag": "nonblocking-read",
+    "system": "Write correct C++17 code. Return code only, no prose. Follow the requested function names and signatures exactly.",
+    "user": "Write int read_key(int fd) for a Linux nonblocking pipe or terminal. Return the byte read as 0..255. Return -2 for EAGAIN or EWOULDBLOCK (the program must wait/retry later, not exit); return -1 for EOF or another permanent error. Retry read after EINTR. Assume <unistd.h> and <cerrno> are included. Function only.",
+    "prefix": "#include <unistd.h>\n#include <cerrno>\n#include <fcntl.h>\n#include <cassert>\n",
+    "suffix": "\nint main(){int p[2];assert(pipe(p)==0);fcntl(p[0],F_SETFL,O_NONBLOCK);assert(read_key(p[0])==-2);unsigned char x=255;assert(write(p[1],&x,1)==1);assert(read_key(p[0])==255);close(p[1]);assert(read_key(p[0])==-1);close(p[0]);}\n",
+    "reference": "int read_key(int fd){unsigned char c;for(;;){auto n=read(fd,&c,1);if(n==1)return c;if(n==0)return -1;if(errno==EINTR)continue;return errno==EAGAIN||errno==EWOULDBLOCK?-2:-1;}}",
+    "run": true,
+    "cap": 1000
+  },
+  {
+    "tag": "notepad",
+    "system": "You are a coding agent in a Linux shell. C++17, one source file, no placeholders. The file is compiled with `g++ -std=c++17 -O2 -o notepad notepad.cpp` and driven by a pty test.",
+    "user": "Write notepad.cpp: a terminal notepad for Linux, C++17, using only <termios.h> <unistd.h> <sys/ioctl.h> <fcntl.h> <cstdio> <cstring> <cstdlib> <string> <vector> <algorithm>.\n\nRequirements, exactly:\n1. argv[1] is the file to edit; load it when it exists, start empty when it does not. No argv[1] means \"untitled.txt\".\n2. Save the termios state, enter raw mode (ICANON, ECHO, ISIG off; VMIN=1, VTIME=0), and restore it on every exit path.\n3. Buffer: std::vector<std::string> lines, cursor at (row, col). Start with one empty line when the file is empty.\n4. Keys: 32..126 inserts at the cursor; 127 and 8 delete left (at column 0 they join the line onto the previous one);\n   13 and 10 split the line at the cursor; 9 inserts four spaces; ESC [ A/B/C/D are the arrows; ESC [ H and ESC [ F\n   and ESC O H and ESC O F are Home and End, as are 1 and 4; 5 and 6 are PageUp and PageDown; 19 (Ctrl+S) saves;\n   17 (Ctrl+Q) quits; a bare ESC also quits.\n5. Draw: window size from ioctl(TIOCGWINSZ); every key writes \"\\\\x1b[H\\\\x1b[2J\", then the visible lines, then\n   \"\\\\x1b[<row>;<col>H\" with 1-based cursor coordinates. Clip lines at the width.\n6. Scroll so the cursor stays visible; scroll_top moves when the cursor leaves the window and on PageUp/PageDown.\n7. Save: every line followed by '\\\\n' to the argv[1] path. Write nothing else to stdout - the screen is the editor's.\n8. Never crash: an unopenable file starts empty, and a failed save must not abort.",
+    "cap": 6000,
+    "run": false
+  }
+]

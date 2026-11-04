@@ -307,8 +307,10 @@ All investigation servers stopped; GPU reported 0 MiB used afterwards.
   icpx and dpcpp are unavailable here. No qualification on those backends is
   implied. The entire 217-test CTest project was not built/run; the Kolibri
   selection was built and run. Other architectures and quantizations untested.
-- This is local work on `kolibri-sram-activation`; no new commit or push was
-  made during this investigation. Origin remains at the prior `35b45422`.
+- At the close of the cache investigation, the work was local on
+  `kolibri-sram-activation` and origin was at `35b45422`. It was subsequently
+  committed as `6c2ef8e4`, merged with newer remote work and pushed at `9ba42dce`.
+  The next investigation is [generated-code quality](generated-code-quality.md).
 
 ## Reproduction commands
 
