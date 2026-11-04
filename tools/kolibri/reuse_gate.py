@@ -21,14 +21,15 @@ Stages (one engine process; each stage starts from a cold state via a resetter r
 
   1.  bitwise      cold one-shot read of `pre + own + tail` vs `pre` then extending with `own + tail`:
                    the 4 generated ids must be identical.  `pre` is 3,000 ids, well past the 513-row
-                   sliding ring, so the ring has wrapped before the extension - extension-only reuse is
-                   ring-safe by construction and this proves it rather than assuming it.
+                   sliding ring. Chunk alignment rewinds before the retained window, so the corrected
+                   engine rebuilds cold; appending without a rewind can still reuse valid KV.
   1b. bitwise-1    same, with a ONE-token tail: the extending request has almost nothing left to prefill, and
                    that must still look correct rather than be mistaken for today's bug.  The read count is NOT
-                   0 - the rewind gives back up to a chunk, so this stage reports ~130 - and the one geometry
-                   that would read nothing at all (reuse == ids.size()-1) is not exercised here.
-  2. accounting    stage 1's reused arm must report reused == |pre| + 1, read == |tail|, prompt_ms > 0.
-                   A prompt_ms of 0.0 with tokens read is the bug, so it fails the gate.
+                   0: the 640-ID prefix has wrapped the ring, so alignment now forces a cold rebuild. The
+                   geometry with no remaining prefill (reuse == ids.size()-1) is not exercised here.
+  2. accounting    stage 1 must either rebuild all tokens after an unsafe rewind, or report a genuine
+                   append reading the tail. A prompt_ms of 0.0 with tokens read fails the gate.
+                   degeneration_gate.py separately proves safe reuse still occurs with full-logit equality.
   3. negative      a prefix that diverges in its last id is not an extension: reused 0, everything read.
   4. cancelled     after a STOP, whatever is claimed must be KV the engine built: extended with the tokens the
                    cancelled request actually produced, the answer must still equal a cold read.
@@ -209,19 +210,20 @@ def main():
         reused_n = field(reuse["done"], 8, int)
         read_n = field(reuse["done"], 14, int)
         prompt_ms = field(reuse["done"], 3, float)
-        # The `read` window is what discriminates: it must cover the tail plus the token the previous request
-        # produced (sampled, never fed, so it has no KV row) plus at most one CHUNK given back by the rewind
-        # that makes a resumed read bitwise-equal to a cold one.  `reused + read == ext_len` is kept only as a
-        # consistency echo - both numbers come from the same expression in the engine, so it cannot fail.
+        # A wrapped ring cannot supply the rows a chunk-alignment rewind needs. The corrected default
+        # rebuilds cold; with alignment explicitly off, a non-rewinding append remains valid. Do not count
+        # stale-row reuse as a speed success. degeneration_gate.py also checks preserved safe reuse.
         ext_len = len(pre) + 1 + len(tail)
         tail_min = len(tail) + 1
-        ok = (reused_n is not None and read_n is not None
-              and reused_n + read_n == ext_len
-              and read_n >= tail_min
-              and read_n <= tail_min + 512
-              and prompt_ms is not None and prompt_ms > 0.0)
+        aligned = os.environ.get("STRATA_KOLIBRI_REUSE_ALIGN", "1") != "0"
+        if aligned:
+            valid_counts = reused_n == 0 and read_n == ext_len
+        else:
+            valid_counts = reused_n == len(pre) and read_n == tail_min
+        ok = valid_counts and prompt_ms is not None and prompt_ms > 0.0
         record(ok, f"2. accounting   {'PASS' if ok else 'FAIL'}  "
-                   f"(reused {reused_n} + read {read_n} = {ext_len}; read between {tail_min} and {tail_min + 512}; "
+                   f"(reused {reused_n} + read {read_n} = {ext_len}; "
+                   f"{'cold rebuild after unsafe rewind' if aligned else 'append without rewind'}; "
                    f"prompt_ms {prompt_ms})")
 
         stage = "1b. bitwise-1"
@@ -247,10 +249,9 @@ def main():
         # for an engine whose prefix comparison was broken outright.
         base3 = short_pre + short_tail
         diverged = base3[:-1] + [(base3[-1] ^ 7)] + [short_pre[0]]
-        # The expectation depends on the mode, and saying so is the point: in the default STRICT mode a prompt
-        # that diverges must reset entirely, while in the opt-in longest-common-prefix mode it may reuse the part
-        # that genuinely matches - and then the thing to prove is that its answer still equals a cold read.
-        lcp = os.environ.get("STRATA_KOLIBRI_REUSE_PREFIX", "0") != "0"
+        # Longest-common-prefix mode is the default. Even a matching prefix must reset when its sliding
+        # rows have been overwritten; it may only reuse the matching part when those rows remain available.
+        lcp = os.environ.get("STRATA_KOLIBRI_REUSE_PREFIX", "1") != "0"
         eng.resetter(reset_token)
         cold3 = eng.send(diverged, 1)
         eng.resetter(reset_token)
@@ -258,7 +259,7 @@ def main():
         div = eng.send(diverged, 1)
         d_re, d_read = field(div["done"], 8, int), field(div["done"], 14, int)
         if lcp:
-            ok = (d_re is not None and 0 < d_re <= len(base3) - 1
+            ok = (d_re == 0 and d_read == len(diverged)
                   and cold3["gen"] == div["gen"] and len(cold3["gen"]) == 1)
             record(ok, f"3. negative     {'PASS' if ok else 'FAIL'}  "
                        f"(prefix mode: reused {d_re} of a {len(base3) - 1}-id common prefix, "

@@ -5947,9 +5947,12 @@ int serve(Engine& e, Scratch& s) {
                 const int64_t prev_end = s.pos;   // tokens the previous request consumed (read before we move it)
                 g_pf_total = (int64_t) ids.size() - 1 - (int64_t) reuse;   // the rule keys on the prefix length
                 const int64_t chunk = (int64_t) pf_chunk_at((int64_t) reuse);
-                if (chunk > 1 && prev_end > 1) {
-                    const int64_t aligned = ((prev_end - 1) / chunk) * chunk;
-                    if (aligned > 0 && (size_t) aligned < reuse) reuse = (size_t) aligned;
+                if (chunk > 1 && prev_end > 0) {
+                    // Rebuild the partial chunk containing the reuse boundary as well as the previous
+                    // request's partial final chunk. Zero is a real boundary: retaining a sub-chunk
+                    // prefix there mixes old prefill/decode rows with a differently shaped cold read.
+                    const int64_t boundary = std::min<int64_t>((int64_t) reuse, prev_end - 1);
+                    reuse = (size_t) ((boundary / chunk) * chunk);
                 }
             }
             // (2) THE PREFILL WRITES AT s.pos, so s.pos must be the reused length before the prefill runs.  After
@@ -5957,6 +5960,13 @@ int serve(Engine& e, Scratch& s) {
             // decode path), so leaving it alone made this request write its chunk that much too far: with a
             // 513-id prefix the resumed prefill wrote 513..521 instead of 512..520, which left position 512
             // holding the previous request's decode-written K/V and wrote 521 twice.  That was the actual bug.
+            // Matching token IDs do not prove that their K/V rows still exist. Sliding layers keep only
+            // the last n_swa positions: after the ring wraps, rewinding (including the chunk-alignment
+            // rewind above) can require rows already overwritten by the previous reply. Rebuild cold
+            // instead of attending to unrelated tokens. Appending at the held position stays valid.
+            if ((int64_t) reuse < s.pos && s.pos > e.g.n_swa) reuse = 0;
+        }
+        if (reuse > 0) {
             s.pos = (int64_t) reuse;
         } else {
             reset_state(e, s);
