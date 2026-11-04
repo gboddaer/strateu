@@ -62,7 +62,9 @@ def evaluate(out, tag, text, case):
     if not case.get("compile", True):
         return result
     binary = out / (tag + ".bin")
-    compile_ = subprocess.run(["g++", "-std=c++17", "-O2", "-o", str(binary), str(cpp)],
+    # `openpty` lives in libutil on glibc < 2.34, so the PTY oracle must link it there;
+    # newer glibc keeps a stub, so the flag is harmless where it is already in libc.
+    compile_ = subprocess.run(["g++", "-std=c++17", "-O2", "-o", str(binary), str(cpp), "-lutil"],
                               capture_output=True, text=True, timeout=60)
     (out / (tag + "-compile.log")).write_text(compile_.stdout + compile_.stderr)
     result["compile_exit"] = compile_.returncode
