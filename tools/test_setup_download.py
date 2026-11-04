@@ -188,14 +188,33 @@ def files(d):
 
 class ParallelDownload(unittest.TestCase):
     def test_a_big_file_comes_over_several_connections(self):
-        with small_pieces(), Server(redirect=True) as srv, tempfile.TemporaryDirectory() as d:
+        # A client can finish reading the body before its server handler's finally block runs.
+        # Count real client fetches, not handlers still cleaning up after completed transfers.
+        fetch = setup._fetch_run
+        lock = threading.Lock()
+        active = peak = 0
+
+        def measured_fetch(*args, **kwargs):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                return fetch(*args, **kwargs)
+            finally:
+                with lock:
+                    active -= 1
+
+        with small_pieces(), Server(redirect=True) as srv, tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(setup, "_fetch_run", measured_fetch):
             code, out = run(srv, d)
             self.assertIsNone(code, out)
             self.assertEqual((Path(d) / NAME).read_bytes(), DATA)
             self.assertEqual(files(d), [NAME, NAME + ".done"])             # no .part, no piece list left behind
             self.assertIn("sha256 " + hashlib.sha256(DATA).hexdigest(), (Path(d) / (NAME + ".done")).read_text())
-            self.assertGreater(srv.max_active, 1)
-            self.assertLessEqual(srv.max_active, 4)
+            self.assertGreater(peak, 1)
+            self.assertLessEqual(peak, 4)
+            self.assertEqual(active, 0)
             self.assertEqual(sorted(asked(srv)), list(range(41)))           # every piece once, none twice
             self.assertIn((0, 0), srv.ranged_gets)                           # the probe is still accounted for
             payload = sorted(r for r in srv.ranged_gets if r != (0, 0))
