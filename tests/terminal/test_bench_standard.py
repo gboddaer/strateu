@@ -714,6 +714,11 @@ class RunTests(StandardBase):
 
         def watched(target, spec, model, **kwargs):
             raw = real(target, spec, model, **kwargs)
+            if spec["phase"] == "concurrency":
+                # This test isolates token accounting, not the host clock's resolution.
+                # Supply a one-second fixture window; zero elapsed time is tested separately.
+                raw["t0"] = spec["round"] * 2_000_000_000
+                raw["t_end"] = raw["t0"] + 1_000_000_000
             raws[spec["id"]] = raw
             return raw
 
@@ -727,9 +732,12 @@ class RunTests(StandardBase):
                          f"the run did not complete; reasons {doc['extensions']['status_reasons']}; "
                          f"failed requests {failed}; server errors {self.server.errors}")
         second = doc["concurrency_rounds"][1]
+        self.assertEqual(second["wall_s"], 1.0)
         self.assertIsNone(second["output_tokens"])
         self.assertIsNone(second["aggregate_tps"])
         first = doc["concurrency_rounds"][0]
+        self.assertEqual((first["wall_s"], first["output_tokens"]), (1.0, 200))
+        self.assertEqual(first["aggregate_tps"], 200.0)
 
         def client_view(rid: str) -> str:
             raw = raws.get(rid)
@@ -748,6 +756,24 @@ class RunTests(StandardBase):
                              f"failed {first['failed']}) has no aggregate; "
                              f"the server took {self.server.order[-12:]} with errors {self.server.errors}; "
                              + "; ".join(client_view(rid) for rid in round_ids))
+        self.assertEqual(bs.validate(doc), [])
+
+    def test_a_zero_elapsed_round_keeps_tokens_but_has_no_aggregate_rate(self):
+        real = bs.stream_chat
+
+        def same_clock_tick(target, spec, model, **kwargs):
+            raw = real(target, spec, model, **kwargs)
+            if spec["phase"] == "concurrency":
+                raw["t0"] = spec["round"] * 2_000_000_000
+                raw["t_end"] = raw["t0"]
+            return raw
+
+        with mock.patch.object(bs, "stream_chat", same_clock_tick):
+            doc, _ = self.run_standard(optional_concurrency=True)
+        self.assertEqual(doc["run"]["status"], "complete")
+        for round_ in doc["concurrency_rounds"]:
+            self.assertEqual((round_["wall_s"], round_["output_tokens"], round_["failed"]), (0.0, 200, 0))
+            self.assertIsNone(round_["aggregate_tps"])
         self.assertEqual(bs.validate(doc), [])
 
     def test_the_plain_summary(self):
