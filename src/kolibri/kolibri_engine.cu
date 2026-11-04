@@ -2172,6 +2172,12 @@ static inline bool expert_stream_usable() {
 
 #if defined(__CUDACC__)
 static std::unique_ptr<strata::kolibri::stream::Context> g_expert_stream;
+// The selection count the live context was sized for.  create() pins max_selections from the view it is
+// given, so a context built by a short first request cannot run a later, longer prompt: run() refuses with
+// "more selections than the slots hold".  A served engine sees exactly that shape (a greeting, then a long
+// conversation), so the context is rebuilt when a view needs more selections instead of leaving the engine
+// on the CPU pool - or, in demand mode, exiting 2 mid-conversation.
+static int g_expert_stream_selections = 0;
 static strata::kolibri::stream::Stats g_expert_stream_stats;
 static long long g_expert_stream_layers = 0;
 
@@ -2218,7 +2224,7 @@ static bool expert_stream_layer(const LayerBlobs& b, Scratch& s, const ActSet& A
     v.top_k = K;
     v.output = A.ey_h;
     try {
-        if (!g_expert_stream) {
+        if (!g_expert_stream || NKc > g_expert_stream_selections) {
             strata::kolibri::stream::Config cfg;
             // STRATA_KOLIBRI_STREAM_SLOTS: the pipeline's slot count, 2 (the shipped depth) or up to kMaxSlots.  More
             // slots let this layer's copy go out before the host blocks on an older batch, which is where a
@@ -2236,7 +2242,12 @@ static bool expert_stream_layer(const LayerBlobs& b, Scratch& s, const ActSet& A
             // with byte-identical full-logit dumps.  STRATA_KOLIBRI_STREAM_DEV_ACT=0 sends the step back to the host.
             cfg.device_activation = true;
             if (const char* da = std::getenv("STRATA_KOLIBRI_STREAM_DEV_ACT")) cfg.device_activation = da[0] != '0';
+            // run() has drained the previous layer. Release its buffers before allocating
+            // the replacement so growth does not temporarily require both full contexts.
+            g_expert_stream.reset();
+            g_expert_stream_selections = 0;
             g_expert_stream = strata::kolibri::stream::create(v, cfg);
+            g_expert_stream_selections = NKc;
         }
         const strata::kolibri::stream::Stats st = strata::kolibri::stream::run(*g_expert_stream, v);
         g_expert_stream_stats.groups += st.groups;
