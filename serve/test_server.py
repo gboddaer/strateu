@@ -23,6 +23,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
 from serve.server import (ANSWER_RESERVE_MIN, CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite, GpuBusy, MockEngine,  # noqa: E402
+                          answer_reserve,
                           PP_DONE_TAIL, Service,
                           StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
                           prompt_tokens_seen,
@@ -201,7 +202,7 @@ class MaxTokens(unittest.TestCase):
                 text = out.getvalue()
                 self.assertIn(f"shortened to {room}", text)
                 if api != "anthropic":          # Anthropic thinks only when asked (#278)
-                    cap = room - min(max(ANSWER_RESERVE_MIN, room // 4), room // 2)
+                    cap = room - answer_reserve(room)
                     self.assertIn(f"thinking limited to {cap} of max_tokens {room}", text)
 
     def test_strict_mode_keeps_the_llama_cpp_400(self):
@@ -4138,6 +4139,86 @@ class EndsInsideThinkingEngine(ThinkingEngine):
             yield t
 
 
+class LoopsInThinkingEngine(ThinkingEngine):
+    """A degenerate thinking reply (#606): one token repeated past the guard, so the reply ends as "length" inside
+    the thinking with no answer.  A prompt that ends the thinking gets the answer, as the model continues after
+    ``.  Records the sampler each pass was given."""
+    LOOP_TOKEN = ord("!")
+    ANSWER = "The answer is 4."
+
+    def __init__(self, tok):
+        super().__init__(tok)
+        self.samplings = []
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        self.samplings.append(dict(sampling or {}))
+        done = self.tok.decode(ids).endswith("</think>" + chr(10) + chr(10))
+        out = self.tok.encode(self.ANSWER) if done else self.tok.encode("Thinking") + [self.LOOP_TOKEN] * 400
+        for t in (out + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
+            if cancel.is_set():
+                return
+            yield t
+
+
+class ReasoningCloseRetryAfterRepeatGuard(unittest.TestCase):
+    """#1053 extended: a reply ended inside its thinking by the repeat guard (finish "length", #606) is continued
+    once with the thinking closed, the way a reply that stopped there (#1053) is.  A client that asked for thinking
+    and got a degenerate loop then has its answer from one request, not an empty reply."""
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = LoopsInThinkingEngine(self.tok)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def chat(self, **extra):
+        body = {"model": "m", "messages": [{"role": "user", "content": "2+2?"}], "max_tokens": 300, **extra}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read().decode())["choices"][0]
+
+    def test_on_by_default_the_reply_answers_from_one_request(self):
+        c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 2)
+        self.assertEqual(c["message"]["content"], LoopsInThinkingEngine.ANSWER)
+        self.assertEqual(c["finish_reason"], "stop")
+
+    def test_the_config_turns_it_off_and_the_reply_stays_empty(self):
+        self.svc.reasoning_close_retry = False
+        c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 1)
+        self.assertFalse(c["message"].get("content"))
+        self.assertEqual(c["finish_reason"], "length")
+
+    def test_on_it_closes_the_thinking_once_and_answers(self):
+        self.svc.reasoning_close_retry = True
+        c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 2)
+        self.assertTrue(self.tok.decode(self.engine.prompts[1]).endswith("</think>" + chr(10) + chr(10)))
+        self.assertEqual(c["message"]["content"], LoopsInThinkingEngine.ANSWER)
+        self.assertEqual(c["finish_reason"], "stop")
+
+    def test_the_retry_raises_only_the_two_settings_that_keep_the_words_coming(self):
+        self.svc.reasoning_close_retry = True
+        self.chat(temperature=.2, presence_penalty=0, top_p=.95, top_k=64, seed=2)
+        self.assertEqual(len(self.engine.samplings), 2)
+        second = self.engine.samplings[1]
+        self.assertEqual((second["temperature"], second["presence_penalty"]), (1.0, 1.5))
+        self.assertEqual((second["top_p"], second["top_k"], second["seed"]), (.95, 64, 2))
+
+    def test_a_sampler_already_at_the_recovery_values_is_left_alone(self):
+        self.svc.reasoning_close_retry = True
+        self.chat(temperature=1.0, presence_penalty=1.5, top_p=.95, top_k=20, seed=2)
+        self.assertEqual(self.engine.samplings[0], self.engine.samplings[1])
+
+
 class ReasoningCloseRetry(unittest.TestCase):
     """#1053 (opt-in): a reply that ends inside <think> with no answer is continued once with the thinking closed."""
 
@@ -4159,10 +4240,18 @@ class ReasoningCloseRetry(unittest.TestCase):
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.loads(r.read().decode())["choices"][0]
 
-    def test_off_by_default_the_reply_stays_empty(self):
+    def test_the_default_does_not_rescue_a_reply_the_model_ended_itself(self):
+        # "degenerate" (the default) covers only the ends a guard caused; a model that stopped inside its thinking is
+        # the opt-in case of #1053
         c = self.chat()
         self.assertEqual(self.engine.prompts.__len__(), 1)
         self.assertFalse(c["message"].get("content"))
+
+    def test_true_rescues_it_and_false_never_does(self):
+        self.svc.reasoning_close_retry = True
+        c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 2)
+        self.assertEqual(c["message"]["content"], EndsInsideThinkingEngine.ANSWER)
 
     def test_on_it_closes_the_thinking_once_and_answers(self):
         self.svc.reasoning_close_retry = True
@@ -4188,6 +4277,22 @@ class ReasoningCloseRetry(unittest.TestCase):
         self.assertEqual(len(self.engine.prompts), 1)
         self.assertFalse(c["message"].get("content"))
         self.assertEqual(c["message"]["reasoning_content"], 'two plus two is "4"')
+
+
+class AnswerReserve(unittest.TestCase):
+    """The share of a cap kept for the answer, which is what a code-sized answer needs at a small cap."""
+
+    def test_a_modest_cap_gets_a_code_sized_answer(self):
+        from serve.server import answer_reserve, ANSWER_RESERVE_TARGET
+        self.assertEqual(answer_reserve(4000), 2000)        # was 1,000: a 1,400-token file truncated mid-function
+        self.assertEqual(answer_reserve(4096), ANSWER_RESERVE_TARGET)
+        self.assertEqual(answer_reserve(8192), 2048)        # a quarter of the cap, as before
+        self.assertEqual(answer_reserve(32768), 8192)       # ... unchanged at the sizes the desktop agent sends
+        self.assertEqual(answer_reserve(2048), 1024)        # never more than half
+        self.assertEqual(answer_reserve(1024), 512)         # ... and never less than ANSWER_RESERVE_MIN
+        for cap in (1024, 1500, 2048, 4000, 4096, 8192, 32768, 65536):
+            self.assertGreaterEqual(answer_reserve(cap), 512, cap)
+            self.assertLessEqual(answer_reserve(cap), cap // 2, cap)
 
 
 class ThinkingBudget(unittest.TestCase):

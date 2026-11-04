@@ -1056,6 +1056,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_link_libraries(kolibri_expert_stream_kernel_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
       add_test(NAME kolibri_expert_stream_kernel_test COMMAND kolibri_expert_stream_kernel_test)
       set_tests_properties(kolibri_expert_stream_kernel_test PROPERTIES TIMEOUT 1800)
+      # Kernel layout and host-expf/SwiGLU feasibility probes use CUDA directly too.
+      add_executable(kolibri_expert_stream_kbench tools/kolibri/expert_stream_kbench.cu)
+      target_include_directories(kolibri_expert_stream_kbench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+      target_link_libraries(kolibri_expert_stream_kbench PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
+      add_executable(kolibri_expf_bit_probe tools/kolibri/expf_bit_probe.cu)
+      target_link_libraries(kolibri_expf_bit_probe PRIVATE ${_strata_gpu_runtime_target} Threads::Threads)
+      add_executable(kolibri_expert_stream_swiglu_probe tools/kolibri/expert_stream_swiglu_probe.cu)
+      target_include_directories(kolibri_expert_stream_swiglu_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/include)
+      target_link_libraries(kolibri_expert_stream_swiglu_probe PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
       # The replay harness contains CPU and GPU arms and refuses timings if captured outputs differ.
       add_executable(expert_stream_replay tools/kolibri/expert_stream_replay.cu src/kolibri/expert_stream.cu)
       target_include_directories(expert_stream_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src

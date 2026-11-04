@@ -484,3 +484,11 @@ What the default costs, stated so a reader can decide for themselves:
   `=1` there exits 2 with the reason.
 - The supported geometry is narrow by design (Q4_K gate/up, Q4_K/Q6_K down, Q8_K, whole 256-value blocks, no NVFP4
   tail, no rotated basis). Any other model falls back with the notice rather than running a different computation.
+
+## After the handoff: three kernel layouts tried on top (branch `kolibri-sram-activation`)
+
+Three changes to the kernels' data layout came next, each behind its own switch and each checked bit for bit before
+its speed was measured: staging the tile's activations in shared memory (2-3 % slower, not enabled), the gate row and
+the up row of one k in one thread (1.017x to 1.033x, now the arm's launch), and a plane-split Q6_K copy of the down
+blobs (1-3 % slower, not enabled). The measurements, the parity evidence and the reason each one landed where it did
+are in [kolibri-stream-kernels-layout.md](kolibri-stream-kernels-layout.md).

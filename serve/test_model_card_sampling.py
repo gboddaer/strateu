@@ -99,6 +99,39 @@ class ModelCardSampling(unittest.TestCase):
         self.svc.shared = {}
         self.assertNotIn("temperature", self.keys())     # a config that asks for greedy gets it
 
+    def test_kolibri_default_changes_temperature_only_in_both_modes(self):
+        self.svc.model_arch = "kolibri1"
+        for request in ({}, {"reasoning_effort": "none"}):
+            with self.subTest(request=request):
+                self.assertEqual(self.keys(**request).split(), ["temperature=1.0"])
+
+    def test_kolibri_explicit_sampling_is_preserved(self):
+        self.svc.model_arch = "kolibri1"
+        self.assertEqual(self.keys(temperature=0), "")
+        keys = self.keys(temperature=0.2, top_p=0.9, top_k=40, min_p=0.05,
+                         repetition_penalty=1.05, penalty_last_n=64, seed=42)
+        self.assertEqual(set(keys.split()), {"temperature=0.2", "top_p=0.9", "top_k=40",
+                                            "min_p=0.05", "penalty_repeat=1.05",
+                                            "penalty_last_n=64", "seed=42"})
+
+    def test_kolibri_config_and_chat_settings_override_default(self):
+        self.svc.model_arch = "kolibri1"
+        self.svc.sampling_defaults = {"temperature": 0.2}
+        self.assertEqual(self.keys().split(), ["temperature=0.2"])
+        self.svc.shared = {"temperature": 0.4}
+        self.assertEqual(self.keys().split(), ["temperature=0.4"])
+        self.assertEqual(self.keys(temperature=0), "")
+
+    def test_kolibri_props_reports_only_new_temperature_default(self):
+        self.svc.model_arch = "kolibri1"
+        with urllib.request.urlopen(self.base + "/props", timeout=10) as response:
+            props = json.load(response)
+        params = props["default_generation_settings"]["params"]
+        self.assertIn("temperature", params)
+        self.assertEqual(params["temperature"], 1.0)
+        for key in ("top_p", "top_k", "min_p", "repeat_penalty", "presence_penalty"):
+            self.assertNotIn(key, params)
+
     def test_no_family_no_defaults(self):
         self.svc.model_arch = None
         self.assertEqual(self.keys(), "")

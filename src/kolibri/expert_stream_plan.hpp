@@ -36,6 +36,9 @@ inline constexpr size_t kDescriptorBytes = 512;
 /// The design's batch bound: at most eight expert groups per slot.
 inline constexpr int kMaxExpertsPerBatch = 8;
 
+/// Slots this path may be configured with (Config::slots): two is the shipped depth, four the widest tried.
+constexpr int kMaxSlots = 4;
+
 /// One expert's selections, in ascending ORIGINAL selection index (the scatter target order).
 struct Group {
     int expert = -1;
@@ -67,6 +70,19 @@ struct Config {
     int experts_per_batch = kMaxExpertsPerBatch;
     size_t weight_bytes_per_slot = 32u << 20;
     size_t device_budget_bytes = 256u << 20;
+    /// Reusable slots.  Two is the shipped depth: batch i's weights and gate/up run while the host finishes batch
+    /// i-1.  More slots let the host issue the next batch's copy before it blocks on an older batch's results, which
+    /// is where a transfer-bound pipeline gains - see docs/experiments/kolibri-stream-kernels-layout.md, section 5.
+    int slots = 2;
+    /// Send the weight and hidden-row copies on a stream of their own instead of the slot's compute stream, with an
+    /// event per expert group so each group's kernel waits only for its own blob.  On one stream a batch's kernels
+    /// cannot start until the whole batch's copy has landed, which is the serialization the ledger's section 6
+    /// points at.
+    bool split_copy_stream = false;
+    /// Compute the SwiGLU and the Q8_K quantization of the hidden row on the device, from the gate/up floats that are
+    /// already there: no gate/up D2H, no host stall behind it, no hidden-row H2D.  The device reproduces this host's
+    /// expf and quantizer bit for bit (the kernel test compares the bytes over sigma 1, 3 and 10).
+    bool device_activation = false;
 };
 
 /// What create() must allocate.  Both slots are counted; every buffer is aligned to kBufferAlign.
@@ -191,10 +207,13 @@ inline Capacity required_capacity(const LayerView& view, const Config& config) {
     const size_t slot = detail::aligned(c.weight_bytes_per_slot, overflow) + detail::aligned(acts, overflow) +
                         detail::aligned(gu, overflow) + detail::aligned(hidden, overflow) +
                         detail::aligned(out, overflow) + detail::aligned(kDescriptorBytes, overflow);
-    c.device_bytes = detail::checked_mul(2u, slot, overflow);
-    c.pinned_bytes = detail::checked_mul(2u, slot, overflow);
+    detail::require(config.slots >= 2 && config.slots <= kMaxSlots,
+                    "expert streaming: the slot count is outside [2, kMaxSlots]");
+    const size_t n_slots = (size_t) config.slots;
+    c.device_bytes = detail::checked_mul(n_slots, slot, overflow);
+    c.pinned_bytes = detail::checked_mul(n_slots, slot, overflow);
     detail::require(c.device_bytes <= config.device_budget_bytes,
-                    "expert streaming: the two slots need more device memory than the configured budget");
+                    "expert streaming: the slots need more device memory than the configured budget");
     // ---- and only now the ids, whose scan is O(selections) -----------------------------------------------------
     for (int sel = 0; sel < view.selection_count; ++sel) {
         const int id = view.expert_ids[sel];

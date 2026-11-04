@@ -10,6 +10,7 @@
 // Usage: expert_stream_pipeline_test [--selftest] [--tails-only]
 
 #include "../../src/kolibri/expert_stream.hpp"
+#include "../../src/kolibri/expert_stream_kernels.cuh"   // es_plane_layout decides the slot allocation count
 
 #include "ggml-cpu.h"
 
@@ -186,7 +187,8 @@ bool compare_bits(const std::vector<float>& got, const std::vector<float>& want,
 }
 
 /// Runs one pipeline case: quantize the activations with the pool's own quantizer, run the context, compare.
-void pipeline_case(const Layer& l, Run& r, int top_k, const char* name, int repeat = 1) {
+void pipeline_case(const Layer& l, Run& r, int top_k, const char* name, int repeat = 1, int slots = 2,
+                   bool split_copy = false, bool dev_act = false) {
     using namespace strata::kolibri::stream;
     ++g_cases;
     const int tokens = (int) (r.ids.size() / (size_t) top_k);
@@ -212,6 +214,9 @@ void pipeline_case(const Layer& l, Run& r, int top_k, const char* name, int repe
     std::unique_ptr<Context> ctx;
     try {
         Config cfg;
+        cfg.slots = slots;   // the schedule is N-deep; every depth must publish the same rows
+        cfg.split_copy_stream = split_copy;   // a separate copy stream changes when bytes land, never what they are
+        cfg.device_activation = dev_act;      // the SwiGLU on the device must publish the host bridge's bytes
         ctx = create(v, cfg);
     } catch (const std::exception& ex) {
         std::printf("  FAIL %s: create threw: %s\n", name, ex.what());
@@ -366,7 +371,10 @@ void failure_cases(const Layer& l, const Layer& l6) {
             threw = true;
         }
         strata::kolibri::stream::detail::fail_allocation_after(-1);
-        if (ord < 18) {   // nine allocations per slot, two slots
+        // nine allocations per slot (the Q6_K plane layout adds one per slot), times the configured slot count
+        const int per_slot = strata::kolibri::stream::es_plane_layout() ? 10 : 9;
+        const int slots_here = strata::kolibri::stream::Config{}.slots;
+        if (ord < per_slot * slots_here) {
             if (!threw) {
                 std::printf("  FAIL alloc-fault: ordinal %d did not fail\n", ord);
                 ++g_failures;
@@ -436,8 +444,14 @@ int main(int argc, char** argv) {
         {
             Run r = make_run(2560, 256, 6, 384, 11);
             pipeline_case(l12, r, 6, "Q4_K down, 256 tokens x top_k 6");
+            pipeline_case(l12, r, 6, "Q4_K down, 256 tokens x top_k 6, three slots", 1, 3);
+            pipeline_case(l12, r, 6, "Q4_K down, 256 tokens x top_k 6, split copy stream", 1, 2, true);
+            pipeline_case(l12, r, 6, "Q4_K down, 256 tokens x top_k 6, device SwiGLU", 1, 2, false, true);
             Run r2 = make_run(2560, 256, 6, 384, 12);
             pipeline_case(l14, r2, 6, "Q6_K down, 256 tokens x top_k 6");
+            pipeline_case(l14, r2, 6, "Q6_K down, 256 tokens x top_k 6, three slots", 1, 3);
+            pipeline_case(l14, r2, 6, "Q6_K down, 256 tokens x top_k 6, split copy stream", 1, 2, true);
+            pipeline_case(l14, r2, 6, "Q6_K down, 256 tokens x top_k 6, device SwiGLU", 1, 2, false, true);
         }
         // (c) skewed: one expert holds 256 + 1 selections (more than three batches on its own)
         {

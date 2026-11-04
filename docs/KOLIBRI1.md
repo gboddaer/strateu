@@ -56,7 +56,12 @@ or directly:
 build/strata-kolibri --model Kolibri-1-Q4_K_M.gguf --ctx 32768
 ```
 
-Sampling defaults (the model card's): temperature 1.0, top-p 0.97, top-k 128. Reasoning effort is per request:
+The model card recommends temperature 1.0, top-p 0.97, top-k 128. Strateu's served Kolibri requests
+(`"arch": "kolibri1"` in the run config) default to **temperature 1.0**, with thinking on or off; other sampling
+settings are unchanged. Request values, shared Chat settings and the config's `sampling` block override the default;
+explicit temperature 0 still means greedy. The low-level engine diagnostic protocol remains greedy unless sampling
+is requested. This temperature default is user-approved; it is not a guarantee of correct code or loop-free output.
+Reasoning effort is per request:
 `"chat_template_kwargs": {"reasoning_effort": "low"}` - `none`, `low`, `medium`, `high`; measured on the T4:
 `none` answers directly ("27 x 43 = 1161.", no thinking), the default thinks first. The tokenizer is gpt2 BPE,
 128,000 tokens, `pre = kolibri1` (the Qwen2 pre-tokenizer split). The model writes tool calls as

@@ -211,9 +211,21 @@ ANSWER_ROOM_MIN_CAP = 1024    # 0.1.45: from this max_tokens on, thinking withou
 DS41_DEFAULT_BUDGET = 32768   # DeepSeek-V4.1 only: the thinking budget when neither the request nor the config names one
 DS41_SMALL_CAP_MIN = 48       # DeepSeek-V4.1 only: from this max_tokens up to ANSWER_ROOM_MIN_CAP, thinking is capped at half of it
 ANSWER_RESERVE_MIN = 512     # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
+ANSWER_RESERVE_TARGET = 2048 # ... and at least this many when the cap allows it: a 4000-token cap left a 1000-token
+                             # answer, and a 1,400-token code file truncated mid-function
+
+
+def answer_reserve(max_new: int) -> int:
+    """The tokens a reply keeps for its answer when the cap has to cover the thinking too: a quarter of the cap, at
+    least ANSWER_RESERVE_TARGET and never more than half of it.  At a 4000-token cap that is 2,000 rather than 1,000,
+    which is what a code-sized answer needs (see ANSWER_RESERVE_TARGET)."""
+    return min(max(ANSWER_RESERVE_MIN, ANSWER_RESERVE_TARGET, max_new // 4), max_new // 2)
+
+
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
-# #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
-# and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
+# #1053 ("reasoning_close_retry": "degenerate" by default): a reply that ends inside its thinking with no answer and no
+# call is continued once with the thinking closed (the same way the budget's wrap-up closes it).  The default rescues the
+# end a degenerate-output guard caused (#606/#728); true also rescues the end the model chose itself; false: neither
 REASONING_CLOSE = "\n</think>\n\n"
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
@@ -3979,7 +3991,10 @@ class Service:
         self.fit_max_tokens = fit_max_tokens          # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
-        self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
+        # #1053: close the thinking once when a reply ends inside it and has no answer.  "degenerate" (the default):
+        # only when a degenerate-output guard ended it (#606/#728); True: also when the model stopped there itself;
+        # False: never.
+        self.reasoning_close_retry = "degenerate"
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
@@ -5298,7 +5313,7 @@ class Service:
             # the cut-off in the middle of the thinking and NO answer.  So thinking is closed early enough to leave
             # the answer its quarter of the cap (the budget's wrap-up: a short closing sentence, </think>, the answer).
             # A request with a budget of its own, or max_tokens below ANSWER_ROOM_MIN_CAP, is left as it was.
-            budget = max_new - min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
+            budget = max_new - answer_reserve(max_new)
             if max_new <= 32768: print(f"[strata] thinking limited to {budget} of max_tokens {max_new} so the answer has room "
                   "(\"answer_room\": false in the config turns this off)", flush=True)
         if (thinking and not budget and self.answer_room and self.family == "deepseek41"
@@ -5312,7 +5327,7 @@ class Service:
         if budget and max_new and max_new > 0:
             # #984: a budget at or near max_tokens never fires before the reply is cut off while still thinking, so
             # it has no answer.  Close the thinking early enough to leave room for one.
-            reserve = min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
+            reserve = answer_reserve(max_new)
             if budget > max_new - reserve:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
@@ -5624,16 +5639,36 @@ class Service:
                                   f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
                                   "instruction (reasoning_loop_recovery)", flush=True)
                             continue
-                        if (self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
+                        # #606/#728: the reply was ended inside its thinking by a degenerate-output guard, not by the
+                        # model closing the thinking: it has no answer either, so the same one retry applies.
+                        # a passage loop only counts when the config did not ask to end the reply there: "stop" is an
+                        # explicit choice, and the close-and-continue retry must not override it
+                        degenerate = bool(repeated or (looped and self.reasoning_loop_recovery != "stop"))
+                        # "degenerate" (the default) rescues the ends a guard caused; True also the ones where the
+                        # model stopped inside its thinking by itself
+                        retry_end = bool(self.reasoning_close_retry) and (degenerate or self.reasoning_close_retry is True)
+                        if (thinking and retry_end
+                                and (finish == "stop" or (finish == "length" and degenerate)) and not close_retried
                                 and not answered and not wrap and not opens and parser.state == "reasoning"
                                 and parser.buf != THINK_END         # #537: not after a held </think>, the end
                                 and (stops is None or stops.hit is None) and not cancel.is_set()):
                             # #1053: the model wrote its reasoning and stopped before </think>: the client would get
                             # an empty answer.  Close the thinking once and let it answer.
                             close_retried = True
+                            if degenerate:
+                                # The loop's own words are in the context, so answering at the settings that looped
+                                # would loop again: raise the two that keep the same words from coming back (as
+                                # reasoning_loop_recovery does; a client's top_p, top_k and seed are never touched),
+                                # and give the repeat guard a fresh count for the pass that answers.
+                                want = (max(1.0, float((sampling or {}).get("temperature") or 0)),
+                                        max(1.5, float((sampling or {}).get("presence_penalty") or 0)))
+                                sampling = {**(sampling or {}), "temperature": want[0],
+                                            "presence_penalty": want[1]}
+                                run_tok, run_len, repeated, looped = None, 0, False, False
                             extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
                             if max_new - n - len(extra) >= 1:
-                                print("[strata] the reply ended inside its thinking with no answer: closing the "
+                                print("[strata] the reply ended inside its thinking with no answer"
+                                      + (" (a repeated token, #606)" if degenerate else "") + ": closing the "
                                       "thinking once and continuing (reasoning_close_retry)", flush=True)
                                 for t in extra:
                                     n += 1
@@ -8616,6 +8651,8 @@ MODEL_CARD_SAMPLING = {
     # Qwen3.6-35B-A3B: the general-task sets (the card's precise-coding set is temperature 0.6, presence_penalty 0)
     "qwen35moe": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
+    # Kolibri 1: temperature only. Other samplers/penalties retain their existing settings; explicit values win.
+    "kolibri1": {"thinking": {"temperature": 1.0}, "instruct": {"temperature": 1.0}},
     # DeepSeek-V4.1-Flash: temperature 1.0, top_p 1.0 for local use (thinking or not), no penalties
     "deepseek41": {"thinking": {"temperature": 1.0, "top_p": 1.0}, "instruct": {"temperature": 1.0, "top_p": 1.0}},
 }
@@ -9053,7 +9090,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         per_replica = requested if isinstance(requested, int) and not isinstance(requested, bool) and requested > 0 else 1
         svc.requested_slots = per_replica * len(groups) if groups else per_replica
     svc.answer_room = cfg.get("answer_room") is not False
-    svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    rcr = cfg.get("reasoning_close_retry", "degenerate")   # #1053: "degenerate" (default), true, or false
+    if rcr not in (True, False, "degenerate"):
+        raise SystemExit('[strata] config "reasoning_close_retry" must be true, false or "degenerate", not ' + repr(rcr))
+    svc.reasoning_close_retry = rcr
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
         icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                     if k in ("exe", "diffusion_model", "vae", "llm", "out_dir") and isinstance(v, str)

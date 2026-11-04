@@ -735,6 +735,7 @@ class Event:
 
 
 THINK_END = "</think>"
+THINK_START = next(k for k in THINK_TAGS if k != THINK_END)   # its opening tag: from THINK_TAGS, so the text is never a literal here
 CALL_START = "<tool_call>"
 CALL_END = "</tool_call>"
 
@@ -963,6 +964,9 @@ class OutputParser:
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  recover: bool = False, declared_only: bool = False):
         self.state = "reasoning" if thinking else "content"
+        # #3655: the model can open the thinking itself (` thinking`, which Kolibri-1 writes as its first token when the
+        # prompt does not): the marker is a control tag, not part of what it thought.  llama.cpp's parser drops it too.
+        self.opening = thinking
         self.buf = ""
         self.lead = False
         self.schemas = {t.get("name"): t for t in tools or []}
@@ -1374,6 +1378,21 @@ class OutputParser:
                 else:
                     return out
             elif self.state == "reasoning":
+                if self.opening:
+                    if not self.buf:
+                        return out
+                    if self.opening == "newline":           # the marker was dropped; its newline may still come
+                        if self.buf.startswith("\n"):
+                            self.buf = self.buf[1:]
+                        self.opening = False
+                    elif self.buf.startswith(THINK_START):
+                        self.buf = self.buf[len(THINK_START):]
+                        self.opening = "newline"
+                        continue                            # the newline written after it may be in this delta too
+                    elif THINK_START.startswith(self.buf):
+                        return out                          # a marker split across deltas: hold it back
+                    else:
+                        self.opening = False                # this reply opened on its text, as most do
                 if self.pending:
                     # calls wait for what follows: more calls or whitespace keep them, `</think>` makes them acts,
                     # any other text means they were quoted

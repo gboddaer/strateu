@@ -2015,6 +2015,9 @@ struct Scratch {
     int32_t *ent_dst = nullptr, *ent_tok = nullptr; char* xq8 = nullptr; char* scratch = nullptr; float* gout = nullptr;
     int* pos_d = nullptr; int* tok_d = nullptr;   // graph decode: position and token id on the device
     // --prefill: the chunk's rows (tmax tokens at once)
+    // 512 is the model's ceiling, not a tuning choice: n_swa is 513, and a chunk wider than the sliding ring would
+    // overwrite it (the engine refuses that outright).  The streamed arm's trade inside that ceiling is different from
+    // the pool's, which is why the chunk is not prefix-dependent (see pf_chunk_at).
     static constexpr int kTmax = 512;
     int* toks_d = nullptr;
     float *x_m = nullptr, *h_m = nullptr, *y_m = nullptr, *q_m = nullptr, *k_m = nullptr, *v_m = nullptr;
@@ -2174,8 +2177,36 @@ static long long g_expert_stream_layers = 0;
 
 /// One prefill chunk-layer's expert leg on the GPU.  The context is created on the first layer (that cost is
 /// first-use, not per-layer) and sized for both down formats this model alternates between.
+/// STRATA_KOLIBRI_STREAM_ROUTE_DUMP=<file>: measurement only, for the question "would an expert cache pay?".  One
+/// line per (layer, chunk) call listing the DISTINCT expert ids the arm is about to fetch, which is exactly what an
+/// expert already resident in VRAM would not have to copy.  With the variable unset no file is opened and nothing is
+/// computed; it changes no arithmetic and is never on in a timed run.
+static bool stream_route_dump_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_KOLIBRI_STREAM_ROUTE_DUMP");
+        return v != nullptr && v[0] != 0;
+    }();
+    return on;
+}
+static void stream_route_dump(const int* ids, int n) {
+    if (!stream_route_dump_on() || ids == nullptr || n <= 0) return;
+    static FILE* const f = [] {
+        const char* v = std::getenv("STRATA_KOLIBRI_STREAM_ROUTE_DUMP");
+        FILE* p = std::fopen(v, "w");
+        if (p == nullptr) std::fprintf(stderr, "kolibri: route dump: cannot write %s\n", v);
+        return p;
+    }();
+    if (f == nullptr) return;
+    std::vector<int> u(ids, ids + n);
+    std::sort(u.begin(), u.end());
+    u.erase(std::unique(u.begin(), u.end()), u.end());
+    for (size_t i = 0; i < u.size(); ++i) std::fprintf(f, i ? " %d" : "%d", u[i]);
+    std::fputc('\n', f);
+}
+
 static bool expert_stream_layer(const LayerBlobs& b, Scratch& s, const ActSet& A, int NKc, int K, int FF, int N,
                                 int experts) {
+    stream_route_dump(A.ids_h, NKc);
     strata::kolibri::stream::LayerView v;
     v.fmt = b.fmt;
     v.weights = b.table;
@@ -2187,7 +2218,26 @@ static bool expert_stream_layer(const LayerBlobs& b, Scratch& s, const ActSet& A
     v.top_k = K;
     v.output = A.ey_h;
     try {
-        if (!g_expert_stream) g_expert_stream = strata::kolibri::stream::create(v, strata::kolibri::stream::Config{});
+        if (!g_expert_stream) {
+            strata::kolibri::stream::Config cfg;
+            // STRATA_KOLIBRI_STREAM_SLOTS: the pipeline's slot count, 2 (the shipped depth) or up to kMaxSlots.  More
+            // slots let this layer's copy go out before the host blocks on an older batch, which is where a
+            // transfer-bound pipeline gains (docs/experiments/kolibri-stream-kernels-layout.md, section 5).
+            if (const char* sl = std::getenv("STRATA_KOLIBRI_STREAM_SLOTS")) {
+                const int n = std::atoi(sl);
+                if (n >= 2 && n <= strata::kolibri::stream::kMaxSlots) cfg.slots = n;
+            }
+            // STRATA_KOLIBRI_STREAM_COPY_STREAM=1 sends the weight and hidden-row copies on a stream of their own with
+            // an event per expert group, so a group's kernel waits for its own blob instead of the batch's last one.
+            if (const char* ccopy = std::getenv("STRATA_KOLIBRI_STREAM_COPY_STREAM")) cfg.split_copy_stream = ccopy[0] == '1';
+            // STRATA_KOLIBRI_STREAM_DEV_ACT=1 keeps the gate/up floats on the card: the SwiGLU and the hidden row's
+            // Q8_K are computed there, in the pool's own arithmetic (the kernel test compares the bytes).
+            // On by default: measured 1.200x / 1.145x / 1.241x (ids512 / ids8191 / ids11000) against the host bridge,
+            // with byte-identical full-logit dumps.  STRATA_KOLIBRI_STREAM_DEV_ACT=0 sends the step back to the host.
+            cfg.device_activation = true;
+            if (const char* da = std::getenv("STRATA_KOLIBRI_STREAM_DEV_ACT")) cfg.device_activation = da[0] != '0';
+            g_expert_stream = strata::kolibri::stream::create(v, cfg);
+        }
         const strata::kolibri::stream::Stats st = strata::kolibri::stream::run(*g_expert_stream, v);
         g_expert_stream_stats.groups += st.groups;
         g_expert_stream_stats.selections += st.selections;
@@ -2301,15 +2351,20 @@ __global__ void k_scatter_rows(const float* __restrict__ src, const int32_t* __r
     if (d < 0) return;   // padding row: the group was padded to a minimum rows-per-expert
     dst[(size_t) d * (size_t) ld + (size_t) c] = src[i];
 }
-static inline bool pf_chunk_key_total() {
-    const char* v = std::getenv("STRATA_KOLIBRI_PF_CHUNK_KEY");
-    return v == nullptr || (v[0] != 0 && std::atoi(v) != 0);
-}
+/// The prefill's chunk size: one size at every prefix length.
+///
+/// STRATA_KOLIBRI_PF_CHUNK caps it; the default is Scratch::kTmax (512), which is also the model's ceiling - n_swa is
+/// 513, so a wider chunk would overwrite the whole sliding ring and the engine refuses it outright.
+///
+/// It is deliberately not prefix-dependent any more.  The chunk used to run 256 tokens below an 8,192-token prefix and
+/// 512 above it (commit 5bbe47d5, tuned on the CPU pool's L2 behaviour), which made the same prompt compute two
+/// different answers depending on its length: every projection and the attention is launched by shape, and a 511-row
+/// launch does not accumulate like a 256-row one.  With each of them now in fixed 256-row tiles the chunk size no
+/// longer changes a bit - verified at 511 tokens and at 8,190 - and the full chunk is the faster side of the pair
+/// (1.20x at 511 tokens, 1.41x at 8,190 through the streamed arm).
+/// docs/experiments/kolibri-stream-kernels-layout.md, sections 17-21.
 static inline int pf_chunk_at(int64_t p0) {
-    // The env value CAPS the chunk; the default is prefix-dependent: a short prefix runs a SMALL chunk (the
-    // router's x matrix then fits the T4's L2 - the 384 expert GEMVs re-read it, and at T=512 it is 5.2 MB vs
-    // the 4 MB L2: pp512 4.73 s at T=256 vs 5.13 s at T=512), while a long prefix runs the full 512 (more chunks
-    // mean more per-chunk overheads: at 32K, T=256 measured 320.9 s vs T=512's 301.5 s).
+    (void) p0;
     static const int cap = [] {
         const char* v = std::getenv("STRATA_KOLIBRI_PF_CHUNK");
         int64_t n = v ? (int64_t) std::atoi(v) : (int64_t) Scratch::kTmax;
@@ -2317,12 +2372,6 @@ static inline int pf_chunk_at(int64_t p0) {
         if (n > (int64_t) Scratch::kTmax) n = (int64_t) Scratch::kTmax;
         return (int) n;
     }();
-    const int small = 256;
-    // The rule keys on the PREFIX LENGTH, not on the position - K28.  Keyed on p0 it made a 32K prompt run the
-    // small chunk for its first 8,192 tokens (32 of its 80 chunk-layers), even though the measurement behind the
-    // rule was taken on long prefixes, where the full chunk wins (301.5 s at T=512 against 320.9 s at T=256).  A
-    // genuinely short prefix (< 8192 tokens in total) keeps the 256 it was tuned for.
-    if ((g_pf_total > 0 && pf_chunk_key_total() ? g_pf_total : p0) < 8192 && cap >= 256) return small < cap ? small : cap;
     return cap;
 }
 
@@ -3375,30 +3424,158 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
         k_rms_rows<<<T, kThreads>>>(A.x_m, e.f32.at(L(l, "attn_norm.weight")), A.h_m, N, e.eps);
         strata::kernels::native_quantize_q8_1(A.h_m, A.xq8_m, N * Tc, 1, g_st);   // Tc contiguous rows = one column (q36)
         k_to_f16<<<grid1((int64_t) Tc * N), kThreads>>>((const float*) A.h_m, A.x16, (int64_t) Tc * N);
+        // A dense projection over the chunk's rows, in FIXED 256-row tiles.  cuBLAS picks its kernel (and with it the
+        // accumulation order) by shape, so a 511-row call and a 256-row call do not agree to the last bit - measured:
+        // the q projection itself differs in 97 % of its values by up to 2.0e-5, and the logits by up to 11 (ledger
+        // section 17).  Tiling every projection to 256 rows makes the arithmetic identical to the 256-token chunk's,
+        // which is the decomposition the bitwise gates were taken on, at any chunk size.
+        auto gemm_rows = [&](const __half* x, const Dense& w, float* y, int rows, int m_out, int k_in) {
+            const int kTile = 256;
+            for (int t0 = 0; t0 < rows; t0 += kTile) {
+                const int m = rows - t0 < kTile ? rows - t0 : kTile;
+                const __half* xt = x + (size_t) t0 * (size_t) k_in;
+                float* yt = y + (size_t) t0 * (size_t) m_out;
+                if (dense_f16_on() && w.f16) e.gemm.f16((const uint16_t*) xt, w.f16, yt, m, m_out, k_in);
+                else e.gemm.native((const uint16_t*) xt, w.type, w.d, yt, m, m_out, k_in);
+            }
+        };
         {
             const Dense& wq = e.dense.at(L(l, "attn_q.weight"));
-            if (dense_f16_on() && wq.f16) e.gemm.f16((const uint16_t*) A.x16, wq.f16, A.q_m, Tc, H * D, N);
-            else e.gemm.native((const uint16_t*) A.x16, wq.type, wq.d, A.q_m, Tc, H * D, N);
+            gemm_rows(A.x16, wq, A.q_m, Tc, H * D, N);
             const Dense& wk = e.dense.at(L(l, "attn_k.weight"));
-            if (dense_f16_on() && wk.f16) e.gemm.f16((const uint16_t*) A.x16, wk.f16, A.k_m, Tc, HKV * D, N);
-            else e.gemm.native((const uint16_t*) A.x16, wk.type, wk.d, A.k_m, Tc, HKV * D, N);
+            gemm_rows(A.x16, wk, A.k_m, Tc, HKV * D, N);
             const Dense& wv = e.dense.at(L(l, "attn_v.weight"));
-            if (dense_f16_on() && wv.f16) e.gemm.f16((const uint16_t*) A.x16, wv.f16, A.v_m, Tc, HKV * D, N);
-            else e.gemm.native((const uint16_t*) A.x16, wv.type, wv.d, A.v_m, Tc, HKV * D, N);
+            gemm_rows(A.x16, wv, A.v_m, Tc, HKV * D, N);
         }
         pp_mark(e.cnt.pf_dense_ns);
         kv8_restore_layer(e, s, l, p0c, g_st);
-        k_attn_prep_multi<<<dim3(H + HKV, Tc), kThreads>>>(A.q_m, A.k_m, A.v_m, e.f32.at(L(l, "attn_q_norm.weight")),
-                                                          e.f32.at(L(l, "attn_k_norm.weight")), A.q_m, s.kc[l],
-                                                          s.vc[l], H, HKV, D, p0c, g.n_swa, s.ctx, e.rope_base,
-                                                          e.eps, sliding);
+        // Option 2 of the ledger's section 20: the norm/RoPE/ring step and the attention run in 256-row SUB-TILES of
+        // the chunk, exactly as the dense projections already do (gemm_rows).  A chunk of any size then performs the
+        // same sequence of 256-row operations the reference dumps were taken on, so the chunk size cannot change the
+        // answer - which is what the measurements in sections 17-20 kept finding it did.
+        {
         kv8_pack_layer(e, s, l, p0c, Tc, g_st);
-        // the chunk reads positions 0..p0c+Tc-1 (full) or the ring's last n_vis (sliding)
-        const int P = sliding ? (int) std::min<int64_t>(p0c + Tc, g.n_swa) : (int) (p0c + Tc);
-        const int64_t first = sliding ? p0c + Tc - P : 0;
-        if (sliding)
-            k_kv_ring<<<grid1((int64_t) HKV * P * D), kThreads>>>(s.kc[l], s.vc[l], A.k16, A.v16, g.n_swa, P,
-                                                                  first, D, HKV);
+        }
+        auto attn_block = [&](int t0, int m, int64_t pp0) {
+            float* const qm = A.q_m + (size_t) t0 * (size_t) H * (size_t) D;
+            const float* const km = A.k_m + (size_t) t0 * (size_t) HKV * (size_t) D;
+            const float* const vm = A.v_m + (size_t) t0 * (size_t) HKV * (size_t) D;
+            __half* const q16m = A.q16 + (size_t) t0 * (size_t) H * (size_t) D;
+            float* const attm = A.att_m + (size_t) t0 * (size_t) H * (size_t) D;
+            k_attn_prep_multi<<<dim3(H + HKV, m), kThreads>>>(qm, km, vm, e.f32.at(L(l, "attn_q_norm.weight")),
+                                                              e.f32.at(L(l, "attn_k_norm.weight")), qm, s.kc[l],
+                                                              s.vc[l], H, HKV, D, pp0, g.n_swa, s.ctx, e.rope_base,
+                                                              e.eps, sliding);
+            // the chunk reads positions 0..pp0+m-1 (full) or the ring's last n_vis (sliding)
+            const int P = sliding ? (int) std::min<int64_t>(pp0 + m, g.n_swa) : (int) (pp0 + m);
+            const int64_t first = sliding ? pp0 + m - P : 0;
+            if (sliding)
+                k_kv_ring<<<grid1((int64_t) HKV * P * D), kThreads>>>(s.kc[l], s.vc[l], A.k16, A.v16, g.n_swa, P,
+                                                                      first, D, HKV);
+            k_to_f16<<<grid1((int64_t) m * H * D), kThreads>>>(qm, q16m, (int64_t) m * H * D);
+    #if STRATA_KOLIBRI_MMA_AVAILABLE
+            if (attn_mma_on() && H == 48 && HKV == 4 && D == 128) {
+                k_attn_flash_mma<<<dim3((unsigned) ((m + 15) / 16), (unsigned) (HKV * 4)), 128, 0, g_st>>>(
+                    q16m, sliding ? A.k16 : s.kc[l], sliding ? A.v16 : s.vc[l], attm, (int) H,
+                    sliding ? (long long) P : (long long) s.ctx, (int) m, P, (int) pp0,
+                    sliding ? (int64_t) g.n_swa : 0, (int) first, 1.0f / sqrtf((float) D));
+            } else
+    #endif
+            if (attn_flash_on() && H == 48 && HKV == 4 && D == 128) {
+                k_attn_flash<<<dim3((unsigned) ((m + 7) / 8), (unsigned) HKV), 256, 0, g_st>>>(
+                    q16m, sliding ? A.k16 : s.kc[l], sliding ? A.v16 : s.vc[l], attm, (int) H,
+                    sliding ? (long long) P : (long long) s.ctx, (int) m, P, (int) pp0,
+                    sliding ? (int64_t) g.n_swa : 0, (int) first, 1.0f / sqrtf((float) D));
+            } else {
+            const int ldp = (P + 7) / 8 * 8;
+            const int G = H / HKV;
+            const int64_t tq_lim = (int64_t) (attn_cap_floats() / ((size_t) H * 512)) * 512;   // nt * ldp <= tq_lim
+            const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(m, tq_lim / ldp));
+            const bool attn_ph = attn_phases_on();
+            std::chrono::steady_clock::time_point ph_last{};
+            if (attn_ph) ph_last = std::chrono::steady_clock::now();
+            auto ph_close = [&](long long& acc) {
+                if (!attn_ph) return;
+                cudaStreamSynchronize(g_st);
+                const auto n = std::chrono::steady_clock::now();
+                acc += std::chrono::duration_cast<std::chrono::nanoseconds>(n - ph_last).count();
+                ph_last = n;
+            };
+            if (attn_kg_on() && (int64_t) m * ldp <= attn_cap_floats()) {
+                const int Bh = (int) std::max<int64_t>(1, std::min<int64_t>(G, attn_cap_floats() / ((size_t) m * ldp)));
+                for (int kvh = 0; kvh < HKV; ++kvh) {
+                    const __half* Kh = sliding ? A.k16 + (size_t) kvh * P * D
+                                               : s.kc[l] + (size_t) kvh * s.ctx * D;
+                    const __half* Vh = sliding ? A.v16 + (size_t) kvh * P * D
+                                               : s.vc[l] + (size_t) kvh * s.ctx * D;
+                    for (int hb = 0; hb < G; hb += Bh) {
+                        const int nb = std::min(Bh, G - hb);
+                        const __half* Qh = q16m + (size_t) (kvh * G + hb) * D;
+                        // the cap-sized buffers hold Bh reusable slots (stream order: scores -> softmax -> PV
+                        // per slot before the next (kvh, hb) reuses it), so base = the slot, NOT the global head
+                        float* Sh = s.att_s + (size_t) (hb / Bh) * m * ldp;
+                        if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, m, D, &one, Kh, CUDA_R_16F,
+                                                       D, 0, Qh, CUDA_R_16F, H * D, D, &zero, Sh, CUDA_R_32F, ldp,
+                                                       (long long) m * ldp, nb, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                            CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "strata-kolibri: scores GEMM failed\n"); std::exit(1); }
+                        ph_close(e.cnt.attn_sc_ns);
+                        k_attn_softmax16<<<dim3(m, nb), kThreads>>>(Sh, s.p16 + (size_t) (hb / Bh) * m * ldp,
+                                                                    ldp, m, P, pp0, 1.0f / sqrtf((float) D),
+                                                                    sliding ? g.n_swa : 0, (int) first, pv_scale());
+                        ph_close(e.cnt.attn_sm_ns);
+                        const __half* Ph = s.p16 + (size_t) (hb / Bh) * m * ldp;
+                        float* Oh = attm + (size_t) (kvh * G + hb) * D;
+                        const float pv_alpha = 1.0f / pv_scale();   // undoes the fp16-mantissa-preserving scale above
+                        if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, D, m, P, &pv_alpha, Vh, CUDA_R_16F, D, 0,
+                                                       Ph, CUDA_R_16F, ldp, (long long) m * ldp, &zero, Oh, CUDA_R_32F,
+                                                       H * D, D, nb, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                            CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "strata-kolibri: PV GEMM failed\n"); std::exit(1); }
+                        ph_close(e.cnt.attn_pv_ns);
+                    }
+                }
+            } else for (int t0 = 0; t0 < m; t0 += tq) {
+                const int nt = std::min(tq, m - t0);
+                for (int kvh = 0; kvh < HKV; ++kvh) {
+                    const __half* Kh = sliding ? A.k16 + (size_t) kvh * P * D
+                                                   : s.kc[l] + (size_t) kvh * s.ctx * D;
+                    const __half* Qh = q16m + ((size_t) t0 * H + kvh * G) * D;
+                    float* Sh = s.att_s + (size_t) kvh * G * nt * ldp;
+                    if (attn_simt_on()) {
+                        const dim3 sg((unsigned) ((P + 63) / 64), (unsigned) ((nt + 31) / 32), (unsigned) (G / 4));
+                        k_attn_scores_simt<32, 64, 32, 4><<<sg, 256, 0, g_st>>>(q16m, Kh, (int) H, (int) pp0, (int) t0,
+                                                                               kvh * G, nt, P, (int) D, ldp,
+                                                                               sliding ? (int64_t) g.n_swa : 0,
+                                                                               (int) first, s.att_s);
+                    } else if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, D, &one, Kh, CUDA_R_16F, D, 0,
+                                                   Qh, CUDA_R_16F, H * D, D, &zero, Sh, CUDA_R_32F, ldp,
+                                                   (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                        CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "strata-kolibri: scores GEMM failed\n"); std::exit(1); }
+                }
+                ph_close(e.cnt.attn_sc_ns);
+                k_attn_softmax16<<<dim3(nt, H), kThreads>>>(s.att_s, s.p16, ldp, nt, P, (int) pp0 + t0,
+                                                            1.0f / sqrtf((float) D), sliding ? g.n_swa : 0, (int) first,
+                                                            1.0f);   // the big-T branch is unscaled (its PV alpha stays 1)
+                ph_close(e.cnt.attn_sm_ns);
+                for (int kvh = 0; kvh < HKV; ++kvh) {
+                    const __half* Vh = sliding ? A.v16 + (size_t) kvh * P * D
+                                                   : s.vc[l] + (size_t) kvh * s.ctx * D;
+                    const __half* Ph = s.p16 + (size_t) kvh * G * nt * ldp;
+                    float* Oh = attm + ((size_t) t0 * H + kvh * G) * D;
+                    if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, D, nt, P, &one, Vh, CUDA_R_16F, D, 0,
+                                                   Ph, CUDA_R_16F, ldp, (long long) nt * ldp, &zero, Oh, CUDA_R_32F,
+                                                   H * D, D, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                        CUBLAS_STATUS_SUCCESS) {
+                        std::fprintf(stderr, "strata-kolibri: PV GEMM failed (t0=%d nt=%d P=%d ldp=%d ctx=%d)\n", t0, nt,
+                                     P, ldp, s.ctx);
+                        std::exit(1);
+                    }
+                }
+                ph_close(e.cnt.attn_pv_ns);
+            }
+            }   // attn_flash's else
+        };
+        for (int t0 = 0; t0 < Tc; t0 += 256)
+            attn_block(t0, Tc - t0 < 256 ? Tc - t0 : 256, p0c + t0);
         if (reuse_gate_kv_path() && (int) l == attn_dump_layer()) {
             // Per-chunk snapshot, so the chunk that perturbs a row is named rather than inferred.  Header magic
             // 0x4b564348 ("KVCH") distinguishes these from the decode-time records (0x4b564344, "KVCD").
@@ -3417,107 +3594,6 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                 }
             }
         }
-        k_to_f16<<<grid1((int64_t) Tc * H * D), kThreads>>>(A.q_m, A.q16, (int64_t) Tc * H * D);
-#if STRATA_KOLIBRI_MMA_AVAILABLE
-        if (attn_mma_on() && H == 48 && HKV == 4 && D == 128) {
-            k_attn_flash_mma<<<dim3((unsigned) ((Tc + 15) / 16), (unsigned) (HKV * 4)), 128, 0, g_st>>>(
-                A.q16, sliding ? A.k16 : s.kc[l], sliding ? A.v16 : s.vc[l], A.att_m, (int) H,
-                sliding ? (long long) P : (long long) s.ctx, (int) Tc, P, (int) p0c,
-                sliding ? (int64_t) g.n_swa : 0, (int) first, 1.0f / sqrtf((float) D));
-        } else
-#endif
-        if (attn_flash_on() && H == 48 && HKV == 4 && D == 128) {
-            k_attn_flash<<<dim3((unsigned) ((Tc + 7) / 8), (unsigned) HKV), 256, 0, g_st>>>(
-                A.q16, sliding ? A.k16 : s.kc[l], sliding ? A.v16 : s.vc[l], A.att_m, (int) H,
-                sliding ? (long long) P : (long long) s.ctx, (int) Tc, P, (int) p0c,
-                sliding ? (int64_t) g.n_swa : 0, (int) first, 1.0f / sqrtf((float) D));
-        } else {
-        const int ldp = (P + 7) / 8 * 8;
-        const int G = H / HKV;
-        const int64_t tq_lim = (int64_t) (attn_cap_floats() / ((size_t) H * 512)) * 512;   // nt * ldp <= tq_lim
-        const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(Tc, tq_lim / ldp));
-        const bool attn_ph = attn_phases_on();
-        std::chrono::steady_clock::time_point ph_last{};
-        if (attn_ph) ph_last = std::chrono::steady_clock::now();
-        auto ph_close = [&](long long& acc) {
-            if (!attn_ph) return;
-            cudaStreamSynchronize(g_st);
-            const auto n = std::chrono::steady_clock::now();
-            acc += std::chrono::duration_cast<std::chrono::nanoseconds>(n - ph_last).count();
-            ph_last = n;
-        };
-        if (attn_kg_on() && (int64_t) Tc * ldp <= attn_cap_floats()) {
-            const int Bh = (int) std::max<int64_t>(1, std::min<int64_t>(G, attn_cap_floats() / ((size_t) Tc * ldp)));
-            for (int kvh = 0; kvh < HKV; ++kvh) {
-                const __half* Kh = sliding ? A.k16 + (size_t) kvh * P * D
-                                           : s.kc[l] + (size_t) kvh * s.ctx * D;
-                const __half* Vh = sliding ? A.v16 + (size_t) kvh * P * D
-                                           : s.vc[l] + (size_t) kvh * s.ctx * D;
-                for (int hb = 0; hb < G; hb += Bh) {
-                    const int nb = std::min(Bh, G - hb);
-                    const __half* Qh = A.q16 + (size_t) (kvh * G + hb) * D;
-                    // the cap-sized buffers hold Bh reusable slots (stream order: scores -> softmax -> PV
-                    // per slot before the next (kvh, hb) reuses it), so base = the slot, NOT the global head
-                    float* Sh = s.att_s + (size_t) (hb / Bh) * Tc * ldp;
-                    if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, Tc, D, &one, Kh, CUDA_R_16F,
-                                                   D, 0, Qh, CUDA_R_16F, H * D, D, &zero, Sh, CUDA_R_32F, ldp,
-                                                   (long long) Tc * ldp, nb, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
-                        CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "strata-kolibri: scores GEMM failed\n"); std::exit(1); }
-                    ph_close(e.cnt.attn_sc_ns);
-                    k_attn_softmax16<<<dim3(Tc, nb), kThreads>>>(Sh, s.p16 + (size_t) (hb / Bh) * Tc * ldp,
-                                                                ldp, Tc, P, p0c, 1.0f / sqrtf((float) D),
-                                                                sliding ? g.n_swa : 0, (int) first, pv_scale());
-                    ph_close(e.cnt.attn_sm_ns);
-                    const __half* Ph = s.p16 + (size_t) (hb / Bh) * Tc * ldp;
-                    float* Oh = A.att_m + (size_t) (kvh * G + hb) * D;
-                    const float pv_alpha = 1.0f / pv_scale();   // undoes the fp16-mantissa-preserving scale above
-                    if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, D, Tc, P, &pv_alpha, Vh, CUDA_R_16F, D, 0,
-                                                   Ph, CUDA_R_16F, ldp, (long long) Tc * ldp, &zero, Oh, CUDA_R_32F,
-                                                   H * D, D, nb, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
-                        CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "strata-kolibri: PV GEMM failed\n"); std::exit(1); }
-                    ph_close(e.cnt.attn_pv_ns);
-                }
-            }
-        } else for (int t0 = 0; t0 < Tc; t0 += tq) {
-            const int nt = std::min(tq, Tc - t0);
-            for (int kvh = 0; kvh < HKV; ++kvh) {
-                const __half* Kh = sliding ? A.k16 + (size_t) kvh * P * D
-                                               : s.kc[l] + (size_t) kvh * s.ctx * D;
-                const __half* Qh = A.q16 + ((size_t) t0 * H + kvh * G) * D;
-                float* Sh = s.att_s + (size_t) kvh * G * nt * ldp;
-                if (attn_simt_on()) {
-                    const dim3 sg((unsigned) ((P + 63) / 64), (unsigned) ((nt + 31) / 32), (unsigned) (G / 4));
-                    k_attn_scores_simt<32, 64, 32, 4><<<sg, 256, 0, g_st>>>(A.q16, Kh, (int) H, (int) p0c, (int) t0,
-                                                                           kvh * G, nt, P, (int) D, ldp,
-                                                                           sliding ? (int64_t) g.n_swa : 0,
-                                                                           (int) first, s.att_s);
-                } else if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, D, &one, Kh, CUDA_R_16F, D, 0,
-                                               Qh, CUDA_R_16F, H * D, D, &zero, Sh, CUDA_R_32F, ldp,
-                                               (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
-                    CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "strata-kolibri: scores GEMM failed\n"); std::exit(1); }
-            }
-            ph_close(e.cnt.attn_sc_ns);
-            k_attn_softmax16<<<dim3(nt, H), kThreads>>>(s.att_s, s.p16, ldp, nt, P, (int) p0c + t0,
-                                                        1.0f / sqrtf((float) D), sliding ? g.n_swa : 0, (int) first,
-                                                        1.0f);   // the big-T branch is unscaled (its PV alpha stays 1)
-            ph_close(e.cnt.attn_sm_ns);
-            for (int kvh = 0; kvh < HKV; ++kvh) {
-                const __half* Vh = sliding ? A.v16 + (size_t) kvh * P * D
-                                               : s.vc[l] + (size_t) kvh * s.ctx * D;
-                const __half* Ph = s.p16 + (size_t) kvh * G * nt * ldp;
-                float* Oh = A.att_m + ((size_t) t0 * H + kvh * G) * D;
-                if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, D, nt, P, &one, Vh, CUDA_R_16F, D, 0,
-                                               Ph, CUDA_R_16F, ldp, (long long) nt * ldp, &zero, Oh, CUDA_R_32F,
-                                               H * D, D, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
-                    CUBLAS_STATUS_SUCCESS) {
-                    std::fprintf(stderr, "strata-kolibri: PV GEMM failed (t0=%d nt=%d P=%d ldp=%d ctx=%d)\n", t0, nt,
-                                 P, ldp, s.ctx);
-                    std::exit(1);
-                }
-            }
-            ph_close(e.cnt.attn_pv_ns);
-        }
-        }   // attn_flash's else
         pp_mark(e.cnt.pf_attn_ns);
         k_to_f16<<<grid1((int64_t) Tc * H * D), kThreads>>>(A.att_m, s.att16, (int64_t) Tc * H * D);
         if (attn_dump_path() && (attn_dump_layer() < 0 || (int) l == attn_dump_layer())) {
@@ -3537,8 +3613,7 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
         }
         {
             const Dense& wo = e.dense.at(L(l, "attn_output.weight"));
-            if (dense_f16_on() && wo.f16) e.gemm.f16((const uint16_t*) s.att16, wo.f16, A.y_m, Tc, N, H * D);
-            else e.gemm.native((const uint16_t*) s.att16, wo.type, wo.d, A.y_m, Tc, N, H * D);
+            gemm_rows(s.att16, wo, A.y_m, Tc, N, H * D);
         }
         k_rms_rows<<<Tc, kThreads>>>(A.y_m, e.f32.at(L(l, "post_attention_norm.weight")), A.y_m, N, e.eps);
         k_add_rows<<<grid1((int64_t) Tc * N), kThreads>>>(A.x_m, A.y_m, (int64_t) Tc * N);
@@ -4416,17 +4491,27 @@ static const int grp_max = [] {
             }   // end the mmvq fallback: the pool leg above must not fall through into the swiglu+down leg
         }
         {
+            // The shared expert's projections in the same FIXED 256-row tiles the attention projections use: a GEMM
+            // picks its kernel by shape, so a 511-row launch and a 256-row one do not agree to the last bit, and the
+            // shared expert adds straight into the layer's output - which made the whole layer answer depend on the
+            // chunk size (ledger section 20).
             const Dense& wg = e.dense.at(L(l, "ffn_gate_shexp.weight"));
-            if (dense_f16_on() && wg.f16) e.gemm.f16((const uint16_t*) A.x16, wg.f16, A.sg_m, Tc, FS, N);
-            else e.gemm.native((const uint16_t*) A.x16, wg.type, wg.d, A.sg_m, Tc, FS, N);
             const Dense& wu = e.dense.at(L(l, "ffn_up_shexp.weight"));
-            if (dense_f16_on() && wu.f16) e.gemm.f16((const uint16_t*) A.x16, wu.f16, A.su_m, Tc, FS, N);
-            else e.gemm.native((const uint16_t*) A.x16, wu.type, wu.d, A.su_m, Tc, FS, N);
+            const Dense& wd = e.dense.at(L(l, "ffn_down_shexp.weight"));
+            auto shx_gemm = [&](const __half* x, const Dense& w, float* y, int rows, int m_out, int k_in) {
+                for (int t0 = 0; t0 < rows; t0 += 256) {
+                    const int m = rows - t0 < 256 ? rows - t0 : 256;
+                    const __half* xt = x + (size_t) t0 * (size_t) k_in;
+                    float* yt = y + (size_t) t0 * (size_t) m_out;
+                    if (dense_f16_on() && w.f16) e.gemm.f16((const uint16_t*) xt, w.f16, yt, m, m_out, k_in);
+                    else e.gemm.native((const uint16_t*) xt, w.type, w.d, yt, m, m_out, k_in);
+                }
+            };
+            shx_gemm(A.x16, wg, A.sg_m, Tc, FS, N);
+            shx_gemm(A.x16, wu, A.su_m, Tc, FS, N);
             k_swiglu_rows<<<grid1((int64_t) Tc * FS), kThreads>>>(A.sg_m, A.su_m, A.sh_m, (int64_t) Tc * FS);
             k_to_f16<<<grid1((int64_t) Tc * FS), kThreads>>>(A.sh_m, A.x16, (int64_t) Tc * FS);
-            const Dense& wd = e.dense.at(L(l, "ffn_down_shexp.weight"));
-            if (dense_f16_on() && wd.f16) e.gemm.f16((const uint16_t*) A.x16, wd.f16, A.sy_m, Tc, N, FS);
-            else e.gemm.native((const uint16_t*) A.x16, wd.type, wd.d, A.sy_m, Tc, N, FS);
+            shx_gemm(A.x16, wd, A.sy_m, Tc, N, FS);
         }
         pp_mark(e.cnt.pf_shx_ns);   // the shared expert's three gemvs + SwiGLU
         if (s.pf_partial_used) {
@@ -5799,16 +5884,19 @@ int serve(Engine& e, Scratch& s) {
             const char* v = std::getenv("STRATA_KOLIBRI_REUSE");
             return v == nullptr || std::atoi(v) != 0;
         }();
-        // STRATA_KOLIBRI_REUSE_PREFIX=1 reuses the LONGEST COMMON PREFIX instead of demanding that the whole held
-        // prefix match.  Measured reason: real clients re-render the conversation as TEXT, and a BPE merge across
-        // the turn boundary rewrites the prompt's last token or two - through /v1/chat/completions, turn 2 agreed
-        // with turn 1 on 57 of 59 ids, so the strict check reset and the turn read all 72 tokens (cache_n 0).
-        // Rows 0..reuse-1 belong to the tokens that DO match, so reusing them is exactly as safe as the strict
-        // case, and the rewind below re-derives the chunk the same way.  OPT-IN and off by default, because the
-        // strict rule is the documented contract and the default path must stay byte-identical.
+        // The LONGEST COMMON PREFIX is the default rule, because the strict whole-prefix rule effectively never fires
+        // on real traffic: clients re-render the conversation as TEXT, and a BPE merge across the turn boundary
+        // rewrites the prompt's last token or two, so the strict check resets and the turn reads its whole prompt.
+        // Measured through /v1/chat/completions on a three-turn conversation sharing a 479-token system prompt
+        // (docs/experiments/kolibri-stream-kernels-layout.md, section 22):
+        //   strict rule:        turn 2 cached_tokens 0, prompt 18,106 ms; turn 3 cached 0, 19,959 ms
+        //   longest prefix:     turn 2 cached_tokens 475, prompt 1,846 ms; turn 3 cached 512, 2,230 ms
+        // and the generated text was identical on all three turns.  Rows 0..match-1 belong to the tokens that DO
+        // match, so reusing them is exactly as safe as the strict case, and the rewind below re-derives the chunk the
+        // same way.  STRATA_KOLIBRI_REUSE_PREFIX=0 restores the strict rule for an A/B.
         const bool prefix_reuse = [] {
             const char* v = std::getenv("STRATA_KOLIBRI_REUSE_PREFIX");
-            return v != nullptr && v[0] != 0 && std::atoi(v) != 0;
+            return v == nullptr || v[0] == 0 || std::atoi(v) != 0;
         }();
         // The prefill never feeds the last prompt token - the decode step does - so that is the most a request can
         // reuse however long the held prefix is.
@@ -5859,9 +5947,12 @@ int serve(Engine& e, Scratch& s) {
                 const int64_t prev_end = s.pos;   // tokens the previous request consumed (read before we move it)
                 g_pf_total = (int64_t) ids.size() - 1 - (int64_t) reuse;   // the rule keys on the prefix length
                 const int64_t chunk = (int64_t) pf_chunk_at((int64_t) reuse);
-                if (chunk > 1 && prev_end > 1) {
-                    const int64_t aligned = ((prev_end - 1) / chunk) * chunk;
-                    if (aligned > 0 && (size_t) aligned < reuse) reuse = (size_t) aligned;
+                if (chunk > 1 && prev_end > 0) {
+                    // Rebuild the partial chunk containing the reuse boundary as well as the previous
+                    // request's partial final chunk. Zero is a real boundary: retaining a sub-chunk
+                    // prefix there mixes old prefill/decode rows with a differently shaped cold read.
+                    const int64_t boundary = std::min<int64_t>((int64_t) reuse, prev_end - 1);
+                    reuse = (size_t) ((boundary / chunk) * chunk);
                 }
             }
             // (2) THE PREFILL WRITES AT s.pos, so s.pos must be the reused length before the prefill runs.  After
@@ -5869,6 +5960,13 @@ int serve(Engine& e, Scratch& s) {
             // decode path), so leaving it alone made this request write its chunk that much too far: with a
             // 513-id prefix the resumed prefill wrote 513..521 instead of 512..520, which left position 512
             // holding the previous request's decode-written K/V and wrote 521 twice.  That was the actual bug.
+            // Matching token IDs do not prove that their K/V rows still exist. Sliding layers keep only
+            // the last n_swa positions: after the ring wraps, rewinding (including the chunk-alignment
+            // rewind above) can require rows already overwritten by the previous reply. Rebuild cold
+            // instead of attending to unrelated tokens. Appending at the held position stays valid.
+            if ((int64_t) reuse < s.pos && s.pos > e.g.n_swa) reuse = 0;
+        }
+        if (reuse > 0) {
             s.pos = (int64_t) reuse;
         } else {
             reset_state(e, s);
@@ -5896,7 +5994,7 @@ int serve(Engine& e, Scratch& s) {
             std::printf("RESUME %lld\n", (long long) reuse);
             std::fflush(stdout);
         }
-        if (e.prefill > 0) {   // chunked prefill: 512 rows per pass, progress per chunk
+        if (e.prefill > 0) {   // chunked prefill: one 512-row pass, progress per chunk
             int64_t i = reuse;
             const int64_t n = pf_end - reuse;   // the tokens still to read (== ids.size()-1 when reuse is 0)
             e.hot_pos_at_last = s.pos;   // the request's own position count, so a reuse does not inherit the last one
@@ -6391,6 +6489,21 @@ int strata::kolibri::run(int argc, char** argv) {
     // CUDA-graph decode rides the grouped path (device-side expert pointers); the slots/pool paths read host
     // ids per layer and are not capturable.  --no-graph keeps the plain launches.
     e.graphs = grouped && !no_graph && slots == 0 && cpu_threads == 0 ? 1 : 0;
+    // A served request reads its prompt through the CHUNKED prefill by default.  That is the path every reference and
+    // every measurement in this repository was taken on, it reads a prompt 2.3x faster than the per-token loop (479
+    // tokens: 7,197 ms against 16,272 ms, measured through /v1/chat/completions), and it is where the streamed expert
+    // arm lives - the per-token loop never reaches it.  It has to be decided here, before the arm's guard below reads
+    // `prefill`.  STRATA_KOLIBRI_SERVE_TOKENS=1 restores the per-token read for an A/B.
+    if (serve_mode && prefill <= 0) {
+        static const bool per_token = [] {
+            const char* v = std::getenv("STRATA_KOLIBRI_SERVE_TOKENS");
+            return v != nullptr && v[0] != 0 && std::atoi(v) != 0;
+        }();
+        if (!per_token) {
+            prefill = 1;     // the arm's guard below reads this
+            e.prefill = 1;   // and this is what serve() runs on (copied at `e.prefill = prefill` far above)
+        }
+    }
     e.prefill = prefill;
     // The CPU pool is OPT-IN (--cpu-threads) and its absence is SILENT: with no pool every routed expert falls
     // through to the per-expert GPU mmvq loop (measured on 2026-10-21: 364,350 mmvq launches = 26.8 s of 35 s
@@ -6522,7 +6635,10 @@ int strata::kolibri::run(int argc, char** argv) {
         else if (pf_partial_on()) why = "STRATA_KOLIBRI_PF_PARTIAL publishes partial sums instead of ey_h";
         else if (dec_res_on()) why = "STRATA_KOLIBRI_DEC_RES serves resident picks on the GPU";
         else if (pf_mmq_on()) why = "the MMQ prompt arm replaces the pool's expert products";
-        else if (serve_mode) why = "the streamed arm serves prefill chunks, not a served request stream";
+        // A served request is not a reason to refuse.  The arm is consulted from forward_multi's chunked prefill
+        // expert leg and from nothing else: a served request's DECODE still goes through the plain path and the
+        // pool/slots, exactly as the CLI's does.  With the chunked prefill on (prefill = 1 below, which serve mode
+        // now sets) a served 479-token prompt runs the same arm a CLI --prefill run does.
         else if (stream_capture_on()) why = "the capture hook records the CPU pool's leg; the streamed arm is a different leg";
         if (why != nullptr) {
             if (expert_stream_demanded()) {
@@ -6761,6 +6877,27 @@ int strata::kolibri::run(int argc, char** argv) {
             slots_tick(e, "chunk", (long long) i);   // a round every --expert-slots-reselect-every positions
         }
         if (pf_host_prev.valid) strata::kernels::cpu::restore_thread_affinity(pf_host_prev);
+#if defined(__CUDACC__)
+        // --counters: what the streamed expert leg spent, and on what.  The arm's wall time is the only number that
+        // reaches the user, but whether a kernel change can move it depends on the split: the host's SwiGLU +
+        // quantization (cpu_activation_ms) runs beside the copies, the kernel launches run behind them, and the
+        // weights alone are the PCIe floor.  Measurement only, no numerics effect.
+        if (e.counters && g_expert_stream_layers > 0) {
+            const strata::kolibri::stream::Stats& c = g_expert_stream_stats;
+            const double gb = 1e-9;
+            std::fprintf(stderr,
+                         "CNT expert-stream: %lld layer-chunk(s), %llu groups, %llu selections, wall %.0f ms, "
+                         "cpu-activation %.0f ms (%.1f%% of wall), weights %.1f GB H2D, acts %.2f GB, gu %.1f GB, "
+                         "hidden %.2f GB, out %.1f GB D2H, %llu launches, %llu slot wait(s)\n",
+                         g_expert_stream_layers, (unsigned long long) c.groups, (unsigned long long) c.selections,
+                         c.wall_ms, c.cpu_activation_ms,
+                         c.wall_ms > 0.0 ? 100.0 * c.cpu_activation_ms / c.wall_ms : 0.0,
+                         c.weight_h2d_bytes * gb, c.activation_h2d_bytes * gb, c.gu_d2h_bytes * gb,
+                         c.hidden_h2d_bytes * gb, c.output_d2h_bytes * gb, (unsigned long long) c.kernel_launches,
+                         (unsigned long long) c.slot_waits);
+            std::fflush(stderr);
+        }
+#endif
         tok = ids.back();
     } else
     for (size_t t = 1; t < ids.size(); ++t) {

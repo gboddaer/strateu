@@ -26,6 +26,9 @@ def target_guards():
 @pytest.mark.parametrize('target', [
     'kolibri_expert_stream_pipeline_test',
     'kolibri_expert_stream_kernel_test',
+    'kolibri_expert_stream_kbench',
+    'kolibri_expf_bit_probe',
+    'kolibri_expert_stream_swiglu_probe',
     'expert_stream_replay',
     'f16_expert_gemm_parity',
 ])
@@ -38,3 +41,22 @@ def test_host_plan_test_is_available_without_a_gpu_backend():
     guards = target_guards()['kolibri_expert_stream_plan_test']
     assert 'if(STRATA_BUILD_TESTS)' in guards
     assert not any('STRATA_ENABLE_' in guard for guard in guards)
+
+
+def test_cuda_stream_state_is_not_referenced_by_hip_code():
+    # These objects are defined only under __CUDACC__; an unguarded counters block breaks HIP compilation.
+    guards = []
+    unguarded = []
+    source = ROOT / 'src/kolibri/kolibri_engine.cu'
+    for number, line in enumerate(source.read_text().splitlines(), 1):
+        code = line.strip()
+        if re.match(r'#\s*(if|ifdef|ifndef)\b', code):
+            guards.append(code)
+        elif re.match(r'#\s*(else|elif)\b', code):
+            guards[-1] = code
+        elif re.match(r'#\s*endif\b', code):
+            guards.pop()
+        if not code.startswith('//') and re.search(r'\bg_expert_stream(?:_stats|_layers)?\b', code):
+            if '#if defined(__CUDACC__)' not in guards:
+                unguarded.append(number)
+    assert not unguarded, f'CUDA-only stream state referenced outside its guard at lines {unguarded}'

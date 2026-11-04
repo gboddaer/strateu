@@ -55,6 +55,7 @@ void* pin_alloc(size_t bytes) {
 
 struct Slot {
     uint8_t* weights = nullptr;    ///< packed blobs of the current batch
+    uint8_t* planes = nullptr;     ///< the same blobs' Q6_K down rows, block bytes split into four planes
     uint8_t* acts = nullptr;       ///< gathered Q8_K rows, one per selection of the batch
     float* gu = nullptr;           ///< gate/up rows, 2 * n_ff floats each
     uint8_t* hidden = nullptr;     ///< quantized hidden rows, one per selection
@@ -64,6 +65,8 @@ struct Slot {
     uint8_t* hidden_pin = nullptr;
     float* out_pin = nullptr;
     cudaStream_t st = nullptr;
+    cudaStream_t copy_st = nullptr;         ///< the split copy stream (Config::split_copy_stream)
+    std::vector<cudaEvent_t> ev_fill;       ///< per group: this group's copy has landed
     cudaEvent_t ev_gu = nullptr;    ///< gate/up results are on the host
     cudaEvent_t ev_out = nullptr;   ///< down results are on the host
 };
@@ -85,15 +88,23 @@ struct Context::Impl {
     int n_embd = 0, n_ff = 0, top_k_hint = 0;
     size_t act_bytes = 0, h_bytes = 0, gu_row = 0, up_off = 0;
     size_t weight_cap = 0;   ///< bytes for one batch's blobs (the plan's 32 MiB, or one blob if larger)
-    Slot s[2];
+    bool dev_act = false;    ///< Config::device_activation: the SwiGLU and the hidden row's Q8_K stay on the device
+    bool planes_on = false;  ///< STRATA_KOLIBRI_STREAM_PLANES: keep the Q6_K down rows in the plane layout
+    size_t plane_bytes = 0;  ///< bytes of one expert's plane region (rows * nb * 210, unchanged in size)
+    std::vector<Slot> s;   ///< cfg.slots reusable slots (two by default)
     std::vector<float> ff;   ///< host scratch: one hidden row before quantization (n_ff floats)
 
     ~Impl() {
         for (Slot& x : s) {
             if (x.st) cudaStreamSynchronize(x.st);
+            if (x.copy_st) cudaStreamSynchronize(x.copy_st);
+            for (cudaEvent_t e : x.ev_fill)
+                if (e) cudaEventDestroy(e);
+            if (x.copy_st) cudaStreamDestroy(x.copy_st);
             for (cudaEvent_t e : {x.ev_gu, x.ev_out})
                 if (e) cudaEventDestroy(e);
-            for (void* p : {(void*) x.weights, (void*) x.acts, (void*) x.gu, (void*) x.hidden, (void*) x.out})
+            for (void* p : {(void*) x.weights, (void*) x.planes, (void*) x.acts, (void*) x.gu, (void*) x.hidden,
+                            (void*) x.out})
                 if (p) cudaFree(p);
             for (void* p : {(void*) x.acts_pin, (void*) x.gu_pin, (void*) x.hidden_pin, (void*) x.out_pin})
                 if (p) cudaFreeHost(p);
@@ -125,7 +136,7 @@ Capacity max_capacity(const Capacity& a, const Capacity& b) {
 
 /// Per-slot buffer sizes, derived from the run geometry exactly as required_capacity() does.
 struct Sizes {
-    size_t weights, acts, gu, hidden, out;
+    size_t weights, acts, gu, hidden, out, planes;
 };
 
 Sizes slot_sizes(const LayerView& v, const Config& cfg, const Capacity& cap) {
@@ -135,7 +146,10 @@ Sizes slot_sizes(const LayerView& v, const Config& cfg, const Capacity& cap) {
     z.gu = (size_t) v.selection_count * 2 * (size_t) v.fmt.n_ff * sizeof(float);
     z.hidden = (size_t) v.selection_count * v.fmt.h_bytes;
     z.out = (size_t) v.selection_count * (size_t) v.fmt.n_embd * sizeof(float);
-    (void) cfg;
+    // One expert's Q6_K down rows in the plane layout: the same 210 bytes per block, so the same size as the blob.
+    z.planes = es_plane_layout() ? (size_t) v.fmt.n_embd * (size_t) (v.fmt.n_ff / 256) * 210u *
+                                       (size_t) cfg.experts_per_batch
+                                 : 0;
     return z;
 }
 
@@ -190,12 +204,17 @@ std::unique_ptr<Context> create(const LayerView& capacity_view, const Config& co
     m->gu_row = capacity_view.fmt.gu_row;
     m->up_off = capacity_view.fmt.up_off;
     m->weight_cap = m->cap.weight_bytes_per_slot;
+    m->dev_act = config.device_activation;
+    m->planes_on = es_plane_layout();
+    m->plane_bytes = (size_t) m->n_embd * (size_t) (m->n_ff / 256) * 210u;
     m->ff.assign((size_t) m->n_ff, 0.f);
     const Sizes z = slot_sizes(capacity_view, config, m->cap);
     g_alloc_ordinal = 0;
     try {
+        m->s.resize((size_t) config.slots);
         for (Slot& x : m->s) {
             x.weights = (uint8_t*) dev_alloc(z.weights);
+            if (z.planes) x.planes = (uint8_t*) dev_alloc(z.planes);
             x.acts = (uint8_t*) dev_alloc(z.acts);
             x.gu = (float*) dev_alloc(z.gu);
             x.hidden = (uint8_t*) dev_alloc(z.hidden);
@@ -205,6 +224,12 @@ std::unique_ptr<Context> create(const LayerView& capacity_view, const Config& co
             x.hidden_pin = (uint8_t*) pin_alloc(z.hidden);
             x.out_pin = (float*) pin_alloc(z.out);
             ck(cudaStreamCreateWithFlags(&x.st, cudaStreamNonBlocking), "cudaStreamCreate");
+            if (m->cfg.split_copy_stream) {
+                ck(cudaStreamCreateWithFlags(&x.copy_st, cudaStreamNonBlocking), "cudaStreamCreate");
+                x.ev_fill.assign((size_t) config.experts_per_batch, nullptr);
+                for (cudaEvent_t& e : x.ev_fill)
+                    ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "cudaEventCreate");
+            }
             ck(cudaEventCreateWithFlags(&x.ev_gu, cudaEventDisableTiming), "cudaEventCreate");
             ck(cudaEventCreateWithFlags(&x.ev_out, cudaEventDisableTiming), "cudaEventCreate");
         }
@@ -253,11 +278,16 @@ Stats run(Context& ctx, const LayerView& view) {
     const std::vector<Batch> batches = make_batches(groups, m.cfg, weight_cap, blob);
 
     auto stage_gu = [&](const Batch& b, Slot& s) {
+        // Where a copy runs: the slot's own stream, or its copy stream when they are split.  Split, each group's
+        // blob gets its own event so that group's kernel waits for its own bytes and not for the batch's last one;
+        // the copy stream then runs ahead while the compute stream multiplies.
+        cudaStream_t cs = s.copy_st != nullptr ? s.copy_st : s.st;
         size_t woff = 0, row = 0;
-        for (int gi : b.group) {
-            const Group& g = groups[(size_t) gi];
+        for (size_t i = 0; i < b.group.size(); ++i) {
+            const Group& g = groups[(size_t) b.group[i]];
             const uint8_t* src = view.weights + (size_t) g.expert * view.weight_stride;
-            ck(cudaMemcpyAsync(s.weights + woff, src, blob, cudaMemcpyHostToDevice, s.st), "weights H2D");
+            ck(cudaMemcpyAsync(s.weights + woff, src, blob, cudaMemcpyHostToDevice, cs), "weights H2D");
+            if (s.copy_st != nullptr) ck(cudaEventRecord(s.ev_fill[i], cs), "record weights");
             st.weight_h2d_bytes += blob;
             // gather this group's activations (one Q8_K row per selection, in its original order)
             for (int sel : g.selections) {
@@ -269,27 +299,55 @@ Stats run(Context& ctx, const LayerView& view) {
         }
         ck(cudaMemcpyAsync(s.acts, s.acts_pin, b.rows * f.fmt.act_bytes, cudaMemcpyHostToDevice, s.st), "acts H2D");
         st.activation_h2d_bytes += b.rows * f.fmt.act_bytes;
+        // The Q6_K down rows, repacked into the plane layout on the device, right after they land: the copy is the
+        // same bytes and the packing runs on the idle copy stream, not on the host.
+        if (m.planes_on && f.fmt.d_type == kQ6K) {
+            for (size_t i = 0; i < b.group.size(); ++i) {
+                if (s.copy_st != nullptr) ck(cudaStreamWaitEvent(s.st, s.ev_fill[i], 0), "wait for weights");
+                const int rcp = es_q6k_pack_planes(s.weights + i * blob + f.fmt.down_off, s.planes + i * m.plane_bytes,
+                                                   (int) (f.fmt.n_ff / 256), (int) m.n_embd, s.st);
+                if (rcp != 0) refuse("the Q6_K plane packing was refused");
+            }
+        }
         // one gate/up launch per expert: rows [gate | up] are contiguous at the same stride
         woff = 0;
         for (size_t i = 0; i < b.group.size(); ++i) {
             const Group& g = groups[(size_t) b.group[i]];
             const int ntok = (int) g.selections.size();
-            const int rc = es_q4k_rows(s.weights + woff, (int) (f.fmt.n_embd / 256), (int) (2 * f.fmt.n_ff),
-                                       s.acts + b.row[i] * f.fmt.act_bytes, (int) f.fmt.act_bytes, ntok,
-                                       s.gu + b.row[i] * 2 * (size_t) f.fmt.n_ff, (int) (2 * f.fmt.n_ff), s.st);
+            if (s.copy_st != nullptr) ck(cudaStreamWaitEvent(s.st, s.ev_fill[i], 0), "wait for weights");
+            // The paired entry covers gate row k and up row k in one thread, so it is handed n_ff rows instead of
+            // 2 * n_ff and writes the same [gate | up] output; the whole-table launch stays the other choice.
+            const int rc = es_gu_pairing()
+                               ? es_q4k_gu_rows(s.weights + woff, (int) (f.fmt.n_embd / 256), (int) f.fmt.n_ff,
+                                                s.acts + b.row[i] * f.fmt.act_bytes, (int) f.fmt.act_bytes, ntok,
+                                                s.gu + b.row[i] * 2 * (size_t) f.fmt.n_ff,
+                                                (int) (2 * f.fmt.n_ff), s.st)
+                               : es_q4k_rows(s.weights + woff, (int) (f.fmt.n_embd / 256), (int) (2 * f.fmt.n_ff),
+                                             s.acts + b.row[i] * f.fmt.act_bytes, (int) f.fmt.act_bytes, ntok,
+                                             s.gu + b.row[i] * 2 * (size_t) f.fmt.n_ff, (int) (2 * f.fmt.n_ff), s.st);
             if (rc != 0) refuse("the gate/up product was refused");
             st.kernel_launches += 1;   // one launch per expert per product; the launcher tiles tokens in its grid
 
             woff += blob;
         }
-        ck(cudaMemcpyAsync(s.gu_pin, s.gu, b.rows * 2 * (size_t) f.fmt.n_ff * sizeof(float), cudaMemcpyDeviceToHost,
-                           s.st),
-           "gate/up D2H");
-        st.gu_d2h_bytes += b.rows * 2 * (size_t) f.fmt.n_ff * sizeof(float);
-        ck(cudaEventRecord(s.ev_gu, s.st), "record gate/up");
+        if (!m.dev_act) {   // the floats stay on the device when the SwiGLU runs there
+            ck(cudaMemcpyAsync(s.gu_pin, s.gu, b.rows * 2 * (size_t) f.fmt.n_ff * sizeof(float), cudaMemcpyDeviceToHost,
+                               s.st),
+               "gate/up D2H");
+            st.gu_d2h_bytes += b.rows * 2 * (size_t) f.fmt.n_ff * sizeof(float);
+            ck(cudaEventRecord(s.ev_gu, s.st), "record gate/up");
+        }
     };
 
     auto stage_down = [&](const Batch& b, Slot& s) {
+        if (m.dev_act) {
+            // Gate/up, SwiGLU + Q8_K and down all run on this slot's stream, so nothing has to reach the host: no
+            // event wait, no host activation step, no hidden-row copy.
+            const int rc0 = es_swiglu_quant(s.gu, (int) f.fmt.n_ff, (int) b.rows, (int) f.fmt.h_bytes, s.hidden, s.st);
+            if (rc0 != 0) refuse("the device SwiGLU was refused");
+            st.kernel_launches += 1;
+            ++st.slot_waits;   // the schedule's shape is unchanged; this wait is the slot's own stream
+        } else {
         ck(cudaEventSynchronize(s.ev_gu), "wait gate/up");
         ++st.slot_waits;
         const auto t0 = std::chrono::steady_clock::now();
@@ -307,21 +365,45 @@ Stats run(Context& ctx, const LayerView& view) {
         }
         st.cpu_activation_ms +=
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        ck(cudaMemcpyAsync(s.hidden, s.hidden_pin, b.rows * f.fmt.h_bytes, cudaMemcpyHostToDevice, s.st), "hidden H2D");
+        // One hidden-row copy per group, on the copy stream when it is split, with the group's own event: the first
+        // group's down kernel no longer waits for the last group's row to reach the card.
+        if (s.copy_st != nullptr) {
+            cudaStream_t cs = s.copy_st;
+            size_t hrow = 0;
+            for (size_t i = 0; i < b.group.size(); ++i) {
+                const size_t rows_i = groups[(size_t) b.group[i]].selections.size();
+                ck(cudaMemcpyAsync(s.hidden + hrow * f.fmt.h_bytes, s.hidden_pin + hrow * f.fmt.h_bytes,
+                                   rows_i * f.fmt.h_bytes, cudaMemcpyHostToDevice, cs),
+                   "hidden H2D");
+                ck(cudaEventRecord(s.ev_fill[i], cs), "record hidden rows");
+                hrow += rows_i;
+            }
+        } else {
+            ck(cudaMemcpyAsync(s.hidden, s.hidden_pin, b.rows * f.fmt.h_bytes, cudaMemcpyHostToDevice, s.st),
+               "hidden H2D");
+        }
         st.hidden_h2d_bytes += b.rows * f.fmt.h_bytes;
+        }
         // one down launch per expert, from the same packed slot layout as stage_gu()
         size_t woff = 0;
         for (size_t i = 0; i < b.group.size(); ++i) {
             const Group& g = groups[(size_t) b.group[i]];
             const int ntok = (int) g.selections.size();
             const uint8_t* down = s.weights + woff + f.fmt.down_off;
+            if (s.copy_st != nullptr && !m.dev_act) ck(cudaStreamWaitEvent(s.st, s.ev_fill[i], 0), "wait for hidden rows");
             const int rc = f.fmt.d_type == kQ4K
                                ? es_q4k_rows(down, (int) (f.fmt.n_ff / 256), m.n_embd,
                                              s.hidden + b.row[i] * f.fmt.h_bytes, (int) f.fmt.h_bytes, ntok,
                                              s.out + b.row[i] * (size_t) m.n_embd, m.n_embd, s.st)
-                               : es_q6k_rows(down, (int) (f.fmt.n_ff / 256), m.n_embd,
-                                             s.hidden + b.row[i] * f.fmt.h_bytes, (int) f.fmt.h_bytes, ntok,
-                                             s.out + b.row[i] * (size_t) m.n_embd, m.n_embd, s.st);
+                               : (m.planes_on ? es_q6k_plane_rows(s.planes + i * m.plane_bytes,
+                                                                  (int) (f.fmt.n_ff / 256), m.n_embd,
+                                                                  s.hidden + b.row[i] * f.fmt.h_bytes,
+                                                                  (int) f.fmt.h_bytes, ntok,
+                                                                  s.out + b.row[i] * (size_t) m.n_embd, m.n_embd, s.st)
+                                              : es_q6k_rows(down, (int) (f.fmt.n_ff / 256), m.n_embd,
+                                                            s.hidden + b.row[i] * f.fmt.h_bytes,
+                                                            (int) f.fmt.h_bytes, ntok,
+                                                            s.out + b.row[i] * (size_t) m.n_embd, m.n_embd, s.st));
             if (rc != 0) refuse("the down product was refused");
             st.kernel_launches += 1;   // one launch per expert per product; the launcher tiles tokens in its grid
 
@@ -346,15 +428,20 @@ Stats run(Context& ctx, const LayerView& view) {
         }
     };
 
-    // ---- the two-slot schedule --------------------------------------------------------------------------------
-    // Batch i loads and computes gate/up on slot i%2 while the host finishes batch i-1 on the other slot.  The slot
-    // reused by batch i was released by batch i-2's scatter, which happened in the previous iteration.
+    // ---- the slot schedule ------------------------------------------------------------------------------------
+    // Batch i issues its weight copy and gate/up on slot i%NS, and the host then finishes the batch NS-1 behind it.
+    // With NS = 2 that is batch i-1 on the other slot: the next copy waits until the older batch's results are on
+    // the host.  With NS = 3 the batch finished here is i-2, so batch i's copy is already in flight while the host
+    // does that batch's SwiGLU and its down product runs - the transfer hides behind a kernel instead of behind the
+    // host.  A slot reused at batch i was released by batch i-NS's scatter, which ran NS-1 iterations ago.
+    const size_t NS = m.s.size();
+    const size_t lag = NS - 1;
     for (size_t i = 0; i < batches.size(); ++i) {
-        Slot& s = m.s[i % 2];
-        stage_gu(batches[i], s);
-        if (i >= 1) stage_down(batches[i - 1], m.s[(i - 1) % 2]);
+        stage_gu(batches[i], m.s[i % NS]);
+        if (i >= lag) stage_down(batches[i - lag], m.s[(i - lag) % NS]);
     }
-    stage_down(batches.back(), m.s[(batches.size() - 1) % 2]);
+    for (size_t k = batches.size() > lag ? batches.size() - lag : 0; k < batches.size(); ++k)
+        stage_down(batches[k], m.s[k % NS]);
 
     st.wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
     st.device_allocations = 0;   // nothing is allocated after create()
