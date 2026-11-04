@@ -68,12 +68,19 @@ test('a run starts without the caller waiting, shows its changed files, and appl
     const result = await ts.startDetached({ workspace, prompt: 'extend the plan', attempts: 1, reviseCommand: `"${process.execPath}" "${script}"` });
     assert.ok(result.ok, JSON.stringify(result));
     // Starting the job costs python and node starts, seconds on a loaded runner and far more than the old
-    // fixed 1400 ms bound assumed. What the name promises is the caller not waiting for the revision to
-    // end, so check it directly: the revision sleeps much longer than starting the job takes, so the run
-    // still reads as generating after the call returns.
+    // fixed 1400 ms bound assumed. The record is first written when the baseline copy starts, before
+    // generating begins, so the phase right after the call can legitimately be checkpointing and is
+    // not a stable fact to assert: on a busier machine the caller's first snapshot lands inside the
+    // checkpointing window. What the name promises is the caller not waiting for the revision to end,
+    // so prove it with what can only exist once the revision ends: its effect absent, the person's
+    // files untouched, and the run still working.
     assert.ok(Date.now() - started < 12000, 'the call took longer than starting the job should');
     const id = result.run.id;
-    assert.equal(ts.status(id).phase, 'generating', 'the call returned while the revision was still running');
+    const phase = ts.status(id).phase;
+    assert.ok(['queued', 'checkpointing', 'generating'].includes(phase),
+      `the call returned while the revision was still running, not with the phase ${JSON.stringify(phase)}`);
+    assert.equal(existsSync(join(workspace, 'extra.md')), false, 'the call returned while the revision was still running');
+    assert.equal(readFileSync(join(workspace, 'plan.md'), 'utf8'), 'first draft\n', 'the call returned before the revision reached the person\'s files');
     let run;
     for (let i = 0; i < 100; i++) { run = ts.status(id); if (['completed', 'failed'].includes(run.phase)) break; await sleep(300); }
     assert.equal(run.phase, 'completed', JSON.stringify(run));
