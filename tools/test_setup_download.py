@@ -34,7 +34,7 @@ NAME = "t.gguf"
 
 
 class Server:
-    """A threaded HTTP server for one file.  `faults(path, start, end, nth)` may answer a request with an error."""
+    """A threaded file server. `faults(path, start, end, nth)` may return an error or a ("wait", Event) gate."""
 
     def __init__(self, data=DATA, ranges=True, length=True, redirect=False, delay=0.002, faults=None):
         self.data, self.ranges, self.length, self.redirect, self.delay = data, ranges, length, redirect, delay
@@ -130,6 +130,8 @@ class Server:
             h.end_headers()
             cut = fault[1] if fault and fault[0] == "cut" else None
             try:
+                if fault and fault[0] == "wait":
+                    fault[1].wait()
                 for i in range(0, len(body), 16384):
                     if cut is not None and i >= cut:
                         h.connection.shutdown(2)           # the connection drops in the middle of the body
@@ -156,7 +158,10 @@ def small_pieces(**extra):
     with contextlib.ExitStack() as st:
         for k, v in consts.items():
             st.enter_context(mock.patch.object(setup, k, v))
-        st.enter_context(mock.patch.object(setup.time, "sleep", lambda s: None))
+        # Keep retry sleeps cheap without changing the HTTP server's delays or the parent's polling clock.
+        clock = mock.Mock(wraps=time)
+        clock.sleep.return_value = None
+        st.enter_context(mock.patch.object(setup, "time", clock))
         env = {k: v for k, v in os.environ.items() if k not in ("STRATA_DL_CONNECTIONS", "STRATA_ALLOW_UNPINNED")}
         env["STRATA_SOURCE"] = "huggingface"
         st.enter_context(mock.patch.dict(os.environ, env, clear=True))
@@ -188,14 +193,33 @@ def files(d):
 
 class ParallelDownload(unittest.TestCase):
     def test_a_big_file_comes_over_several_connections(self):
-        with small_pieces(), Server(redirect=True) as srv, tempfile.TemporaryDirectory() as d:
+        # A client can finish reading the body before its server handler's finally block runs.
+        # Count real client fetches, not handlers still cleaning up after completed transfers.
+        fetch = setup._fetch_run
+        lock = threading.Lock()
+        active = peak = 0
+
+        def measured_fetch(*args, **kwargs):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                return fetch(*args, **kwargs)
+            finally:
+                with lock:
+                    active -= 1
+
+        with small_pieces(), Server(redirect=True) as srv, tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(setup, "_fetch_run", measured_fetch):
             code, out = run(srv, d)
             self.assertIsNone(code, out)
             self.assertEqual((Path(d) / NAME).read_bytes(), DATA)
             self.assertEqual(files(d), [NAME, NAME + ".done"])             # no .part, no piece list left behind
             self.assertIn("sha256 " + hashlib.sha256(DATA).hexdigest(), (Path(d) / (NAME + ".done")).read_text())
-            self.assertGreater(srv.max_active, 1)
-            self.assertLessEqual(srv.max_active, 4)
+            self.assertGreater(peak, 1)
+            self.assertLessEqual(peak, 4)
+            self.assertEqual(active, 0)
             self.assertEqual(sorted(asked(srv)), list(range(41)))           # every piece once, none twice
             self.assertIn((0, 0), srv.ranged_gets)                           # the probe is still accounted for
             payload = sorted(r for r in srv.ranged_gets if r != (0, 0))
@@ -235,19 +259,26 @@ class ParallelDownload(unittest.TestCase):
 
 class NoRangeSupport(unittest.TestCase):
     def test_a_server_that_ignores_range_is_read_in_one_stream(self):
-        with small_pieces(), Server(ranges=False) as srv, tempfile.TemporaryDirectory() as d:
+        with small_pieces(), Server(ranges=False) as srv, tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(setup, "download_single", wraps=setup.download_single) as single, \
+                mock.patch.object(setup, "_fetch_run", wraps=setup._fetch_run) as ranged:
             code, out = run(srv, d)
             self.assertIsNone(code, out)
             self.assertEqual((Path(d) / NAME).read_bytes(), DATA)
-            self.assertEqual(srv.max_active, 1)
+            # Discarded range probes may still be unwinding on the server; the client must use one stream.
+            self.assertEqual(single.call_count, 1)
+            ranged.assert_not_called()
             self.assertEqual(files(d), [NAME, NAME + ".done"])
 
     def test_a_server_without_any_length_is_read_in_one_stream(self):
-        with small_pieces(), Server(length=False, ranges=False) as srv, tempfile.TemporaryDirectory() as d:
+        with small_pieces(), Server(length=False, ranges=False) as srv, tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(setup, "download_single", wraps=setup.download_single) as single, \
+                mock.patch.object(setup, "_fetch_run", wraps=setup._fetch_run) as ranged:
             code, out = run(srv, d, pin=None)                                # no length, so nothing to check a pin against first
             self.assertIsNone(code, out)
             self.assertEqual((Path(d) / NAME).read_bytes(), DATA)
-            self.assertEqual(srv.max_active, 1)
+            self.assertEqual(single.call_count, 1)
+            ranged.assert_not_called()
 
     def test_a_head_without_a_length_still_gets_the_connections(self):
         """ModelScope's HEAD has no Content-Length (#1915): the length comes from a one-byte ranged GET, not 'unknown'."""
@@ -319,7 +350,16 @@ class Resume(unittest.TestCase):
             "setup.file_pin = lambda u: pin\n"
             "setup.download(sys.argv[1], __import__('pathlib').Path(sys.argv[2]) / %r, 'the model')\n"
             % (str(ROOT), str(ROOT / "tools"), CHUNK, len(DATA), hashlib.sha256(DATA).hexdigest(), NAME))
-        with small_pieces(), Server(delay=0.05) as srv, tempfile.TemporaryDirectory() as notes_d, tempfile.TemporaryDirectory() as d:
+        release = threading.Event()
+
+        def hold_later_pieces(path, start, end, nth):
+            # Enough early pieces can finish and be checkpointed, but the child cannot finish the file
+            # while the parent is descheduled or reading that checkpoint. Release only after the kill.
+            if start >= 16 * CHUNK:
+                return ("wait", release)
+            return None
+
+        with small_pieces(), Server(faults=hold_later_pieces) as srv, tempfile.TemporaryDirectory() as notes_d, tempfile.TemporaryDirectory() as d:
             env = dict(os.environ, STRATA_SOURCE="huggingface")
             notes = Path(notes_d) / "child.log"
             proc = subprocess.Popen([sys.executable, "-c", runner, srv.url, d], env=env,
@@ -335,8 +375,11 @@ class Resume(unittest.TestCase):
                         pass
                     time.sleep(0.05)
             finally:
-                proc.kill()
-                proc.wait()
+                try:
+                    proc.kill()
+                    proc.wait()
+                finally:
+                    release.set()
             child_log = notes.read_text(errors="replace") if notes.exists() and notes.stat().st_size else ""
             self.assertTrue((Path(d) / (NAME + ".part")).exists(),
                             "the download finished before it was killed\n" + child_log)
@@ -345,6 +388,7 @@ class Resume(unittest.TestCase):
             saved = json.loads(side.read_text())
             done = {i for a, b in saved["done"] for i in range(a, b)}
             self.assertGreaterEqual(len(done), 12, child_log)
+            self.assertLess(len(done), 41, "the fixture must leave unfinished pieces for the resumed download")
             srv.clear()
             code, out = run(srv, d)
             self.assertIsNone(code, out)

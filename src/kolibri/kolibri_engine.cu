@@ -6877,6 +6877,7 @@ int strata::kolibri::run(int argc, char** argv) {
             slots_tick(e, "chunk", (long long) i);   // a round every --expert-slots-reselect-every positions
         }
         if (pf_host_prev.valid) strata::kernels::cpu::restore_thread_affinity(pf_host_prev);
+#if defined(__CUDACC__)
         // --counters: what the streamed expert leg spent, and on what.  The arm's wall time is the only number that
         // reaches the user, but whether a kernel change can move it depends on the split: the host's SwiGLU +
         // quantization (cpu_activation_ms) runs beside the copies, the kernel launches run behind them, and the
@@ -6896,6 +6897,7 @@ int strata::kolibri::run(int argc, char** argv) {
                          (unsigned long long) c.slot_waits);
             std::fflush(stderr);
         }
+#endif
         tok = ids.back();
     } else
     for (size_t t = 1; t < ids.size(); ++t) {
