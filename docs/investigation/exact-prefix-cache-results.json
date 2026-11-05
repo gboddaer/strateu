@@ -301,7 +301,7 @@
       "candidate_cached_prompt_ms": [2153.0, 2171.3],
       "cached_tokens": 2560
     },
-    "cpu_tests": {"passed": 219, "skipped": 22, "optional_network_deselected": 1},
+    "cpu_tests": {"passed": 220, "skipped": 22, "optional_network_deselected": 1},
     "serve_tests": {"run": 1257, "result": "OK", "skipped": 31},
     "not_passed": [
       "root pytest collection: benchmark argparse SystemExit and 55 collection errors",

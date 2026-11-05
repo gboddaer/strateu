@@ -144,13 +144,15 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--store', action='store_true')
     parser.add_argument('--engine', action='store_true')
-    parser.add_argument('--bin', type=Path, default=ROOT / 'build-cache-cuda/strata-kolibri')
+    parser.add_argument('--bin', type=Path, help='required with --engine; select the build being qualified explicitly')
     parser.add_argument('--model', default='/data4/models/Kolibri-1-Q4_K_M/Kolibri-1-Q4_K_M.gguf')
     parser.add_argument('--output', type=Path, default=OUT / 'engine')
     parser.add_argument('--cpu-threads', type=int, default=14)
     args = parser.parse_args()
     if not args.store and not args.engine:
         args.store = args.engine = True
+    if args.engine and args.bin is None:
+        parser.error('--engine requires --bin; do not accidentally test a stale control build')
     print('Former gap regressions (GREEN requires the original desired behaviour):')
     status = 0
     if args.store:

@@ -27,6 +27,17 @@ sampled histories, and to reject a request that fails to publish its own vector.
 | Continue after token-graph abort | reuse 0, exact | **3072 reused**, exact |
 | STOP after first PP of a 9216-ID prefill | reads 18/18 chunks | reads **2/18**, emits **0 tokens**, cancel |
 
+Reproduce against the selected build explicitly (the old control binary is kept
+unchanged for A/B tests):
+
+```sh
+python tools/kolibri/known_gaps.py --store
+python tools/kolibri/known_gaps.py --engine --bin build-gaps-cuda/strata-kolibri --output /tmp/kolibri-gaps-new
+```
+
+The output directory must be new. `--engine` requires `--bin` to avoid accidentally
+qualifying a stale control build.
+
 The STOP sender and engine reader run concurrently: the second chunk can already
 be in flight when STOP arrives. The contract is to finish that chunk, not abort
 halfway through its writes. STOP after PP 3 likewise finished at PP 4. Repeated
@@ -104,7 +115,7 @@ No GPU clocks or global machine policies were changed.
 
 ## CPU/server verification and explicit limits
 
-Passed: CPU tools/setup **219 passed, 22 skipped, 1 optional network check
+Passed: CPU tools/setup **220 passed, 22 skipped, 1 optional network check
 deselected**; full server suite **1257 tests OK, 31 skipped**. CUDA build passed
 with existing unused-symbol warnings; the serving suite still emits existing
 telemetry ResourceWarnings.
