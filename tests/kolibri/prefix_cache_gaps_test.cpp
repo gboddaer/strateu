@@ -1,6 +1,5 @@
-// RED tests for known gaps in the exact checkpoints. They assert the behaviour we
-// WANT and therefore fail while the gaps stand; they are deliberately not part of
-// the passing unit suite. Run through tools/kolibri/known_gaps.py.
+// Former RED tests: required retention properties, now in the regular CPU suite.
+// Also run through tools/kolibri/known_gaps.py.
 #include "kolibri/prefix_cache.hpp"
 #include <cstdio>
 #include <cstring>
@@ -27,7 +26,7 @@ int main() {
     // turn regenerated with fewer messages) is an exact prefix of what the engine
     // held, but the only boundary below it was evicted by the newest-first FIFO.
     check("shorter-history-keeps-an-older-boundary", c.best_position(600) == 512,
-          "a 600-id follow-up found no boundary at or below 600");
+          "require boundary 512 for a 600-id follow-up");
 
     // Gap 2: an edit in the middle of the held history (a changed early system
     // message, a retried tool result) can only reuse a boundary below the edit.
@@ -36,10 +35,10 @@ int main() {
         edit.capture(position, spans);
     edit.prune(1500); // the edit is at 1500: later boundaries are another branch
     check("edit-in-the-middle-keeps-the-boundary-below-it", edit.best_position(1500) == 1024,
-          "an edit at 1500 kept no boundary at or below 1500");
+          "require boundary 1024 below an edit at 1500");
 
     // These are the same two properties the engine-level runner measures end to end;
-    // both currently fall back to a full cold read, which is exact but slow.
+    // both must keep useful anchors within the unchanged three-frame budget.
     std::printf("%d known gap(s) still open\n", red);
     return red == 0 ? 0 : 1;
 }

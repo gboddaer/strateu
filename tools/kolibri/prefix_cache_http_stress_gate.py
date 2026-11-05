@@ -90,7 +90,7 @@ def run_arm(args, original, mode, port):
     def record(tag, request, answer, elapsed, prompt_ids=None):
         # Every completed call contributes its rendered IDs, so the arms are
         # compared on the exact prompt each one ran, not just on the aborts.
-        prompt_ids = prompt_ids if prompt_ids is not None else last_ids()
+        prompt_ids = prompt_ids if prompt_ids is not None else last_ids(tag)
         with urllib.request.urlopen(url + '/v1/status', timeout=10) as response:
             status = json.load(response)
         records = read_records(dump)
@@ -116,12 +116,21 @@ def run_arm(args, original, mode, port):
             connection.close()
         return record(tag, request, answer, elapsed)
 
-    def last_ids():
+    def last_ids(tag=None):
         path = folder / 'prompt-ids.jsonl'
         if not path.exists():
             return None
-        lines = path.read_text().splitlines()
-        return json.loads(lines[-1])['ids'] if lines else None
+        entries = [json.loads(line) for line in path.read_text().splitlines()]
+        # Both clients may have rendered before either finishes. The last entry
+        # is not necessarily this worker's prompt; match its unique synthetic text.
+        needle = {'concurrent-a': 'Name fact 0001.',
+                  'concurrent-b': 'Name module 003.'}.get(tag)
+        if needle:
+            matches = [entry for entry in entries if needle in entry['text']]
+            if not matches:
+                raise AssertionError('missing rendered prompt for ' + tag)
+            return matches[-1]['ids']
+        return entries[-1]['ids'] if entries else None
 
     def abort(tag, messages, seconds=None, after_delta=False, **kwargs):
         """Close the socket during the prompt read or right after the first delta."""
@@ -157,6 +166,7 @@ def run_arm(args, original, mode, port):
                         first_delta = time.monotonic() - started
                         break
         finally:
+            response.close()
             connection.close()                     # a real client hang-up
         entry = {'tag': tag, 'request': request, 'answer': None, 'wall_s': elapsed,
                  'timings': None, 'logit_record_index': None,
@@ -312,6 +322,9 @@ def run_arm(args, original, mode, port):
         if errors:
             raise RuntimeError('concurrent arm failed: ' + '; '.join(errors))
 
+        # Explicitly establish the owner; concurrent admission order is not a
+        # promise, and a first request of a different session must go cold.
+        call('final-long-primer', diverge)
         # --- after all of that, a long exact extension still has to work ---------
         call('final-long-turn',
              diverge + [{'role': 'assistant', 'content': 'It is 1309.'},
@@ -344,10 +357,13 @@ def main():
         probe.bind(('127.0.0.1', args.port))
     off, a = run_arm(args, original, 'off', args.port)
     on, b = run_arm(args, original, 'on', args.port + 1)
-    if [r['tag'] for r in off] != [r['tag'] for r in on]:
-        raise AssertionError('the two arms ran different scenarios')
+    # Concurrent clients need not complete in the same order across arms.
+    off_by_tag, on_by_tag = ({r['tag']: r for r in arm} for arm in (off, on))
+    if off_by_tag.keys() != on_by_tag.keys() or len(off_by_tag) != len(off):
+        raise AssertionError('the two arms ran different scenarios or duplicate tags')
     pairs, failures = [], []
-    for x, y in zip(off, on):
+    for tag, x in off_by_tag.items():
+        y = on_by_tag[tag]
         if x['request'] != y['request']:
             raise AssertionError('request %s differs between arms' % x['tag'])
         if x['aborted'] or y['aborted'] or x['logit_record_index'] is None:
@@ -363,10 +379,21 @@ def main():
         if not equal:
             failures.append(x['tag'] + ': cache-on logits differ from cache-off')
     # Same scenario, same transcript: the rendered token IDs must agree too.
-    off_ids = [r['rendered_ids'] for r in off if r['rendered_ids']]
-    on_ids = [r['rendered_ids'] for r in on if r['rendered_ids']]
+    off_ids = {r['tag']: r['rendered_ids'] for r in off if r['rendered_ids']}
+    on_ids = {r['tag']: r['rendered_ids'] for r in on if r['rendered_ids']}
     if off_ids != on_ids:
         failures.append('rendered prompt IDs differ between arms')
+    for mode, arm in (('off', off_by_tag), ('on', on_by_tag)):
+        message = arm['tools-primer']['answer']['choices'][0]['message']
+        calls = message.get('tool_calls') or []
+        try:
+            function = calls[0]['function']
+            valid = (function['name'] == 'read_file' and
+                     json.loads(function['arguments']) == {'path': 'src/demo.cpp'})
+        except (IndexError, KeyError, TypeError, ValueError):
+            valid = False
+        if not valid:
+            failures.append(mode + ': model did not return the requested valid read_file call')
     # Requests that grow a matching transcript must reuse a long prefix.
     promised = [t for t in ('tools-round-1', 'tools-round-2', 'tools-parallel',
                             'tools-malformed', 'tools-empty', 'tools-big-result',
@@ -380,8 +407,12 @@ def main():
         if row['tag'] in promised:
             reuse = (row['timings'] or {}).get('cache_n') or 0
             hits[row['tag']] = reuse
-            if reuse < 1024:
-                failures.append('%s: only %d reused tokens' % (row['tag'], reuse))
+            # A promptly cancelled prefill may have completed only one chunk.
+            # Require that real checkpoint, not work the client asked to abort.
+            minimum = 512 if row['tag'] == 'abort-prefill-repeat' else 1024
+            if reuse < minimum:
+                failures.append('%s: only %d reused tokens (minimum %d)'
+                                % (row['tag'], reuse, minimum))
     # The 1-token loop grows by one short message per turn: it must not regress
     # into a full re-read of the transcript, but one token of prefix is not enough
     # to demand a long hit, so it only has to stay exact.

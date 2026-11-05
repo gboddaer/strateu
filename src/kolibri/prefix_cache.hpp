@@ -52,9 +52,13 @@ public:
         const size_t size = checked_size(spans);
         if (position <= 0 || size == 0) return false;
         prune(position - 1); // replace duplicates, invalidate descendant branches
+        // Keep early anchors and the newest boundary. Evicting the oldest
+        // entry made every shortened history or early edit go cold. Replacing
+        // the previous newest keeps append performance while retaining the
+        // earlier anchors (with one frame this is simply newest-only).
         while (used_ > budget_ - size) {
-            used_ -= entries_.front().data.size();
-            entries_.pop_front();
+            used_ -= entries_.back().data.size();
+            entries_.pop_back();
         }
         try {
             Entry e{position, {}, std::vector<uint8_t>(size)};

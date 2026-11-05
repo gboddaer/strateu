@@ -6071,6 +6071,7 @@ int serve(Engine& e, Scratch& s) {
             e.pf_total = n;   // the POOL_ALL rule: one decision for the whole prompt
         g_pf_total = n;   // K28: and the chunk rule keys on it (see pf_chunk_at)
             while (i < pf_end) {
+                if (stop.load(std::memory_order_acquire)) break;
                 const int T = (int) std::min<int64_t>(pf_chunk_at(s.pos), pf_end - i);
                 KC(cudaMemcpy(s.toks_d, ids.data() + i, (size_t) T * 4, cudaMemcpyHostToDevice));
                 forward_multi(e, s, T, s.pos);
@@ -6093,10 +6094,23 @@ int serve(Engine& e, Scratch& s) {
             }
         } else
         for (int64_t t = (int64_t) reuse + 1; t < (int64_t) ids.size(); ++t) {   // the prompt minus its last token
+            if (stop.load(std::memory_order_acquire)) break;
             forward(e, s, ids[t - 1], nullptr);   // ONE token through the plain path: this line is the read
             std::printf("PP %lld %lld %.0f %.1f\n", (long long) t, (long long) ids.size(), ms_since(t0),
                         (double) (t - reuse) / std::max(1e-9, ms_since(t0) / 1000.0));
             std::fflush(stdout);
+        }
+        if (stop.load(std::memory_order_acquire)) {
+            // Each completed chunk is durable; never claim unread prompt IDs or
+            // start decoding just to acknowledge a cancelled prefill. Checkpoints
+            // and absolute attention rows below s.pos still belong to this prefix.
+            live.assign(ids.begin(), ids.begin() + (size_t) s.pos);
+            std::fill(s.kt_ready.begin(), s.kt_ready.end(), (char) 0);
+            hot_forget_prompt(e);
+            std::printf("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0 0 0 0.0 %lld 0\n",
+                        ids.size(), ms_since(t0), reuse, (long long) s.pos - (long long) reuse);
+            std::fflush(stdout);
+            continue;
         }
         e.hot_pos_at_last = s.pos;   // the request's own position count: a reuse starts at `reuse`, not at 0
         // The prompt has now been routed through every layer, so one large round is worth more than any number of
@@ -6130,8 +6144,17 @@ int serve(Engine& e, Scratch& s) {
         for (;;) {
             forward(e, s, tok, nullptr);
             if (decode_aborted) {
-                reset_state(e, s);
-                live.clear();
+                // The token graph has drained. Only its current position may be
+                // partial; completed prefill checkpoints precede it, and their
+                // absolute attention prefix has not been overwritten. Keep that
+                // owned history for a checkpoint restore on the next request.
+                if (s.prefix_cache.count() > 0) {
+                    live.resize(std::min<size_t>(live.size(), (size_t) s.pos));
+                    std::fill(s.kt_ready.begin(), s.kt_ready.end(), (char) 0);
+                } else {
+                    reset_state(e, s);
+                    live.clear();
+                }
                 finish = "cancel";
                 break;
             }

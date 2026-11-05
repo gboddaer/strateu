@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""RED tests for the known gaps in exact Kolibri prefix checkpoints.
+"""Regression tests for the former gaps in exact Kolibri prefix checkpoints.
 
-Each case asserts the behaviour we WANT, so this runner exits 1 while a gap is
-open. It is kept out of the passing unit/serve suites on purpose: a red test that
-is wired into a green suite stops meaning anything. Nothing here changes engine
-code; it only measures and reports.
+Each case retains its original desired behaviour and exits 1 on regression.
+The two CPU retention cases also run in the normal pytest suite. The model gate
+requires the same desired reuse AND finite byte-identical full logits.
 
   --store    compile and run tests/kolibri/prefix_cache_gaps_test.cpp (no GPU)
   --engine   run the four end-to-end gaps on a real engine (GPU, several minutes)
 
-Exactness is not in question in any of these cases: every measured comparison so
-far was bit-identical to a cold read. What fails is reuse - the work is correct and
-paid for twice - or how promptly a cancelled prompt read stops.
+The original baseline failed reuse and cancellation assertions while keeping
+exact logits. Fixes must satisfy both: a cache hit with different logits fails.
 """
 import argparse
 import json
@@ -25,10 +23,10 @@ ROOT = HERE.parents[1]
 OUT = Path('/tmp/kolibri-known-gaps')
 
 GAPS = {
-    'truncated-target': 'a shorter exact prefix reuses nothing (older boundary evicted)',
-    'middle-edit': 'an edit at 1500 of 3072 reuses nothing (older boundary evicted)',
-    'token-abort-continue': 'a STOP during decoding discards the held history and all checkpoints',
-    'prefill-stop-interrupts-read': 'a STOP during the prompt read lets the whole prompt finish',
+    'truncated-target': 'a shorter exact prefix retains a matching early boundary',
+    'middle-edit': 'an edit at 1500 retains a canonical boundary below the edit',
+    'token-abort-continue': 'decoding STOP preserves valid prefill checkpoints',
+    'prefill-stop-interrupts-read': 'prompt STOP ends at a completed chunk boundary',
 }
 
 
@@ -77,10 +75,11 @@ def run_engine(binary: Path, model: str, output: Path, threads: int) -> int:
     rows, red = [], []
 
     def logits_of(ids, n=1, **kwargs):
+        before = len(read_records(dump)) if dump.exists() else 0
         response = engine.run(ids, n, **kwargs)
         records = read_records(dump)
-        if not records or len(records[-1][2]) != 128000 * 4:
-            raise ValueError('missing complete Kolibri logits')
+        if len(records) != before + 1 or len(records[-1][2]) != 128000 * 4:
+            raise ValueError('request did not produce its own complete Kolibri logits')
         return response, records[-1][2]
 
     def want(name, ok, detail):
@@ -100,7 +99,7 @@ def run_engine(binary: Path, model: str, output: Path, threads: int) -> int:
         engine.resetter(1)
         logits_of(ids3k)
         warm, logits = logits_of(target)
-        want('truncated-target', (warm['resume'] or 0) >= 512,
+        want('truncated-target', (warm['resume'] or 0) >= 512 and reference == logits,
              'reused %s tokens, exact=%s' % (warm['resume'] or 0, reference == logits))
 
         # (2) edit in the middle
@@ -109,7 +108,7 @@ def run_engine(binary: Path, model: str, output: Path, threads: int) -> int:
         engine.resetter(1)
         logits_of(ids3k)
         warm, logits = logits_of(target)
-        want('middle-edit', (warm['resume'] or 0) >= 1024,
+        want('middle-edit', (warm['resume'] or 0) >= 1024 and reference == logits,
              'reused %s tokens, exact=%s' % (warm['resume'] or 0, reference == logits))
 
         # (3) STOP during decoding, then the next turn continues the real reply
@@ -117,12 +116,10 @@ def run_engine(binary: Path, model: str, output: Path, threads: int) -> int:
         logits_of(ids3k)
         stopped = engine.run(ids3k + tail[:8], 64, stop_after_tokens=3)
         follow = ids3k + stopped['gen'] + tail[:8]
-        reference = cold(follow)
-        engine.resetter(1)
-        logits_of(ids3k)
-        stopped = engine.run(ids3k + tail[:8], 64, stop_after_tokens=3)
-        warm, logits = logits_of(ids3k + stopped['gen'] + tail[:8])
-        want('token-abort-continue', (warm['resume'] or 0) >= 1024,
+        warm, logits = logits_of(follow)
+        reference = cold(follow)  # the actual cancelled IDs, never a second sampled history
+        want('token-abort-continue',
+             (warm['resume'] or 0) >= 1024 and reference == logits and stopped['done'][5] == 'cancel',
              'produced %s before cancel, next turn reused %s, exact=%s'
              % (stopped['gen'], warm['resume'] or 0, reference == logits))
 
@@ -130,7 +127,10 @@ def run_engine(binary: Path, model: str, output: Path, threads: int) -> int:
         engine.resetter(1)
         stopped = engine.run(long_ids, 8, stop_after_pp=1)
         chunks = (len(long_ids) - 1) // 512 + 1
-        want('prefill-stop-interrupts-read', stopped['pp'] <= 2,
+        want('prefill-stop-interrupts-read',
+             stopped['pp_at_stop'] == 1 and stopped['pp'] <= 2 and
+             stopped['done'][5] == 'cancel' and not stopped['gen'] and
+             0 < int(stopped['done'][14]) <= 1024,
              'STOP after PP %s, %d of %d chunks still read, finish=%s'
              % (stopped['pp_at_stop'], stopped['pp'], chunks, stopped['done'][5]))
     finally:
@@ -151,7 +151,7 @@ def main():
     args = parser.parse_args()
     if not args.store and not args.engine:
         args.store = args.engine = True
-    print('Known gaps (a RED line is a real, currently open gap):')
+    print('Former gap regressions (GREEN requires the original desired behaviour):')
     status = 0
     if args.store:
         status = run_store()
@@ -162,7 +162,7 @@ def main():
     print()
     for name, text in GAPS.items():
         print('  ' + name + ': ' + text)
-    print('RED suite exit %d (0 would mean every gap was closed; update the docs then)' % status)
+    print('Regression gate exit %d (0 = all requested properties satisfied)' % status)
     return status
 
 

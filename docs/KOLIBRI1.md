@@ -98,14 +98,14 @@ full chunk may correctly require a cold read. This is one live history, not a
 persistent multi-session cache. Packed INT8, adaptive routing and other
 unsupported arithmetic/reuse profiles disable checkpoints by name.
 
-Three measured gaps remain, each with a RED test in
-[the stress findings](investigation/prefix-cache-known-gaps.md): a much shorter
-follow-up or an edit in the middle of the history falls back to a full cold read
-because the newest boundaries are the ones kept; a STOP during generation discards
-the held history and the checkpoints, so the next turn re-reads the prompt; and a
-STOP during the prompt read does not shorten it. Accuracy is unaffected in all
-three - every comparison was byte-identical to a cold read - but they cost time.
-A second client's prompt also cannot reuse a prefix owned by another live history.
+The former six RED assertions now pass: early canonical anchors survive shortened
+histories and edits; a drained token abort preserves valid prefill checkpoints;
+and prompt STOP ends at a completed chunk without decoding an unwanted token.
+The 128 MiB budget is unchanged. Reserving early anchors can leave fewer
+intermediate boundaries, so arbitrary edits do not have a latency guarantee.
+See [the fixes and full-logit/speed qualification](investigation/prefix-cache-gap-fixes.md).
+This remains one active history: interleaving unrelated sessions can legitimately
+go cold, rather than restore another owner's absolute attention rows.
 
 On the Tesla T4 / two E5-2690 v4 host, Q4_K_M, 14 threads, 128K allocated context,
 three HTTP cold-prompt runs measured **150.0 / 149.2 / 149.7 tok/s** with the cache

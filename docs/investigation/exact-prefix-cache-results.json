@@ -147,6 +147,7 @@
   "qualification_limit": "Selected complete logit vectors and tested workflows, not universal model accuracy or exhaustive scheduling-race proof",
   "raw_artifacts": "/data4/kolibri-sram/out/exact-prefix-cache/",
   "stress_campaign": {
+    "status": "historical RED baseline; superseded by gap_fix_qualification",
     "date": "2026-11-04",
     "engine_comparisons": 28,
     "engine_all_finite_bitwise_equal": true,
@@ -264,5 +265,55 @@
         "tools/kolibri/known_gaps.py"
       ]
     }
+  },
+  "gap_fix_qualification": {
+    "date": "2026-11-05",
+    "report": "prefix-cache-gap-fixes.md",
+    "candidate_sha256": "f0da4786034f2b2d68a4d6b2adf4ba4f713717e277c5404e9e54c5044b88b129",
+    "original_assertions_reproduced_red": 6,
+    "original_assertions_now_green": 6,
+    "payload_budget_mib_unchanged": 128,
+    "shorter_history_reuse": 512,
+    "mid_history_edit_reuse": 1024,
+    "post_token_abort_reuse": 3072,
+    "stop_after_first_pp": {"completed_chunks": 2, "full_prompt_chunks": 18, "generated_tokens": 0},
+    "finite_bitwise_gates": {
+      "long_matrix_cases": 24,
+      "maximum_actual_reuse": 32256,
+      "basic_stress_cases": 16,
+      "prefill_abort_cases": 4,
+      "token_abort_cases": 4,
+      "one_frame_budget_cases": 4,
+      "historical_degeneration_streamed_cases": 6,
+      "historical_degeneration_pool_cases": 6,
+      "stream_growth_long_vectors": 4,
+      "http_stress_steps": 27,
+      "http_stress_comparable_vectors": 24,
+      "http_exact_rendered_id_pairs": 26,
+      "baseline_candidate_full_vector_pairs": 24
+    },
+    "same_day_numa_bound_speed": {
+      "baseline_cache_on_cold_tok_s": [149.9, 150.7],
+      "candidate_cache_on_cold_tok_s": [150.7, 150.5],
+      "baseline_cache_off_cold_tok_s": [154.4, 152.6],
+      "candidate_cache_off_cold_tok_s": [150.9, 151.3],
+      "baseline_cached_prompt_ms": [2149.6, 2169.8],
+      "candidate_cached_prompt_ms": [2153.0, 2171.3],
+      "cached_tokens": 2560
+    },
+    "cpu_tests": {"passed": 219, "skipped": 22, "optional_network_deselected": 1},
+    "serve_tests": {"run": 1257, "result": "OK", "skipped": 31},
+    "not_passed": [
+      "root pytest collection: benchmark argparse SystemExit and 55 collection errors",
+      "combined tools/setup/Terminal suite: incomplete after 1300-second timeout"
+    ],
+    "limits": [
+      "single live history, not independent multi-session caching",
+      "anchor retention can require more recomputation at other edit locations",
+      "HIP/SYCL builds/runtime not run",
+      "other GPUs and actual 128K histories not run",
+      "forced GPU allocation failure and exhaustive cancellation schedules not run"
+    ],
+    "raw_artifacts": "/data4/kolibri-sram/out/exact-prefix-cache/fix-gaps/"
   }
 }

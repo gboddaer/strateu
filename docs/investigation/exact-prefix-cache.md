@@ -1,5 +1,9 @@
 # Exact long-prefix reuse for Kolibri coding-agent turns
 
+This records the initial feature qualification. Later retention and cancellation
+fixes, unchanged-speed controls and the six former RED assertions turning GREEN
+are in [the follow-up qualification](prefix-cache-gap-fixes.md).
+
 ## Problem and approach
 
 The merged engine could match a transcript's IDs but could not safely rewind its

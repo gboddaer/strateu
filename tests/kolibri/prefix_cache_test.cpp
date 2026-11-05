@@ -23,10 +23,13 @@ int main() {
     assert(c.count() == 2 && c.bytes() == 32);
     k[0] = 6;
     assert(c.capture(1536, spans));
-    assert(c.count() == 2 && c.best_position(512) == 0);
-    assert(c.restore(1200, spans) == 1024 && k[0] == 5);
+    assert(c.count() == 2 && c.best_position(512) == 512);
+    assert(c.best_position(2000) == 1536); // newest survives alongside the early anchor
+    assert(c.restore(1200, spans) == 512 && k[0] == 1);
     c.prune(1100);
-    assert(c.count() == 1 && c.best_position(2000) == 1024);
+    assert(c.count() == 1 && c.best_position(2000) == 512);
+    c.clear();
+    assert(c.capture(1024, spans));
     k[0] = 7;
     assert(c.capture(1024, spans));
     assert(c.count() == 1 && c.bytes() == 16);

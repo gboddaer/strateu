@@ -30,7 +30,7 @@ static bool run_token_graph(const Engine& e, Scratch& s, cudaStream_t stream) {
     }
     auto cancelled = [] { return decode_cancel && decode_cancel->load(std::memory_order_acquire); };
     if (cancelled()) {
-        KC(cudaStreamSynchronize(stream));  // finish this token's embedding before the caller resets state
+        KC(cudaStreamSynchronize(stream));  // drain before the caller discards the partial token
         decode_aborted = true;
         return true;
     }
@@ -155,7 +155,7 @@ static bool run_token_graph(const Engine& e, Scratch& s, cudaStream_t stream) {
         if (user_cancel) {
             std::fprintf(stderr, "kolibri: DEC_TOKEN_GRAPH cancelled: graph drained; token discarded\n");
             decode_aborted = true;
-            return true;  // caller must reset KV/live prefix and emit no token for this step
+            return true;  // caller discards this step; only canonical prefix checkpoints may survive
         }
         std::fprintf(stderr, "kolibri: DEC_TOKEN_GRAPH failed (status %u, ready %u, expected %u); no token emitted\n",
                      load(control->status), load(control->ready), hb.expect);

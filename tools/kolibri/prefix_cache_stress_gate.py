@@ -149,6 +149,9 @@ def main():
             row['pp_lines'] = stopped['pp']
             row['pp_at_stop'] = stopped['pp_at_stop']
             row['cancel_ok'] = stopped['done'][5] == 'cancel'
+            if stopped['pp_at_stop'] is not None:
+                row['cancel_ok'] = (row['cancel_ok'] and not stopped['gen'] and
+                                    stopped['pp'] <= stopped['pp_at_stop'] + 1)
         if extra:
             row.update(extra)
         rows.append(row)
@@ -185,15 +188,9 @@ def main():
             check('boundary-512', ids3k[:513], ids3k[:513] + tail[:8], minimum_reuse=512)
             check('below-boundary-511', ids3k[:511], ids3k[:511] + tail[:8], require_hit=False)
             check('boundary-1024', ids3k[:1025], ids3k[:1025] + tail[:8], minimum_reuse=1024)
-            # Known gap F1 (docs/investigation/prefix-cache-known-gaps.md): the
-            # boundary below a much shorter follow-up has been evicted, so this
-            # falls back cold. Exactness is still required here; known_gaps.py
-            # asserts the reuse we want.
-            check('truncated-target', ids3k, ids3k[:600], require_hit=None)
-            # Known gap F2: an edit at 1500 needs a boundary the newest-first FIFO
-            # has already evicted. Cold is exact; the reuse is what is missing.
-            check('middle-edit', ids3k, ids3k[:1500] + [ids3k[1500] ^ 3] + ids3k[1501:] + tail[:8],
-                  require_hit=None)
+            # Former gaps F1/F2: early anchors must survive newer captures.
+            check('truncated-target', ids3k, ids3k[:600], minimum_reuse=512)
+            check('middle-edit', ids3k, ids3k[:1500] + [ids3k[1500] ^ 3] + ids3k[1501:] + tail[:8])
             check('suffix-over-ring', ids3k, ids3k + ids3k[:600])
             engine.resetter(1)
             repeated = [request(ids3k + tail[:8]) for _ in range(3)]
@@ -260,38 +257,35 @@ def main():
             stopped = engine.run(ids3k + tail[:8], 64, stop_after_tokens=3)
             produced = stopped['gen']
             # A later turn is the prefix plus what the aborted request really wrote.
-            target = ids3k + produced + tail[:8]
+            target = ids3k + tail[:8] + produced + tail[8:16]
             warm, logits = request(target)
-            # Known gap F3: the STOP is seen by the decode graph, which resets the
-            # held state and clears every checkpoint, so this continuation re-reads
-            # the prompt. exact=True is required; reuse is not promised today.
-            record('token-stop-then-continue', logits == cold(target), warm['resume'] or 0, None, stopped,
-                   {'continuation_len': len(target), 'known_gap': 'F3'})
+            record('token-stop-then-continue', logits == cold(target), warm['resume'] or 0, True, stopped,
+                   {'continuation_len': len(target)})
             # A branch that diverges inside the aborted reply must not borrow its rows.
-            branch = ids3k + produced[:-1] + [produced[-1] ^ 5] + tail[:8]
+            branch = ids3k + tail[:8] + produced[:-1] + [produced[-1] ^ 5] + tail[8:16]
             warm, logits = request(branch)
             record('token-stop-branch', logits == cold(branch), warm['resume'] or 0, None,
-                   prefix_limit=len(ids3k) + len(produced) - 1)
+                   prefix_limit=len(ids3k) + 8 + len(produced) - 1)
             # Abort during a request that itself started from a checkpoint.
             engine.resetter(1)
             request(ids3k)
             request(ids3k + tail[:8])
             hit = engine.run(ids3k + tail[:8] + tail[8:16], 64, stop_after_tokens=2)
             aborted_reuse = hit['resume'] or 0
-            target = ids3k + tail[:8] + hit['gen'] + tail[16:24]
+            target = ids3k + tail[:16] + hit['gen'] + tail[16:24]
             warm, logits = request(target)
             record('token-stop-after-hit', aborted_reuse >= 1024 and logits == cold(target),
-                   warm['resume'] or 0, None, hit,
-                   {'aborted_request_reuse': aborted_reuse, 'known_gap': 'F3'})
+                   warm['resume'] or 0, True, hit,
+                   {'aborted_request_reuse': aborted_reuse})
             # Repeated aborts must not leave a stale claim behind.
             engine.resetter(1)
             request(ids3k)
             aborts = [engine.run(ids3k + tail[:8], 64, stop_after_tokens=2) for _ in range(3)]
             same = all(a['gen'] == aborts[0]['gen'] for a in aborts)
-            target = ids3k + aborts[-1]['gen'] + tail[:8]
+            target = ids3k + tail[:8] + aborts[-1]['gen'] + tail[8:16]
             warm, logits = request(target)
-            record('token-stop-repeated', same and logits == cold(target), warm['resume'] or 0, None,
-                   aborts[-1], {'all_aborts_identical': same, 'known_gap': 'F3'})
+            record('token-stop-repeated', same and logits == cold(target), warm['resume'] or 0, True,
+                   aborts[-1], {'all_aborts_identical': same})
 
         if group == 'budget':
             # One checkpoint fits. Every append must stay exact, and no reuse may

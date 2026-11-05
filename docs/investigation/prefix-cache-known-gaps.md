@@ -1,5 +1,11 @@
 # Prefix-cache stress findings: what fails, and the RED tests for it
 
+**Historical RED baseline (`69741cf9`).** F1–F4 and all six RED assertions are now
+fixed; see [the RED-to-GREEN qualification](prefix-cache-gap-fixes.md). The values
+below are retained as the original evidence, not current failure claims. F5 is a
+single-live-history limit, not a demonstrated failure to reuse matching first
+prompts across unrelated clients.
+
 Date 2026-11-04. Branch `fix/kolibri-exact-prefix-cache`, engine commit `301352d2`
 plus the test-only additions in this change. Build `build-cache-cuda/strata-kolibri`,
 SHA256 `8eba03b8f98c6502df7ebfcd8bd437d285ef6b5eb2cf180701b0907a36b65bc8`.
