@@ -85,10 +85,10 @@ class KolibriSourceTuning(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
 
-    def install(self, hip=True):
+    def install(self, hip=True, gpu=None):
         from tools.test_setup_qwen36 import args, run
         return run(setup.install_own_path, args(models_dir=str(self.root / "models"), model="Q4_K_M", vision="no"),
-                   "kolibri", {"index": 0, "count": 1, "vram_gb": 32, "arch": "gfx1201", "name": "R9700"},
+                   "kolibri", gpu or {"index": 0, "count": 1, "vram_gb": 32, "arch": "gfx1201", "name": "R9700"},
                    hip, [], 13, [], 8080, 96, None)
 
     def test_source_install_selects_compatible_shared_expert_tuning(self):
@@ -117,13 +117,35 @@ class KolibriSourceTuning(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertNotIn("env", self.cfg)
 
-    def test_cuda_config_does_not_change(self):
+    def test_cuda_config_persists_model_specific_defaults_without_hip_tuning(self):
         from unittest import mock
         with mock.patch.object(setup, "hipblaslt_table") as find:
             rc, out = self.install(hip=False)
         self.assertEqual(rc, 0, out)
         find.assert_not_called()
-        self.assertNotIn("env", self.cfg)
+        self.assertEqual(self.cfg["env"]["STRATA_KOLIBRI_EXPERT_F16"], "0")
+        self.assertEqual(self.cfg["env"]["STRATA_KOLIBRI_STREAM_DEV_ACT"], "1")
+        self.assertEqual(self.cfg["env"]["STRATA_KOLIBRI_PREFIX_CACHE_MB"], "128")
+        self.assertEqual(self.cfg["sampling"]["temperature"], 1.0)
+
+    def test_t4_defaults_keep_exact_streaming_not_rejected_fp16_cache(self):
+        from unittest import mock
+        gpu = {"index": 0, "count": 1, "vram_gb": 16, "arch": 75, "name": "Tesla T4"}
+        with mock.patch.object(setup, "expert_worker_count", return_value=14):
+            rc, out = self.install(hip=False, gpu=gpu)
+        self.assertEqual(rc, 0, out)
+        env, argv = self.cfg["env"], self.cfg["args"]
+        self.assertEqual(env["STRATA_KOLIBRI_EXPERT_STREAM"], "1")
+        self.assertEqual(env["STRATA_KOLIBRI_EXPERT_F16"], "0")
+        self.assertEqual(env["STRATA_KOLIBRI_POOL_ALL"], "1")
+        self.assertEqual(env["STRATA_KOLIBRI_REUSE_PREFIX"], "1")
+        self.assertEqual(env["STRATA_KOLIBRI_REUSE_ALIGN"], "1")
+        self.assertEqual(env["STRATA_KOLIBRI_PF_CHUNK"], "512")
+        self.assertEqual(argv[argv.index("--cpu-threads") + 1], "14")
+        self.assertEqual(argv[argv.index("--expert-slots") + 1], "0")
+        self.assertNotIn("--expert-slots-hot", argv)
+        self.assertNotIn("STRATA_KOLIBRI_PF_PARTIAL", env)
+        self.assertEqual(self.cfg["sampling"], {"temperature": 1.0})
 
 
 if __name__ == "__main__":

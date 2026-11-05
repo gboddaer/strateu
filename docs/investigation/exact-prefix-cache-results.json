@@ -1,0 +1,82 @@
+{
+  "scope": "CUDA Tesla T4 Q4_K_M; identical forced histories and finite full-vocabulary logits",
+  "base_commit": "3f4822028090a09a5c45c98856310b8601ab6255",
+  "engine_sha256": "8eba03b8f98c6502df7ebfcd8bd437d285ef6b5eb2cf180701b0907a36b65bc8",
+  "engine_source_sha256": "b243fb840b7989605dfed721cc9adefa00540fcce40d8530b79f8f2bc1856509",
+  "checkpoint_header_sha256": "95845f6214056e10ab62f15a2fac61cabad30842e18fea1763e0c9fa11095b46",
+  "hardware": {
+    "gpu": "Tesla T4 16 GiB",
+    "driver": "580.196.07",
+    "cpu": "2 x Xeon E5-2690 v4",
+    "engine_lanes": 14,
+    "model": "Kolibri-1 Q4_K_M",
+    "build": "CUDA Release SM75, Q6K experts enabled"
+  },
+  "checkpoint_payload_budget_mib": 128,
+  "checkpoint_bytes": 42024960,
+  "streamed_matrix": {
+    "comparisons": 24,
+    "all_finite_bitwise_equal": true,
+    "largest_previous_history_ids": 32768,
+    "maximum_reused_tokens": 32256,
+    "coverage": ["append", "edit", "replay", "one-token suffix", "8191/11000/32768 histories", "branch ownership", "unrelated reset", "forced continuation", "six repeats", "token/prefill STOP"]
+  },
+  "pool_matrix": {
+    "comparisons_completed_before_timeout": 20,
+    "completed_comparisons_finite_bitwise_equal": true,
+    "whole_command_status": "incomplete: 1500 second timeout",
+    "remaining_cancellation_cases_run_separately": 2,
+    "separate_cancellation_cases_passed": true
+  },
+  "controls": {
+    "cache_off": "zero long reuse; finite bitwise equal",
+    "one_mib_budget": "zero long reuse; finite bitwise equal",
+    "adaptive_pool_route": "checkpoints disabled; finite bitwise equal",
+    "historical_degeneration_streamed_cases": 6,
+    "historical_degeneration_pool_cases": 6,
+    "historical_cases_all_finite_bitwise_equal": true,
+    "stream_growth_long_vectors": 4,
+    "stream_growth_vectors_finite_bitwise_equal": true
+  },
+  "http_primary_unbound": {
+    "allocated_context": 131072,
+    "cold_prompt_tokens": 2706,
+    "cold_requests_per_arm": 3,
+    "cold_pp_off": [154.2, 150.7, 149.7],
+    "cold_pp_on": [150.0, 149.2, 149.7],
+    "cached_tokens": [2560, 2560, 2560],
+    "new_prompt_tokens": [176, 182, 176],
+    "cached_prompt_ms": [2212.4, 2243.1, 2249.3],
+    "identical_request_reset_cold_prompt_ms": [18180.9, 18336.0, 18349.6],
+    "tool_result_cached_prompt_ms": 3210.1,
+    "tool_result_reset_cold_prompt_ms": 19470.3,
+    "cross_mode_full_logit_pairs": 16,
+    "all_finite_bitwise_equal": true
+  },
+  "http_further_unbound_cold_pp": [
+    {"off": 155.1, "on": 151.5},
+    {"off": 156.4, "on": 139.9}
+  ],
+  "http_setup_numa_binding": {
+    "cpu_and_memory_node": 1,
+    "cold_pp_off": [156.9, 152.9],
+    "cold_pp_on": [153.8, 153.3],
+    "cached_prompt_ms": [2136.0, 2157.2],
+    "tool_result_cached_prompt_ms": 3075.1,
+    "tool_result_reset_cold_prompt_ms": 18882.6,
+    "exact_rendered_id_pairs": 12,
+    "finite_bitwise_logit_pairs": 12,
+    "same_request_cross_binding_bitwise_logit_pairs": 18
+  },
+  "reasoning_budget_wrap": {
+    "native_segments": 2,
+    "reused_per_segment": [0, 2560],
+    "nonempty_final_answer": true,
+    "note": "Integration/accounting check, not an additional cold-equivalence comparison"
+  },
+  "cpu_tests": {"passed": 218, "skipped": 22, "network_check_deselected": 1},
+  "serve_tests": {"run": 1257, "result": "OK", "skipped": 31},
+  "not_run": ["HIP/SYCL compilation/runtime", "other GPUs", "actual 128K-token histories", "forced GPU allocation failure", "real multi-session client workloads"],
+  "qualification_limit": "Selected complete logit vectors and tested workflows, not universal model accuracy or exhaustive scheduling-race proof",
+  "raw_artifacts": "/data4/kolibri-sram/out/exact-prefix-cache/"
+}

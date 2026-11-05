@@ -53,6 +53,7 @@
 #include <cuda_fp16.h>
 #include "kv_int8.cuh"
 #include "kq_a1.cuh"
+#include "prefix_cache.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -1948,6 +1949,8 @@ struct Scratch {
     __half* dec_att16 = nullptr;
     int* ids;
     std::vector<__half*> kc, vc;   // S3: FP16 KV -- half the bytes/token and half the prefill traffic
+    strata::kolibri::prefix::Cache prefix_cache;
+    std::vector<strata::kolibri::prefix::Span> prefix_spans;
     // Experimental Phase 2a: packed durable KV plus ONE shared FP16 attention workspace.
     bool kv_int8 = false;
     std::vector<strata::kolibri::experimental::Kv8Block*> k8, v8;
@@ -5026,6 +5029,7 @@ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std:
 /// Drop the held state: position 0 and empty KV caches (the serve protocol's fresh-request path).
 void reset_state(Engine& e, Scratch& s) {
     const Clock::time_point t0 = Clock::now();
+    s.prefix_cache.clear(); // full-attention rows are about to be invalidated too
     std::fill(s.kt_ready.begin(), s.kt_ready.end(), (char) 0);   // K27b: the mirrors describe the old KV
     // K11: the old clear memset the WHOLE cache (1.35 GB at ctx 33024 = 4 ms per request).  Attention only
     // reads rows below the position counter, so a fresh request only needs the rows it can reach: full-attention
@@ -5765,6 +5769,47 @@ static void dyn_probe_finish(const Engine& e) {
 /// [key=value ...] <ids>; PP lines as the prompt is consumed; T <id> per token; DONE at the end.  STOP cancels
 /// the running request.  A request whose ids extend the held prefix continues it (the serve `live` logic).
 int serve(Engine& e, Scratch& s) {
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+    long cache_mb = 128;
+#else
+    long cache_mb = 0; // other backends require their own runtime qualification
+#endif
+    if (const char* value = std::getenv("STRATA_KOLIBRI_PREFIX_CACHE_MB")) {
+        char* end = nullptr;
+        cache_mb = std::strtol(value, &end, 10);
+        if (end == value || *end || cache_mb < 0 || cache_mb > 4096) {
+            std::fprintf(stderr, "kolibri: PREFIX_CACHE_MB must be an integer in [0,4096]\n");
+            return 2;
+        }
+    }
+    // Exact checkpoints require a fixed cold arithmetic route. Adaptive pool
+    // selection depends on prompt length, which changes after prefix reuse.
+    const char* pool_mode = std::getenv("STRATA_KOLIBRI_POOL_ALL");
+    const char* align_mode = std::getenv("STRATA_KOLIBRI_REUSE_ALIGN");
+    const char* reuse_mode = std::getenv("STRATA_KOLIBRI_REUSE");
+    // Packed INT8 uses aliased per-layer staging, not durable FP16 ring pointers.
+    if (s.kv_int8 || e.prefill <= 0 || e.cpu_threads <= 0 || expert_f16_n() > 0 || e.slots > 0 ||
+        e.grouped > 0 || pf_pipe_on() || (pool_mode && std::atoi(pool_mode) != 1) ||
+        (align_mode && std::atoi(align_mode) == 0) || (reuse_mode && std::atoi(reuse_mode) == 0)) {
+        if (cache_mb > 0) std::fprintf(stderr, "kolibri: exact prefix checkpoints disabled for unsupported arithmetic/reuse profile\n");
+        cache_mb = 0;
+    }
+    s.prefix_cache.set_budget((size_t) cache_mb * 1024 * 1024);
+    size_t ring_bytes = 0;
+    for (size_t l = 0; l < s.kc.size(); ++l) {
+        if (!strata::core::is_swa_layer(e.g, (int64_t) l)) continue;
+        const size_t bytes = (size_t) e.g.n_head_kv * (size_t) e.g.n_swa * (size_t) e.g.head_dim * sizeof(__half);
+        s.prefix_spans.push_back({s.kc[l], bytes});
+        s.prefix_spans.push_back({s.vc[l], bytes});
+        ring_bytes += bytes * 2;
+    }
+    if (cache_mb > 0 && ring_bytes > s.prefix_cache.budget()) {
+        std::fprintf(stderr, "kolibri: prefix checkpoint budget is smaller than one complete ring; cache disabled\n");
+        cache_mb = 0;
+        s.prefix_cache.set_budget(0);
+    }
+    std::printf("INFO prefix_cache_mib=%ld prefix_checkpoint_bytes=%zu prefill_chunk=%d\n",
+                cache_mb, ring_bytes, pf_chunk_at(0));
     // INFO key=value before READY is what fills serve/server.py's engine.info (parser at :839), and /metrics
     // publishes that dict as its "engine" block - which is where the Monitor tab reads the expert figures.  The
     // Kolibri engine never printed one, so the tab had no slots and no hit-rate context to show.  Keys match the
@@ -5926,7 +5971,21 @@ int serve(Engine& e, Scratch& s) {
                 match = held;
             }
         }
-        if (match > 0) {
+        // Checkpoints belong to the current exact-ID history, never to an old branch.
+        s.prefix_cache.prune((int64_t) match);
+        if (s.prefix_cache.best_position((int64_t) match) > 0) {
+            // Default FP16 rings are device allocations (halloc means HALF, not
+            // host). Transfer checkpoint bytes explicitly; never dereference them
+            // on the CPU. Derived transpose mirrors are rebuilt below.
+            KC(cudaDeviceSynchronize());
+            reuse = (size_t) s.prefix_cache.restore((int64_t) match, s.prefix_spans,
+                [](void* dst, const void* src, size_t bytes) {
+                    KC(cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice));
+                });
+            std::fill(s.kt_ready.begin(), s.kt_ready.end(), (char) 0);
+        }
+        const bool checkpoint_reused = reuse > 0;
+        if (match > 0 && !checkpoint_reused) {
             reuse = match;
             // K27b rebuilds each layer's K/V transpose mirror ONCE per REQUEST, on the first decode token,
             // on the documented assumption that this "also covers everything a prefill wrote".  reset_state()
@@ -6017,6 +6076,16 @@ int serve(Engine& e, Scratch& s) {
                 forward_multi(e, s, T, s.pos);
                 s.pos += T;
                 i += T;
+                // Only full canonical chunks are cold-equivalent prefix states.
+                // Never checkpoint a partial final tile or any decode-written row.
+                if (reuse_on && s.prefix_cache.budget() > 0 && T == pf_chunk_at(0) &&
+                    s.pos % pf_chunk_at(0) == 0) {
+                    KC(cudaStreamSynchronize(g_st));
+                    s.prefix_cache.capture(s.pos, s.prefix_spans,
+                        [](void* dst, const void* src, size_t bytes) {
+                            KC(cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost));
+                        });
+                }
                 std::printf("PP %lld %lld %.0f %.1f\n", (long long) i, (long long) ids.size(), ms_since(t0),
                             (double) (i - reuse) / std::max(1e-9, ms_since(t0) / 1000.0));
                 std::fflush(stdout);
