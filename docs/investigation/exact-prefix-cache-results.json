@@ -19,7 +19,18 @@
     "all_finite_bitwise_equal": true,
     "largest_previous_history_ids": 32768,
     "maximum_reused_tokens": 32256,
-    "coverage": ["append", "edit", "replay", "one-token suffix", "8191/11000/32768 histories", "branch ownership", "unrelated reset", "forced continuation", "six repeats", "token/prefill STOP"]
+    "coverage": [
+      "append",
+      "edit",
+      "replay",
+      "one-token suffix",
+      "8191/11000/32768 histories",
+      "branch ownership",
+      "unrelated reset",
+      "forced continuation",
+      "six repeats",
+      "token/prefill STOP"
+    ]
   },
   "pool_matrix": {
     "comparisons_completed_before_timeout": 20,
@@ -42,26 +53,65 @@
     "allocated_context": 131072,
     "cold_prompt_tokens": 2706,
     "cold_requests_per_arm": 3,
-    "cold_pp_off": [154.2, 150.7, 149.7],
-    "cold_pp_on": [150.0, 149.2, 149.7],
-    "cached_tokens": [2560, 2560, 2560],
-    "new_prompt_tokens": [176, 182, 176],
-    "cached_prompt_ms": [2212.4, 2243.1, 2249.3],
-    "identical_request_reset_cold_prompt_ms": [18180.9, 18336.0, 18349.6],
+    "cold_pp_off": [
+      154.2,
+      150.7,
+      149.7
+    ],
+    "cold_pp_on": [
+      150.0,
+      149.2,
+      149.7
+    ],
+    "cached_tokens": [
+      2560,
+      2560,
+      2560
+    ],
+    "new_prompt_tokens": [
+      176,
+      182,
+      176
+    ],
+    "cached_prompt_ms": [
+      2212.4,
+      2243.1,
+      2249.3
+    ],
+    "identical_request_reset_cold_prompt_ms": [
+      18180.9,
+      18336.0,
+      18349.6
+    ],
     "tool_result_cached_prompt_ms": 3210.1,
     "tool_result_reset_cold_prompt_ms": 19470.3,
     "cross_mode_full_logit_pairs": 16,
     "all_finite_bitwise_equal": true
   },
   "http_further_unbound_cold_pp": [
-    {"off": 155.1, "on": 151.5},
-    {"off": 156.4, "on": 139.9}
+    {
+      "off": 155.1,
+      "on": 151.5
+    },
+    {
+      "off": 156.4,
+      "on": 139.9
+    }
   ],
   "http_setup_numa_binding": {
     "cpu_and_memory_node": 1,
-    "cold_pp_off": [156.9, 152.9],
-    "cold_pp_on": [153.8, 153.3],
-    "cached_prompt_ms": [2136.0, 2157.2],
+    "cold_pp_off": [
+      156.9,
+      152.9
+    ],
+    "cold_pp_on": [
+      153.8,
+      153.3
+    ],
+    "cached_prompt_ms": [
+      2136.0,
+      2157.2
+    ],
     "tool_result_cached_prompt_ms": 3075.1,
     "tool_result_reset_cold_prompt_ms": 18882.6,
     "exact_rendered_id_pairs": 12,
@@ -70,13 +120,149 @@
   },
   "reasoning_budget_wrap": {
     "native_segments": 2,
-    "reused_per_segment": [0, 2560],
+    "reused_per_segment": [
+      0,
+      2560
+    ],
     "nonempty_final_answer": true,
     "note": "Integration/accounting check, not an additional cold-equivalence comparison"
   },
-  "cpu_tests": {"passed": 218, "skipped": 22, "network_check_deselected": 1},
-  "serve_tests": {"run": 1257, "result": "OK", "skipped": 31},
-  "not_run": ["HIP/SYCL compilation/runtime", "other GPUs", "actual 128K-token histories", "forced GPU allocation failure", "real multi-session client workloads"],
+  "cpu_tests": {
+    "passed": 218,
+    "skipped": 22,
+    "network_check_deselected": 1
+  },
+  "serve_tests": {
+    "run": 1257,
+    "result": "OK",
+    "skipped": 31
+  },
+  "not_run": [
+    "HIP/SYCL compilation/runtime",
+    "other GPUs",
+    "actual 128K-token histories",
+    "forced GPU allocation failure",
+    "real multi-session client workloads"
+  ],
   "qualification_limit": "Selected complete logit vectors and tested workflows, not universal model accuracy or exhaustive scheduling-race proof",
-  "raw_artifacts": "/data4/kolibri-sram/out/exact-prefix-cache/"
+  "raw_artifacts": "/data4/kolibri-sram/out/exact-prefix-cache/",
+  "stress_campaign": {
+    "date": "2026-11-04",
+    "engine_comparisons": 28,
+    "engine_all_finite_bitwise_equal": true,
+    "http_steps": 26,
+    "http_comparable_steps": 23,
+    "http_all_finite_bitwise_equal": true,
+    "http_rendered_prompts_compared": 25,
+    "http_rendered_ids_identical": true,
+    "groups": {
+      "basic": {
+        "cases": 16,
+        "reuse": [
+          512,
+          0,
+          1024,
+          0,
+          0,
+          2560,
+          3072,
+          2560,
+          3072,
+          3072,
+          3072,
+          3072,
+          3072,
+          0,
+          2560,
+          2560
+        ]
+      },
+      "prefill": {
+        "cases": 4,
+        "reuse": [
+          8704,
+          8704,
+          8704,
+          8704
+        ],
+        "stop_after_pp_lines": 18,
+        "chunks_read_after_stop": 18,
+        "chunks_total": 18
+      },
+      "token": {
+        "cases": 4,
+        "reuse": [
+          0,
+          3072,
+          0,
+          0
+        ]
+      },
+      "budget_one_frame": {
+        "cases": 4,
+        "budget_mib": 48,
+        "reuse": [
+          2560,
+          3072,
+          3072,
+          3072
+        ]
+      }
+    },
+    "http": {
+      "tool_rounds_reuse": 1024,
+      "long_turn_reuse": 2560,
+      "abort_during_prefill": {
+        "bytes_before_close": 234,
+        "first_token_delta_s": null,
+        "next_request_reuse": 2560
+      },
+      "abort_during_decoding": {
+        "first_token_delta_s_on_arm": 1.99,
+        "first_token_delta_s_off_arm": 17.81,
+        "next_request_reuse": 0
+      },
+      "concurrent_clients": {
+        "reuse": 0,
+        "exact": true
+      }
+    },
+    "open_gaps": {
+      "F1_shorter_exact_prefix_reuses_nothing": {
+        "measured_reuse": 0,
+        "wanted_reuse": 512,
+        "exact": true
+      },
+      "F2_mid_history_edit_reuses_nothing": {
+        "measured_reuse": 0,
+        "wanted_reuse": 1024,
+        "exact": true
+      },
+      "F3_token_abort_discards_checkpoints": {
+        "measured_reuse": 0,
+        "wanted_reuse": 1024,
+        "exact": true,
+        "race_dependent": true
+      },
+      "F4_prefill_stop_does_not_stop_read": {
+        "pp_after_stop": 18,
+        "pp_total": 18,
+        "finish": "cancel"
+      },
+      "F5_interleaved_clients_no_reuse": {
+        "measured_reuse": 0,
+        "exact": true,
+        "documented_limit": true
+      }
+    },
+    "red_suite": {
+      "command": "python tools/kolibri/known_gaps.py",
+      "exit": 1,
+      "cases_red": 6,
+      "files": [
+        "tests/kolibri/prefix_cache_gaps_test.cpp",
+        "tools/kolibri/known_gaps.py"
+      ]
+    }
+  }
 }
