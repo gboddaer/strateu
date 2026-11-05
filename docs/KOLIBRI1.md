@@ -71,6 +71,60 @@ server reads it as structured `tool_calls` with no setting to add (measured: `ge
 form has that form read as calls (`tool_call_recovery` unset), and `"tool_call_recovery": false` in the config turns
 it off again.
 
+## CUDA prefill and prefix-cache settings
+
+The current CUDA Kolibri profile uses **streamed expert prefill**, not the old
+fp16 expert cache. Source setup writes its settings explicitly into the run
+config. Other model families are unchanged; HIP keeps its own prefill profile.
+
+| Setting | CUDA Kolibri default |
+| --- | --- |
+| Engine arguments | `--prefill --cpu-threads <node-local physical cores, cap 24> --expert-slots 0` |
+| NUMA placement | Explicit `launch_prefix` from the selected GPU's node where topology is unambiguous |
+| `STRATA_KOLIBRI_EXPERT_STREAM` | `1` on supported CUDA architectures; capability fallback on older/unknown devices |
+| `STRATA_KOLIBRI_STREAM_DEV_ACT`, `STRATA_KOLIBRI_STREAM_GU` | `1` |
+| `STRATA_KOLIBRI_EXPERT_F16` | `0` |
+| `STRATA_KOLIBRI_POOL_ALL`, `STRATA_KOLIBRI_REUSE`, `STRATA_KOLIBRI_REUSE_PREFIX`, `STRATA_KOLIBRI_REUSE_ALIGN` | `1` |
+| `STRATA_KOLIBRI_PF_CHUNK` | `512` |
+| `STRATA_KOLIBRI_PREFIX_CACHE_MB` | `128` MiB of host checkpoint payload; `0` disables checkpoints |
+| Served sampling | temperature `1.0`; explicit request/config/shared settings still win |
+
+Prefix checkpoints retain exact sliding-window KV bytes at completed prefill
+boundaries. A later turn restores the newest matching boundary and reads only
+the suffix. It does not reuse overwritten ring rows or preserve a decode-written
+partial suffix as if it had been computed by cold prefill. The budget is bounded;
+early edits, evicted checkpoints, unrelated sessions and prefixes shorter than a
+full chunk may correctly require a cold read. This is one live history, not a
+persistent multi-session cache. Packed INT8, adaptive routing and other
+unsupported arithmetic/reuse profiles disable checkpoints by name.
+
+The former six RED assertions now pass: early canonical anchors survive shortened
+histories and edits; a drained token abort preserves valid prefill checkpoints;
+and prompt STOP ends at a completed chunk without decoding an unwanted token.
+The 128 MiB budget is unchanged. Reserving early anchors can leave fewer
+intermediate boundaries, so arbitrary edits do not have a latency guarantee.
+See [the fixes and full-logit/speed qualification](investigation/prefix-cache-gap-fixes.md).
+This remains one active history: interleaving unrelated sessions can legitimately
+go cold, rather than restore another owner's absolute attention rows.
+
+On the Tesla T4 / two E5-2690 v4 host, Q4_K_M, 14 threads, 128K allocated context,
+three HTTP cold-prompt runs measured **150.0 / 149.2 / 149.7 tok/s** with the cache
+on. Growing turns reused **2560 tokens** and read 176–182 new tokens in
+**2.21–2.25 s**, against **18.18–18.35 s** for identical cold requests. Small
+suffixes can show lower *tokens/s* despite much lower latency; inspect
+`cached_tokens`, remaining tokens and prompt time together. Tool-result history
+also reused the prefix. With setup's explicit node-1 CPU/memory binding, a further
+pair measured **153.8 / 153.3 tok/s** cold and **2.14 / 2.16 s** for cached turns.
+Unbound runs varied, including a later 139.9 tok/s cold result; the investigation
+retains all measurements. Complete finite cache-on/off HTTP logits matched, as did
+forced-history checkpoint tests through 32K context. See the
+[exact-prefix investigation](investigation/exact-prefix-cache.md) for controls,
+failed experiments, limits and raw artifact locations. These are not performance
+claims for other hardware or guarantees of correct model-generated code.
+
+The older speed tables below are historical campaigns, not a recommendation to
+turn the rejected fp16 expert cache back on.
+
 ## How the engine path works
 
 `src/kolibri/kolibri_engine.cu` is a driver of its own beside Flash-Next's (the `strata` family switch picks it

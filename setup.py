@@ -8051,16 +8051,18 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
 
     step(7, "writing the start script")
     if fam.get("binary"):
-        # the family binary's own flags (src/kolibri/kolibri_main.cpp).  The expert cache and the chunked prefill are
-        # the defaults docs/KOLIBRI1.md describes: auto fits the slots to the VRAM still free (--vram-reserve-mib
-        # keeps room for the runtime), hot places them by routed picks, and the profile carries the set across
-        # restarts.  --prefill with the CPU pool's threads is the prefill path; without it the engine reads a prompt
-        # one token at a time (measured: 55 tok/s against 154-159 with these flags on a Tesla T4, findings-log 0.7).
+        # Family-native flags. CUDA Kolibri uses the accuracy-preserving streamed
+        # prefill with no expert residency. Other backends retain their own placement
+        # profile. Keep the prefill and worker count explicit in the saved settings.
         args = ["--model", str(gguf), "--ctx", str(ctx),
-                "--prefill", "--cpu-threads", str(expert_worker_count(nvidia=not (hip or amd))),
-                "--expert-slots", "auto", "--expert-slots-hot",
-                "--expert-slots-profile", str(data / f"hot-{tag.lower()}.prof"),
-                "--vram-reserve-mib", str(a.vram_reserve_mib if a.vram_reserve_mib is not None else 1024)]
+                "--prefill", "--cpu-threads", str(expert_worker_count(nvidia=not (hip or amd)))]
+        if fam["arch"] == "kolibri1" and not (hip or amd):
+            # The exact CUDA streamed leg needs no routed-expert residency or FP16 cache.
+            args += ["--expert-slots", "0"]
+        else:
+            args += ["--expert-slots", "auto", "--expert-slots-hot",
+                     "--expert-slots-profile", str(data / f"hot-{tag.lower()}.prof"),
+                     "--vram-reserve-mib", str(a.vram_reserve_mib if a.vram_reserve_mib is not None else 1024)]
     else:
         args = ["--native", str(gguf), "--max-context", str(ctx), "--prefill", "auto", "--mtp", str(fam["mtp"])]
     if a.vram_reserve_mib is not None:             # VRAM left free for other programs: the experts take that much less
@@ -8112,24 +8114,26 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
             cfg["vision"]["threads"] = vision_threads()
     elif getattr(a, "vision_tokens", None) is not None:
         warn("--vision-tokens: images are off, so it is not used")
-    if fam.get("binary") and "tesla t4" in " ".join(gpu_name(g) for g in [gpu] if g).lower():
-        # A 16 GB Tesla T4: the measured speed environment (findings-log 0.7, published-figures #35/#36).  The fp16
-        # expert cache is what makes the prompt read fast, at the cost of VRAM the residency cache would hold; 20
-        # experts/layer is the largest value that still leaves slots, and PF_PARTIAL needs it (its scratch lives in
-        # that block).  A user's own env in the config still wins, and another card gets none of this.
-        cfg.setdefault("env", {}).update({
-            "GGML_CUDA_DISABLE_GRAPHS": "1",
-            "STRATA_KOLIBRI_PF_STAGE": "1",
-            "STRATA_KOLIBRI_ROUTER_TILE": "1",
-            "STRATA_KOLIBRI_ROUTER_TK": "3",
-            "STRATA_KOLIBRI_ROUTER_TJ": "16",
-            "STRATA_KOLIBRI_ATTN_MB": "256",
-            "STRATA_KOLIBRI_RES_TOP": "48",
-            "STRATA_KOLIBRI_ATTN_FLASH": "1",
-            "STRATA_KOLIBRI_EXPERT_F16": "20",
-            "STRATA_KOLIBRI_PF_PARTIAL": "1",
-        })
-        ok("Tesla T4: the measured Kolibri speed environment is written into the config (EXPERT_F16=20, PF_PARTIAL)")
+    if fam["arch"] == "kolibri1":
+        cfg["sampling"] = {"temperature": 1.0}
+        if not (hip or amd):
+            # Persist the accuracy-preserving CUDA profile, not the rejected historical
+            # FP16 expert-cache preset. Old CUDA devices retain capability fallback.
+            arch = str(gpu.get("arch", ""))
+            cfg.setdefault("env", {}).update({
+                "STRATA_KOLIBRI_EXPERT_STREAM": "1" if arch.isdigit() and int(arch) >= 61 else "",
+                "STRATA_KOLIBRI_STREAM_DEV_ACT": "1",
+                "STRATA_KOLIBRI_STREAM_GU": "1",
+                "STRATA_KOLIBRI_EXPERT_F16": "0",
+                "STRATA_KOLIBRI_POOL_ALL": "1",
+                "STRATA_KOLIBRI_PF_CHUNK": "512",
+                "STRATA_KOLIBRI_REUSE": "1",
+                "STRATA_KOLIBRI_REUSE_PREFIX": "1",
+                "STRATA_KOLIBRI_REUSE_ALIGN": "1",
+                "STRATA_KOLIBRI_PREFIX_CACHE_MB": "128",
+            })
+            ok("Kolibri CUDA: streamed prefill, device activation, 512-token chunks, "
+               "exact prefix checkpoints (128 MiB); FP16 expert cache off")
     # requests at once ("parallel", opt-in): written only when given; the recommendation is said once
     if par is not None:
         if par >= 2:
