@@ -1,6 +1,6 @@
 # Cache-friendly thinking levels for Kolibri
 
-Status: proposed. Branch `fix/kolibri-cache-friendly-thinking`, base `7e6ec5ec`.
+Status: accepted. Branch `fix/kolibri-cache-friendly-thinking`, base `7e6ec5ec`.
 Date: 2026-11-06.
 
 ## Problem
@@ -20,27 +20,27 @@ per task.
 
 ## Decision
 
-Move the level instruction to a short trailing system turn - the existing
-`effort_position: "end"` layout (#458) - and allow it for Kolibri without the engine's
-`--tail-role-token`. With the instruction at the end, all levels share the whole conversation
-prefix, so a switch reuses the newest 512-token checkpoint and reads at most one block plus
-the trailing turn. That is the same cost as a normal next turn (the first row above).
+Make the end layout the **default** on the Kolibri prefix cache and move the level instruction to a short
+trailing system turn - the existing `effort_position: "end"` layout (#458) - without the engine's
+`--tail-role-token`. With the instruction at the end, all levels share the whole conversation prefix, so a
+switch reuses the newest 512-token checkpoint and reads at most one block plus the trailing turn. That is the
+same cost as a normal next turn (the first row above). `"effort_position": "start"` in the run config keeps the
+older top-of-prompt behaviour.
 
-Rejected for this change: an exact engine checkpoint in front of the trailing turn (saves
-about another 2 s per switch, but the tail boundary is mid-chunk; splitting the prefill chunk
-changes GEMM shapes and needs a numerical qualification under the accuracy policy).
+The maintainer chose this default knowingly: [CONTRIBUTING.md](../../CONTRIBUTING.md) otherwise asks for a new
+feature to be opt-in and the default prompt to stay byte-identical. Only Kolibri configs with the prefix cache
+on change; every other family keeps the prompt it had.
 
 ## Design
 
-- The layout is opt-in: `"effort_position": "end"` in the run config. Without it, prompts
-  stay byte-identical to today, as [CONTRIBUTING.md](../../CONTRIBUTING.md) requires.
-- `serve/server.py:effort_end_args` gains one branch. With `"end"`, an engine without
-  `--tail-role-token`, `cfg["arch"] == "kolibri1"` and the Kolibri prefix cache on
-  (`STRATA_KOLIBRI_PREFIX_CACHE_MB` > 0 in the config's `env` or the environment), it returns
-  an empty list: layout enabled, no engine arguments. It prints that a level switch reuses the
-  newest 512-token checkpoint rather than the exact boundary. Every other case keeps today's
-  answer: `None` and the 0.1.39 message for other engines, `None` for Kolibri without the
-  prefix cache.
+- The layout is the default for `arch: kolibri1`: an unset `effort_position` means `end` there and
+  `start` for every other family; an explicit `start` opts out. Setup writes the key into the
+  Kolibri config. The prefix-cache size does not change the prompt, so a cache-off arm renders
+  the same prompt (that keeps the on/off logit gate a fair comparison).
+- `serve/server.py:effort_end_args` returns `[]` (layout enabled, no engine arguments) for
+  `arch: kolibri1` when the engine lacks `--tail-role-token`, and prints that a level switch
+  reuses the newest 512-token checkpoint. Other families keep today's answer: `None` and the
+  0.1.39 message.
 - `svc.effort_end = effort_end is not None` so the empty list still enables the layout; the
   replica and split paths append the empty list harmlessly.
 - `render_prompt` and `head_ids` already implement this layout (#458) and need no change:
@@ -52,8 +52,8 @@ changes GEMM shapes and needs a numerical qualification under the accuracy polic
 
 ## Tests
 
-1. `effort_end_args`: Kolibri + `end` + prefix cache -> `[]` (enabled) and no engine
-   arguments; Kolibri + `end` without the cache -> `None`; another family + `end` without the
+1. `effort_end_args`: Kolibri -> `[]` (enabled, no engine arguments) with any prefix-cache
+   setting and with the key unset; Kolibri + `start` -> `None`; another family + `end` without the
    flag -> `None` and the existing message; a bad value still raises.
 2. The existing `EffortAtTheEnd` layout tests keep passing unchanged (prompt strings, off's
    pre-closed block, reuse of the whole conversation in the simulated engine).
@@ -77,8 +77,8 @@ changes GEMM shapes and needs a numerical qualification under the accuracy polic
   Exact reuse needs the engine work that this change deliberately avoids.
 - Off is unaffected in content: the pre-closed block stays at the very end, so off to on (and
   back) is also a tail-only difference.
-- Opt-in: setup does not write `effort_position` yet, and single-GPU serving is the tested
-  path.
+- Opt-in for other families, default for Kolibri: their prompts and caches are untouched.
+- Single-GPU serving is the tested path.
 
 ## Out of scope
 

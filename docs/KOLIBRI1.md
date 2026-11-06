@@ -85,7 +85,9 @@ Anthropic-compatible client.
 
 A request that names no level uses the server's default, which is high unless the config sets
 `reasoning_effort`. The levels are words for the model, so they are not exact: `low` and `medium` sometimes
-think for about the same time, `high` is usually longest.
+think for about the same time, `high` is usually longest. On the Kolibri prefix cache the level sentence goes
+in a trailing system turn (see [Changing the level keeps the saved prompt](#changing-the-level-keeps-the-saved-prompt)),
+so switching levels does not re-read the conversation.
 
 `"reasoning_budget_tokens": N` caps the thinking. The server closes the block when the budget is reached, so
 the answer still gets its room (`"thinking_budget_tokens"`, the name llama.cpp uses, is accepted too). It is a
@@ -130,13 +132,17 @@ the answer above the budget, so `maxTokens` must be at least the largest budget 
 high 8192 that is 9216, and 12288 leaves room. Measured with pi 1.5.0: off sent `reasoning_effort: none` and
 produced 5 output tokens with 0 thinking characters; medium sent 4096; high sent 8192.
 
-### Changing the level costs the saved prompt
+### Changing the level keeps the saved prompt
 
-The effort sentence sits at the top of the prompt and the engine cannot yet checkpoint in front of it
-(`--tail-role-token` / `effort_position: "end"` is not supported by the Kolibri engine). Every level switch
-therefore re-reads the conversation. On a 4430-token prompt, one level reused 4096 cached tokens and answered
-in 2.3 s; switching high to low reused 0 and read the prompt again in 27 s. Staying on one level keeps the
-cache, and request-side budgets do not change the prompt text.
+For Kolibri a non-default level goes in a short system turn right before the answer
+(`effort_position: "end"`, the default). The conversation up to that turn is the same for every level, so a
+switch reuses the newest 512-token checkpoint instead of reading the conversation again. Measured on a
+4430-token prompt on the T4: a cold read takes 26.7 s; then switching high -> low -> none -> medium -> high,
+every request reused 4096 tokens and read 334-363 fresh ones in 2.3-2.7 s, the cost of a normal next turn.
+`"effort_position": "start"` in the run config puts the level back at the top (the older behaviour: every
+switch reads the conversation again). The reuse needs the prefix cache; without it the prompt simply has the
+level at the end. Request-side budgets do not change the prompt text, so changing only a budget never costs a
+re-read.
 
 ## CUDA prefill and prefix-cache settings
 
