@@ -43,11 +43,14 @@ on change; every other family keeps the prompt it had.
   0.1.39 message.
 - `svc.effort_end = effort_end is not None` so the empty list still enables the layout; the
   replica and split paths append the empty list harmlessly.
-- `render_prompt` and `head_ids` already implement this layout (#458) and need no change:
-  default and `high` keep today's prompt, `low`/`medium` render the conversation with the
-  template's default sentence at the top plus a trailing `system` turn, and off keeps the
-  pre-closed empty thinking block at the very end. The top sentence is the template's default
-  (`high`) for every level; that is existing #458 behaviour and stays.
+- `render_prompt` and `head_ids` already implement the layout (#458): `low`/`medium` render the
+  conversation plus a trailing `system` turn, off keeps the pre-closed empty thinking block at the
+  very end. One addition here: the model's template writes its own level sentence at the top of the
+  system block (a default of `high` for every level), which would contradict the trailing turn. The
+  server drops that paragraph from the rendered prompt - only when it is one of the template's own
+  four sentences, which are read from the template at load - and uses the template's wording for the
+  level in the trailing turn. The GGUF and the tokenizer pack are not touched; `start` renders
+  byte-identically to the model's template (tested).
 - No engine change, no template change, no arithmetic or chunk change.
 
 ## Tests
@@ -61,9 +64,10 @@ on change; every other family keeps the prompt it had.
    `cache_n` 4096, fresh at most 512 plus the trailing turn (about 338), roughly 2.4 s, and
    every request's full 128000-value logits byte-identical to a cold read of the same prompt
    (`STRATA_KOLIBRI_LOGITS_DUMP`).
-4. Quality: the prompts change, so the fixed task set from
-   `tools/kolibri/code_quality_probe.py` plus one tool-call case, start vs end layout at
-   `low`, `medium` and `high`. Report every case; make no equivalence claim.
+4. Quality: the prompts change, so a fixed task set plus tool-call cases, start vs end layout at
+   `low`, `medium` and `high`. Report every case; make no equivalence claim. Measured after the
+   drop: all answers correct; thinking at `low` 218/663 characters against 170/482 at the top, and
+   at `medium` 1042/838 against 1164/462 (discount/boxes), with no answer lost to the cap.
 5. Docs: `docs/KOLIBRI1.md`, the "Changing the level costs the saved prompt" subsection, gains
    the setting and the measured numbers.
 

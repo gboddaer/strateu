@@ -74,14 +74,14 @@ it off again.
 
 ## Thinking levels
 
-Kolibri writes its thinking into a ` thinking` block before the answer. The choice is per request, through the
+Kolibri writes its thinking into a `<think>` block before the answer. The choice is per request, through the
 model's own chat template, so it works the same in the app, the Terminal and any OpenAI- or
 Anthropic-compatible client.
 
 | Level | What the template does | How to ask for it |
 | --- | --- | --- |
 | off | writes an empty, already closed thinking block, so the model starts on the answer | `"reasoning_effort": "none"`, `"chat_template_kwargs": {"enable_thinking": false}`, Anthropic `thinking: {"type": "disabled"}` |
-| low, medium, high | leaves the thinking block open and puts a "think briefly / methodically / carefully" sentence in the system message | `"reasoning_effort": "low"` and so on; Anthropic `thinking: {"type": "enabled", "budget_tokens": N}` maps under 2048 to low, under 8192 to medium, otherwise high |
+| low, medium, high | leaves the thinking block open and puts a "think briefly / methodically / carefully" sentence in the system message (the trailing one when the level sits at the end) | `"reasoning_effort": "low"` and so on; Anthropic `thinking: {"type": "enabled", "budget_tokens": N}` maps under 2048 to low, under 8192 to medium, otherwise high |
 
 A request that names no level uses the server's default, which is high unless the config sets
 `reasoning_effort`. The levels are words for the model, so they are not exact: `low` and `medium` sometimes
@@ -136,13 +136,14 @@ produced 5 output tokens with 0 thinking characters; medium sent 4096; high sent
 
 For Kolibri a non-default level goes in a short system turn right before the answer
 (`effort_position: "end"`, the default). The conversation up to that turn is the same for every level, so a
-switch reuses the newest 512-token checkpoint instead of reading the conversation again. Measured on a
-4430-token prompt on the T4: a cold read takes 26.7 s; then switching high -> low -> none -> medium -> high,
-every request reused 4096 tokens and read 334-363 fresh ones in 2.3-2.7 s, the cost of a normal next turn.
-`"effort_position": "start"` in the run config puts the level back at the top (the older behaviour: every
-switch reads the conversation again). The reuse needs the prefix cache; without it the prompt simply has the
-level at the end. Request-side budgets do not change the prompt text, so changing only a budget never costs a
-re-read.
+switch reuses the newest 512-token checkpoint instead of reading the conversation again. The trailing turn uses
+the template's own sentence for the level, and the sentence the template would write at the top is dropped, so
+the level is named once and nowhere says "high" for a lower level. Measured on a 4430-token prompt on the T4: a
+cold read takes 26.1 s; then switching high -> low -> none -> medium -> high, every request reused 4096 tokens
+and read 292-328 fresh ones in 2.1-2.6 s, the cost of a normal next turn. `"effort_position": "start"` in the
+run config leaves the prompt byte-identical to the model's template (the level at the top; every switch reads
+the conversation again). The reuse needs the prefix cache; without it the prompt simply has the level at the
+end. Request-side budgets do not change the prompt text, so changing only a budget never costs a re-read.
 
 ## CUDA prefill and prefix-cache settings
 
