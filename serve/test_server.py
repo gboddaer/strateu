@@ -935,6 +935,76 @@ class EffortAtTheEnd(unittest.TestCase):
                 effort_end_args({"effort_position": "middle"}, str(new), Tok())
 
 
+class EffortAtTheEndOnKolibri(unittest.TestCase):
+    """The Kolibri template (the model's own, in the GGUF) writes a level sentence at the top.  With the level in the
+    trailing turn (effort_position end) the server drops that paragraph, and only that paragraph."""
+
+    ASSISTANT = chr(60) + "|im_start|" + chr(62) + "assistant\n"
+    SYSTEM = chr(60) + "|im_start|" + chr(62) + "system\n"
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.svc = Service(MockEngine(self.tok, "ok", max_context=1 << 20), self.tok,
+                           ChatTemplate(ROOT / "tools/kolibri/chat_template.jinja"))
+
+    def text(self, end, tools=None, messages=None, **kw):
+        self.svc.effort_end = end
+        return self.svc.render_prompt(messages or [{"role": "user", "content": "hi"}], tools, kw)
+
+    def test_the_end_layout_has_no_level_sentence_at_the_top(self):
+        for kw in ({}, {"reasoning_effort": "low"}, {"reasoning_effort": "medium"},
+                   {"enable_thinking": False}):
+            self.assertNotIn("# Reasoning effort", self.text(True, **kw), kw)
+
+    def test_the_start_layout_keeps_the_sentence(self):
+        self.assertIn("# Reasoning effort", self.text(False, reasoning_effort="low"))
+        self.assertIn("# Reasoning effort", self.text(False))
+    def test_the_start_layout_is_the_template_render(self):
+        """Opting out leaves the prompt byte-identical to the model's template."""
+        msg = [{"role": "user", "content": "hi"}]
+        self.svc.effort_end = False
+        for kw in ({}, {"reasoning_effort": "low"}, {"reasoning_effort": "medium"},
+                   {"enable_thinking": False}):
+            self.assertEqual(self.svc.render_prompt(msg, None, kw),
+                             self.svc.template.render(msg, tools=None, add_generation_prompt=True, **kw), kw)
+
+
+    def test_the_system_message_survives(self):
+        text = self.text(True, messages=[{"role": "system", "content": "S"},
+                                         {"role": "user", "content": "hi"}], reasoning_effort="low")
+        self.assertTrue(text.startswith(self.SYSTEM + "S"), repr(text[:80]))
+        self.assertNotIn("# Reasoning effort", text)
+
+    def test_the_tools_section_survives_without_a_system_message(self):
+        tools = [{"type": "function", "function": {"name": "read_file", "description": "Read a file.",
+                                                   "parameters": {"type": "object", "properties": {}}}}]
+        text = self.text(True, tools=tools, reasoning_effort="low")
+        self.assertTrue(text.startswith(self.SYSTEM + "# Tools"), repr(text[:80]))
+        self.assertNotIn("# Reasoning effort", text)
+        self.assertIn("<tools>", text)
+
+    def test_system_and_tools_keep_one_separator(self):
+        tools = [{"type": "function", "function": {"name": "read_file", "description": "Read a file.",
+                                                   "parameters": {"type": "object", "properties": {}}}}]
+        text = self.text(True, tools=tools, reasoning_effort="low",
+                         messages=[{"role": "system", "content": "S"}, {"role": "user", "content": "hi"}])
+        self.assertTrue(text.startswith(self.SYSTEM + "S\n\n# Tools"), repr(text[:80]))
+        self.assertNotIn("# Reasoning effort", text)
+
+    def test_the_trailing_turn_and_the_off_block_survive(self):
+        text = self.text(True, reasoning_effort="low")
+        self.assertIn("Reasoning effort is set to low", text[-300:])
+        self.assertIn("Think briefly through only the essential steps", text[-300:])   # the template's own wording
+        self.assertTrue(text.endswith(self.ASSISTANT))
+        self.assertTrue(self.text(True, enable_thinking=False).endswith(
+            self.ASSISTANT + chr(60) + "think" + chr(62) + "\n\n" + chr(60) + "/think" + chr(62) + "\n\n"))
+
+    def test_other_text_is_never_dropped(self):
+        from serve.server import drop_effort_sentence
+        text = self.SYSTEM + "# Reasoning effort\n\nmy own words<|im_end|>\n" + self.ASSISTANT
+        self.assertEqual(drop_effort_sentence(text, frozenset({"a sentence"})), text)
+
+
 class StatusNeedsTheKey(unittest.TestCase):
     """#212: /status shows the end of the answer being written, so it needs the key like /v1/*."""
 
