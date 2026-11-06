@@ -61,15 +61,82 @@ The model card recommends temperature 1.0, top-p 0.97, top-k 128. Strateu's serv
 settings are unchanged. Request values, shared Chat settings and the config's `sampling` block override the default;
 explicit temperature 0 still means greedy. The low-level engine diagnostic protocol remains greedy unless sampling
 is requested. This temperature default is user-approved; it is not a guarantee of correct code or loop-free output.
-Reasoning effort is per request:
-`"chat_template_kwargs": {"reasoning_effort": "low"}` - `none`, `low`, `medium`, `high`; measured on the T4:
-`none` answers directly ("27 x 43 = 1161.", no thinking), the default thinks first. The tokenizer is gpt2 BPE,
+Reasoning effort is per request: `"reasoning_effort": "low"` - `none`, `low`, `medium` or `high`; measured on the T4:
+`none` answers directly ("27 x 43 = 1161.", no thinking), the default thinks first. See
+[Thinking levels](#thinking-levels) for what each level does, the token budgets and the pi setup.
+The tokenizer is gpt2 BPE,
 128,000 tokens, `pre = kolibri1` (the Qwen2 pre-tokenizer split). The model writes tool calls as
 `<tool_call>{JSON}</tool_call>` next to the template's XML form. Its own chat template asks for exactly that form, so the
 server reads it as structured `tool_calls` with no setting to add (measured: `get_weather {"city": "Berlin"}`,
 `finish_reason: tool_calls`). The server decides this from the template it serves: a template that asks for the JSON
 form has that form read as calls (`tool_call_recovery` unset), and `"tool_call_recovery": false` in the config turns
 it off again.
+
+## Thinking levels
+
+Kolibri writes its thinking into a ` thinking` block before the answer. The choice is per request, through the
+model's own chat template, so it works the same in the app, the Terminal and any OpenAI- or
+Anthropic-compatible client.
+
+| Level | What the template does | How to ask for it |
+| --- | --- | --- |
+| off | writes an empty, already closed thinking block, so the model starts on the answer | `"reasoning_effort": "none"`, `"chat_template_kwargs": {"enable_thinking": false}`, Anthropic `thinking: {"type": "disabled"}` |
+| low, medium, high | leaves the thinking block open and puts a "think briefly / methodically / carefully" sentence in the system message | `"reasoning_effort": "low"` and so on; Anthropic `thinking: {"type": "enabled", "budget_tokens": N}` maps under 2048 to low, under 8192 to medium, otherwise high |
+
+A request that names no level uses the server's default, which is high unless the config sets
+`reasoning_effort`. The levels are words for the model, so they are not exact: `low` and `medium` sometimes
+think for about the same time, `high` is usually longest.
+
+`"reasoning_budget_tokens": N` caps the thinking. The server closes the block when the budget is reached, so
+the answer still gets its room (`"thinking_budget_tokens"`, the name llama.cpp uses, is accepted too). It is a
+cap, not a target: a level whose thinking ends earlier than the budget does not pad to it.
+
+Measured on a Tesla T4 16 GiB with 2x Xeon E5-2690 v4, Q4_K_M, temperature 0:
+
+- off: 2 output tokens for "27 x 43", 3-5 for other short questions, and no `reasoning_content`. The answer can
+  still show a one-line calculation; nothing is generated in a thinking block.
+- low / medium / high, output tokens including the answer: 286 / 322 / 387 on a discount question,
+  596 / 549 / 667 on comparing 7/8 with 0.86, 214 / 319 / 317 on a cube volume. All answers were correct.
+- budgets 32 / 64 / 128 / 256: 54 / 86 / 150 / 276 output tokens, thinking about the budget plus the answer.
+
+### In pi
+
+A model entry in `~/.pi/agent/models.json` (provider `strata-kolibri`). `thinkingLevelMap` turns pi's levels into
+Kolibri's; without it, and with `"reasoning": false`, pi sends no level at all and the server's default (high)
+thinks even when the level says off.
+
+```json
+{
+  "id": "kolibri-1-q4_k_m",
+  "reasoning": true,
+  "maxTokens": 12288,
+  "thinkingLevelMap": {
+    "off": "none", "minimal": "low", "low": "low",
+    "medium": "medium", "high": "high", "xhigh": "high", "max": "high"
+  },
+  "compat": { "thinkingTokenBudgetField": "thinking_budget_tokens" }
+}
+```
+
+and in `~/.pi/agent/settings.json`:
+
+```json
+{ "defaultThinkingLevel": "medium",
+  "thinkingBudgets": { "minimal": 512, "low": 2048, "medium": 4096, "high": 8192 } }
+```
+
+pi sends the level as `reasoning_effort` and the budget as `thinking_budget_tokens`. It keeps 1024 tokens for
+the answer above the budget, so `maxTokens` must be at least the largest budget plus 1024; with medium 4096 and
+high 8192 that is 9216, and 12288 leaves room. Measured with pi 1.5.0: off sent `reasoning_effort: none` and
+produced 5 output tokens with 0 thinking characters; medium sent 4096; high sent 8192.
+
+### Changing the level costs the saved prompt
+
+The effort sentence sits at the top of the prompt and the engine cannot yet checkpoint in front of it
+(`--tail-role-token` / `effort_position: "end"` is not supported by the Kolibri engine). Every level switch
+therefore re-reads the conversation. On a 4430-token prompt, one level reused 4096 cached tokens and answered
+in 2.3 s; switching high to low reused 0 and read the prompt again in 27 s. Staying on one level keeps the
+cache, and request-side budgets do not change the prompt text.
 
 ## CUDA prefill and prefix-cache settings
 
