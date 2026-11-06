@@ -3066,13 +3066,17 @@ def engine_binary(exe: str, cfg: dict | None = None) -> str:
 
 
 def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
-    """#458 (opt-in): the engine arguments for "effort_position": "end" - the id of "system" as --tail-role-token, so
-    the engine checkpoints in front of the trailing effort turn - or None when the config leaves it at the top (the
-    default) or the engine is too old for it (said once; the prompt stays the default one).  ValueError for a value
-    other than "start" / "end"."""
-    pos = cfg.get("effort_position", "start")
+    """Where a request's non-default reasoning effort goes.  "end" puts it in a short system turn right before the
+    answer, so a request that changes only the effort keeps the conversation prefix: on the Kolibri prefix cache the
+    newest 512-token checkpoint is reused; an engine with --tail-role-token checkpoints exactly in front of the turn.
+    Unset means "end" for Kolibri (its prefix cache is what makes a level switch cheap) and "start" for every other
+    family, which leaves the prompt as it was.  Returns the engine arguments (empty for Kolibri, which needs none) or
+    None when the effort stays at the top.  ValueError for a value other than "start" / "end"."""
+    pos = cfg.get("effort_position")
+    if pos is None:
+        pos = "end" if cfg.get("arch") == "kolibri1" else "start"
     if pos not in ("start", "end"):
-        raise ValueError(f'"effort_position" must be "start" (the default) or "end", not {pos!r}')
+        raise ValueError(f'"effort_position" must be "start" or "end", not {pos!r}')
     if pos == "start":
         return None
     try:
@@ -3081,13 +3085,18 @@ def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
     except OSError:
         known = False
     role = tok.encode("system", parse_special=True)
-    if not known or len(role) != 1:
-        print("[strata] effort_position \"end\" needs engine 0.1.39 or newer (--tail-role-token): the reasoning "
-              "effort stays at the top of the prompt", flush=True)
-        return None
-    print("[strata] effort_position end: a request's non-default reasoning effort goes right before the answer, so "
-          "changing it keeps the cached conversation", flush=True)
-    return ["--tail-role-token", str(role[0])]
+    if known and len(role) == 1:
+        print("[strata] effort_position end: a request's non-default reasoning effort goes right before the answer, "
+              "so changing it keeps the cached conversation", flush=True)
+        return ["--tail-role-token", str(role[0])]
+    if cfg.get("arch") == "kolibri1":
+        print("[strata] effort_position end (Kolibri): a request's non-default reasoning effort goes right before "
+              "the answer, so changing it reuses the newest 512-token checkpoint instead of reading the conversation "
+              "again", flush=True)
+        return []
+    print("[strata] effort_position \"end\" needs engine 0.1.39 or newer (--tail-role-token): the reasoning effort "
+          "stays at the top of the prompt", flush=True)
+    return None
 
 
 def engine_silence_s(cfg: dict) -> float:
@@ -4007,8 +4016,9 @@ class Service:
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
-        # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
-        # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
+        # #458 (the config's "effort_position": "end", the default for Kolibri): a non-default
+        # reasoning effort goes in a short system turn before the answer instead of the top of the prompt, so
+        # switching it keeps the cached conversation
         self.effort_end = False
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
         self.config_path = None                         # #564: the run config the web page's Settings view edits
@@ -9202,7 +9212,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
-    svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
+    svc.effort_end = effort_end is not None             # #458: "effort_position" end (empty args on Kolibri)
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         svc.reasoning_budget_configured = True
         try:

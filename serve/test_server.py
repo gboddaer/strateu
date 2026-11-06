@@ -911,13 +911,25 @@ class EffortAtTheEnd(unittest.TestCase):
             new.write_bytes(b"...  --tail-role-token ID --serve: ...")
             old.write_bytes(b"... --turn-token ID ...")
             out = io.StringIO()
-            with contextlib.redirect_stdout(out):
+            with mock.patch.dict(os.environ, {"STRATA_KOLIBRI_PREFIX_CACHE_MB": "0"}), \
+                    contextlib.redirect_stdout(out):
                 self.assertIsNone(effort_end_args({}, str(new), Tok()))
                 self.assertIsNone(effort_end_args({"effort_position": "start"}, str(new), Tok()))
                 self.assertEqual(effort_end_args({"effort_position": "end"}, str(new), Tok()),
                                  ["--tail-role-token", "8678"])
                 self.assertIsNone(effort_end_args({"effort_position": "end"}, str(old), Tok()))
                 self.assertIsNone(effort_end_args({"effort_position": "end"}, str(new), ByteTokenizer()))
+                kolibri = {"arch": "kolibri1", "env": {"STRATA_KOLIBRI_PREFIX_CACHE_MB": "128"}}
+                # the default for Kolibri: enabled, and it needs no engine argument
+                self.assertEqual(effort_end_args(kolibri, str(old), Tok()), [])
+                self.assertEqual(effort_end_args({"arch": "kolibri1"}, str(old), Tok()), [])
+                self.assertEqual(effort_end_args({**kolibri, "effort_position": "end"}, str(old), ByteTokenizer()), [])
+                self.assertIsNone(effort_end_args({**kolibri, "effort_position": "start"}, str(old), Tok()))
+                # the prefix cache size does not change the prompt: off is still the end layout
+                self.assertEqual(effort_end_args({"arch": "kolibri1",
+                                                  "env": {"STRATA_KOLIBRI_PREFIX_CACHE_MB": "0"}}, str(old), Tok()), [])
+                # another family keeps the prompt it had
+                self.assertIsNone(effort_end_args({"arch": "qwen35moe"}, str(old), Tok()))
             self.assertIn("needs engine 0.1.39 or newer", out.getvalue())
             with self.assertRaises(ValueError):
                 effort_end_args({"effort_position": "middle"}, str(new), Tok())
