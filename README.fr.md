@@ -60,56 +60,35 @@ complets sont dans [DETAILS.md](docs/DETAILS.md#speed-measured). Une carte avec 
 RTX 3090 (24 Go) devrait écrire environ 100-140 tokens par seconde. Longues discussions et autres cartes :
 [vitesse de chaque modèle](docs/MODELS.md#how-fast-is-each-size), [résultats de la communauté](docs/COMMUNITY_BENCHMARKS.md).
 
-Ce fork a aussi mesuré **[Kolibri 1](docs/KOLIBRI1.md)** d'Aleph Alpha (Q4_K_M) sur une **Tesla T4 (16 Go)** avec
-755 Go de RAM pour le pool d'experts :
+Ce fork a aussi mesuré **Kolibri 1** d'Aleph Alpha (Q4_K_M) sur une **Tesla T4 (16 GB)** avec 755 Go de RAM pour le
+pool d'experts. Les lignes ont été mesurées le 2026-11-06 avec le profil que `./setup.sh --family kolibri` écrit aujourd'hui : prefill
+d'experts en streaming avec le cache fp16 d'experts **désactivé**, pool CPU actif, pas de slots d'experts,
+checkpoints de préfixe exacts de 128 MiB, serveur sur le nœud NUMA de la GPU et température 1.0 de la carte du modèle.
 
-| Prompt | Écrit ses réponses | Lit votre prompt |
+| Prompt | Écrit les réponses | Lit votre prompt |
 | --- | ---: | ---: |
-| **court (512 tokens)** | 30 tokens/s (liaison NUMA, sans le cache d'experts) | 156-160 tokens/s (`PF_PARTIAL` optionnel : 180-181, à chaud 202) |
-| **32K tokens** | 13-14 tokens/s (liaison NUMA) | 119-120 tokens/s |
-| **100K tokens** | — | 97 tokens/s |
+| **court (512 tokens)** | 28,2 tokens/s | 147-149 tokens/s |
+| **38K tokens** | 12,2 tokens/s | 80,9 tokens/s |
+| **91K tokens** | 6,6 tokens/s | 25,1 tokens/s |
 
-Le même fichier sur le Radeon intégré d'un Ryzen AI Max+ 395 (Radeon 8060S, Strix Halo, `gfx1151`, HIP sur ROCm 7.14.1) avec 123 GiB de RAM pour le pool d'experts :
+Deux exécutions à froid pour la ligne courte, une pour 38K et 91K ; les prompts faisaient 659, 37 857 et 91 057 tokens (la lecture de 91K a pris 61 minutes). Un prompt
+répété ne relit pas la conversation : le checkpoint exact le plus récent est restauré et seul le nouveau suffixe est
+lu (une conversation de 4,4K tokens a réutilisé 4 096 tokens et lu le reste en 2,3 s). Changer le niveau de réflexion
+ne coûte plus ce préfixe, car le niveau se trouve dans un tour final.
 
-| Prompt | Écrit ses réponses | Lit votre prompt |
-| --- | ---: | ---: |
-| **court (512 tokens)** | 23,8 tokens/s | 168,5 tokens/s |
-| **32K tokens** | 9,8 tokens/s | 114,0 tokens/s |
+**Le défaut privilégie la précision et reste exact.** Un tour en cache renvoie les mêmes 128 000 logits complets
+qu'une lecture à froid du même prompt, vérifié jusqu'à des historiques de 32K tokens. L'ancien cache fp16 d'experts
+qui accélérait le prefill de la T4 - et le `PF_PARTIAL` optionnel par-dessus - n'est **pas** utilisé et reste
+rejeté : sur des historiques forcés identiques, le cache seul a mesuré une KL moyenne de **0,400** et un écart
+maximal d'un seul logit de **11,08**, et avec `PF_PARTIAL` une KL moyenne de **0,168** avec un accord top-1 sur
+seulement **7 étapes sur 9**. Ce travail continue sur sa propre branche
+([docs/KOLIBRI_CUDA_PREVIEW.md](docs/KOLIBRI_CUDA_PREVIEW.md)) ; [la politique de précision](docs/KOLIBRI_ACCURACY_POLICY.md)
+décide de ce qui peut devenir un défaut.
 
-Aucun prompt de 100K n'a été mesuré sur l'iGPU.
-
-Deux exécutions par chiffre sur le binaire déterministe au bit près, charge de la machine annoncée ; la ligne 100K
-vient d'un seul exécution à froid. Ces lignes ont été prises à 256K de contexte avec un cache d'experts
-**dimensionné à la main**. La version actuelle dimensionne le cache elle-même et peut placer les experts selon la
-fréquence à laquelle le routeur les choisit :
-
-- `--expert-slots auto` mesure la place restante après les poids denses, le KV et le scratch, puis prend
-  **75 slots/couche (8,49 Gio)** à **160K** de contexte, en gardant 700 Mio libres pour le runtime CUDA. Il imprime
-  le taux de change impliqué : 1 slot = 114 Mio = 5 857 tokens de contexte, car contexte et cache puisent dans la
-  même VRAM. Dans la configuration livrée pour la Tesla T4 (`--ctx 131072`, `EXPERT_F16=20`,
-  `--vram-reserve-mib 1024`) le même calcul prend **7 slots/couche (0,89 Gio)** : le cache fp16 d'experts et le cache
-  de résidence se partagent les mêmes 16 Go.
-- `--expert-slots-hot` remplit ces slots par fréquence de routage plutôt que par identifiant d'expert, **une carte
-  par couche** (le défaut depuis le 2026-10-27), et `--expert-slots-profile` conserve l'ensemble appris d'un démarrage
-  à l'autre. L'ensemble est rechoisi par **tours** : tous les 32 positions, au plus 96 experts bougent pendant une
-  requête, et un tour plus large, jusqu'à 2 048, suit chaque prompt ; un candidat doit battre de 1,5 l'expert qu'il
-  évince (compteurs décroissant de 0,7 par tour). Sur cette T4 à 160K de contexte, le taux de réussite est passé de
-  **21,4 %** (par id) à **83,2 %** à la première requête et **88,7 %** à la seconde (deux exécutions chacune) ; le même
-  code à 128K avec `EXPERT_F16=20` sert **31,4 % / 33,1 %**, car le cache fp16 ne laisse que 7 slots/couche au lieu de
-  75. Le décodage avec sampling reste à 24,4-26,3 tokens/s ; greedy est ~30 % plus rapide et boucle sur ce modèle
-  (`Chudnov Chudnov Chudnov ...`), c'est pourquoi le serveur échantillonne par défaut.
-- Le moteur accepte ce que `--ctx` lui donne ; pour une Tesla T4 de 16 Go, `setup.py` recommande désormais **128K**,
-  car le KV de 128K coûte 2,5 Gio des 16. Un `--context` explicite, ou le `--max-context` de la configuration,
-  l'emporte.
-
-Le coût d'un tour est borné : 96 experts, c'est 218-222 Mio sur PCIe en ~22 ms en cours de requête, et le tour
-d'après-prompt, jusqu'à 2 048, fait 4 691 Mio en ~470 ms (le tour non borné de la campagne déplaçait 57 experts,
-6,5 Gio, ~690 ms). La résidence déplace des octets, et avec un pool CPU en jeu cela les change : un expert sur un slot
-est lu en fp32, le même expert sur le pool en q8_1 (findings-log 0.3 : |dlogit| moyen 0,855, l'id bascule au token 8) ;
-sans le pool, les deux voies GPU sont bitwise. Vitesse livrée sur cette T4, deux exécutions liées au nœud NUMA 1 :
-**154,0 / 158,6 tokens/s** pour lire un prompt de 512 tokens, **24,83 / 24,93 tokens/s** pour écrire, et un prompt
-répété est lu en **0 ms**. Spécifications de la machine et tableaux complets :
-[le rapport de campagne](docs/strateu-campaign-report.md).
+Le même fichier tourne sur la Radeon intégrée d'un Ryzen AI Max+ 395 (Radeon 8060S, Strix Halo, `gfx1151`, HIP sur
+ROCm 7.14.1) avec 123 Gio de RAM : 23,8 tokens/s en écriture et 168,5 tokens/s en lecture d'un prompt de 512 tokens,
+9,8 et 114,0 à 32K. Cette mesure a été prise avec un cache d'experts dimensionné à la main, le défaut de l'époque et n'a pas été refaite avec
+les défauts actuels.
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
 <sub>Strata est gratuit. S'il tourne bien sur votre PC, un café aide à poursuivre le travail.</sub></p>

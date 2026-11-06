@@ -68,65 +68,35 @@ NVIDIA: Q2_0 with engine 0.1.36, the other rows with 0.1.26 (4K answers, 32K pro
 about 100-140 tokens per second. Long chats and other cards: [speed of each model](docs/MODELS.md#how-fast-is-each-size),
 [community results](docs/COMMUNITY_BENCHMARKS.md).
 
-In earlier campaigns, this fork also measured Aleph Alpha's **[Kolibri 1](docs/KOLIBRI1.md)** (Q4_K_M) on a **Tesla T4 (16 GB)** with
-755 GB of RAM holding the expert pool:
+This fork also measured Aleph Alpha's **[Kolibri 1](docs/KOLIBRI1.md)** (Q4_K_M) on a
+**Tesla T4 (16 GB)** with 755 GB of RAM holding the expert pool. The rows below were measured on 2026-11-06 with the profile
+`./setup.sh --family kolibri` writes today: streamed expert prefill with the fp16 expert cache **off**, the CPU pool
+on, no expert slots, exact 128 MiB prefix checkpoints, the server on the GPU's NUMA node, and the model card's
+temperature 1.0.
 
 | Prompt | Writes answers | Reads your prompt |
 | --- | ---: | ---: |
-| **short (512 tokens)** | 30 tokens/s (NUMA binding, expert cache off) | 156-160 tokens/s (opt-in `PF_PARTIAL`: 180-181, warm server 202) |
-| **32K tokens** | 13-14 tokens/s (NUMA binding) | 119-120 tokens/s |
-| **100K tokens** | — | 97 tokens/s |
+| **short (512 tokens)** | 28.2 tokens/s | 147-149 tokens/s |
+| **38K tokens** | 12.2 tokens/s | 80.9 tokens/s |
+| **91K tokens** | 6.6 tokens/s | 25.1 tokens/s |
 
-The same file on the integrated Radeon of a Ryzen AI Max+ 395 (Radeon 8060S, Strix Halo, `gfx1151`, HIP on
-ROCm 7.14.1) with 123 GiB of RAM holding the expert pool:
+Two cold runs for the short row and one each for the 38K and 91K rows; the prompts were 659, 37,857 and
+91,057 tokens (the 91K read took 61 minutes). A repeated prompt
+does not read the conversation again: the newest exact checkpoint is restored and only the new suffix is read (a
+4.4K-token conversation reused 4,096 tokens and read the rest in 2.3 s). Changing the thinking level no longer costs
+that prefix either, because the level sits in a trailing turn.
 
-| Prompt | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **short (512 tokens)** | 23.8 tokens/s | 168.5 tokens/s |
-| **32K tokens** | 9.8 tokens/s | 114.0 tokens/s |
+**The default is accuracy-first and exact.** A cached turn returns the same full 128,000-value logits as a cold read
+of the same prompt, checked through 32K-token histories. The older fp16 expert cache that used to make the T4 prefill
+faster - and the opt-in `PF_PARTIAL` layered on it - is **not** used and remains rejected: on identical forced
+histories the cache alone measured mean KL **0.400** and a worst single-logit difference of **11.08**, and with
+`PF_PARTIAL` mean KL **0.168** with top-1 agreement on only **7 of 9** steps. That work continues on its own branch
+([docs/KOLIBRI_CUDA_PREVIEW.md](docs/KOLIBRI_CUDA_PREVIEW.md)); [the accuracy policy](docs/KOLIBRI_ACCURACY_POLICY.md)
+governs what may become a default.
 
-No 100K prompt was measured on the iGPU.
-
-Two runs each on the bitwise-deterministic binary, box load stated; the 100K row is a single cold run. Those rows were
-taken at a 256K context with a **hand-sized** expert cache. The current build sizes the cache itself and can place
-experts by how often the router picks them:
-
-- `--expert-slots auto` measured the room left after the dense weights, the KV and the scratch, then took
-  **75 slots/layer (8.49 GiB)** at a **160K** context, keeping 700 MiB clear for the CUDA runtime. It prints the
-  exchange rate it implies: 1 slot = 114 MiB = 5,857 tokens of context, because context and cache draw on the same
-  VRAM. In the shipped Tesla T4 configuration (`--ctx 131072`, `EXPERT_F16=20`, `--vram-reserve-mib 1024`) the same
-  fit takes **7 slots/layer (0.89 GiB)**: the fp16 expert cache and the residency cache draw on the same 16 GB.
-- `--expert-slots-hot` fills those slots by routed-pick frequency instead of by expert id, **one map per layer** (the
-  default since 2026-10-27), and `--expert-slots-profile` carries the learned set across restarts. The set is re-chosen
-  in **rounds**: every 32 positions at most 96 experts move while a request runs, and one larger round of up to 2,048
-  runs after each prompt; a candidate has to beat the expert it evicts by 1.5 decayed counts, and the counts decay by
-  0.7 a round. On this T4 at a 160K context the hit rate went from **21.4%** (by id) to **83.2%** on the first request
-  and **88.7%** on the second (two runs each); the same code at 128K with `EXPERT_F16=20` serves **31.4% / 33.1%**,
-  because the fp16 cache leaves 7 slots/layer instead of 75. Decode with sampling stays at 24.4-26.3 tokens/s; greedy
-  is ~30% faster but loops on this model (`Chudnov Chudnov Chudnov ...`), which is why the server samples by default.
-- The engine takes whatever `--ctx` gives it; for a 16 GB Tesla T4 `setup.py` now recommends **128K**, because the KV
-  of 128K costs 2.5 GiB of the 16. An explicit `--context`, or the config's `--max-context`, overrides it.
-
-**The T4 prefill rates above are not free of accuracy cost, and that is measured.**  On the T4 the fast prefill comes
-from the fp16 expert cache (`EXPERT_F16`), which is on in the shipped T4 configuration. Measured 2026-10-30 against the
-plain path on identical forced histories (512-id prompt, 9 forced steps, full 128,000-value logits): mean KL **0.400**
-and a worst single-logit difference of **11.08** for the cache alone, and mean KL **0.168** with top-1 agreement on only
-**7 of 9** steps once `PF_PARTIAL` is added. Two runs of either configuration are bitwise identical, but repeatability
-alone does not establish the cause or rule out a deterministic implementation defect. The reported KL is two orders
-of magnitude worse than the R9700 figure, and neither configuration is qualified under [the accuracy policy](docs/KOLIBRI_ACCURACY_POLICY.md). The accuracy-first T4
-configuration is therefore the engine's own default with the expert cache off: **51.6 / 53.6 tokens/s** reading a
-512-token prompt and **30.5 / 30.5 tokens/s** writing, bitwise identical to the plain path at 512, 8,191 and 11,000
-prompt tokens. The fp16 cache is being investigated on its own branch; the numbers and the open questions are in
-[docs/KOLIBRI_CUDA_PREVIEW.md](docs/KOLIBRI_CUDA_PREVIEW.md).
-
-The cost of a round is bounded: 96 experts is 218-222 MiB over PCIe in ~22 ms mid-request, and the after-prompt round
-of up to 2,048 is 4,691 MiB in ~470 ms (the campaign's unbudgeted round moved 57 experts, 6.5 GiB, ~690 ms). Residency
-moves bytes, and with a CPU pool in play that does change them - an expert in a slot is read in fp32, the same expert
-on the pool in q8_1 (findings-log 0.3: mean |dlogit| 0.855, the id flips at token 8); with the pool off the two device
-legs are bitwise. Shipped T4 speed, two runs pinned to NUMA node 1: **154.0 / 158.6 tokens/s** reading a 512-token
-prompt, **24.83 / 24.93 tokens/s** writing, and a repeated prompt reads in **0 ms**. The shipped T4 configuration runs
-the fp16 expert cache, so those prefill rates carry the accuracy cost noted above. Box spec, full tables and context:
-[the campaign report](docs/strateu-campaign-report.md).
+The same file runs on the integrated Radeon of a Ryzen AI Max+ 395 (Radeon 8060S, Strix Halo, `gfx1151`, HIP on ROCm
+7.14.1) with 123 GiB of RAM: 23.8 tokens/s writing and 168.5 tokens/s reading a 512-token prompt, 9.8 and 114.0 at
+32K. That earlier measurement used a hand-sized expert cache, the default then and was not re-run with today's defaults.
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
 <sub>Strata is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>
