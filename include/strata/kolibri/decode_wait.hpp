@@ -42,6 +42,9 @@ inline void decode_control_store(uint32_t& word, uint32_t value) noexcept {
 enum : uint32_t { DecodeWaitOk = 0, DecodeWaitAborted = 1, DecodeWaitTimedOut = 2 };
 
 // Capturable, compute-queue wait. The finite budget is in device clock64 ticks, NOT wall milliseconds.
+// On AMD gfx11 the device clock is a 20-bit SHADER_CYCLES counter that wraps at 2^20, so the budget is
+// applied there as poll iterations scaled by the same time (tick_budget / 64); the wall time a caller gets
+// is the same on both backends. See the comment in decode_wait.cu for the measurement.
 // On cancellation or timeout the graph may drain, but the caller must invalidate the token and reset
 // affected state before reuse. Never emit logits from an aborted graph as a successful token.
 void enqueue_decode_wait(DecodeWaitControl* device_control, uint64_t tick_budget, void* stream);
