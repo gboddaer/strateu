@@ -194,6 +194,7 @@ def write_temporary(path: Path, parts: list) -> None:
 # #458: the trailing effort turn ("effort_position": "end"); low is the template's own sentence, medium (which the
 # template says nothing for: no xhigh sentence is medium there) says it, since the xhigh one stays at the top
 EFFORT_TURN = "<|im_start|>system\n{}<|im_end|>\n"
+EFFORT_HEADING = "# Reasoning effort\n\n"      # the model's template writes this paragraph at the top of the system block
 EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the "
                       "conclusion without unnecessary elaboration.",
                "medium": "Reasoning effort is set to medium. Think as much as the task needs, without unnecessary "
@@ -202,6 +203,32 @@ EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief 
                "xhigh": "Reasoning effort is set to xhigh. Please think carefully through the task, validate key "
                         "assumptions, consider plausible alternatives, and prioritize correctness, consistency, and "
                         "clarity in the final answer."}
+
+
+def drop_effort_sentence(text: str, sentences) -> str:
+    """Remove the model template's level paragraph from the top of the system block, but only when it is one of the
+    template's own sentences.  With `effort_position: "end"` the level is named in the trailing turn instead, and
+    the default sentence at the top (always "high") would contradict it.  Any other text is left untouched."""
+    i = text.find(EFFORT_HEADING)
+    if i < 0:
+        return text
+    tools_at = text.find("\n\n# Tools", i)
+    end = tools_at if tools_at >= 0 else text.find("<|im_end|>", i)
+    if end < 0 or text[i + len(EFFORT_HEADING):end] not in sentences:
+        return text
+    start = i - 2 if text[max(0, i - 2):i] == "\n\n" else i
+    out = text[:start] + text[end:]
+    head = "<|im_start|>system\n"
+    block = out.find(head)
+    if block >= 0 and start == block + len(head):      # the paragraph was the whole system block
+        after = block + len(head)
+        if out.startswith("\n\n# Tools", after):
+            out = out[:after] + out[after + 2:]
+        elif out.startswith("<|im_end|>", after):
+            out = out[:block] + out[after + len("<|im_end|>\n"):]
+    return out
+
+
 VISION_START = "<|vision_start|>"
 # #606: a reply that repeats one token this many times in a row is ended there ("length"): a model in a loop, or a
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
@@ -3066,13 +3093,17 @@ def engine_binary(exe: str, cfg: dict | None = None) -> str:
 
 
 def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
-    """#458 (opt-in): the engine arguments for "effort_position": "end" - the id of "system" as --tail-role-token, so
-    the engine checkpoints in front of the trailing effort turn - or None when the config leaves it at the top (the
-    default) or the engine is too old for it (said once; the prompt stays the default one).  ValueError for a value
-    other than "start" / "end"."""
-    pos = cfg.get("effort_position", "start")
+    """Where a request's non-default reasoning effort goes.  "end" puts it in a short system turn right before the
+    answer, so a request that changes only the effort keeps the conversation prefix: on the Kolibri prefix cache the
+    newest 512-token checkpoint is reused; an engine with --tail-role-token checkpoints exactly in front of the turn.
+    Unset means "end" for Kolibri (its prefix cache is what makes a level switch cheap) and "start" for every other
+    family, which leaves the prompt as it was.  Returns the engine arguments (empty for Kolibri, which needs none) or
+    None when the effort stays at the top.  ValueError for a value other than "start" / "end"."""
+    pos = cfg.get("effort_position")
+    if pos is None:
+        pos = "end" if cfg.get("arch") == "kolibri1" else "start"
     if pos not in ("start", "end"):
-        raise ValueError(f'"effort_position" must be "start" (the default) or "end", not {pos!r}')
+        raise ValueError(f'"effort_position" must be "start" or "end", not {pos!r}')
     if pos == "start":
         return None
     try:
@@ -3081,13 +3112,18 @@ def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
     except OSError:
         known = False
     role = tok.encode("system", parse_special=True)
-    if not known or len(role) != 1:
-        print("[strata] effort_position \"end\" needs engine 0.1.39 or newer (--tail-role-token): the reasoning "
-              "effort stays at the top of the prompt", flush=True)
-        return None
-    print("[strata] effort_position end: a request's non-default reasoning effort goes right before the answer, so "
-          "changing it keeps the cached conversation", flush=True)
-    return ["--tail-role-token", str(role[0])]
+    if known and len(role) == 1:
+        print("[strata] effort_position end: a request's non-default reasoning effort goes right before the answer, "
+              "so changing it keeps the cached conversation", flush=True)
+        return ["--tail-role-token", str(role[0])]
+    if cfg.get("arch") == "kolibri1":
+        print("[strata] effort_position end (Kolibri): a request's non-default reasoning effort goes right before "
+              "the answer, so changing it reuses the newest 512-token checkpoint instead of reading the conversation "
+              "again", flush=True)
+        return []
+    print("[strata] effort_position \"end\" needs engine 0.1.39 or newer (--tail-role-token): the reasoning effort "
+          "stays at the top of the prompt", flush=True)
+    return None
 
 
 def engine_silence_s(cfg: dict) -> float:
@@ -4007,9 +4043,11 @@ class Service:
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
-        # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
-        # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
+        # #458 (the config's "effort_position": "end", the default for Kolibri): a non-default
+        # reasoning effort goes in a short system turn before the answer instead of the top of the prompt, so
+        # switching it keeps the cached conversation
         self.effort_end = False
+        self._effort_sentences: dict[str, str] | None = None     # the template's own level sentences (lazy)
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
@@ -4908,6 +4946,26 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
+    def template_effort_sentences(self) -> dict[str, str]:
+        """The model template's own level sentences, keyed low/medium/high/none.  Empty when its system block has no
+        such paragraph (then nothing is dropped and the server's own EFFORT_TEXT is used)."""
+        if self._effort_sentences is None:
+            found = {}
+            for level, kw in (("low", {"reasoning_effort": "low"}), ("medium", {"reasoning_effort": "medium"}),
+                              ("high", {"reasoning_effort": "high"}), ("none", {"enable_thinking": False})):
+                text = self.template.render([{"role": "user", "content": "x"}], tools=None,
+                                            add_generation_prompt=False, **kw)
+                i = text.find(EFFORT_HEADING)
+                j = text.find("<|im_end|>", i) if i >= 0 else -1
+                if j > i:
+                    found[level] = text[i + len(EFFORT_HEADING):j]
+            self._effort_sentences = found
+        return self._effort_sentences
+
+    def drop_effort_sentence(self, text: str) -> str:
+        """The rendered prompt without the template's top level paragraph (see `drop_effort_sentence`)."""
+        return drop_effort_sentence(text, set(self.template_effort_sentences().values()))
+
     def render_prompt(self, messages, tools, kwargs) -> str:
         """The template rendered.  #458: with `effort_end`, a request with a non-default effort (low, medium or no
         thinking) is rendered as a default one up to the answer - the same prompt start, so the conversation cache
@@ -4915,15 +4973,23 @@ class Service:
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
+        # The level is carried by the trailing turn, so the top keeps no level sentence (the template's own default
+        # sentence would otherwise say "high" for every level).
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
-            return self.template.render(messages, tools=tools, **kwargs)
+            text = self.template.render(messages, tools=tools, **kwargs)
+            return self.drop_effort_sentence(text) if self.effort_end else text
         base = {k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
         history = self.template.render(messages, tools=tools, add_generation_prompt=False, **base)
         full = self.template.render(messages, tools=tools, add_generation_prompt=True, **kwargs)
         mine = self.template.render(messages, tools=tools, add_generation_prompt=False, **kwargs)
         if not full.startswith(mine):                  # a template this cannot take apart: rendered as asked
             return full
-        tail = "" if off else EFFORT_TURN.format(EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"]))
+        if self.effort_end:
+            history = self.drop_effort_sentence(history)
+        # the template's own wording for this level, so the trailing turn says what the top used to say
+        level = "low" if effort in ("minimal", "low") else "medium" if effort == "medium" else "high"
+        sentence = self.template_effort_sentences().get(level) or EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"])
+        tail = "" if off else EFFORT_TURN.format(sentence)
         return history + tail + full[len(mine):]
 
     def encode_prompt(self, messages, tools, kwargs, store: bool = True) -> list[int]:
@@ -5201,8 +5267,12 @@ class Service:
             off = kwargs.get("enable_thinking") is False        # render_prompt's rule for #458's effort_end
             kw = ({k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
                   if self.effort_end and (off or effort not in (None, "", "xhigh", "high")) else dict(kwargs))
+            if self.effort_end:
+                kw["omit_reasoning_effort"] = True       # render_prompt's rule: no level sentence at the top
             kw["add_generation_prompt"] = False
             text = self.template.render(marked, tools=marked_tools, **kw)
+            if self.effort_end:
+                text = self.drop_effort_sentence(text)      # the level is in the trailing turn, not at the top
             cut = text.find(self.PREFIX_END)
             if cut >= 0:
                 text = text[:cut]
@@ -9202,7 +9272,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
-    svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
+    svc.effort_end = effort_end is not None             # #458: "effort_position" end (empty args on Kolibri)
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         svc.reasoning_budget_configured = True
         try:

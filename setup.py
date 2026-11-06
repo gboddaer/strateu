@@ -8116,6 +8116,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         warn("--vision-tokens: images are off, so it is not used")
     if fam["arch"] == "kolibri1":
         cfg["sampling"] = {"temperature": 1.0}
+        cfg["effort_position"] = "end"              # a level change reuses the prefix cache when it is on
         if not (hip or amd):
             # Persist the accuracy-preserving CUDA profile, not the rejected historical
             # FP16 expert-cache preset. Old CUDA devices retain capability fallback.
