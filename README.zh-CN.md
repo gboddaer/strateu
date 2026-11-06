@@ -17,8 +17,7 @@ AI 模型，通常要用服务器才能跑。它能聊天、写代码、看图�
 **strateu** 是 [Niko1221/Strata](https://github.com/Niko1221/Strata) 的一个以实测为本的分支，工作重心是
 **Kolibri 1** 引擎（`src/kolibri`）。一周的测量让这个 CUDA 移植版本变得**逐位可复现**（prefill 通过 racecheck、
 两次运行差异为 0.0），并**用 KL 散度对标 llama.cpp**（109 个回答步骤为 0.00132，top-1 一致率 0.982，plain-path
-oracle 为 BITWISE）。16 GB 显卡上的实测（每项两次、壁钟计时）：32K 提示后的 prefill 约为 **119-120 token/秒**；
-生成约为 **30 token/秒**（短，未开专家缓存）与 **13-14 token/秒**（32K 后）——审计发现此前误用计数器数值后重新测得；100K 长文本的“大海捞针”检索 5 例命中 4 例，
+oracle 为 BITWISE）。16 GB 显卡（Tesla T4）上的壁钟实测：短提示的 prefill 为 **147-149 token/秒**、38K 为 **80.9 token/秒**；生成为短上下文 **28.2 token/秒**、38K 之后 **12.2 token/秒**；100K 长文本的“大海捞针”检索 5 例命中 4 例，
 两处偏差都已记录（在那个长度上 llama.cpp 参考实现本身也不稳定）。闸门和速度配置在 `tools/kolibri/`；每个数字
 都做两次运行并注明机器负载，完整证据链见[战役报告](docs/strateu-campaign-report.md)和 `docs/superpowers/plans/` 下的账目文件。
 
@@ -81,7 +80,7 @@ NUMA 节点、按模型卡使用温度 1.0。
 
 同一文件也能在 Ryzen AI Max+ 395 的集成 Radeon（Radeon 8060S、Strix Halo、`gfx1151`、ROCm 7.14.1 上的 HIP）
 与 123 GiB 内存上运行：512 token 提示下生成 23.8 token/s、读取 168.5 token/s；32K 下为 9.8 和 114.0。那次测量
-使用的是当时默认的 fp16 专家缓存，没有用今天的默认重新测量。
+使用的是当时默认的手工设定大小的专家缓存，没有用今天的默认重新测量。
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="请我喝杯咖啡" height="50"></a><br>
 <sub>Strata 是免费的。如果它在你的电脑上跑得不错，请我喝杯咖啡，让这个项目继续下去。</sub></p>

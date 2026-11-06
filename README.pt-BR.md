@@ -18,9 +18,7 @@ funciona com seus apps e agentes de programação. Nada sai do seu PC. Ele tamb�
 **strateu** é um fork medido do [Niko1221/Strata](https://github.com/Niko1221/Strata), focado no motor
 **Kolibri 1** (`src/kolibri`). Uma semana de medições tornou o port CUDA **determinístico bit a bit** (o prefill
 passa no racecheck, diferença 0.0 entre duas execuções) e **verificado contra o llama.cpp por divergência KL**
-(0,00132 em 109 passos de resposta, top-1 0,982, oracle do caminho simples em BITWISE). Numa placa de 16 GB, medido a relógio (duas execuções cada): cerca de **119-120 tokens/s** de prefill após um
-prompt de 32K, **30 tokens/s** de geração curto (sem o cache de especialistas) e **13-14 tokens/s** após 32K
-(remedido após uma auditoria apontar cifras antes derivadas de contador). a agulha de 100K é recuperada em 4 de 5 casos, com as duas
+(0,00132 em 109 passos de resposta, top-1 0,982, oracle do caminho simples em BITWISE). Numa placa de 16 GB (Tesla T4), medido a relógio: **147-149 tokens/s** de prefill com um prompt curto e **80,9 tokens/s** em 38K, **28,2 tokens/s** de geração curto e **12,2 tokens/s** após 38K. A agulha de 100K é recuperada em 4 de 5 casos, com as duas
 divergências registradas (a própria referência llama.cpp é instável nessa extensão). Os portões de qualidade e a
 configuração de velocidade ficam em `tools/kolibri/`; cada número vem de duas execuções com a carga da máquina
 anotada. A evidência completa: [o relatório da campanha](docs/strateu-campaign-report.md) e os registros em `docs/superpowers/plans/`.
