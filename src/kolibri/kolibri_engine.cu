@@ -294,7 +294,27 @@ struct LayerBlobs {
     // experts first.
     std::vector<int32_t> f16_slot_id;
     std::vector<uint64_t> f16_slot_last;
+    // --expert-no-pin: the blob is packed on demand from the GGUF mmap instead of read out of a pinned host table.
+    // The three source pointers are the tensors' file data (the map stays open for the engine's life), and the
+    // byte strides are the sources' bytes per expert, so pack_blob reproduces the load-time repack exactly.
+    const uint8_t* gu_src = nullptr;
+    const uint8_t* up_src = nullptr;
+    const uint8_t* dn_src = nullptr;
+    size_t gu_eb = 0;
+    size_t d_eb = 0;
+    uint8_t* hstage = nullptr;      // no-pin staging: `spill` blobs packed here, then copied to b.dev
 };
+
+/// --expert-no-pin: reproduce the load-time repack for ONE expert, straight from the mapped GGUF tensors.  The
+/// three copies and their destination offsets are the load loop's own, so a blob packed here holds exactly the
+/// bytes the pinned table would hold (the arithmetic downstream is identical, not merely equivalent).
+static void pack_blob(const LayerBlobs& b, const strata::core::ModelGeometry& g, int64_t ex, uint8_t* dst) {
+    const size_t gu_bytes = (size_t) g.n_ff * b.L.gu_row;
+    const size_t dn_bytes = (size_t) g.n_embd * b.L.d_row;
+    std::memcpy(dst, b.gu_src + (size_t) ex * b.gu_eb, gu_bytes);
+    std::memcpy(dst + b.L.up_off, b.up_src + (size_t) ex * b.gu_eb, gu_bytes);
+    std::memcpy(dst + b.L.down_off, b.dn_src + (size_t) ex * b.d_eb, dn_bytes);
+}
 
 /// A persistent worker pool: run(f, n) splits [0, n) over n shards across the pool (caller runs shard 0) and
 /// returns when all shards are done.  --cpu-threads sizes it; the CPU expert pool is its user.
@@ -372,6 +392,13 @@ struct Engine {
     std::vector<int> pf_cores;      // the pinnable physical cores, derived ONCE at startup before any pinning
     int64_t pf_total = 0;           // the prefill's total prompt length (the POOL_ALL rule keys on it)
     int slots = 0;                  // --expert-slots: experts per layer resident in VRAM (the GPU expert cache)
+    // --expert-no-pin: no pinned host table at all.  The 19,200 blobs are packed from the GGUF mmap when a pick
+    // misses and copied into `spill` device slots, so host RAM holds only evictable page cache instead of a 42.58
+    // GiB locked table (which does not fit a 30 GB box, and cannot swap).  Needs --expert-slots; excludes the pool,
+    // grouped, fp16-cache, a1 and streamed legs, all of which read the table directly.
+    bool no_pin = false;
+    int spill = 0;                  // no_pin: device slots per layer for the picks that miss (== top_k)
+    std::unique_ptr<strata::GgufModel> model;   // no_pin: the map the blobs are packed from, kept open
     // EXPERT-CACHE FITTING AND HOTNESS RESIDENCY (opt-in; with the knobs off every field below is unused and the
     // cache is allocated by expert id exactly as before).  --expert-slots auto fits the slot count to the VRAM
     // that is still free once the dense weights, the KV and the scratch are allocated (the Qwen engine's method);
@@ -2956,6 +2983,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
             if (e.counters) ++e.cnt.br_slots;
             const int S = e.slots;
             s.slot_ids.resize((size_t) K); s.ovf_ids.resize((size_t) K);
+            std::vector<int> nopin_miss;   // --expert-no-pin: the picks this layer must pack out of the map
             for (int k = 0; k < K; ++k) {
                 const int id = g_ids_host[(size_t) k];
                 // Where this pick is served from.  The id path (default) is slot == id for the first `slots` ids,
@@ -2966,8 +2994,16 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                                     (e.per_layer ? (int) (g.n_layers * g.n_expert) : (int) g.n_expert))
                     sidx = e.slot_of[e.hot_idx(l, id)];
                 else sidx = id < S ? id : -1;
+                if (e.no_pin) {
+                    // No pinned table: a miss is packed from the map into this layer's spill slots, and both the
+                    // in-slot pass and the overflow pass read b.dev (the hits' overflow pick is the zero slot).
+                    s.slot_ids[k] = sidx >= 0 ? sidx : S;
+                    if (sidx >= 0) s.ovf_ids[k] = S;
+                    else { s.ovf_ids[k] = S + 1 + (int) nopin_miss.size(); nopin_miss.push_back(id); }
+                } else {
                 s.slot_ids[k] = sidx >= 0 ? sidx : S;                                          // dev zero slot
                 s.ovf_ids[k] = sidx >= 0 ? (e.cpu_threads > 0 ? sidx : (int) g.n_expert) : id;  // pinned zero slot
+                }
                 // Counted ALWAYS, not only under --counters: the DONE line carries these as the request's hits and
                 // lookups, which is what the monitor's hit rate is computed from.  Two integer adds per routed pick.
                 // slot_bytes stays behind --counters because only the CNT report reads it.
@@ -2978,6 +3014,17 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                     if (!e.hot_score.empty()) e.hot_score[e.hot_idx(l, id)] += 1.0;   // the decayed score the swap
                     // policy sorts on: same index, halved about every 1.9 rounds (see kolibri_hot_policy.hpp)
                 }
+            }
+            if (e.no_pin && !nopin_miss.empty()) {
+                if ((int) nopin_miss.size() > e.spill) {   // cannot happen: one miss per routed pick
+                    std::fprintf(stderr, "strata-kolibri: --expert-no-pin: %zu misses > %d spill slots\n",
+                                 nopin_miss.size(), e.spill);
+                    std::exit(2);
+                }
+                for (size_t j = 0; j < nopin_miss.size(); ++j) pack_blob(b, g, nopin_miss[j], b.hstage + j * b.stride);
+                KC(cudaMemcpyAsync(b.dev + b.stride * (size_t) (S + 1), b.hstage, b.stride * nopin_miss.size(),
+                                   cudaMemcpyHostToDevice, st));
+                KC(cudaStreamSynchronize(st));
             }
             g_ids_host = s.slot_ids;
             gemv(gu, s.h, s.eg2, s.ids, K, 0, b.dev, b.stride);   // K21: this gate gemv ran twice per layer
@@ -3012,10 +3059,11 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
             } else {
                 g_ids_host = s.ovf_ids;
                 if (e.counters) ++e.cnt.br_gpu;   // slots miss served from the pinned table over PCIe
-                gemv(gu, s.h, s.eg, s.ids, K, 0, b.table, b.stride);
-                gemv(gu, s.h, s.eu, s.ids, K, 0, b.table + b.L.up_off, b.stride);
+                const uint8_t* ovf_base = e.no_pin ? b.dev : b.table;   // no table in no-pin: the spill slots are the source
+                gemv(gu, s.h, s.eg, s.ids, K, 0, ovf_base, b.stride);
+                gemv(gu, s.h, s.eu, s.ids, K, 0, ovf_base + b.L.up_off, b.stride);
                 k_swiglu<<<(K * FF + B - 1) / B, B, 0, st>>>(s.eg, s.eu, s.eh, K * FF);
-                gemv(dn, s.eh, s.ey, s.ids, K, FF, b.table + b.L.down_off, b.stride);
+                gemv(dn, s.eh, s.ey, s.ids, K, FF, ovf_base + b.L.down_off, b.stride);
                 yc = s.ey;
             }
             KC(cudaStreamSynchronize(g_st));   // the shared-expert gemv ran on g_st; the sum below reads sy on the default stream
@@ -5350,15 +5398,26 @@ static long long slots_sum_stride(const Engine& e) {
 // stream.  Asynchronous on purpose: the copies are ordered behind every kernel already launched on g_st (which read
 // the OLD occupants) and ahead of the next token's kernels, so a round neither drains the device nor waits per move.
 static void slot_promote(Engine& e, int id, int slot) {
-    for (auto& b : e.blobs)
+    for (auto& b : e.blobs) {
+        if (e.no_pin) {   // pack into the staging blob, then one H2D from it; there is no pinned source
+            pack_blob(b, e.g, id, b.hstage);
+            KC(cudaMemcpyAsync(b.dev + b.stride * (size_t) slot, b.hstage, b.stride, cudaMemcpyHostToDevice, g_st));
+            continue;
+        }
         KC(cudaMemcpyAsync(b.dev + b.stride * (size_t) slot, b.table + b.stride * (size_t) id, b.stride,
                            cudaMemcpyHostToDevice, g_st));
+    }
 }
 
 // The same move for ONE layer: 1 queued copy of stride bytes (2.21 MB at this model).  The source is the PINNED host
 // table (LayerBlobs::table), so the copy is a real async DMA rather than a staged one.
 static void slot_promote_layer(Engine& e, int64_t l, int id, int slot) {
     LayerBlobs& b = e.blobs[(size_t) l];
+    if (e.no_pin) {
+        pack_blob(b, e.g, id, b.hstage);
+        KC(cudaMemcpyAsync(b.dev + b.stride * (size_t) slot, b.hstage, b.stride, cudaMemcpyHostToDevice, g_st));
+        return;
+    }
     KC(cudaMemcpyAsync(b.dev + b.stride * (size_t) slot, b.table + b.stride * (size_t) id, b.stride,
                        cudaMemcpyHostToDevice, g_st));
 }
@@ -5482,7 +5541,9 @@ static void alloc_slots(Engine& e, int ctx) {
         KC(cudaMemGetInfo(&fb, &tb));
         const long long reserve = (long long) e.vram_reserve_mib << 20;
         const long long room = (long long) fb - reserve;
-        int n = (stride_sum > 0 && room > stride_sum) ? (int) (room / stride_sum) - 1 : 0;  // + zero slot per layer
+        // + 1 zero slot per layer; --expert-no-pin also keeps `spill` staging slots per layer.
+        const int stay = 1 + (e.no_pin ? e.spill : 0);
+        int n = (stride_sum > 0 && room > (long long) stride_sum * stay) ? (int) (room / stride_sum) - stay : 0;
         if (n > n_exp) n = n_exp;
         if (n < 1) {
             const long long per_tok = std::max<long long>(1, kv_bytes_per_token(e));
@@ -5528,8 +5589,14 @@ static void alloc_slots(Engine& e, int ctx) {
     const bool id_seed = !e.hot_on;
     for (int64_t l = 0; l < (int64_t) e.blobs.size(); ++l) {
         LayerBlobs& b = e.blobs[(size_t) l];
-        KC(cudaMalloc((void**) &b.dev, b.stride * (size_t) (e.slots + 1)));
-        if (id_seed) {
+        KC(cudaMalloc((void**) &b.dev, b.stride * (size_t) (e.slots + 1 + e.spill)));
+        if (e.no_pin) {   // pack the seed out of the map: there is no host table to copy it from
+            const std::vector<int>& seed = seeds[(size_t) std::min<int64_t>(l, (int64_t) n_lay - 1)];
+            for (int s = 0; s < e.slots; ++s) {
+                pack_blob(b, e.g, seed[(size_t) s], b.hstage);
+                KC(cudaMemcpy(b.dev + b.stride * (size_t) s, b.hstage, b.stride, cudaMemcpyHostToDevice));
+            }
+        } else if (id_seed) {
             KC(cudaMemcpy(b.dev, b.table, b.stride * (size_t) e.slots, cudaMemcpyHostToDevice));   // as before
         } else {
             const std::vector<int>& seed = seeds[(size_t) std::min<int64_t>(l, (int64_t) n_lay - 1)];
@@ -6224,9 +6291,24 @@ static inline bool poison_zero_slot() {
 /// tables.  Split files: every tensor lives in one shard; the shard's mmap pointer is the source.
 bool load(const std::string& path, Engine& e, std::string& err) {
     const auto t0 = std::chrono::steady_clock::now();
-    const strata::GgufModel gm = strata::GgufModel::open(path);
+    // --expert-no-pin keeps the map open for the engine's life (the blobs are packed from it on demand).  Moving the
+    // unique_ptr does not relocate the object, so `gm` stays valid either way.
+    auto gm_owner = std::make_unique<strata::GgufModel>(strata::GgufModel::open(path));
+    strata::GgufModel& gm = *gm_owner;
+    if (e.no_pin) e.model = std::move(gm_owner);
     if (!strata::core::geometry_from_gguf(gm.meta(), e.g, e.top_k, err)) return false;
     if (e.g.family != strata::ModelFamily::Kolibri1) { err = "strata-kolibri runs kolibri1 files only"; return false; }
+    if (e.no_pin) {
+        // The legs below index LayerBlobs::table directly; with no table there is nothing for them to read.
+        if (e.slots == 0) {
+            err = "--expert-no-pin needs --expert-slots (or auto): there must be a device cache to fill";
+            return false;
+        }
+        if (e.cpu_threads > 0) { err = "--expert-no-pin cannot use --cpu-threads: the CPU pool reads the pinned table"; return false; }
+        if (e.grouped > 0) { err = "--expert-no-pin cannot use --grouped: it reads the pinned table over UVA"; return false; }
+        if (expert_f16_n() > 0) { err = "--expert-no-pin cannot use STRATA_KOLIBRI_EXPERT_F16: it seeds from the pinned table"; return false; }
+        e.spill = (int) e.top_k;   // at most one miss per routed pick per layer
+    }
     // S5 (task-8): the mixed-type expert check runs BEFORE the layout check, so a file whose
     // ffn_gate_exps.type != ffn_up_exps.type is always rejected with the type message (the layout check
     // would otherwise report a size error first for a header-only or truncated file, hiding the real cause).
@@ -6292,11 +6374,18 @@ bool load(const std::string& path, Engine& e, std::string& err) {
         }
         const size_t sb = lcm(lcm((size_t) 144, (size_t) 210), (size_t) 34);   // Q4_K / Q6_K / Q8_0 super-blocks
         b.stride = ((b.L.bytes + sb - 1) / sb) * sb;
-        KC(cudaHostAlloc((void**) &b.table, b.stride * (size_t) (e.g.n_expert + 1), cudaHostAllocDefault));
-        if (poison_zero_slot())
-            std::memset(b.table + b.stride * (size_t) e.g.n_expert, 0xA5, b.stride);   // the poison control
-        else
-            std::memset(b.table + b.stride * (size_t) e.g.n_expert, 0, b.stride);  // the slots path's zero slot
+        if (e.no_pin) {
+            // No pinned table: a pageable staging buffer of `spill` blobs is the only host copy, and it exists only
+            // for the duration of one layer step.  Host RAM then holds the GGUF through the page cache, evictable.
+            b.hstage = (uint8_t*) std::malloc(b.stride * (size_t) std::max(1, e.spill));
+            if (b.hstage == nullptr) { err = "--expert-no-pin: host staging allocation failed"; return false; }
+        } else {
+            KC(cudaHostAlloc((void**) &b.table, b.stride * (size_t) (e.g.n_expert + 1), cudaHostAllocDefault));
+            if (poison_zero_slot())
+                std::memset(b.table + b.stride * (size_t) e.g.n_expert, 0xA5, b.stride);   // the poison control
+            else
+                std::memset(b.table + b.stride * (size_t) e.g.n_expert, 0, b.stride);  // the slots path's zero slot
+        }
         const size_t gu_rows = (size_t) e.g.n_ff, d_rows = (size_t) e.g.n_embd;
         const size_t gu_eb = gu_rows * b.L.gu_row, d_eb = d_rows * b.L.d_row;
         const uint8_t* gs = gf->tensor_data(*gate);
@@ -6309,6 +6398,10 @@ bool load(const std::string& path, Engine& e, std::string& err) {
                 if (ti.name == L(l, "ffn_down_exps.weight")) ds = gm.shard(s).tensor_data(ti);
             }
         }
+        // The source coordinates are kept for every mode: pack_blob is the same three copies the eager loop below
+        // runs, so the no-pin path and the pinned path produce identical blob bytes.
+        b.gu_src = gs; b.up_src = us; b.dn_src = ds; b.gu_eb = gu_eb; b.d_eb = d_eb;
+        if (!e.no_pin)
         for (int64_t ex = 0; ex < e.g.n_expert; ++ex) {
             uint8_t* blob = b.table + (size_t) ex * b.stride;
             std::memcpy(blob, gs + (size_t) ex * gu_eb, gu_rows * b.L.gu_row);
@@ -6428,6 +6521,7 @@ int strata::kolibri::run(int argc, char** argv) {
     double min_gain = 1.5;
     double decay = 0.7;
     int reserve_mib = 700;                     // --vram-reserve-mib: the Qwen engine's own default
+    int no_pin = 0;                            // --expert-no-pin: pack the blobs from the GGUF map, no pinned table
     std::string profile;                       // --expert-slots-profile: the learned hot set, read and written here
     int attn_bench = 0;             // K25 instrument: --attn-bench N launches the real attention kernel N times
     int attn_mode = 0;              // 0 = full, 1 = score pass only (V neutralised), 2 = V pass only (scores const)
@@ -6478,6 +6572,7 @@ int strata::kolibri::run(int argc, char** argv) {
     else if (a == "--expert-slots-decay" && i + 1 < argc) { hot = 1; decay = std::atof(argv[++i]); }
     else if (a == "--vram-reserve-mib" && i + 1 < argc) reserve_mib = std::atoi(argv[++i]);
         else if (a == "--expert-vram" && i + 1 < argc) expert_vram = std::atoi(argv[++i]);
+        else if (a == "--expert-no-pin") no_pin = 1;
         else if (a == "--grouped") grouped = 1;
         else if (a == "--no-graph") no_graph = 1;
         else if (a == "--prefill") prefill = 1;
@@ -6543,6 +6638,16 @@ int strata::kolibri::run(int argc, char** argv) {
     KC(cudaMalloc(&g_q8, strata::kernels::native_q8_1_bytes((int) kActBuf, 1)));
     e.counters = counters != 0;   // before load(): the VRAM report is printed there
     e.hist_on = env_on("STRATA_KOLIBRI_EXPERT_HIST");   // coverage probe; before load() so the table is sized
+    e.no_pin = no_pin != 0;   // before load(): the pinned table is allocated (or not) there
+    e.slots = slots;          // before load(): --expert-no-pin refuses 0, and auto (-1) resolves later
+    if (e.no_pin && prefill > 0) {
+        // The prefill expert leg (forward_multi) still reads LayerBlobs::table at six sites.  Say so, rather than
+        // run with a null table and ship zeros.
+        std::fprintf(stderr, "strata-kolibri: --expert-no-pin does not serve --prefill yet: the prefill expert leg "
+                             "reads the pinned table.  Drop --prefill (the prompt goes through the decode path, "
+                             "which no-pin does serve) or run without --expert-no-pin.\n");
+        return 1;
+    }
     if (!load(model, e, err)) {
         std::fprintf(stderr, "strata-kolibri: %s\n", err.c_str());
         return 1;
@@ -6608,6 +6713,12 @@ int strata::kolibri::run(int argc, char** argv) {
         }
     }
     e.prefill = prefill;
+    if (e.no_pin && e.prefill > 0) {   // serve mode forces prefill on above; the same refusal applies
+        std::fprintf(stderr, "strata-kolibri: --expert-no-pin does not serve the prefill arm yet (it reads the pinned "
+                             "table).  Run without --expert-no-pin, or STRATA_KOLIBRI_SERVE_TOKENS=1 for the "
+                             "per-token path.\n");
+        return 1;
+    }
     // The CPU pool is OPT-IN (--cpu-threads) and its absence is SILENT: with no pool every routed expert falls
     // through to the per-expert GPU mmvq loop (measured on 2026-10-21: 364,350 mmvq launches = 26.8 s of 35 s
     // GPU busy, and the prefill 4.6x slower - 22,126 ms vs 4,744 ms - with nothing in the log).  A future reader
