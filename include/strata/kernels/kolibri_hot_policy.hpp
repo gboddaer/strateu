@@ -25,6 +25,17 @@
 
 namespace strata::kolibri {
 
+// Keep a profile's ranked prefix and fill remaining slots with unused expert IDs.
+// Callers supply validated, unique profile entries and 0 <= slots <= experts.
+inline void complete_hot_seed(std::vector<int>& seed, int experts, int slots) {
+    std::vector<bool> taken((size_t) experts, false);
+    for (int id : seed) taken[(size_t) id] = true;
+    for (int id = 0; id < experts && (int) seed.size() < slots; ++id)
+        if (!taken[(size_t) id]) seed.push_back(id);
+    seed.resize((size_t) slots);
+}
+
+
 /// One move: `expert` takes `slot`, whose previous occupant was `victim` (-1 when the slot was empty).
 struct HotSwap {
     int layer = 0;

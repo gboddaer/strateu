@@ -5686,7 +5686,8 @@ static void alloc_slots(Engine& e, int ctx) {
             for (int id = 0; id < n_exp && (int) seed.size() < e.slots; ++id)
                 if (!taken[(size_t) id]) seed.push_back(id);
         }
-        seed.resize((size_t) e.slots);
+        if (e.no_pin) strata::kolibri::complete_hot_seed(seed, n_exp, e.slots);
+        else seed.resize((size_t) e.slots);
     }
     e.slot_of.assign((size_t) (e.per_layer ? (int64_t) n_lay * n_exp : n_exp), -1);
     for (int l = 0; l < n_lay; ++l)

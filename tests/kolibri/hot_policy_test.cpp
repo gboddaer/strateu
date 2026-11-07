@@ -47,6 +47,15 @@ static void check_plan(const std::vector<HotSwap>& got, const std::vector<Expect
 }
 
 int main() {
+    // Short saved profiles must not pad the cache with duplicate expert zero.
+    std::vector<int> seed{5, 2};
+    complete_hot_seed(seed, 8, 6);
+    if (seed != std::vector<int>({5, 2, 0, 1, 3, 4})) { std::puts("FAIL partial profile top-up"); ++fails; }
+    complete_hot_seed(seed, 8, 6);
+    if (seed != std::vector<int>({5, 2, 0, 1, 3, 4})) { std::puts("FAIL seed top-up idempotence"); ++fails; }
+    std::vector<int> empty;
+    complete_hot_seed(empty, 4, 4);
+    if (empty != std::vector<int>({0, 1, 2, 3})) { std::puts("FAIL empty profile top-up"); ++fails; }
     // ---- Case A: empty slots are filled best-score first, and a cold cache has only those.
     {
         const std::vector<double> score{5, 0, 3, 0,   2, 9, 0, 0};   // layer 0: e0 5, e2 3 | layer 1: e0 2, e1 9
