@@ -14,6 +14,7 @@ p.add_argument('--bin', required=True)
 p.add_argument('--model', required=True)
 p.add_argument('--out', default='/tmp/kolibri-unpinned-check')
 p.add_argument('--phase', choices=['short', 'long', 'hot', 'all'], default='all')
+p.add_argument('--hot', action='store_true', help='enable per-layer hot residency (required by demand profile)')
 a = p.parse_args()
 out = pathlib.Path(a.out)
 out.mkdir(parents=True, exist_ok=True)
@@ -21,6 +22,8 @@ ids = pathlib.Path(__file__).with_name('oracle_ids512.txt')
 base = [a.bin, '--model', a.model, '--expert-no-pin', '--ctx', '131072',
         '--vram-reserve-mib', '1536', '--tokens-file', str(ids), '--n', '4',
         '--force', '286,3515,310']
+if a.hot:
+    base += ['--expert-slots-hot']
 
 def run(name, args, expected=0):
     with (out / (name + '.log')).open('w') as log:

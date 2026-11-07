@@ -418,24 +418,40 @@ fused compressed-weight GEMM, or a card class where the placement sign flips - n
 `--expert-no-pin` is an opt-in mode for machines whose RAM cannot hold the full pinned expert table.
 It keeps the GGUF mapped and copies missing experts into GPU memory before computing them. The file cache
 can be evicted; it does not lock the whole model in RAM. Dense weights and KV, including sliding-window KV,
-stay in VRAM. Small router-transfer buffers are still pinned; the expert staging buffers are pageable.
+stay in VRAM. Small router-transfer buffers are still pinned. The baseline uses a shared pageable expert stage;
+the optional pipeline/demand profiles use bounded pinned transfer buffers, not a pinned model table.
 
 For 128K capacity, with an explicit runtime reserve:
 
 ```sh
-build-kolibri-hip/strata-kolibri --model /path/Kolibri-1-Q4_K_M.gguf \
+STRATA_KOLIBRI_NOPIN_PROFILE=demand \
+  build-kolibri-hip/strata-kolibri --model /path/Kolibri-1-Q4_K_M.gguf \
   --expert-no-pin --expert-slots auto --expert-slots-hot \
-  --ctx 131072 --vram-reserve-mib 1536 \
+  --expert-slots-profile kolibri.profile --ctx 131072 --vram-reserve-mib 1536 \
   --prefill --tokens-file tools/kolibri/oracle_ids512.txt --n 4
 ```
 
 `--tokens` takes comma-separated **token IDs**, not English text. Use the server's tokenizer and chat template
 when preparing a chat prompt. This command tests the engine directly; it does not start a server.
 
-The cache is sized after dense weights, KV and prefill workspace have been allocated. It also budgets
-per-layer spill slots. `--expert-slots-hot` and `--expert-slots-profile PATH` can learn and persist the resident
+The cache budget accounts for dense weights, KV, workspace, per-layer spill slots and a runtime reserve.
+The optional optimized profiles jointly size the cache and the stage needed for nonresident experts. `--expert-slots-hot` and `--expert-slots-profile PATH` can learn and persist the resident
 set. Prefill uses resident experts directly and stages missing experts from the mmap. Decode uses the cache
 and per-layer spill slots. This changes placement, not expert quantization or kernel arithmetic.
+
+`STRATA_KOLIBRI_NOPIN_PROFILE` selects an opt-in profile:
+
+- `baseline` (default): eager cache fill and conservative transfers.
+- `balanced`: skip zero-overflow work, reuse spill weights and fit cache/stage memory jointly.
+- `pipeline`: balanced plus two event-owned transfer buffers and resident/missing-work overlap.
+- `demand`: pipeline plus lazy filling of free permanent cache slots. It seeds only a supplied profile;
+  other experts are fetched and retained when routing selects them. It requires hot, per-layer residency.
+
+On the W7800, demand gave the best startup/reuse results. This is not a CUDA qualification or a new global
+default. Set `STRATA_KOLIBRI_TRANSFER_RING=pageable` to avoid pinned expert transfer buffers, or `off` for
+blocking pageable transfers. The pinned ring is capped at 64 MiB total, about 30 MiB for this model.
+Full results, rejected experiments, exact limits and reproduction commands are in the
+[W7800 cache campaign](experiments/kolibri-w7800-cache-optimization.md).
 
 Do not combine this mode with `--cpu-threads`, `--grouped` or `STRATA_KOLIBRI_EXPERT_F16`; startup refuses
 them because those paths require the host expert table. This mode is not a new default. Reserving 128K KV
@@ -459,7 +475,9 @@ and full-logit agreement after loading that profile. Low-cache tests can be slow
 intentionally fetch most experts from the file-backed store.
 
 Local validation on a Radeon PRO W7800 (gfx1100), 30 GiB RAM, Q4_K_M, HIP: with 128K capacity, prefill enabled
-and a 1,536 MiB reserve, auto-fit selected 326 experts per layer and reported 1,710 MiB free after allocation.
+and a 1,536 MiB reserve, the baseline allocated 326 expert slots/layer and reported 1,710 MiB free.
+The optimized joint budget allocated 334 slots/layer, with about 1,626–1,628 MiB free. In demand mode,
+allocated slots are not necessarily loaded: only saved-profile or requested experts occupy them.
 The 512-token oracle generated `286 3515 310 262`. Complete forced-history logits agreed bit-for-bit across
 cache sizes and repeated prefill; a 1,025-token case crossed chunk and sliding-window boundaries. A chat-template
 smoke test answered `Paris` to the capital-of-France question. These are engine correctness checks, not a task-quality

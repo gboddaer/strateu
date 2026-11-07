@@ -1011,9 +1011,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # (plan docs/superpowers/plans/2026-10-16-kolibri1.md).  Q6_K experts (the Q4_K_M files' mixed Q4_K/Q6_K
   # down projections) need STRATA_Q6K_EXPERTS; setup builds with it on.
   if(STRATA_ENABLE_HIP)
-    set_source_files_properties(src/kolibri/decode_wait.cu PROPERTIES LANGUAGE HIP)
+    set_source_files_properties(src/kolibri/decode_wait.cu src/kolibri/expert_transfer.cu PROPERTIES LANGUAGE HIP)
   endif()
-  add_library(strata_kolibri STATIC src/kolibri/kolibri_engine.cu src/kolibri/pf_combine.cu src/kolibri/decode_wait.cu)
+  add_library(strata_kolibri STATIC src/kolibri/kolibri_engine.cu src/kolibri/pf_combine.cu src/kolibri/decode_wait.cu src/kolibri/expert_transfer.cu)
   # The streamed expert pipeline is CUDA-only: a HIP/SYCL build keeps its current path and, with the opt-in flag set,
   # refuses by name (expert_stream_on() in kolibri_engine.cu).  Never add this file to a HIP target.
   if(STRATA_ENABLE_CUDA)
@@ -1031,6 +1031,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # compiles pf_combine.cu on its own rather than linking strata_kolibri, because the test must not need any
   # engine internals (no GGUF, no pool) - only the kernel and its launcher.
   if(STRATA_BUILD_TESTS)
+    if(STRATA_ENABLE_HIP)
+      set_source_files_properties(tests/kolibri/expert_transfer_test.cu src/kolibri/expert_transfer.cu PROPERTIES LANGUAGE HIP)
+    endif()
+    add_executable(kolibri_expert_transfer_test tests/kolibri/expert_transfer_test.cu src/kolibri/expert_transfer.cu)
+    target_include_directories(kolibri_expert_transfer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${_strata_gpu_include_directories})
+    target_link_libraries(kolibri_expert_transfer_test PRIVATE ${_strata_gpu_runtime_target})
+    add_test(NAME kolibri_expert_transfer_test COMMAND kolibri_expert_transfer_test)
     # Real-engine rollover injection lives in a test TU, not in a production runtime knob.
     if(STRATA_ENABLE_HIP)
       set_source_files_properties(tests/kolibri/decode_rollover.cu PROPERTIES LANGUAGE HIP)
@@ -1074,7 +1081,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_link_libraries(expert_stream_replay PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
     endif()
     add_executable(kolibri_decode_rollover tests/kolibri/decode_rollover.cu
-                   src/kolibri/pf_combine.cu src/kolibri/decode_wait.cu)
+                   src/kolibri/pf_combine.cu src/kolibri/decode_wait.cu src/kolibri/expert_transfer.cu)
     target_include_directories(kolibri_decode_rollover PRIVATE $<TARGET_PROPERTY:strata_kolibri,INCLUDE_DIRECTORIES>)
     target_compile_definitions(kolibri_decode_rollover PRIVATE $<TARGET_PROPERTY:strata_kolibri,COMPILE_DEFINITIONS>)
     target_compile_options(kolibri_decode_rollover PRIVATE $<TARGET_PROPERTY:strata_kolibri,COMPILE_OPTIONS>)

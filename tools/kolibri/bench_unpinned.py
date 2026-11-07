@@ -30,6 +30,8 @@ def main():
     ap.add_argument('--stats', action='store_true')
     ap.add_argument('--env', action='append', default=[])
     a = ap.parse_args()
+    if a.prompt < 1 or a.n < 1:
+        ap.error('prompt and decode lengths must be positive')
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     prefix = out / a.label
@@ -37,6 +39,8 @@ def main():
     prompt = (ids * ((a.prompt + len(ids) - 1) // len(ids)))[:a.prompt]
     prefix.with_suffix('.ids').write_text(','.join(prompt))
     profile = prefix.with_suffix('.profile')
+    if a.profile_input and Path(a.profile_input).resolve() == profile.resolve():
+        ap.error('--profile-input must differ from the output profile')
     profile.unlink(missing_ok=True)
     if a.profile_input:
         profile.write_bytes(Path(a.profile_input).read_bytes())
@@ -71,7 +75,7 @@ def main():
               'phases': phases, 'logits_sha256': hashlib.sha256(data).hexdigest(),
               'binary_sha256': hashlib.sha256(Path(a.bin).read_bytes()).hexdigest(),
               'generated': next(x for x in text.splitlines() if x.startswith('gen:')),
-              'diagnostics': [x for x in text.splitlines() if x.startswith('NOPIN_STATS') or 'free (reserve' in x]}
+              'diagnostics': [x for x in text.splitlines() if x.startswith(('NOPIN_STATS', 'NOPIN_IO')) or 'free (reserve' in x]}
     prefix.with_suffix('.json').write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result, indent=2))
 

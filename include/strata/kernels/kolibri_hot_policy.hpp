@@ -22,8 +22,73 @@
 #include <algorithm>
 #include <cstdint>
 #include <vector>
+#include <stdexcept>
 
 namespace strata::kolibri {
+
+// Full prefill grouping needs staging only for the complement of the resident set.
+// Joint fitting avoids budgeting a second whole layer of experts unnecessarily.
+inline int fit_expert_cache(int64_t room, int64_t layer_stride_sum, int64_t max_stride,
+                            int experts, int spill, bool prefill) {
+    for (int n = experts; n >= 1; --n) {
+        const int64_t stage = prefill ? std::max(1, experts - n) * max_stride : 0;
+        if ((int64_t) (n + 1 + spill) * layer_stride_sum + stage <= room) return n;
+    }
+    return 0;
+}
+
+struct SpillFetch { int expert, slot; };
+inline std::vector<SpillFetch> admit_free(int32_t* map, int experts, int slots, const std::vector<int>& requested) {
+    bool missing = false;
+    for (int id : requested) {
+        if (id<0 || id>=experts || map[id]>=slots) throw std::invalid_argument("demand expert or slot outside cache");
+        missing = missing || map[id]<0;
+    }
+    if (!missing) return {};   // the warm path needs no allocation or whole-layer scan
+    std::vector<bool> occupied((size_t) slots, false);
+    for (int id=0; id<experts; ++id) {
+        if (map[id]>=slots) throw std::invalid_argument("demand slot outside cache");
+        if (map[id]>=0) occupied[(size_t) map[id]]=true;
+    }
+    std::vector<SpillFetch> fills;
+    int free=0;
+    for (int id : requested) {
+        if (id<0 || id>=experts) throw std::invalid_argument("demand expert outside model");
+        if (map[id]>=0) continue;
+        while (free<slots && occupied[(size_t) free]) ++free;
+        if (free==slots) break;
+        map[id]=free; occupied[(size_t) free]=true; fills.push_back({id,free});
+    }
+    return fills;
+}
+
+struct SpillPlan { std::vector<int> slots; std::vector<SpillFetch> fetches; };
+// Retain recent misses in the already-allocated spill slots. Every current pick is
+// protected before a victim is chosen; a repeated pick never incurs another fetch.
+inline SpillPlan plan_spill(std::vector<int>& resident, const std::vector<int>& requested) {
+    std::vector<int> unique = requested;
+    std::sort(unique.begin(), unique.end());
+    unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
+    if (unique.size() > resident.size()) throw std::invalid_argument("spill cache overcommit");
+    SpillPlan plan;
+    for (int id : requested) {
+        auto hit = std::find(resident.begin(), resident.end(), id);
+        if (hit == resident.end()) {
+            auto victim = std::find_if(resident.begin(), resident.end(), [&](int x) {
+                return !std::binary_search(unique.begin(), unique.end(), x);
+            });
+            if (victim == resident.end()) throw std::logic_error("spill cache has no unprotected victim");
+            const int slot = (int) (victim - resident.begin());
+            *victim = id;
+            plan.fetches.push_back({id, slot});
+            plan.slots.push_back(slot);
+        } else plan.slots.push_back((int) (hit - resident.begin()));
+    }
+    return plan;
+}
+
+// A poison zero-slot is a deliberate diagnostic and must never be optimized away.
+inline bool skip_zero_overflow(size_t misses, bool poison) { return misses == 0 && !poison; }
 
 // Keep a profile's ranked prefix and fill remaining slots with unused expert IDs.
 // Callers supply validated, unique profile entries and 0 <= slots <= experts.
