@@ -306,15 +306,46 @@ struct LayerBlobs {
     uint8_t* hstage = nullptr;      // no-pin staging: `spill` blobs packed here, then copied to b.dev
 };
 
+// Optional offline campaign diagnostics: no stream synchronization is introduced by these counters.
+struct NoPinStats {
+    uint64_t packs = 0, bytes = 0, repeats = 0, pack_ns = 0;
+    std::unordered_map<const uint8_t*, uint64_t> seen;
+};
+static NoPinStats g_np_stats;
+static bool np_stats_on() { static const bool on = env_on("STRATA_KOLIBRI_NOPIN_STATS"); return on; }
+static std::chrono::steady_clock::time_point g_np_phase;
+static void np_phase_start() { if (env_on("STRATA_KOLIBRI_BENCH")) g_np_phase = std::chrono::steady_clock::now(); }
+static void np_phase(const char* name, size_t tokens) {
+    if (!env_on("STRATA_KOLIBRI_BENCH")) return;
+    const auto now = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(now - g_np_phase).count();
+    std::fprintf(stderr, "NOPIN_PHASE %s tokens=%zu ms=%.3f\n", name, tokens, ms);
+    if (np_stats_on()) {
+        std::fprintf(stderr, "NOPIN_STATS %s packs=%llu bytes=%llu repeat_packs=%llu pack_ms=%.3f\n", name,
+                     (unsigned long long) g_np_stats.packs, (unsigned long long) g_np_stats.bytes,
+                     (unsigned long long) g_np_stats.repeats, (double) g_np_stats.pack_ns / 1e6);
+        g_np_stats = NoPinStats{};
+    }
+    g_np_phase = std::chrono::steady_clock::now();
+}
+
 /// --expert-no-pin: reproduce the load-time repack for ONE expert, straight from the mapped GGUF tensors.  The
 /// three copies and their destination offsets are the load loop's own, so a blob packed here holds exactly the
 /// bytes the pinned table would hold (the arithmetic downstream is identical, not merely equivalent).
 static void pack_blob(const LayerBlobs& b, const strata::core::ModelGeometry& g, int64_t ex, uint8_t* dst) {
+    const auto started = np_stats_on() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const size_t gu_bytes = (size_t) g.n_ff * b.L.gu_row;
     const size_t dn_bytes = (size_t) g.n_embd * b.L.d_row;
     std::memcpy(dst, b.gu_src + (size_t) ex * b.gu_eb, gu_bytes);
     std::memcpy(dst + b.L.up_off, b.up_src + (size_t) ex * b.gu_eb, gu_bytes);
     std::memcpy(dst + b.L.down_off, b.dn_src + (size_t) ex * b.d_eb, dn_bytes);
+    if (np_stats_on()) {
+        ++g_np_stats.packs;
+        g_np_stats.bytes += b.stride;
+        if (g_np_stats.seen[b.gu_src + (size_t) ex * b.gu_eb]++ > 0) ++g_np_stats.repeats;
+        g_np_stats.pack_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count();
+    }
 }
 
 /// A persistent worker pool: run(f, n) splits [0, n) over n shards across the pool (caller runs shard 0) and
@@ -6584,6 +6615,7 @@ bool load(const std::string& path, Engine& e, std::string& err) {
 }  // namespace
 
 int strata::kolibri::run(int argc, char** argv) {
+    np_phase_start();
     std::string model, tokens, dump_layers, dump_logits, dump_full, force, tokens_file;
     bool load_only = false, serve_mode = false;
     int n_gen = 8, ctx = 8192, cpu_threads = 0, slots = 0, grouped = 0, no_graph = 0, prefill = 0, counters = 0;
@@ -7073,6 +7105,7 @@ int strata::kolibri::run(int argc, char** argv) {
     init_scratch(e, s);
     alloc_slots(e, ctx);   // after init_scratch: the fit measures the KV and the scratch as already spent
     if (e.graphs > 0 && e.gexec.empty()) capture_graphs(e, s);
+    if (e.no_pin) np_phase("startup", 0);
     std::vector<float> lg((size_t) e.g.n_vocab);
     std::vector<float> layers((size_t) e.g.n_layers * (size_t) e.g.n_embd);
     std::FILE* fl = dump_layers.empty() ? nullptr : std::fopen(dump_layers.c_str(), "wb");
@@ -7203,6 +7236,7 @@ int strata::kolibri::run(int argc, char** argv) {
     // greedy picks - kl.py's teacher-forced KL path, kolibriref's semantics)
     const int n_steps = (int) forced.empty() ? n_gen : (int) forced.size() + 1;
     std::vector<int> gen;
+    if (e.no_pin) np_phase("prefill", ids.size() - 1);
     std::printf("gen:");
     for (int i = 0; i < n_steps; ++i) {
         const double dyn_t0 = dyn_probe_on() ? dyn_now_ms() : 0.0;
@@ -7223,6 +7257,7 @@ int strata::kolibri::run(int argc, char** argv) {
         if (dyn_probe_on()) dyn_probe_step(e, "token", dyn_now_ms() - dyn_t0);
         slots_tick(e, "token", (long long) s.pos);   // a round every --expert-slots-reselect-every positions
     }
+    if (e.no_pin) np_phase("decode", (size_t) n_steps);
     dyn_probe_finish(e);
     std::printf("\n");
     print_counters(e, "run");
