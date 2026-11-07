@@ -355,6 +355,14 @@ class InstallOwnPath(unittest.TestCase):
         self.assertTrue(setup.own_path_config(self.cfg))
         self.assertEqual(setup.calibration_targets([p], None, None), [])   # the tuning is Flash-Next's
 
+    def test_low_ram_leaves_the_qwen36_family_alone(self):
+        # install_own_path is shared with Kolibri, which has an mmap placement to fall back to.  This family does not.
+        rc, out = self.install(ram=16.0, model="UD-Q4_K_XL", vision="no")   # UD-Q4_K_XL itself needs 32 GB
+        self.assertEqual(rc, 0, out)
+        self.assertIn("may not start", out)
+        self.assertNotIn("--expert-no-pin", self.cfg["args"])
+        self.assertNotIn("STRATA_KOLIBRI_NOPIN_PROFILE", self.cfg.get("env") or {})
+
 
 if __name__ == "__main__":
     unittest.main()

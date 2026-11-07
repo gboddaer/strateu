@@ -7945,7 +7945,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         say(f"  Recommended for {ram:.0f} GB of RAM: {rec} (the largest that fits; any size can be chosen)")
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)],
                                      str(names.index(rec) + 1), a.yes)) - 1]
-    if ram < fam["models"][model]["ram_gb"]:
+    if ram < fam["models"][model]["ram_gb"] and fam["arch"] != "kolibri1":
         confirm_risk(f"{model} needs about {fam['models'][model]['ram_gb']} GB of RAM; this PC has {ram:.0f} GB: the "
                      "OS may page and it may not start", bool(a.model), a.yes,
                      f"{model} needs about {fam['models'][model]['ram_gb']} GB of RAM",
@@ -7953,6 +7953,18 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose")
     ok(f"size: {model}")
     tag = fam["tag"] + model
+    placement = None
+    if fam["arch"] == "kolibri1":                  # the table needs 42.9 GiB pinned: setup picks the placement from RAM
+        placement = kolibri_expert_placement(
+            fam, model, ram, hip or bool(amd),
+            data_folder_for(a)[0] / f"hot-{tag.lower()}.prof",
+            a.vram_reserve_mib if a.vram_reserve_mib is not None else 1024)
+        if placement[2]:
+            for line in placement[2].splitlines():
+                say(line)
+        else:
+            ok(f"expert table: {fam['models'][model]['expert_table_gib']:.0f} GiB of experts in RAM for this card's "
+               f"pool, and this PC has {ram:.0f} GiB")
     rec_ctx = own_path_context(fam, gpu.get("vram_gb", 0.0))
     if a.context:
         ctx = a.context
@@ -8080,16 +8092,16 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
 
     step(7, "writing the start script")
     if fam.get("binary"):
-        # Family-native flags. CUDA Kolibri uses the accuracy-preserving streamed
-        # prefill with no expert residency. Other backends retain their own placement
-        # profile. Keep the prefill and worker count explicit in the saved settings.
-        args = ["--model", str(gguf), "--ctx", str(ctx),
-                "--prefill", "--cpu-threads", str(expert_worker_count(nvidia=not (hip or amd)))]
-        if fam["arch"] == "kolibri1" and not (hip or amd):
-            # The exact CUDA streamed leg needs no routed-expert residency or FP16 cache.
-            args += ["--expert-slots", "0"]
-        else:
-            args += ["--expert-slots", "auto", "--expert-slots-hot",
+        # Family-native flags. Kolibri's placement comes from kolibri_expert_placement (the table when this PC's RAM
+        # holds it, else the mmap cache, which has no CPU pool). Keep the prefill and worker count explicit.
+        args = ["--model", str(gguf), "--ctx", str(ctx), "--prefill"]
+        if placement is not None:
+            if "--expert-no-pin" not in placement[0]:
+                args += ["--cpu-threads", str(expert_worker_count(nvidia=not (hip or amd)))]
+            args += placement[0]
+        else:                                       # an own-path family without a placement decision of its own
+            args += ["--cpu-threads", str(expert_worker_count(nvidia=not (hip or amd))),
+                     "--expert-slots", "auto", "--expert-slots-hot",
                      "--expert-slots-profile", str(data / f"hot-{tag.lower()}.prof"),
                      "--vram-reserve-mib", str(a.vram_reserve_mib if a.vram_reserve_mib is not None else 1024)]
     else:
@@ -8150,20 +8162,31 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
             # Persist the accuracy-preserving CUDA profile, not the rejected historical
             # FP16 expert-cache preset. Old CUDA devices retain capability fallback.
             arch = str(gpu.get("arch", ""))
-            cfg.setdefault("env", {}).update({
-                "STRATA_KOLIBRI_EXPERT_STREAM": "1" if arch.isdigit() and int(arch) >= 61 else "",
-                "STRATA_KOLIBRI_STREAM_DEV_ACT": "1",
-                "STRATA_KOLIBRI_STREAM_GU": "1",
-                "STRATA_KOLIBRI_EXPERT_F16": "0",
-                "STRATA_KOLIBRI_POOL_ALL": "1",
-                "STRATA_KOLIBRI_PF_CHUNK": "512",
-                "STRATA_KOLIBRI_REUSE": "1",
-                "STRATA_KOLIBRI_REUSE_PREFIX": "1",
-                "STRATA_KOLIBRI_REUSE_ALIGN": "1",
-                "STRATA_KOLIBRI_PREFIX_CACHE_MB": "128",
-            })
-            ok("Kolibri CUDA: streamed prefill, device activation, 512-token chunks, "
-               "exact prefix checkpoints (128 MiB); FP16 expert cache off")
+            if placement is None or not placement[1]:   # the table leg: its streamed prefill reads the pinned table
+                cfg.setdefault("env", {}).update({
+                    "STRATA_KOLIBRI_EXPERT_STREAM": "1" if arch.isdigit() and int(arch) >= 61 else "",
+                    "STRATA_KOLIBRI_STREAM_DEV_ACT": "1",
+                    "STRATA_KOLIBRI_STREAM_GU": "1",
+                    "STRATA_KOLIBRI_EXPERT_F16": "0",
+                    "STRATA_KOLIBRI_POOL_ALL": "1",
+                    "STRATA_KOLIBRI_PF_CHUNK": "512",
+                    "STRATA_KOLIBRI_REUSE": "1",
+                    "STRATA_KOLIBRI_REUSE_PREFIX": "1",
+                    "STRATA_KOLIBRI_REUSE_ALIGN": "1",
+                    "STRATA_KOLIBRI_PREFIX_CACHE_MB": "128",
+                })
+                ok("Kolibri CUDA: streamed prefill, device activation, 512-token chunks, "
+                   "exact prefix checkpoints (128 MiB); FP16 expert cache off")
+            else:                                   # the mmap leg has no pinned table: keep what is placement-neutral
+                cfg.setdefault("env", {}).update({
+                    "STRATA_KOLIBRI_EXPERT_F16": "0",
+                    "STRATA_KOLIBRI_REUSE": "1",
+                    "STRATA_KOLIBRI_REUSE_PREFIX": "1",
+                    "STRATA_KOLIBRI_REUSE_ALIGN": "1",
+                    "STRATA_KOLIBRI_PREFIX_CACHE_MB": "128",
+                })
+        if placement is not None and placement[1]:
+            cfg.setdefault("env", {}).update(placement[1])
     # requests at once ("parallel", opt-in): written only when given; the recommendation is said once
     if par is not None:
         if par >= 2:

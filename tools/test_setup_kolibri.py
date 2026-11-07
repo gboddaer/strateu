@@ -85,11 +85,11 @@ class KolibriSourceTuning(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
 
-    def install(self, hip=True, gpu=None):
+    def install(self, hip=True, gpu=None, ram=96, model="Q4_K_M"):
         from tools.test_setup_qwen36 import args, run
-        return run(setup.install_own_path, args(models_dir=str(self.root / "models"), model="Q4_K_M", vision="no"),
+        return run(setup.install_own_path, args(models_dir=str(self.root / "models"), model=model, vision="no"),
                    "kolibri", gpu or {"index": 0, "count": 1, "vram_gb": 32, "arch": "gfx1201", "name": "R9700"},
-                   hip, [], 13, [], 8080, 96, None)
+                   hip, [], 13, [], 8080, ram, None)
 
     def test_source_install_selects_compatible_shared_expert_tuning(self):
         from unittest import mock
@@ -147,6 +147,108 @@ class KolibriSourceTuning(unittest.TestCase):
         self.assertNotIn("STRATA_KOLIBRI_PF_PARTIAL", env)
         self.assertEqual(self.cfg["sampling"], {"temperature": 1.0})
 
+
+    CUDA = {"index": 0, "count": 1, "vram_gb": 16, "arch": 75, "name": "Tesla T4"}
+    PREFIX = ["numactl", "--cpunodebind=0", "--membind=0"]
+    TUNING = Path("/data/strata/gfx1201-hipblaslt-100202.txt")
+    # the CUDA profile the approved default persists: five table-leg entries plus five that stay in every placement
+    STREAM_ENV = {"STRATA_KOLIBRI_EXPERT_STREAM": "1", "STRATA_KOLIBRI_STREAM_DEV_ACT": "1",
+                  "STRATA_KOLIBRI_STREAM_GU": "1", "STRATA_KOLIBRI_POOL_ALL": "1",
+                  "STRATA_KOLIBRI_PF_CHUNK": "512"}
+    COMMON_ENV = {"STRATA_KOLIBRI_EXPERT_F16": "0", "STRATA_KOLIBRI_REUSE": "1",
+                  "STRATA_KOLIBRI_REUSE_PREFIX": "1", "STRATA_KOLIBRI_REUSE_ALIGN": "1",
+                  "STRATA_KOLIBRI_PREFIX_CACHE_MB": "128"}
+    CUDA_ENV = {**STREAM_ENV, **COMMON_ENV}
+    DEMAND = {"STRATA_KOLIBRI_NOPIN_PROFILE": "demand"}
+
+    def gguf(self):
+        return self.root / "models" / "kolibri-Q4_K_M" / "Kolibri-1-Q4_K_M.gguf"
+
+    def profile(self):
+        return self.root / "data" / "hot-kolibri-q4_k_m.prof"
+
+    def mmap_args(self):
+        return ["--expert-no-pin", "--expert-slots", "auto", "--expert-slots-hot",
+                "--expert-slots-profile", str(self.profile()), "--vram-reserve-mib", "1024"]
+
+    def slot_args(self):
+        return ["--expert-slots", "auto", "--expert-slots-hot",
+                "--expert-slots-profile", str(self.profile()), "--vram-reserve-mib", "1024"]
+
+    def placement_install(self, hip, ram, **kw):
+        """The same install, with the placement's inputs fixed so the fixtures are deterministic."""
+        from unittest import mock
+        def numa(nvidia=True, **kw):
+            return [] if not nvidia else self.PREFIX          # the real one binds only on NVIDIA
+
+        with mock.patch.object(setup, "expert_worker_count", return_value=14), \
+             mock.patch.object(setup, "expert_numa_prefix", side_effect=numa), \
+             mock.patch.object(setup, "hipblaslt_table", return_value=self.TUNING if hip else None):
+            return self.install(hip=hip, gpu=None if hip else self.CUDA, ram=ram, **kw)
+
+    def test_the_high_ram_cuda_config_is_unchanged(self):
+        for ram in (64, 128):
+            rc, out = self.placement_install(hip=False, ram=ram)
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(self.cfg["args"], ["--model", str(self.gguf()), "--ctx", "32768", "--prefill",
+                                                "--cpu-threads", "14", "--expert-slots", "0"], ram)
+            self.assertEqual(self.cfg["env"], self.CUDA_ENV, ram)
+            self.assertEqual(self.cfg["launch_prefix"], self.PREFIX, ram)
+
+    def test_the_high_ram_hip_config_is_unchanged(self):
+        rc, out = self.placement_install(hip=True, ram=128)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.cfg["args"], ["--model", str(self.gguf()), "--ctx", "131072", "--prefill",
+                                            "--cpu-threads", "14"] + self.slot_args())
+        self.assertEqual(self.cfg["env"], {"STRATA_HIPBLASLT_TUNING": str(self.TUNING)})
+        self.assertNotIn("launch_prefix", self.cfg)      # the real prefix is NVIDIA-only
+
+    def test_low_ram_cuda_writes_the_mmap_placement(self):
+        rc, out = self.placement_install(hip=False, ram=32)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.cfg["args"], ["--model", str(self.gguf()), "--ctx", "32768", "--prefill"]
+                         + self.mmap_args())
+        self.assertNotIn("--cpu-threads", self.cfg["args"])
+        self.assertEqual(self.cfg["env"], {**self.COMMON_ENV, **self.DEMAND})
+        self.assertIn("table-placement threshold", out)
+        self.assertNotIn("may not start", out)
+
+    def test_low_ram_cuda_keeps_no_table_leg_environment(self):
+        rc, out = self.placement_install(hip=False, ram=32)
+        self.assertEqual(rc, 0, out)
+        for key in self.STREAM_ENV:
+            self.assertNotIn(key, self.cfg["env"])
+
+    def test_low_ram_hip_writes_the_mmap_placement_and_keeps_its_tuning(self):
+        rc, out = self.placement_install(hip=True, ram=32)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.cfg["args"], ["--model", str(self.gguf()), "--ctx", "131072", "--prefill"]
+                         + self.mmap_args())
+        self.assertNotIn("--cpu-threads", self.cfg["args"])
+        self.assertEqual(self.cfg["env"], {**self.DEMAND,
+                                           "STRATA_HIPBLASLT_TUNING": str(self.TUNING)})
+
+    def test_low_ram_hip_without_a_tuning_table_has_exactly_the_demand_environment(self):
+        from unittest import mock
+        with mock.patch.object(setup, "expert_worker_count", return_value=14), \
+             mock.patch.object(setup, "expert_numa_prefix", return_value=[]), \
+             mock.patch.object(setup, "hipblaslt_table", return_value=None):
+            rc, out = self.install(hip=True, ram=32)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.cfg["env"], self.DEMAND)
+
+    def test_the_saved_config_follows_the_threshold_on_both_backends(self):
+        for ram, mmap_expected in ((51.9, True), (52, False)):
+            for hip in (False, True):
+                rc, out = self.placement_install(hip=hip, ram=ram)
+                self.assertEqual(rc, 0, out)
+                self.assertEqual("--expert-no-pin" in self.cfg["args"], mmap_expected, (ram, hip))
+
+    def test_a_low_ram_unattended_install_needs_no_table_question(self):
+        rc, out = self.placement_install(hip=False, ram=32, model=None)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("--expert-no-pin", self.cfg["args"])
+        self.assertIn("table-placement threshold", out)
 
 class KolibriPlacement(unittest.TestCase):
     """The RAM rule that picks Kolibri's expert placement (plan 2026-11-07, Task 1).
@@ -219,6 +321,7 @@ class KolibriPlacement(unittest.TestCase):
         self.assertIn("--expert-no-pin", args)
         self.assertIn("unknown", note.lower())
         self.assertNotIn("0 GiB", note)
+
 
 
 if __name__ == "__main__":
