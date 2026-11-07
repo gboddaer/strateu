@@ -1,5 +1,8 @@
 # Kolibri 1 — running Aleph Alpha's Kolibri 1 on Strata
 
+**New here?** [Install, start and use Kolibri](KOLIBRI_QUICKSTART.md) is the short way in: what you need, one
+install command, the start script, the API addresses and the memory modes. This page is the reference behind it.
+
 Kolibri 1 is [Aleph Alpha](https://huggingface.co/Aleph-Alpha/Kolibri-1)'s 78-billion-parameter
 mixture-of-experts reasoning model for German and English (3.46 B active per token, Apache-2.0). Strata runs it
 on the same idea as Flash-Next: every expert in system RAM, the most-used ones on the graphics card, the CPU and
