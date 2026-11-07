@@ -153,7 +153,7 @@ config. Other model families are unchanged; HIP keeps its own prefill profile.
 
 | Setting | CUDA Kolibri default |
 | --- | --- |
-| Engine arguments | `--prefill --cpu-threads <node-local physical cores, cap 24> --expert-slots 0` |
+| Engine arguments | `--prefill --cpu-threads <node-local physical cores, cap 24> --expert-slots 0` on a PC whose RAM holds the expert table; below 52 GiB for Q4_K_M source setup writes `--expert-no-pin --expert-slots auto --expert-slots-hot` instead (see below) |
 | NUMA placement | Explicit `launch_prefix` from the selected GPU's node where topology is unambiguous |
 | `STRATA_KOLIBRI_EXPERT_STREAM` | `1` on supported CUDA architectures; capability fallback on older/unknown devices |
 | `STRATA_KOLIBRI_STREAM_DEV_ACT`, `STRATA_KOLIBRI_STREAM_GU` | `1` |
@@ -416,7 +416,9 @@ fused compressed-weight GEMM, or a card class where the placement sign flips - n
 ### Expert cache without a pinned host table
 
 `--expert-no-pin` is an opt-in mode for machines whose RAM cannot hold the full pinned expert table.
-It keeps the GGUF mapped and copies missing experts into GPU memory before computing them. The file cache
+Source setup selects it, with `STRATA_KOLIBRI_NOPIN_PROFILE=demand`, when the PC has less than 52 GiB of RAM
+for Q4_K_M; on a larger PC it stays a flag you pass yourself. It keeps the GGUF mapped and copies missing
+experts into GPU memory before computing them. The file cache
 can be evicted; it does not lock the whole model in RAM. Dense weights and KV, including sliding-window KV,
 stay in VRAM. Small router-transfer buffers are still pinned. The baseline uses a shared pageable expert stage;
 the optional pipeline/demand profiles use bounded pinned transfer buffers, not a pinned model table.
@@ -447,8 +449,14 @@ and per-layer spill slots. This changes placement, not expert quantization or ke
 - `demand`: pipeline plus lazy filling of free permanent cache slots. It seeds only a supplied profile;
   other experts are fetched and retained when routing selects them. It requires hot, per-layer residency.
 
-On the W7800, demand gave the best startup/reuse results. This is not a CUDA qualification or a new global
-default. Set `STRATA_KOLIBRI_TRANSFER_RING=pageable` to avoid pinned expert transfer buffers, or `off` for
+On the W7800, demand gave the best startup/reuse results. It is not a new global default. Source setup now picks
+the placement from the PC's RAM: Q4_K_M publishes a 56 GiB need for a pinned table of about 43 GiB, and below
+52 GiB (that need less the 4 GiB shave setup applies to its RAM checks) setup writes the mmap demand profile and
+prints why. That is a recommendation, not a measured allocation boundary, and fewer CPU cores alone do not change
+it: free VRAM and storage speed still decide whether the cache fits and how fast it runs. On a T4 that can hold the
+table, an un-streamed CPU-pool run measured faster than the mmap profiles in both timed phases, so the table stays
+the CUDA choice there. [The cache selection record](KOLIBRI_CACHE_SELECTION.md) has both sets of numbers, the gates
+and the limits. Set `STRATA_KOLIBRI_TRANSFER_RING=pageable` to avoid pinned expert transfer buffers, or `off` for
 blocking pageable transfers. The pinned ring is capped at 64 MiB total, about 30 MiB for this model.
 Full results, rejected experiments, exact limits and reproduction commands are in the
 [W7800 cache campaign](experiments/kolibri-w7800-cache-optimization.md).
