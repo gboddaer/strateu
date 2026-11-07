@@ -148,5 +148,78 @@ class KolibriSourceTuning(unittest.TestCase):
         self.assertEqual(self.cfg["sampling"], {"temperature": 1.0})
 
 
+class KolibriPlacement(unittest.TestCase):
+    """The RAM rule that picks Kolibri's expert placement (plan 2026-11-07, Task 1).
+
+    ram_gb() and the size table are GiB despite the historical _gb suffix; the threshold is setup's
+    recommendation, so the rows are the published 56 GiB need less the 4 GiB shave the repo already uses.
+    """
+
+    PROFILE = Path("/data/strata/hot-kolibri-q4_k_m.prof")
+    TABLE = ["--expert-slots", "auto", "--expert-slots-hot",
+             "--expert-slots-profile", str(PROFILE), "--vram-reserve-mib", "1024"]
+    MMAP = ["--expert-no-pin"] + TABLE
+    DEMAND = {"STRATA_KOLIBRI_NOPIN_PROFILE": "demand"}
+
+    def setUp(self):
+        self.fam = setup.OWN_PATH_FAMILIES["kolibri"]
+
+    def placement(self, ram, on_hip=False, reserve=1024):
+        return setup.kolibri_expert_placement(self.fam, "Q4_K_M", ram, on_hip, self.PROFILE, reserve)
+
+    def test_the_table_metadata_and_the_published_need(self):
+        d = self.fam["models"]["Q4_K_M"]
+        self.assertEqual(d["ram_gb"], 56)                 # the published need does not move
+        self.assertEqual(d["expert_table_gib"], 42.9)     # the engine's "42.90 GiB pinned" load line
+
+    def test_cuda_holds_the_table_from_the_threshold_up(self):
+        for ram in (52, 56, 64, 128):
+            self.assertEqual(self.placement(ram), (["--expert-slots", "0"], {}, ""), ram)
+
+    def test_cuda_takes_the_mmap_cache_below_the_threshold(self):
+        for ram in (24, 30, 32, 48, 51, 51.9):
+            args, env, note = self.placement(ram)
+            self.assertEqual(args, self.MMAP, ram)
+            self.assertEqual(env, self.DEMAND, ram)
+            self.assertTrue(note, ram)
+
+    def test_hip_holds_the_slot_cache_from_the_threshold_up(self):
+        for ram in (52, 56, 64, 128):
+            self.assertEqual(self.placement(ram, on_hip=True), (self.TABLE, {}, ""), ram)
+
+    def test_hip_takes_the_mmap_cache_below_the_threshold(self):
+        for ram in (24, 32, 51.9):
+            args, env, note = self.placement(ram, on_hip=True)
+            self.assertEqual(args, self.MMAP, ram)
+            self.assertEqual(env, self.DEMAND, ram)
+            self.assertTrue(note, ram)
+
+    def test_the_threshold_is_the_published_need_minus_the_shave(self):
+        self.assertEqual(setup.KOLIBRI_TABLE_RAM_SHAVE_GB, 4)
+        self.assertEqual(self.placement(52)[2], "")
+        self.assertNotEqual(self.placement(51.9)[2], "")
+
+    def test_an_explicit_reserve_is_carried_through(self):
+        self.assertEqual(self.placement(32, reserve=1536)[0][-1], "1536")
+        self.assertEqual(self.placement(64, on_hip=True, reserve=1536)[0][-1], "1536")
+
+    def test_the_note_states_its_numbers_in_gib(self):
+        note = self.placement(32)[2]
+        self.assertIn("32 GiB", note)
+        self.assertIn("52 GiB", note)
+        self.assertIn("43 GiB", note)
+
+    def test_the_note_promises_neither_startup_nor_speed(self):
+        note = self.placement(32)[2].lower()
+        for claim in ("guarantee", "will start", "always start", "faster", "slower"):
+            self.assertNotIn(claim, note)
+
+    def test_unreadable_ram_is_conservative_and_says_so(self):
+        args, env, note = self.placement(0)
+        self.assertIn("--expert-no-pin", args)
+        self.assertIn("unknown", note.lower())
+        self.assertNotIn("0 GiB", note)
+
+
 if __name__ == "__main__":
     unittest.main()

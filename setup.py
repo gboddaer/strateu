@@ -667,7 +667,8 @@ OWN_PATH_FAMILIES = {
                 "hf": hf("Hob-forge/Kolibri-1-GGUF"), "file": "Kolibri-1-{q}.gguf", "tag": "kolibri-",
                 "name": "kolibri-1", "license": "Apache 2.0: https://huggingface.co/AlephAlpha/Kolibri-1",
                 "binary": "strata-kolibri",   # source-build family: its own engine binary (src/kolibri), compiled in build/
-                "models": {"Q4_K_M": {"about": "4-bit (Q4_K experts, Q6_K down-projections every 5th layer)", "ram_gb": 56}},
+                "models": {"Q4_K_M": {"about": "4-bit (Q4_K experts, Q6_K down-projections every 5th layer)",
+                                      "ram_gb": 56, "expert_table_gib": 42.9}},   # 42.90 GiB pinned, the engine's load line
                 # the Q4_K_M hash is the HF API LFS oid at the pinned commit, from the local files' .fetch/ script
                 # (HEAD at 40eaa5cf: 200, 47454113472 bytes).  Q4_K_M is the only size setup offers: Q5_K_M, Q6_K
                 # and Q8_0 live in repo SUBFOLDERS (Q8_0/Kolibri-1-Q8_0-0000i-of-00002.gguf - a flat URL is a 404)
@@ -7778,6 +7779,34 @@ def own_path_size(fam: dict, ram: float) -> str:
     """The recommended size: the largest file whose RAM need this PC has (the smallest when none fits)."""
     fits = [m for m, d in fam["models"].items() if ram >= d["ram_gb"]]
     return max(fits, key=lambda m: own_path_bytes(fam, m)) if fits else next(iter(fam["models"]))
+
+
+# The shave this file already applies to RAM checks of the same shape (see MODELS' "ram_gb" - 4 below).  The values
+# are GiB despite the historical _gb suffix: ram_gb() and the size tables are GiB.
+KOLIBRI_TABLE_RAM_SHAVE_GB = 4
+
+
+def kolibri_expert_placement(fam: dict, model: str, ram: float, on_hip: bool,
+                             profile: Path, reserve_mib: int) -> tuple[list[str], dict[str, str], str]:
+    """Kolibri's expert placement for this PC: the pinned table when the detected RAM holds it, else the mmap cache.
+
+    Returns the placement's own engine arguments, the environment entries it adds, and the explanation setup prints.
+    The threshold is setup's recommendation, not a measured allocation boundary: free VRAM and the file cache decide
+    whether the mmap cache fits and how fast it runs.  No I/O, and the current process environment is not read.
+    """
+    need = fam["models"][model]
+    slot_args = ["--expert-slots", "auto", "--expert-slots-hot",
+                 "--expert-slots-profile", str(profile), "--vram-reserve-mib", str(reserve_mib)]
+    threshold = need["ram_gb"] - KOLIBRI_TABLE_RAM_SHAVE_GB
+    if ram >= threshold:
+        return (slot_args, {}, "") if on_hip else (["--expert-slots", "0"], {}, "")
+    where = (f"this PC has {ram:.0f} GiB RAM" if ram > 0
+             else "this PC's RAM is unknown to setup (it could not be read)")
+    note = (f"{fam['title']} {model}: {where}; setup's table-placement threshold is {threshold:.0f} GiB.\n"
+            f"Selecting the mmap demand cache to avoid the approximately {need['expert_table_gib']:.0f} GiB pinned "
+            "expert table.  Available VRAM and file-cache/storage performance still affect whether it fits and "
+            "how fast it runs.")
+    return (["--expert-no-pin"] + slot_args, {"STRATA_KOLIBRI_NOPIN_PROFILE": "demand"}, note)
 
 
 def own_path_vision(a, fam: dict, gpu: dict, hip: bool) -> str:
