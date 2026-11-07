@@ -302,6 +302,7 @@ struct LayerBlobs {
     const uint8_t* dn_src = nullptr;
     size_t gu_eb = 0;
     size_t d_eb = 0;
+    std::unique_ptr<uint8_t[]> hstage_owner;
     uint8_t* hstage = nullptr;      // no-pin staging: `spill` blobs packed here, then copied to b.dev
 };
 
@@ -3608,10 +3609,16 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                                                                                kvh * G, nt, P, (int) D, ldp,
                                                                                sliding ? (int64_t) g.n_swa : 0,
                                                                                (int) first, s.att_s);
-                    } else if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, D, &one, Kh, CUDA_R_16F, D, 0,
+                    } else {
+                        const auto status = cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, D, &one, Kh, CUDA_R_16F, D, 0,
                                                    Qh, CUDA_R_16F, H * D, D, &zero, Sh, CUDA_R_32F, ldp,
-                                                   (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
-                        CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "strata-kolibri: scores GEMM failed\n"); std::exit(1); }
+                                                   (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+                        if (status != CUBLAS_STATUS_SUCCESS) {
+                            std::fprintf(stderr, "strata-kolibri: scores GEMM failed: status=%d P=%d nt=%d D=%d ldp=%d G=%d\n",
+                                         (int) status, P, nt, D, ldp, G);
+                            std::exit(1);
+                        }
+                    }
                 }
                 ph_close(e.cnt.attn_sc_ns);
                 k_attn_softmax16<<<dim3(nt, H), kThreads>>>(s.att_s, s.p16, ldp, nt, P, (int) pp0 + t0,
@@ -3811,7 +3818,52 @@ void forward_multi(Engine& e, Scratch& s, int T, int64_t p0, int T2 = 0, int64_t
                          NKc, uniq, h);
             std::fflush(stderr);
         }
-        if (b.native_ok && !(pool_all && e.cpu_threads > 0)) {
+        // Resolve only touched experts. Hits read the cache, misses are packed from the file map into
+        // a shared device stage. Its previous users must finish before the next layer/chunk reuses it.
+        std::vector<const uint8_t*> mapped_blobs;
+        if (e.no_pin) {
+            KC(cudaStreamSynchronize(g_st));
+            mapped_blobs.assign((size_t) g.n_expert, nullptr);
+            int staged = 0;
+            for (int sel = 0; sel < NKc; ++sel) {
+                const int id = A.ids_h[sel];
+                if (mapped_blobs[(size_t) id]) continue;
+                const int slot = e.slot_of[e.hot_idx(e.per_layer ? l : 0, id)];
+                if (slot >= 0) mapped_blobs[(size_t) id] = b.dev + (size_t) slot * b.stride;
+                else {
+                    uint8_t* dst = s.stage + (size_t) staged++ * b.stride;
+                    pack_blob(b, g, id, b.hstage);
+                    KC(cudaMemcpyAsync(dst, b.hstage, b.stride, cudaMemcpyHostToDevice, g_st));
+                    KC(cudaStreamSynchronize(g_st));   // packing the next blob reuses hstage
+                    mapped_blobs[(size_t) id] = dst;
+                }
+            }
+        }
+        if (e.no_pin && b.native_ok) {
+            // Same grouping as k_group: ascending expert id, then original selection order. Keep
+            // the original cap_groups: changing it changes the grouped kernel's reduction order.
+            std::vector<unsigned long long> ptr;
+            std::vector<int32_t> starts, dst, tok;
+            for (int id = 0; id < (int) g.n_expert; ++id) {
+                if (!mapped_blobs[(size_t) id]) continue;
+                ptr.push_back((unsigned long long) mapped_blobs[(size_t) id]);
+                starts.push_back((int32_t) dst.size());
+                for (int sel = 0; sel < NKc; ++sel) if (A.ids_h[sel] == id) {
+                    dst.push_back(sel); tok.push_back(sel / K);
+                }
+            }
+            starts.push_back(NKc);
+            const int32_t groups = (int32_t) ptr.size();
+            KC(cudaMemcpyAsync(A.grp_ptr_m, ptr.data(), ptr.size() * sizeof(ptr[0]), cudaMemcpyHostToDevice, g_st));
+            KC(cudaMemcpyAsync(A.grp_start_m, starts.data(), starts.size() * sizeof(starts[0]), cudaMemcpyHostToDevice, g_st));
+            KC(cudaMemcpyAsync(A.n_groups_m, &groups, sizeof(groups), cudaMemcpyHostToDevice, g_st));
+            KC(cudaMemcpyAsync(A.ent_dst_m, dst.data(), dst.size() * sizeof(dst[0]), cudaMemcpyHostToDevice, g_st));
+            KC(cudaMemcpyAsync(A.ent_tok_m, tok.data(), tok.size() * sizeof(tok[0]), cudaMemcpyHostToDevice, g_st));
+            strata::kernels::native_expert_grouped(b.L, A.grp_ptr_m, A.grp_start_m, A.n_groups_m, A.ent_dst_m,
+                                                   A.ent_tok_m, std::min<int64_t>(NKc, g.n_expert) + 1, NKc,
+                                                   A.xq8_m, s.scratch_m, A.gout_m, g_st);
+            KC(cudaStreamSynchronize(g_st));   // host metadata and staged weights remain live until consumed
+        } else if (b.native_ok && !(pool_all && e.cpu_threads > 0)) {
             if (e.counters && e.slots > 0) {   // pricing only; --counters runs
                 const int* hid = A.ids_h;   // already published - this used to be a SECOND synchronous D2H of the same ids
                 std::vector<char> seen((size_t) g.n_expert, 0);
@@ -4536,7 +4588,8 @@ static const int grp_max = [] {
                 strata::kernels::native_quantize_q8_1(A.h_m + (size_t) t * N, g_q8, N, 1, g_st);
                 for (int k = 0; k < K; ++k) {
                     const int sel = t * K + k;
-                    const uint8_t* blob = b.table + (size_t) A.ids_h[sel] * b.stride;
+                    const uint8_t* blob = e.no_pin ? mapped_blobs[(size_t) A.ids_h[sel]]
+                                                   : b.table + (size_t) A.ids_h[sel] * b.stride;
                     strata::kernels::native_mmvq(b.L.gu_type, blob, (const char*) g_q8, s.eg_m + (size_t) sel * FF,
                                                  N, FF, 1, g_st);
                     strata::kernels::native_mmvq(b.L.gu_type, blob + b.L.up_off, (const char*) g_q8,
@@ -4546,7 +4599,8 @@ static const int grp_max = [] {
             k_swiglu_rows<<<grid1((int64_t) NKc * FF), kThreads>>>(s.eg_m, s.eu_m, s.eh_m, (int64_t) NKc * FF);
             for (int sel = 0; sel < NKc; ++sel) {
                 strata::kernels::native_quantize_q8_1(s.eh_m + (size_t) sel * FF, g_q8, FF, 1, g_st);
-                const uint8_t* blob = b.table + (size_t) A.ids_h[sel] * b.stride + b.L.down_off;
+                const uint8_t* blob = (e.no_pin ? mapped_blobs[(size_t) A.ids_h[sel]]
+                                               : b.table + (size_t) A.ids_h[sel] * b.stride) + b.L.down_off;
                 strata::kernels::native_mmvq(b.L.d_type, blob, (const char*) g_q8, A.gout_m + (size_t) sel * N,
                                              FF, N, 1, g_st);
             }
@@ -4703,7 +4757,8 @@ void init_scratch(const Engine& e, Scratch& s) {
         {
             size_t stride_max = 0;
             for (const auto& bb : e.blobs) stride_max = std::max(stride_max, (size_t) bb.stride);
-            s.stage_n = 192;
+            // Unpinned prefill may touch every expert. This shared stage is paid for before auto-fit.
+            s.stage_n = e.no_pin ? (int) g.n_expert : 192;
             KC(cudaMalloc((void**) &s.stage, (size_t) s.stage_n * stride_max));
             KC(cudaMalloc((void**) &s.stage_ids_m, (size_t) Scratch::kTmax * (size_t) e.top_k * sizeof(int)));
             s.stage_rank.assign((size_t) g.n_expert, -1);
@@ -4953,6 +5008,22 @@ void init_scratch(const Engine& e, Scratch& s) {
         s.dec_x16 = (__half*) dalloc((size_t) g.n_embd * 2);
         s.dec_eh16 = (__half*) dalloc((size_t) 16 * g.n_ff * 2);   // one FF block per resident pick
     }
+    if (e.no_pin && e.prefill > 0) {
+        // These are prefill resources, not CPU-pool resources. The historical pool-only binding
+        // leaves GPU-only prefill with null ring pointers and no router publication event.
+        KC(cudaHostAlloc((void**) &s.ids_h, (size_t) Scratch::kTmax * K * sizeof(int), cudaHostAllocDefault));
+        KC(cudaEventCreateWithFlags(&s.ev, cudaEventDisableTiming));
+        s.act1.ids_h = s.ids_h; s.act1.ev = s.ev;
+        s.act1.k16 = s.k16; s.act1.v16 = s.v16;
+        s.act1.wts_m = s.wts_m;
+        if (pf_pipe_on()) {
+            KC(cudaHostAlloc((void**) &s.ids_h2, (size_t) Scratch::kTmax * K * sizeof(int), cudaHostAllocDefault));
+            KC(cudaEventCreateWithFlags(&s.ev2, cudaEventDisableTiming));
+            s.act2.ids_h = s.ids_h2; s.act2.ev = s.ev2;
+            s.act2.k16 = s.k16_2; s.act2.v16 = s.v16_2;
+            s.act2.wts_m = s.wts_m2;
+        }
+    }
     if (dense_f16_on()) {   // S6: the decode's fp16 activation buffers (one dense vector + the attention output)
         s.dec_h16 = (__half*) dalloc((size_t) g.n_embd * 2);
         s.dec_att16 = (__half*) dalloc((size_t) g.n_head * g.head_dim * 2);
@@ -4965,7 +5036,7 @@ void init_scratch(const Engine& e, Scratch& s) {
     // buffers (every use is a device kernel or the clear), so moving ONLY the full layers to VRAM changes the address
     // and nothing else.  Cost: 709.5 MiB of the ~4.5 GiB free.  The sliding layers keep their host ring (513 rows,
     // 26 MB in total).  STRATA_KOLIBRI_KV_DEV=1, default off until measured.
-    const bool kv_dev = env_on("STRATA_KOLIBRI_KV_DEV");
+    const bool kv_dev = e.no_pin || env_on("STRATA_KOLIBRI_KV_DEV");
     s.kv_int8 = env_on("STRATA_KOLIBRI_KV_INT8");
     if (s.kv_int8) {
         // Existing per-layer transposed mirrors remain valid: restore and quantize this
@@ -4993,7 +5064,7 @@ void init_scratch(const Engine& e, Scratch& s) {
             using strata::kolibri::experimental::Kv8Block;
             Kv8Block *pk=nullptr, *pv=nullptr;
             const size_t bytes=elems/64*sizeof(Kv8Block);
-            if (kv_dev && !sliding) {
+            if (kv_dev && (e.no_pin || !sliding)) {
                 KC(cudaMalloc((void**)&pk,bytes)); KC(cudaMalloc((void**)&pv,bytes));
             } else {
                 KC(cudaHostAlloc((void**)&pk,bytes,cudaHostAllocDefault));
@@ -5002,7 +5073,7 @@ void init_scratch(const Engine& e, Scratch& s) {
             KC(cudaMemset(pk,0,bytes)); KC(cudaMemset(pv,0,bytes));
             s.k8.push_back(pk); s.v8.push_back(pv);
             s.kc.push_back(s.kv8_stage_k); s.vc.push_back(s.kv8_stage_v);
-        } else if (kv_dev && !sliding) {
+        } else if (kv_dev && (e.no_pin || !sliding)) {
             void* pk = nullptr;
             void* pv = nullptr;
             KC(cudaMalloc(&pk, elems * 2));
@@ -5402,6 +5473,7 @@ static void slot_promote(Engine& e, int id, int slot) {
         if (e.no_pin) {   // pack into the staging blob, then one H2D from it; there is no pinned source
             pack_blob(b, e.g, id, b.hstage);
             KC(cudaMemcpyAsync(b.dev + b.stride * (size_t) slot, b.hstage, b.stride, cudaMemcpyHostToDevice, g_st));
+            KC(cudaStreamSynchronize(g_st));   // hstage is reused by the next promotion
             continue;
         }
         KC(cudaMemcpyAsync(b.dev + b.stride * (size_t) slot, b.table + b.stride * (size_t) id, b.stride,
@@ -5416,6 +5488,7 @@ static void slot_promote_layer(Engine& e, int64_t l, int id, int slot) {
     if (e.no_pin) {
         pack_blob(b, e.g, id, b.hstage);
         KC(cudaMemcpyAsync(b.dev + b.stride * (size_t) slot, b.hstage, b.stride, cudaMemcpyHostToDevice, g_st));
+        KC(cudaStreamSynchronize(g_st));   // pageable does not imply source lifetime ends at enqueue
         return;
     }
     KC(cudaMemcpyAsync(b.dev + b.stride * (size_t) slot, b.table + b.stride * (size_t) id, b.stride,
@@ -5540,7 +5613,9 @@ static void alloc_slots(Engine& e, int ctx) {
         size_t fb = 0, tb = 0;
         KC(cudaMemGetInfo(&fb, &tb));
         const long long reserve = (long long) e.vram_reserve_mib << 20;
-        const long long room = (long long) fb - reserve;
+        // Per-layer allocation rounding and lazy runtime workspaces are not part of stride_sum.
+        // Keep an extra 128 MiB fit margin in no-pin mode, beyond the user's runtime reserve.
+        const long long room = (long long) fb - reserve - (e.no_pin ? (128LL << 20) : 0);
         // + 1 zero slot per layer; --expert-no-pin also keeps `spill` staging slots per layer.
         const int stay = 1 + (e.no_pin ? e.spill : 0);
         int n = (stride_sum > 0 && room > (long long) stride_sum * stay) ? (int) (room / stride_sum) - stay : 0;
@@ -5558,9 +5633,9 @@ static void alloc_slots(Engine& e, int ctx) {
         std::fprintf(stderr,
                      "strata-kolibri: expert cache fit: %.0f MiB free after dense+KV+scratch -> %d slots/layer"
                      " (%.2f GiB), %d MiB kept for the runtime, %.0f MiB left\n",
-                     (double) fb / (1 << 20), e.slots, (double) (stride_sum * (e.slots + 1)) / (1 << 30),
+                     (double) fb / (1 << 20), e.slots, (double) (stride_sum * (e.slots + 1 + e.spill)) / (1 << 30),
                      e.vram_reserve_mib,
-                     (double) ((long long) fb - reserve - stride_sum * (e.slots + 1)) / (1 << 20));
+                     (double) ((long long) fb - reserve - stride_sum * (e.slots + 1 + e.spill)) / (1 << 20));
     }
     e.slots = std::min(e.slots, n_exp);
     // What starts resident: the profile's hot set if there is one, else experts 0..S-1 (the id-ordered cache).  Per
@@ -6375,10 +6450,10 @@ bool load(const std::string& path, Engine& e, std::string& err) {
         const size_t sb = lcm(lcm((size_t) 144, (size_t) 210), (size_t) 34);   // Q4_K / Q6_K / Q8_0 super-blocks
         b.stride = ((b.L.bytes + sb - 1) / sb) * sb;
         if (e.no_pin) {
-            // No pinned table: a pageable staging buffer of `spill` blobs is the only host copy, and it exists only
-            // for the duration of one layer step.  Host RAM then holds the GGUF through the page cache, evictable.
-            b.hstage = (uint8_t*) std::malloc(b.stride * (size_t) std::max(1, e.spill));
-            if (b.hstage == nullptr) { err = "--expert-no-pin: host staging allocation failed"; return false; }
+            // Bounded pageable staging per layer, reused across steps. The full expert backing
+            // stays in the evictable file cache, rather than a duplicated pinned host table.
+            b.hstage_owner = std::make_unique<uint8_t[]>(b.stride * (size_t) std::max(1, e.spill));
+            b.hstage = b.hstage_owner.get();
         } else {
             KC(cudaHostAlloc((void**) &b.table, b.stride * (size_t) (e.g.n_expert + 1), cudaHostAllocDefault));
             if (poison_zero_slot())
@@ -6485,7 +6560,14 @@ bool load(const std::string& path, Engine& e, std::string& err) {
     }
     int native_layers = 0;
     for (const LayerBlobs& b : e.blobs) native_layers += b.native_ok ? 1 : 0;
-    std::fprintf(stderr,
+    if (e.no_pin) {
+        size_t staging_bytes = 0;
+        for (const auto& b : e.blobs) staging_bytes += b.stride * (size_t) e.spill;
+        std::fprintf(stderr, "strata-kolibri: %s: %zu tensors (layout checked); %.2f GiB expert blobs backed by GGUF mmap; "
+                             "%.0f MiB pageable staging; no pinned expert table; dense %.2f GiB on GPU; %.1f s\n",
+                     path.c_str(), checked, (double) expert_bytes / (1LL << 30),
+                     (double) staging_bytes / (1 << 20), (double) dense_bytes / (1LL << 30), secs);
+    } else std::fprintf(stderr,
                  "strata-kolibri: %s: %zu tensors (layout checked); experts %zu x %zu blobs repacked, %.2f GiB "
                  "pinned; dense %.2f GiB on the GPU; native expert kernels for %zu / %zu layers; %.1f s\n",
                  path.c_str(), checked, e.blobs.size(), (size_t) e.g.n_expert, (double) expert_bytes / (1 << 30),
@@ -6640,14 +6722,8 @@ int strata::kolibri::run(int argc, char** argv) {
     e.hist_on = env_on("STRATA_KOLIBRI_EXPERT_HIST");   // coverage probe; before load() so the table is sized
     e.no_pin = no_pin != 0;   // before load(): the pinned table is allocated (or not) there
     e.slots = slots;          // before load(): --expert-no-pin refuses 0, and auto (-1) resolves later
-    if (e.no_pin && prefill > 0) {
-        // The prefill expert leg (forward_multi) still reads LayerBlobs::table at six sites.  Say so, rather than
-        // run with a null table and ship zeros.
-        std::fprintf(stderr, "strata-kolibri: --expert-no-pin does not serve --prefill yet: the prefill expert leg "
-                             "reads the pinned table.  Drop --prefill (the prompt goes through the decode path, "
-                             "which no-pin does serve) or run without --expert-no-pin.\n");
-        return 1;
-    }
+    e.cpu_threads = cpu_threads;   // load's compatibility checks must see the actual requested options
+    e.grouped = grouped;
     if (!load(model, e, err)) {
         std::fprintf(stderr, "strata-kolibri: %s\n", err.c_str());
         return 1;
@@ -6713,17 +6789,11 @@ int strata::kolibri::run(int argc, char** argv) {
         }
     }
     e.prefill = prefill;
-    if (e.no_pin && e.prefill > 0) {   // serve mode forces prefill on above; the same refusal applies
-        std::fprintf(stderr, "strata-kolibri: --expert-no-pin does not serve the prefill arm yet (it reads the pinned "
-                             "table).  Run without --expert-no-pin, or STRATA_KOLIBRI_SERVE_TOKENS=1 for the "
-                             "per-token path.\n");
-        return 1;
-    }
     // The CPU pool is OPT-IN (--cpu-threads) and its absence is SILENT: with no pool every routed expert falls
     // through to the per-expert GPU mmvq loop (measured on 2026-10-21: 364,350 mmvq launches = 26.8 s of 35 s
     // GPU busy, and the prefill 4.6x slower - 22,126 ms vs 4,744 ms - with nothing in the log).  A future reader
     // would read that as a regression, so the prefill says so out loud.
-    if (e.prefill > 0 && e.cpu_threads == 0)
+    if (e.prefill > 0 && e.cpu_threads == 0 && !e.no_pin)
         std::fprintf(stderr, "strata-kolibri: WARNING: --prefill without --cpu-threads means NO CPU pool: every "
                              "routed expert takes the per-expert GPU mmvq fallback (measured 4.6x slower on the "
                              "512-token prefill: 22,126 ms vs 4,744 ms).  Pass --cpu-threads 24 for the speed "
@@ -6860,7 +6930,9 @@ int strata::kolibri::run(int argc, char** argv) {
                 return 2;
             }
             g_expert_stream_disabled = true;
-            std::fprintf(stderr, "kolibri: expert streaming unavailable (%s); serving this run on the CPU pool\n", why);
+            if (e.no_pin)
+                std::fprintf(stderr, "kolibri: mmap-backed GPU expert cache active; CPU streaming leg disabled\n");
+            else std::fprintf(stderr, "kolibri: expert streaming unavailable (%s); serving this run on the CPU pool\n", why);
         }
     }
     if (stream_capture_on()) {
@@ -7154,6 +7226,7 @@ int strata::kolibri::run(int argc, char** argv) {
     dyn_probe_finish(e);
     std::printf("\n");
     print_counters(e, "run");
+    if (e.no_pin) hot_profile_save(e);   // direct CLI runs should persist the learned set too
     if (fl) std::fclose(fl);
     if (fg) std::fclose(fg);
     if (ff) std::fclose(ff);
