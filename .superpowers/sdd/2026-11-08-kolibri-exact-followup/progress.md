@@ -27,7 +27,7 @@ Plan: `docs/superpowers/plans/2026-11-08-kolibri-exact-followup.md`.
 |---|---|---|---|
 | 0 driver budget | in progress | tests + controls below | pending |
 | 2 selected MMVQ | KEEP + KEEP-ENABLER (fix review pending) | full-logit gates + 5 timing pairs + integration matrix | review 1 acted on |
-| 3 quantization reuse | not started | | |
+| 3 quantization reuse | REJECT (no repeatable gain, no named consumer) | exactness + 5 timing pairs + integration | review 1 agrees |
 | 4 cache admission | not started | | |
 | 5 synchronization | not started | | |
 | 6 promotion fences | not started | | |
@@ -110,3 +110,22 @@ Decision: KEEP (local W7800 decode) + KEEP-ENABLER for Task 3.
 | Integration runner used a 300 s watchdog | Procedural | FIXED: `--timeout` default 10800. The completed artifacts were not rerun; every case finished well inside 300 s, so no timeout was mistaken for a pass. Recorded in the manifest. |
 
 Third focused review requested for evidence closure.
+
+## Task 3 — explicit quantization reuse (REJECTED)
+
+Evidence: `.superpowers/sdd/2026-11-08-kolibri-exact-followup/task3/summary.md`,
+`task3/integration-compare.txt`, timing JSONs and logs.
+Four flag combinations on 512/128 all kept SHA `6ffefa8f...`; cache8 both `466f48f2...`; 10/10 short/long/hot/profile
+dumps byte-identical. Reuse alone 512 paired median -0.1% (ratio of medians -10.2%), cache8 neutral; both flags vs
+selected alone -0.8% with a 4.36 tok/s outlier. No named retained consumer.
+Review 1 (`gpt-6.1-sol`, exit 0) agreed with REJECT. Helper, wiring, flag, test and CMake target removed; evidence kept.
+
+### Review findings
+
+| Finding | Sev | Resolution |
+|---|---|---|
+| Reuse integration exact but no repeatable gain and no justified enabler | Decision | REJECTED and removed as proposed. |
+| Test calls existing primitives, not `gemv_pair_quantized`; no production RED | Medium | Recorded as a skipped qualification; the experiment was rejected, so no retained code depends on it. |
+| Task 3 evidence lacks a 4097/8 comparison and pinned-table numerical qualification | Medium | Recorded as skipped/not qualified; not claimed as passed. The integration runner is no-pin only. |
+| Short `g_ids_host` fallback in `gemv()` can index out of bounds | Medium | PRE-EXISTING legacy defect exposed by the removed guard; no normal-path trigger found. Recorded for follow-up, not introduced by this task. |
+

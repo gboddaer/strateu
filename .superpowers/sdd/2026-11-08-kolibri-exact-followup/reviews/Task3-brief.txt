@@ -1,0 +1,27 @@
+Independent review of plan Task 3 (explicit activation quantization reuse). Read-only; do not edit.
+
+TASK: `docs/superpowers/plans/2026-11-08-kolibri-exact-followup.md`, "Task3". Candidate: one explicit q8_1 producer for
+an adjacent gate/up pair, consumed by both matrices; flag STRATA_KOLIBRI_REUSE_Q8=1 default off; no stale reuse across
+groups or down projections; exact bytes and outputs.
+
+DIFF SCOPE: working tree against HEAD 33ed811a on amdw7800probuild_optimize:
+`src/kolibri/kolibri_engine.cu`, `tests/kolibri/quant_reuse_test.cpp`, `CMakeLists.txt`.
+The candidate also uses Task 2's selected API when both flags are on.
+
+EVIDENCE: `.superpowers/sdd/2026-11-08-kolibri-exact-followup/task3/summary.md`,
+`task3/integration-compare.txt`, timing JSONs, logs. Key: four flag combinations on 512/128 all SHA 6ffefa8f...;
+cache8 both SHA 466f48f2...; 10/10 integration dumps byte-identical; reuse alone 512 paired median -0.1%
+(ratio of medians -10.2%), cache8 neutral; both flags vs selected alone ratio -0.8% with a 4.36 tok/s outlier.
+
+CLAIMED DECISION: REJECT the integration (exact but no repeatable gain, cache8 neutral, no named retained consumer);
+remove helper/wiring/flag/test after review.
+
+CHECK with file:line:
+1. Is the reuse actually exact in every wired path: same activation, same columns, same stream ordering, no stale
+   bytes between groups, gate/up shapes/types, pinned and no-pin bases, n_sel range?
+2. Does the helper preserve the legacy path for non-quantized/mismatched shapes and when the host pick array is short?
+3. Is the test meaningful, and is the lack of a production RED a fatal gap for an experiment that is rejected anyway?
+4. Is the timing/decision evidence sufficient to REJECT? Could reuse be a justified enabler for a later task/final
+   composition despite no standalone gain?
+5. Any correctness or lifecycle defect, even if the code is about to be removed.
+State findings by severity with file:line. If REJECT is the right decision, say so plainly.
