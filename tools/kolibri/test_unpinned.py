@@ -15,6 +15,7 @@ p.add_argument('--model', required=True)
 p.add_argument('--out', default='/tmp/kolibri-unpinned-check')
 p.add_argument('--phase', choices=['short', 'long', 'hot', 'all'], default='all')
 p.add_argument('--hot', action='store_true', help='enable per-layer hot residency (required by demand profile)')
+p.add_argument('--timeout', type=float, default=10800.0, help='per-process watchdog in seconds')
 a = p.parse_args()
 out = pathlib.Path(a.out)
 out.mkdir(parents=True, exist_ok=True)
@@ -27,7 +28,7 @@ if a.hot:
 
 def run(name, args, expected=0):
     with (out / (name + '.log')).open('w') as log:
-        r = subprocess.run(base + args, stdout=log, stderr=subprocess.STDOUT, timeout=300)
+        r = subprocess.run(base + args, stdout=log, stderr=subprocess.STDOUT, timeout=a.timeout)
     assert r.returncode == expected, (name, r.returncode, out / (name + '.log'))
     return (out / (name + '.log')).read_text()
 

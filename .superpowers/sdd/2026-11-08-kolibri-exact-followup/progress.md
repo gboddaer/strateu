@@ -26,7 +26,7 @@ Plan: `docs/superpowers/plans/2026-11-08-kolibri-exact-followup.md`.
 | Task | Decision | Evidence | Review |
 |---|---|---|---|
 | 0 driver budget | in progress | tests + controls below | pending |
-| 2 selected MMVQ | not started | | |
+| 2 selected MMVQ | KEEP + KEEP-ENABLER (fix review pending) | full-logit gates + 5 timing pairs + integration matrix | review 1 acted on |
 | 3 quantization reuse | not started | | |
 | 4 cache admission | not started | | |
 | 5 synchronization | not started | | |
@@ -78,3 +78,35 @@ assertions. FIXED: both now use the marker stub, assert `must differ`, assert no
 
 Final Task 0 evidence: 17 tests OK; `py_compile` OK for tool and tests; controls rerun at 10800 s with identical
 hashes. Decision: **KEEP** (test-driver correctness fix; no engine change, no speed claim).
+
+## Task 2 — exact multi-selection MMVQ
+
+Evidence: `.superpowers/sdd/2026-11-08-kolibri-exact-followup/task2/summary.md`, `mmvq_selected_test.log`,
+`integration-off/`, `integration-on/`, timing JSONs.
+Full logits: off/on 512/128 `6ffefa8f...`, cache8 `466f48f2...`, 4097/8 `241969a0...`; integration 10/10 cases identical.
+Timing: 512/128 decode 5/5 faster, paired median +20.9%; cache8 inconclusive (+2.8% paired median, one -13.3%).
+Decision: KEEP (local W7800 decode) + KEEP-ENABLER for Task 3.
+
+### Task 2 review 1 (`gpt-6.1-sol`, exit 0)
+
+| Finding | Sev | Resolution |
+|---|---|---|
+| Q6 refusal keyed on env flag, not per-pointer registration; a directly packed matrix could bypass | Important | FIXED: `q6_packed_registered()` checks each selected pointer; packed-Q6 sentinel test added. |
+| gfx906 default-wave mode would run the parity test and fail by design | Important | FIXED: gfx906 parity test runs with `STRATA_MMVQ_WAVE=0`; separate `--expect-refusal` test registered only for gfx906. Not runnable on this gfx1100 host. |
+| Required short/long/hot regression matrix and profile replay missing | Important | FIXED: `test_unpinned.py --phase all --hot` off/on; 10/10 complete dumps byte-identical. |
+| Unaligned base throws while derived returns false; contract unclear | Minor | FIXED: header states the distinction; tests cover unaligned base throw and unaligned derived false. |
+| Cache8 median misreported as +0.1% | Reporting | FIXED: summary now +2.8% paired, +0.47% ratio of medians, still inconclusive. |
+| RED evidence and ctest log incomplete | Evidence | FIXED: RED compile error, GREEN test log and integration hashes recorded. |
+| ctest `decode_wait` failure | Environment | Device-0 mismatch: test is registered with `HIP_VISIBLE_DEVICES=0`; same binary passes on device 1, and the failure reproduces without this change. |
+
+### Task 2 review 2 (`gpt-6.1-sol`, exit 0) — fix verification
+
+| Finding | Sev | Resolution |
+|---|---|---|
+| Integration report claimed a SHA list that did not exist; off/on equality not auditable | Important | FIXED: `task2/integration-compare.txt` has per-case size, float count, finiteness, SHA-256, equality, input/profile hashes and run-time executable hash. 10/10 finite and identical. |
+| gfx906 refusal test inherited `STRATA_MMVQ_WAVE` | Minor | FIXED: refusal test forces `STRATA_MMVQ_WAVE=1`, parity forces `=0`. |
+| Packed-Q6 sentinel could pass under inherited `STRATA_Q6_PACKED=1` | Minor | FIXED: test unsets it at entry; only the later of two selections is registered, exercising the per-pointer loop. |
+| cache8 summary still said +0.7% | Reporting | FIXED: +0.47% ratio of medians, +2.8% paired median, inconclusive. |
+| Integration runner used a 300 s watchdog | Procedural | FIXED: `--timeout` default 10800. The completed artifacts were not rerun; every case finished well inside 300 s, so no timeout was mistaken for a pass. Recorded in the manifest. |
+
+Third focused review requested for evidence closure.

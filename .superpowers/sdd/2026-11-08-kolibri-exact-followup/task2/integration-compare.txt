@@ -1,0 +1,30 @@
+# Task 2 integration comparison
+
+integration executable: build-kolibri-hip/strata-kolibri sha256 d9474ffe711878c508566e26fd65a01e3c5b35ca8a8d4e3a3736b148ddc0870f
+current executable after the per-pointer Q6 refusal fix: sha256 fae6bb4203fa5b8dd1389af2da38c616807f64b6b9236286402b28ce541262f4
+(the fix only adds a Q6 registry lookup; these runs select Q4_K and register no Q6 table; flag-on 512/128 was rerun with the current binary and kept the same hash)
+model: /home/gbo/models/Kolibri-1-Q4_K_M.gguf sha256 c2ac1301424441ef210b6de50ce25e8ccf69f86494df53d6ba52ed558456062e
+off command: tools/kolibri/test_unpinned.py --phase all --hot (no STRATA_KOLIBRI_MMVQ_SELECTED)
+on command: same with STRATA_KOLIBRI_MMVQ_SELECTED=1
+driver: tools/kolibri/test_unpinned.py (these runs used the old 300 s per-case watchdog and all completed; the driver now defaults to 10800 s, but these artifacts were not rerun)
+
+| case | bytes | floats | finite | sha256 | identical |
+|---|---|---|---|---|---|
+| decode-short-spill | 2048000 | 512000 | True | `2e755d6f1e8411dfdc78992dd18557515923f4c5a36ead39c9b4d15234fd7f71` | True |
+| decode-short | 2048000 | 512000 | True | `2e755d6f1e8411dfdc78992dd18557515923f4c5a36ead39c9b4d15234fd7f71` | True |
+| decode | 2048000 | 512000 | True | `49fce53c80a8e08d028f719c471f8cc55c883034b9779bfb7f1617bd46aa146f` | True |
+| hot-cold | 2048000 | 512000 | True | `42dd3dab9601a539e44a772f8833093c6b9e4d78216dd8bf3616db628cc0b3ec` | True |
+| hot-warm | 2048000 | 512000 | True | `42dd3dab9601a539e44a772f8833093c6b9e4d78216dd8bf3616db628cc0b3ec` | True |
+| long-prefill-spill | 2048000 | 512000 | True | `fbfb227e004397683e2466592728e832699b311157c561a84ad4b72731baa454` | True |
+| long-prefill | 2048000 | 512000 | True | `fbfb227e004397683e2466592728e832699b311157c561a84ad4b72731baa454` | True |
+| prefill-repeat | 2048000 | 512000 | True | `b2b99a9c7bf01cdbbdedc7c6aeb24767baab3a57d9b7e43aea50fd0ed75121f5` | True |
+| prefill-spill | 2048000 | 512000 | True | `b2b99a9c7bf01cdbbdedc7c6aeb24767baab3a57d9b7e43aea50fd0ed75121f5` | True |
+| prefill | 2048000 | 512000 | True | `b2b99a9c7bf01cdbbdedc7c6aeb24767baab3a57d9b7e43aea50fd0ed75121f5` | True |
+- integration-off/ids8.txt: 37 bytes, sha256 `f77b098354adecc1b91129f3fd951da9006f4567885d8c3dde8397428b83e004`
+- integration-on/ids8.txt: 37 bytes, sha256 `f77b098354adecc1b91129f3fd951da9006f4567885d8c3dde8397428b83e004`
+- integration-off/ids1025.txt: 4524 bytes, sha256 `c1f3beb81fec7f05995ae4304e6dd0b3b2d9eb3e5df4f87512031554f4336103`
+- integration-on/ids1025.txt: 4524 bytes, sha256 `c1f3beb81fec7f05995ae4304e6dd0b3b2d9eb3e5df4f87512031554f4336103`
+- integration-off/hot.profile: 16703 bytes, sha256 `5e33f6ab0109254fd74aa40f2b5b4e70f723ed7f2f2e266b16cd54fe8c76e881`
+- integration-on/hot.profile: 16703 bytes, sha256 `5e33f6ab0109254fd74aa40f2b5b4e70f723ed7f2f2e266b16cd54fe8c76e881`
+
+All ten complete dumps finite and byte-identical: **True**

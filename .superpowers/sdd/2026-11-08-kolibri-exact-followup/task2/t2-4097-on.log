@@ -1,0 +1,27 @@
+kolibri: decode acceleration off (--cpu-threads must select the CPU pool); running the plain decode path
+strata-kolibri: /home/gbo/models/Kolibri-1-Q4_K_M.gguf: 903 tensors (layout checked); 42.90 GiB expert blobs backed by GGUF mmap; 15 MiB pageable staging; no pinned expert table; dense 1.62 GiB on GPU; 1.4 s
+CNT vram free=42.96 GiB total=44.98 GiB (after dense upload)
+strata-kolibri: expert cache: PER-LAYER residency map (50 layers x 384 experts), not one global set (default; --no-expert-slots-per-layer for a single set)
+strata-kolibri: expert cache: a round every 32 position(s), at most 96 move(s) mid-request and 2048 after a request, min gain 1.50, decay 0.70
+kolibri: mmap-backed GPU expert cache active; CPU streaming leg disabled
+strata-kolibri: expert cache fit: 39860 MiB free after dense+KV+scratch -> 326 slots/layer (37.20 GiB), 1536 MiB kept for the runtime, 230 MiB left
+strata-kolibri: expert cache: 326 slots/layer = 36.42 GiB VRAM
+strata-kolibri: (ctx, slots) draw on the same VRAM: 1 slot = 114 MiB = 5857 context tokens at 20.0 KB/token; ctx 131072 x 20480 = 2.50 GiB, 1710 MiB free (reserve 1536 MiB)
+NOPIN_PHASE startup tokens=0 ms=120486.961
+PFchunk 512/4096 13698ms
+PFchunk 1024/4096 21177ms
+PFchunk 1536/4096 27523ms
+PFchunk 2048/4096 33521ms
+PFchunk 2560/4096 39667ms
+PFchunk 3072/4096 45769ms
+PFchunk 3584/4096 51914ms
+PFchunk 4096/4096 58009ms
+strata-kolibri: hot slots [after prompt]: 1222 expert(s) newly resident after 1228800 picks (mean gain 136.84+), 2795 MiB over PCIe in 1599.8 ms, budget 2048 (per-layer map)
+NOPIN_PHASE prefill tokens=4096 ms=59611.616
+strata-kolibri: selected MMVQ n_sel=6 n_in=2560 n_out=512
+NOPIN_PHASE decode tokens=8 ms=564.810
+CNT run tok=8 | slot hits=2394 miss=6 (99.8% hit) expert PCIe=1.8 MB/tok | d2h=8/4096000 B (0.5 MB/tok) h2d=0/0 B (0.0 MB/tok) | reset=0 ms / 0 (0.00 ms)
+CNT decode residency: 0 of 0 picks served from the fp16 cache (0.0%)
+CNT branches per tok: pool 0.0 gpu-expert 50.0 slots-path 50.0 grouped 0.0 (layers/token total 50.0 of 50)
+strata-kolibri: hot profile: 9509 of 16300 slot(s) written to .superpowers/sdd/2026-11-08-kolibri-exact-followup/task2/t2-4097-on.profile
+gen: 940 3515 310 262 14292 1343 1444 314
