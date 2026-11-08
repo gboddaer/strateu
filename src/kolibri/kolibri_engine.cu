@@ -2073,6 +2073,7 @@ struct Scratch {
     __half* dec_x16 = nullptr;
     __half* dec_eh16 = nullptr;
     __half* dec_att16 = nullptr;
+    float* zero_yc = nullptr;     // opt-in immutable K*N zero buffer for the skip-zero-overflow path
     int* ids;
     std::vector<__half*> kc, vc;   // S3: FP16 KV -- half the bytes/token and half the prefill traffic
     strata::kolibri::prefix::Cache prefix_cache;
@@ -3201,6 +3202,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
             }
             KC(cudaStreamSynchronize(g_st));   // the slot gemv run on g_st; k_moe_sum2 below reads ey2 on the default stream
             float* yc;
+            bool zero_used = false;
             if (e.cpu_threads > 0 && b.pool_ok) {   // the pool's own capability, not the GPU's (see LayerBlobs)
                 if (e.counters) ++e.cnt.br_pool;
                 g_ids_host.assign(g_ids_host.size(), 0);   // restored below from the device ids
@@ -3229,7 +3231,8 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                 if (e.counters) ++e.cnt.br_gpu;   // slots miss served from the pinned table over PCIe
                 if (e.no_pin && np_option("STRATA_KOLIBRI_SKIP_ZERO_OVERFLOW") &&
                     strata::kolibri::skip_zero_overflow(nopin_miss.size(), poison_zero_slot())) {
-                    KC(cudaMemsetAsync(s.ey, 0, (size_t) K * N * sizeof(float), g_st));
+                    if (s.zero_yc) zero_used = true;   // immutable buffer: no per-layer memset, no aliasing
+                    else KC(cudaMemsetAsync(s.ey, 0, (size_t) K * N * sizeof(float), g_st));
                     if (np_stats_on()) ++g_np_stats.zero_skips;
                 } else {
                 const uint8_t* ovf_base = e.no_pin ? b.dev : b.table;   // no table in no-pin: the spill slots are the source
@@ -3239,6 +3242,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                 gemv(dn, s.eh, s.ey, s.ids, K, FF, ovf_base + b.L.down_off, b.stride);
                 }
                 yc = s.ey;
+                if (zero_used) yc = s.zero_yc;   // the unconditional fallback above must not undo the skip
             }
             KC(cudaStreamSynchronize(g_st));   // the shared-expert gemv ran on g_st; the sum below reads sy on the default stream
             s.yc = yc;   // the MoE sum runs in the shared code, after the shared-expert gemv
@@ -4966,6 +4970,10 @@ void init_scratch(const Engine& e, Scratch& s) {
     s.att = dalloc(g.n_head * g.head_dim);
     s.router = dalloc(g.n_expert);
     s.eg = dalloc((size_t) K * FF); s.eu = dalloc((size_t) K * FF); s.eh = dalloc((size_t) K * FF); s.ey = dalloc((size_t) K * N);
+    if (env_on("STRATA_KOLIBRI_ZERO_BUFFER")) {
+        s.zero_yc = dalloc((size_t) K * N);
+        KC(cudaMemset(s.zero_yc, 0, (size_t) K * N * sizeof(float)));
+    }
     s.sg = dalloc(g.n_ff_shexp); s.su = dalloc(g.n_ff_shexp); s.sh = dalloc(g.n_ff_shexp);
     s.wts = dalloc(K);
     KC(cudaMalloc((void**) &s.pos_d, 4));

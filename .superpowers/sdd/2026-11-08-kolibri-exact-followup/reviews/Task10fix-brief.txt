@@ -1,0 +1,21 @@
+Follow-up Task 10 review after your finding. Read the revised `task10/summary.md`.
+
+You were right: the first patch set yc=s.zero_yc inside the skip branch but the downstream `yc = s.ey` overwrote it.
+Fixed with `zero_used` and `if (zero_used) yc = s.zero_yc` after that line. Gate ZERO_BUFFER=1, default off, only with
+SKIP_ZERO_OVERFLOW=1.
+
+Evidence:
+- 512/128 skip path: off/on both `6ffefa8f...` (6114/6026 skips).
+- cache8: both `466f48f2...` (zero skips).
+- full integration with both flags: 10/10 dumps identical to Task 2 control.
+- 3 alternating 512 pairs: decode 13.82 -> 14.65 tok/s median, +5.6% paired, 3/3 positive (+23.9/+2.5/+5.6%).
+- all-resident does not fit (42.90 GiB vs 39,860 MiB free; 326/384 slots).
+
+Proposal: KEEP opt-in (no default promotion).
+
+Check:
+1. Is the corrected pointer path now exact and correctly scoped?
+2. Are the 3-pair gain and 10/10 integration enough to keep, or too noisy?
+3. Does the retained path actually remove the intended per-layer memset without aliasing?
+4. What targeted tests (miss->hit->miss, poison-zero, mixed types) are still missing.
+Say plainly whether KEEP opt-in is justified.

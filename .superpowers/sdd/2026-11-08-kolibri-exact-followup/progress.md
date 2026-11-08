@@ -32,9 +32,9 @@ Plan: `docs/superpowers/plans/2026-11-08-kolibri-exact-followup.md`.
 | 5 synchronization | REJECT (no repeatable speedup; removed) | gate + GPU ordering + 10 pairs + integration | review 3 agrees |
 | 6 promotion fences | REJECT (12 ms, no end-to-end gain demonstrated) | batch test + 389-move round + diff | review agrees |
 | 7 GPU hit dispatch | BLOCKED (prototype qualified; engine lifecycle deferred) | counters + DEC_PHASES + hit/miss/update/reset test | 4 reviews agree |
-| 8 CPU packing | not started | | |
-| 9 host-copy diagnosis | not started | | |
-| 10 zero buffer | not started | | |
+| 8 CPU packing | REJECT (two lanes slower) | byte-exact test + 2 alternating pairs | pending |
+| 9 host-copy diagnosis | REJECT (2 GB/s ceiling; no setting gain) | probe, default/SDMA on/off | pending |
+| 10 zero buffer | KEEP opt-in (+5.6% decode, exact; 5/5 pairs) | 5+5 pairs + 10/10 integration | pending |
 | final composition | not started | | |
 
 ## Task 0 — driver budget
@@ -164,3 +164,23 @@ hit -> miss -> map update -> map reset against CPU translation with complete out
 engine: partial residency still needs host ids for `np_admit` and misses, and all-resident does not fit (42.90 GiB
 experts vs 39,860 MiB after dense+KV+scratch; auto-fit 326 slots/layer). Experimental code removed; diff kept.
 BLOCKED, not a pass. No server.
+
+## Task 8 - bounded CPU packing (REJECTED)
+
+Two-lane packer was byte-exact (0/1/37/4099-byte spans, gaps, repeats, source lifetime, drain) and full logits stayed
+`6ffefa8f...`. On two 512/128 pairs packing was not faster: startup 70.8/148.0 s off vs 89.7/156.6 s on; prefill
+6.8/25.8 vs 21.3/19.3 s; decode 0.94/2.04 vs 2.43/10.56 s. Packing is mmap/IO-bound; a second lane competes. Code,
+engine wiring and test removed; sources/diff/logs kept. No server.
+
+## Task 9 - host-copy ceiling (REJECTED, no switch)
+
+New standalone `tools/kolibri/transfer_probe.cu`: 64 MiB cap, pageable/pinned, 1/4/16/64 MiB, best of five,
+every byte verified. All rows ~2.0 GB/s; pinned 64 MiB 33.618/33.614/33.618 ms for default/SDMA=1/0 (33.618/33.618/33.614 ms at 64 MiB). Engine decode
+traffic ~70 MB/s is far below the ceiling. No engine or system change; probe kept as a diagnostic. No server.
+
+## Task 10 - zero buffer (KEEP opt-in)
+
+First attempt had a pointer bug (downstream `yc = s.ey` overwrote the buffer) and diverged; corrected with an
+`if (zero_used)` override. 512/128 and cache8 full dumps match `6ffefa8f`/`466f48f2`; 10/10 integration identical.
+Five pairs: 13.79 -> 14.14 decode tok/s median (+5.6% paired, 5/5 positive); cache8 neutral. All-resident does not fit (42.90 GiB
+vs 39,860 MiB free; 326/384 slots). Opt-in only, no default promotion. No server.
