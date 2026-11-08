@@ -50,23 +50,43 @@ BEFORE rebuilding. Preserve the ignored workspace and all full-logit/raw measure
 retained change is committed or a task is marked complete, an independent review runs on `gpt-6.1-sol` and is
 acted on. The reviewer never edits the tree: it runs read-only and ephemeral from the repository root.
 
+**Primary reviewer:** `openai-codex/gpt-6.1-sol`, thinking `high`.
+**Fallback reviewer:** `ollama/glm-5.3-flash:cloud` (no thinking parameter), used only when the primary is
+unreachable or produces no reply. Both were verified reachable before this rule was written: `pi --list-models`
+lists both, a plain prompt returned `READY_TEST_OK` from each, and a read-only repository review returned a
+correct file-based answer from each. **Both are remote services: the brief, diff paths and quoted code leave this
+machine.** Never include credentials, the 47 GB model file, unrelated workspace data or personal data.
+
 ```sh
 mkdir -p .superpowers/sdd/2026-11-08-kolibri-exact-followup/reviews
-pi --print --no-session --no-extensions --no-mcp --no-skills --no-prompt-templates \
-  --no-context-files --no-themes --tools read,grep,find,ls \
-  --model openai-codex/gpt-6.1-sol --thinking high \
-  "<review brief>" > .superpowers/sdd/2026-11-08-kolibri-exact-followup/reviews/TaskN.md 2>&1
+R=.superpowers/sdd/2026-11-08-kolibri-exact-followup/reviews/TaskN
+BRIEF="$(cat "$R-brief.txt")"
+REVIEW_ARGS="--print --no-session --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files --no-themes --tools read,grep,find,ls"
+# Primary: OpenAI Codex.
+timeout 900 pi $REVIEW_ARGS --model openai-codex/gpt-6.1-sol --thinking high "$BRIEF" > "$R-review-gpt61sol.md" 2>&1
+PRIMARY_EXIT=$?; echo "$PRIMARY_EXIT" > "$R-review-gpt61sol.exit"
+if [ "$PRIMARY_EXIT" != 0 ] || ! grep -q '[[:alnum:]]' "$R-review-gpt61sol.md"; then
+  # Fallback: Ollama glm-5.3-flash:cloud (provider compat has no reasoning-effort parameter).
+  timeout 900 pi $REVIEW_ARGS --model ollama/glm-5.3-flash:cloud "$BRIEF" > "$R-review-glm53flash.md" 2>&1
+  FALLBACK_EXIT=$?; echo "$FALLBACK_EXIT" > "$R-review-glm53flash.exit"
+  [ "$FALLBACK_EXIT" = 0 ] && grep -q '[[:alnum:]]' "$R-review-glm53flash.md" || echo BLOCKED > "$R-review-status.txt"
+fi
 ```
 
-Reachability was verified before adding this gate: `pi --list-models gpt-6.1` lists `openai-codex gpt-6.1-sol`,
-and both a plain prompt and a read-only repository review returned successfully. If the model becomes unavailable,
-record the milestone review as BLOCKED; do not silently substitute another reviewer.
+Treat an output that is only a provider/API error message as no reply even if its exit code is zero. On BLOCKED,
+stop that milestone and report it; do not invent a review.
+
+**Fallback trigger is availability only:** nonzero exit, a timeout, an empty/whitespace-only file, or content that
+is only a provider/API error. A negative or inconvenient review is NOT a reason to switch reviewers. Record the
+reviewer model, command, exit code and UTC time in the ledger. If the primary is unusable, use the fallback once;
+if both are unusable, mark the milestone review BLOCKED. Do not try a third model, and never silently skip the gate.
+The fallback review carries the same authority and must be acted on exactly the same way.
 
 The brief must contain, in this order: (1) the exact plan task and its acceptance rules; (2) the base and head
 commits and `git diff` scope; (3) paths to raw logs, full-logit hashes and timing artifacts; (4) the claimed decision;
 (5) an explicit demand for technical evidence, not reassurance. Ask it to report findings by severity with file:line,
 and to state separately: correctness/bitwise risks, lifecycle/race risks, performance-evidence gaps, and any plan
-step that was skipped. Do not paste credentials, the model file, or unrelated workspace data.
+step that was skipped. Prefer naming exact paths over pasting large diffs, but quote the critical hunks.
 
 **Acting on findings is part of the milestone, not optional:**
 
@@ -78,7 +98,7 @@ step that was skipped. Do not paste credentials, the model file, or unrelated wo
 3. Critical/Important findings get one fix pass using RED→GREEN tests, then the full common gate is re-run.
    If the fix changes arithmetic, data lifetimes or public interfaces beyond the reviewed diff, request a focused
    follow-up review of that fix and act on it the same way. Do not loop indefinitely on cosmetic Minor items; ledger them.
-4. The retained commit must include the review file and the resolution notes. A milestone whose review is missing,
+4. The retained commit must include the review file(s), exit-code files and the resolution notes. A milestone whose review is missing,
    unanswered, or marked BLOCKED is not complete, even if tests pass.
 
 ## Task0: seal controls and fix the test-driver budget (not attention work)

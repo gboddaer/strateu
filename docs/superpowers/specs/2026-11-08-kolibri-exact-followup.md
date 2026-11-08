@@ -8,8 +8,10 @@ for a smaller agent. Items may be kept as tested enablers of a named next step w
 
 Every milestone (Task0 and Tasks2–10, plus final composition) requires an independent read-only review by
 `openai-codex/gpt-6.1-sol` before it is committed or declared complete, and every review finding must be acted on:
-fixed with a proving test, rejected with technical evidence, or deferred with an explicit dependency. Reachability
-was verified with both `pi --list-models gpt-6.1` and a read-only repository review before this rule was written.
+fixed with a proving test, rejected with technical evidence, or deferred with an explicit dependency. If that model
+is unreachable or does not reply, use `ollama/glm-5.3-flash:cloud` once; if both fail, the review is BLOCKED. A
+negative review never triggers a reviewer switch. Reachability and read-only repository reviews were verified for
+both models before this rule was written. Both are remote: never send credentials, the model file or unrelated data.
 A missing or BLOCKED review means the milestone is not complete.
 
 ## Binding constraints
