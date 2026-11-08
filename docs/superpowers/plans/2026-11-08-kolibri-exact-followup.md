@@ -34,6 +34,7 @@ BEFORE rebuilding. Preserve the ignored workspace and all full-logit/raw measure
    positive gain is acceptable; noise is inconclusive, not a win. Profile diagnostic runs separately.
 7. KEEP if correct and faster; KEEP-ENABLER if correct and used by a named subsequent retained path; otherwise
    reject/isolate the experiment. Never keep a dangerous speculative framework just because it might help someday.
+   Then run the mandatory external review gate below and act on it before marking the milestone complete.
 8. Full HIP test-tree build and main+standalone builds before commit. CUDA/SYCL unavailable => NOT RUN, no cross-backend claim.
 
 ## Review focus
@@ -42,6 +43,43 @@ BEFORE rebuilding. Preserve the ignored workspace and all full-logit/raw measure
 - Copy completion is not permission to overwrite weights still being read:keep reader and readiness fences.
 - Prefill may select more experts than permanent slots:protect every current resident pick and bound staging/evictions.
 - A fast warm path must still allow first use, a later miss, poison-zero diagnostics, reset/drain and mixed-format fallback.
+
+## External review gate (MANDATORY at every milestone)
+
+**A milestone is the completion of Task0 and of every Task2–Task10, plus the final composition.** Before a
+retained change is committed or a task is marked complete, an independent review runs on `gpt-6.1-sol` and is
+acted on. The reviewer never edits the tree: it runs read-only and ephemeral from the repository root.
+
+```sh
+mkdir -p .superpowers/sdd/2026-11-08-kolibri-exact-followup/reviews
+pi --print --no-session --no-extensions --no-mcp --no-skills --no-prompt-templates \
+  --no-context-files --no-themes --tools read,grep,find,ls \
+  --model openai-codex/gpt-6.1-sol --thinking high \
+  "<review brief>" > .superpowers/sdd/2026-11-08-kolibri-exact-followup/reviews/TaskN.md 2>&1
+```
+
+Reachability was verified before adding this gate: `pi --list-models gpt-6.1` lists `openai-codex gpt-6.1-sol`,
+and both a plain prompt and a read-only repository review returned successfully. If the model becomes unavailable,
+record the milestone review as BLOCKED; do not silently substitute another reviewer.
+
+The brief must contain, in this order: (1) the exact plan task and its acceptance rules; (2) the base and head
+commits and `git diff` scope; (3) paths to raw logs, full-logit hashes and timing artifacts; (4) the claimed decision;
+(5) an explicit demand for technical evidence, not reassurance. Ask it to report findings by severity with file:line,
+and to state separately: correctness/bitwise risks, lifecycle/race risks, performance-evidence gaps, and any plan
+step that was skipped. Do not paste credentials, the model file, or unrelated workspace data.
+
+**Acting on findings is part of the milestone, not optional:**
+
+1. Read the review against the code; invoke `superpowers:receiving-code-review`. Verify each claim before changing
+   anything; do not implement suggestions that are wrong or unverified.
+2. Record every finding in the execution ledger as FIXED (with the failing test that proved it), REJECTED (with
+   technical justification and evidence), or DEFERRED (with an explicit dependency). Unanswered findings block
+   completion.
+3. Critical/Important findings get one fix pass using RED→GREEN tests, then the full common gate is re-run.
+   If the fix changes arithmetic, data lifetimes or public interfaces beyond the reviewed diff, request a focused
+   follow-up review of that fix and act on it the same way. Do not loop indefinitely on cosmetic Minor items; ledger them.
+4. The retained commit must include the review file and the resolution notes. A milestone whose review is missing,
+   unanswered, or marked BLOCKED is not complete, even if tests pass.
 
 ## Task0: seal controls and fix the test-driver budget (not attention work)
 
@@ -156,6 +194,8 @@ Files:new standalone tools/kolibri transfer probe and tests only if existing pro
 
 ## Task10: all-resident exact fast path
 
+> Task10 and the final composition are milestones: run the external review gate and act on it before committing or closing the task.
+
 Files:Modify src/kolibri/kolibri_engine.cu,tests/kolibri targeted zero-buffer tests.
 Gate:STRATA_KOLIBRI_ZERO_BUFFER=1,defaultoff,requires existing skip-zero-overflow path.
 - [ ] RED compare per-layer memset overflow output with one dedicated immutable K*N zero buffer;include miss->hit->miss,
@@ -165,6 +205,7 @@ Gate:STRATA_KOLIBRI_ZERO_BUFFER=1,defaultoff,requires existing skip-zero-overflo
 - [ ] Do not fold the final sum or change floating reduction/sign handling. Common gate and final composed-path comparison.
 
 ## Finalization
+- [ ] Each Task0/Task2–Task10 and the final composition has a `reviews/` artifact, a resolution entry per finding, and a ledgered decision with raw evidence.
 - [ ] Every task has a decision with raw evidence. Keep successful flags individually overrideable;do not silently add them to demand defaults.
 - [ ] Rebuild all affected HIP targets,run full integration and current setup regression suites,then perform final long-context paired gate.
 - [ ] Record CUDA/SYCL NOT RUN if unavailable;no release readiness inference. Self-review if independent delegation remains unauthorized.

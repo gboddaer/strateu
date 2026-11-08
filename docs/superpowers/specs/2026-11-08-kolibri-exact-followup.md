@@ -6,6 +6,12 @@ The user authorizes best-effort execution to the end of the ranked optimization 
 10 fully resident fast path. Skip item1(attention tiling). Explanations and interfaces must be clear enough
 for a smaller agent. Items may be kept as tested enablers of a named next step without an isolated speed win.
 
+Every milestone (Task0 and Tasks2–10, plus final composition) requires an independent read-only review by
+`openai-codex/gpt-6.1-sol` before it is committed or declared complete, and every review finding must be acted on:
+fixed with a proving test, rejected with technical evidence, or deferred with an explicit dependency. Reachability
+was verified with both `pi --list-models gpt-6.1` and a read-only repository review before this rule was written.
+A missing or BLOCKED review means the milestone is not complete.
+
 ## Binding constraints
 - Execute on amdw7800probuild_optimize, created from amdw7800probuild after committing/pushing the preparation documents.
   Preserve pre-existing untracked files. Do not implement on the base branch. No implementation merge/push is requested.
