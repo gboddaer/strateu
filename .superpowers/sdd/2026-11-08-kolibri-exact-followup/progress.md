@@ -29,7 +29,7 @@ Plan: `docs/superpowers/plans/2026-11-08-kolibri-exact-followup.md`.
 | 2 selected MMVQ | KEEP + KEEP-ENABLER (fix review pending) | full-logit gates + 5 timing pairs + integration matrix | review 1 acted on |
 | 3 quantization reuse | REJECT (no repeatable gain, no named consumer) | exactness + 5 timing pairs + integration | review 1 agrees |
 | 4 cache admission | REJECT (no gain over demand; not correctness) | 4K/16K/65K + demand control + integration | review 2 agrees |
-| 5 synchronization | not started | | |
+| 5 synchronization | REJECT (no repeatable speedup; removed) | gate + GPU ordering + 10 pairs + integration | review 3 agrees |
 | 6 promotion fences | not started | | |
 | 7 GPU hit dispatch | not started | | |
 | 8 CPU packing | not started | | |
@@ -142,3 +142,9 @@ zero evictions, same SHA). The integration has no demonstrated incremental gain 
 no retained consumer. Removed planner, wiring and Task4 tests; existing demand free-slot admission untouched.
 Not completed/passed: balanced controls, repeated-pack counts, five-pair gates, eviction-lifecycle qualification.
 Baseline-only gains (19.78/78.31/313.35 GB staging -> 4.69/8.35/19.88 GB admission) are preserved as evidence.
+
+## Task 5 - redundant decode synchronization (REJECTED)
+
+Narrow gate + GPU ordering test + full-logit/integration equality all pass. First five 512 pairs: +6.7% median (3/5);
+second five: -6.4% median (0/5), combined about -5.9%. The first series was noise. Gate, wiring and tests removed; both drains and ownership fences restored; evidence kept. Correctness was not the reason; no repeatable gain was demonstrated.
+
