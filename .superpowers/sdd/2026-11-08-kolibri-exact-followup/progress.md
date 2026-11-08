@@ -28,7 +28,7 @@ Plan: `docs/superpowers/plans/2026-11-08-kolibri-exact-followup.md`.
 | 0 driver budget | in progress | tests + controls below | pending |
 | 2 selected MMVQ | KEEP + KEEP-ENABLER (fix review pending) | full-logit gates + 5 timing pairs + integration matrix | review 1 acted on |
 | 3 quantization reuse | REJECT (no repeatable gain, no named consumer) | exactness + 5 timing pairs + integration | review 1 agrees |
-| 4 cache admission | not started | | |
+| 4 cache admission | REJECT (no gain over demand; not correctness) | 4K/16K/65K + demand control + integration | review 2 agrees |
 | 5 synchronization | not started | | |
 | 6 promotion fences | not started | | |
 | 7 GPU hit dispatch | not started | | |
@@ -129,3 +129,16 @@ Review 1 (`gpt-6.1-sol`, exit 0) agreed with REJECT. Helper, wiring, flag, test 
 | Task 3 evidence lacks a 4097/8 comparison and pinned-table numerical qualification | Medium | Recorded as skipped/not qualified; not claimed as passed. The integration runner is no-pin only. |
 | Short `g_ids_host` fallback in `gemv()` can index out of bounds | Medium | PRE-EXISTING legacy defect exposed by the removed guard; no normal-path trigger found. Recorded for follow-up, not introduced by this task. |
 
+
+## Task 4 - prefill cache admission
+
+Evidence: `.superpowers/sdd/2026-11-08-kolibri-exact-followup/task4/summary.md`,
+`task4/integration-compare.txt`, timing JSONs/logs.
+Traffic: 4K 19.78 -> 4.69 GB, 16K 78.31 -> 8.35 GB, 65K 313.35 -> 19.88 GB; zero staging in the on-runs. Full logits
+identical at each size and 10/10 integration dumps identical. Wall: 4K noisy, 16K -5.4%/-27.6%, 65K -9.7%/-11.7%;
+prefill +11.7% to +62%. Decode unchanged at 65K, can fall at 16K.
+Decision: **REJECT** after the demand-profile control (demand off 25.15 GB / 1246.0 s; demand on 25.11 GB / 1263.2 s,
+zero evictions, same SHA). The integration has no demonstrated incremental gain in the tested demand configuration and
+no retained consumer. Removed planner, wiring and Task4 tests; existing demand free-slot admission untouched.
+Not completed/passed: balanced controls, repeated-pack counts, five-pair gates, eviction-lifecycle qualification.
+Baseline-only gains (19.78/78.31/313.35 GB staging -> 4.69/8.35/19.88 GB admission) are preserved as evidence.

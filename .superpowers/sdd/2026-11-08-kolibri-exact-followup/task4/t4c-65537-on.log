@@ -1,0 +1,147 @@
+kolibri: decode acceleration off (--cpu-threads must select the CPU pool); running the plain decode path
+strata-kolibri: /home/gbo/models/Kolibri-1-Q4_K_M.gguf: 903 tensors (layout checked); 42.90 GiB expert blobs backed by GGUF mmap; 15 MiB pageable staging; no pinned expert table; dense 1.62 GiB on GPU; 1.7 s
+CNT vram free=42.96 GiB total=44.98 GiB (after dense upload)
+strata-kolibri: expert cache: PER-LAYER residency map (50 layers x 384 experts), not one global set (default; --no-expert-slots-per-layer for a single set)
+strata-kolibri: expert cache: a round every 32 position(s), at most 96 move(s) mid-request and 2048 after a request, min gain 1.50, decay 0.70
+kolibri: mmap-backed GPU expert cache active; CPU streaming leg disabled
+strata-kolibri: expert cache fit: 39860 MiB free after dense+KV+scratch -> 326 slots/layer (37.20 GiB), 1536 MiB kept for the runtime, 230 MiB left
+strata-kolibri: expert cache: 326 slots/layer = 36.42 GiB VRAM
+strata-kolibri: (ctx, slots) draw on the same VRAM: 1 slot = 114 MiB = 5857 context tokens at 20.0 KB/token; ctx 131072 x 20480 = 2.50 GiB, 1710 MiB free (reserve 1536 MiB)
+NOPIN_PHASE startup tokens=0 ms=115077.909
+PFchunk 512/65536 13536ms
+PFchunk 1024/65536 20100ms
+PFchunk 1536/65536 25302ms
+PFchunk 2048/65536 31791ms
+PFchunk 2560/65536 38033ms
+PFchunk 3072/65536 43187ms
+PFchunk 3584/65536 49577ms
+PFchunk 4096/65536 55188ms
+PFchunk 4608/65536 60242ms
+PFchunk 5120/65536 65293ms
+PFchunk 5632/65536 70175ms
+PFchunk 6144/65536 75086ms
+PFchunk 6656/65536 80042ms
+PFchunk 7168/65536 84995ms
+PFchunk 7680/65536 89972ms
+PFchunk 8192/65536 94938ms
+PFchunk 8704/65536 99935ms
+PFchunk 9216/65536 104973ms
+PFchunk 9728/65536 109932ms
+PFchunk 10240/65536 114895ms
+PFchunk 10752/65536 120027ms
+PFchunk 11264/65536 125147ms
+PFchunk 11776/65536 130231ms
+PFchunk 12288/65536 135411ms
+PFchunk 12800/65536 140584ms
+PFchunk 13312/65536 145951ms
+PFchunk 13824/65536 151252ms
+PFchunk 14336/65536 156614ms
+PFchunk 14848/65536 161991ms
+PFchunk 15360/65536 167552ms
+PFchunk 15872/65536 173014ms
+PFchunk 16384/65536 178461ms
+PFchunk 16896/65536 184116ms
+PFchunk 17408/65536 189793ms
+PFchunk 17920/65536 195615ms
+PFchunk 18432/65536 201400ms
+PFchunk 18944/65536 207248ms
+PFchunk 19456/65536 213161ms
+PFchunk 19968/65536 219114ms
+PFchunk 20480/65536 225211ms
+PFchunk 20992/65536 231335ms
+PFchunk 21504/65536 237513ms
+PFchunk 22016/65536 243770ms
+PFchunk 22528/65536 250205ms
+PFchunk 23040/65536 256706ms
+PFchunk 23552/65536 263168ms
+PFchunk 24064/65536 269741ms
+PFchunk 24576/65536 276382ms
+PFchunk 25088/65536 283114ms
+PFchunk 25600/65536 289869ms
+PFchunk 26112/65536 296819ms
+PFchunk 26624/65536 303899ms
+PFchunk 27136/65536 311023ms
+PFchunk 27648/65536 318202ms
+PFchunk 28160/65536 325399ms
+PFchunk 28672/65536 332750ms
+PFchunk 29184/65536 340152ms
+PFchunk 29696/65536 347791ms
+PFchunk 30208/65536 355531ms
+PFchunk 30720/65536 363243ms
+PFchunk 31232/65536 371016ms
+PFchunk 31744/65536 378812ms
+PFchunk 32256/65536 386714ms
+PFchunk 32768/65536 394604ms
+PFchunk 33280/65536 403086ms
+PFchunk 33792/65536 411605ms
+PFchunk 34304/65536 420177ms
+PFchunk 34816/65536 428819ms
+PFchunk 35328/65536 437488ms
+PFchunk 35840/65536 446200ms
+PFchunk 36352/65536 455066ms
+PFchunk 36864/65536 463880ms
+PFchunk 37376/65536 472813ms
+PFchunk 37888/65536 482429ms
+PFchunk 38400/65536 492151ms
+PFchunk 38912/65536 501955ms
+PFchunk 39424/65536 511856ms
+PFchunk 39936/65536 521765ms
+PFchunk 40448/65536 531779ms
+PFchunk 40960/65536 541981ms
+PFchunk 41472/65536 552063ms
+PFchunk 41984/65536 562220ms
+PFchunk 42496/65536 572485ms
+PFchunk 43008/65536 582806ms
+PFchunk 43520/65536 593304ms
+PFchunk 44032/65536 604969ms
+PFchunk 44544/65536 616681ms
+PFchunk 45056/65536 628495ms
+PFchunk 45568/65536 640420ms
+PFchunk 46080/65536 652581ms
+PFchunk 46592/65536 664629ms
+PFchunk 47104/65536 676731ms
+PFchunk 47616/65536 688947ms
+PFchunk 48128/65536 701198ms
+PFchunk 48640/65536 713597ms
+PFchunk 49152/65536 726084ms
+PFchunk 49664/65536 738590ms
+PFchunk 50176/65536 751171ms
+PFchunk 50688/65536 763790ms
+PFchunk 51200/65536 776531ms
+PFchunk 51712/65536 789393ms
+PFchunk 52224/65536 802362ms
+PFchunk 52736/65536 817328ms
+PFchunk 53248/65536 832414ms
+PFchunk 53760/65536 847577ms
+PFchunk 54272/65536 862791ms
+PFchunk 54784/65536 878096ms
+PFchunk 55296/65536 893576ms
+PFchunk 55808/65536 909155ms
+PFchunk 56320/65536 924778ms
+PFchunk 56832/65536 940547ms
+PFchunk 57344/65536 956438ms
+PFchunk 57856/65536 972421ms
+PFchunk 58368/65536 988467ms
+PFchunk 58880/65536 1004608ms
+PFchunk 59392/65536 1020879ms
+PFchunk 59904/65536 1037214ms
+PFchunk 60416/65536 1053707ms
+PFchunk 60928/65536 1070287ms
+PFchunk 61440/65536 1086981ms
+PFchunk 61952/65536 1103756ms
+PFchunk 62464/65536 1120602ms
+PFchunk 62976/65536 1137541ms
+PFchunk 63488/65536 1154576ms
+PFchunk 64000/65536 1171758ms
+PFchunk 64512/65536 1189055ms
+PFchunk 65024/65536 1206454ms
+PFchunk 65536/65536 1224009ms
+strata-kolibri: hot slots [after prompt]: 548 expert(s) newly resident after 19660800 picks (mean gain 24.43+), 1253 MiB over PCIe in 978.1 ms, budget 2048 (per-layer map)
+NOPIN_PHASE prefill tokens=65536 ms=1224993.724
+NOPIN_PHASE decode tokens=8 ms=969.840
+CNT run tok=8 | slot hits=2390 miss=10 (99.6% hit) expert PCIe=2.9 MB/tok | d2h=8/4096000 B (0.5 MB/tok) h2d=0/0 B (0.0 MB/tok) | reset=0 ms / 0 (0.00 ms)
+CNT prefill admit: experts=8277 evictions=8277 bytes=19.88 GB
+CNT decode residency: 0 of 0 picks served from the fp16 cache (0.0%)
+CNT branches per tok: pool 0.0 gpu-expert 50.0 slots-path 50.0 grouped 0.0 (layers/token total 50.0 of 50)
+strata-kolibri: hot profile: 10489 of 16300 slot(s) written to .superpowers/sdd/2026-11-08-kolibri-exact-followup/task4/t4c-65537-on.profile
+gen: 940 3515 310 262 14292 1343 1444 46
