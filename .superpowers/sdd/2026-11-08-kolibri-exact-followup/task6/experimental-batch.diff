@@ -1,0 +1,142 @@
+diff --git a/src/kolibri/kolibri_engine.cu b/src/kolibri/kolibri_engine.cu
+index 597a57d2..149b234f 100644
+--- a/src/kolibri/kolibri_engine.cu
++++ b/src/kolibri/kolibri_engine.cu
+@@ -5691,13 +5691,21 @@ static long long slots_sum_stride(const Engine& e) {
+ // One expert's blob into one device slot, for every layer: n_layers memcpys of stride bytes, queued on the engine's
+ // stream.  Asynchronous on purpose: the copies are ordered behind every kernel already launched on g_st (which read
+ // the OLD occupants) and ahead of the next token's kernels, so a round neither drains the device nor waits per move.
+-static void slot_promote(Engine& e, int id, int slot) {
++static bool promote_batch_on() {
++    static const bool on = env_on("STRATA_KOLIBRI_PROMOTE_BATCH");
++    return on;
++}
++
++// batch=true is set only for a whole slots_reselect move list: the caller records one old-reader dependency before
++// the list and one readiness dependency after it.  Every copy still goes through the ring's single copy stream, so
++// the final event covers all of them.  hstage (no ring) keeps its per-move sync, where the next pack reuses it.
++static void slot_promote(Engine& e, int id, int slot, bool batch = false) {
+     for (auto& b : e.blobs) {
+         if (e.transfer) {
+-            e.transfer->wait_for(g_st);   // old slot consumers finish before the copy stream overwrites it
++            if (!batch) e.transfer->wait_for(g_st);   // old slot consumers finish before the copy stream overwrites it
+             pack_blob(b, e.g, id, e.transfer->acquire());
+             e.transfer->submit(b.dev + b.stride * (size_t) slot, b.stride);
+-            e.transfer->wait_on(g_st);
++            if (!batch) e.transfer->wait_on(g_st);
+             continue;
+         }
+         if (e.no_pin) {   // pack into the staging blob, then one H2D from it; there is no pinned source
+@@ -5713,13 +5721,13 @@ static void slot_promote(Engine& e, int id, int slot) {
+ 
+ // The same move for ONE layer: 1 queued copy of stride bytes (2.21 MB at this model).  The source is the PINNED host
+ // table (LayerBlobs::table), so the copy is a real async DMA rather than a staged one.
+-static void slot_promote_layer(Engine& e, int64_t l, int id, int slot) {
++static void slot_promote_layer(Engine& e, int64_t l, int id, int slot, bool batch = false) {
+     LayerBlobs& b = e.blobs[(size_t) l];
+     if (e.transfer) {
+-        e.transfer->wait_for(g_st);
++        if (!batch) e.transfer->wait_for(g_st);
+         pack_blob(b, e.g, id, e.transfer->acquire());
+         e.transfer->submit(b.dev + b.stride * (size_t) slot, b.stride);
+-        e.transfer->wait_on(g_st);
++        if (!batch) e.transfer->wait_on(g_st);
+         return;
+     }
+     if (e.no_pin) {
+@@ -6017,10 +6025,20 @@ static void slots_reselect(Engine& e, const char* why = nullptr, int budget = -1
+     // (the 2,699-move round measured on 2026-10-27).  This is the Qwen3.8-Flash-Next engine's ordering: copies on the
+     // engine's own stream, joined once.
+     const auto t0 = Clock::now();
++    const bool batch = promote_batch_on() && e.transfer != nullptr && !dec_stream_on() && !dec_handoff_on();
++    if (batch) {
++        static bool traced = false;
++        if (!traced) {
++            traced = true;
++            std::fprintf(stderr, "strata-kolibri: promotion batch: one reader fence and one readiness fence per round\n");
++        }
++        e.transfer->wait_for(g_st);   // all old readers were launched before this point
++    }
+     for (const strata::kolibri::HotSwap& s : plan) {
+-        if (e.per_layer) slot_promote_layer(e, s.layer, s.expert, s.slot);
+-        else slot_promote(e, s.expert, s.slot);
++        if (e.per_layer) slot_promote_layer(e, s.layer, s.expert, s.slot, batch);
++        else slot_promote(e, s.expert, s.slot, batch);
+     }
++    if (batch) e.transfer->wait_on(g_st);   // the last copy event covers every upload in the round
+     KC(cudaStreamSynchronize(g_st));
+     e.hot_promotions += (long long) plan.size();
+     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+diff --git a/tests/kolibri/expert_transfer_test.cu b/tests/kolibri/expert_transfer_test.cu
+index 7f65f5bc..78d805c4 100644
+--- a/tests/kolibri/expert_transfer_test.cu
++++ b/tests/kolibri/expert_transfer_test.cu
+@@ -7,6 +7,7 @@
+ #include <cstdio>
+ 
+ static void ck(cudaError_t e) { if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e)); }
++static void batch_round_test(bool pinned);
+ int main() {
+     constexpr size_t cap = 8192;
+     unsigned char* dev = nullptr;
+@@ -73,5 +74,60 @@ int main() {
+         for (auto x : host) if (x != 231) throw std::runtime_error("reset/replay copied stale weights");
+     }
+     ck(cudaFree(dev));
++    for (bool pinned : {false, true}) batch_round_test(pinned);
+     std::puts("PASS pageable/pinned transfer ring: delayed DMA, wraparound, partial layouts, bounds, drain");
+ }
++
++// Task 6: one reader fence before a multi-move round, one readiness fence after it, two ring buffers, then a new
++// generation and a second consumer stream.  The old readers must finish before either destination is overwritten;
++// the new consumer must not read a half-published round.
++static void batch_round_test(bool pinned) {
++    constexpr size_t cap = 4096;
++    unsigned char* dev = nullptr;
++    ck(cudaMalloc((void**)&dev, 4 * cap));
++    strata::kolibri::ExpertTransfer ring(cap, pinned);
++    unsigned char *obs0 = nullptr, *obs1 = nullptr;
++    ck(cudaHostAlloc((void**)&obs0, cap, cudaHostAllocDefault));
++    ck(cudaHostAlloc((void**)&obs1, cap, cudaHostAllocDefault));
++    ck(cudaMemset(dev, 7, 2 * cap));
++    cudaStream_t reader = nullptr, other = nullptr;
++    ck(cudaStreamCreateWithFlags(&reader, cudaStreamNonBlocking));
++    ck(cudaStreamCreateWithFlags(&other, cudaStreamNonBlocking));
++    ck(cudaLaunchHostFunc(reader, [](void*) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }, nullptr));
++    ck(cudaMemcpyAsync(obs0, dev, cap, cudaMemcpyDeviceToHost, reader));
++    ck(cudaMemcpyAsync(obs1, dev + cap, cap, cudaMemcpyDeviceToHost, reader));
++    ring.wait_for(reader);                       // the one prior-reader fence covers both old readers
++    std::memset(ring.acquire(), 11, cap);
++    ring.submit(dev, cap);
++    std::memset(ring.acquire(), 12, cap);
++    ring.submit(dev + cap, cap);
++    ring.wait_on(nullptr);                       // the last copy event covers the whole round
++    ck(cudaStreamSynchronize(nullptr));
++    ck(cudaStreamSynchronize(reader));
++    for (size_t j = 0; j < cap; ++j) {
++        if (obs0[j] != 7 || obs1[j] != 7) throw std::runtime_error("batch overwrote an old reader");
++    }
++    unsigned char host[cap];
++    ck(cudaMemcpy(host, dev, cap, cudaMemcpyDeviceToHost));
++    for (size_t j = 0; j < cap; ++j) if (host[j] != 11) throw std::runtime_error("batch destination 0 wrong");
++    ck(cudaMemcpy(host, dev + cap, cap, cudaMemcpyDeviceToHost));
++    for (size_t j = 0; j < cap; ++j) if (host[j] != 12) throw std::runtime_error("batch destination 1 wrong");
++    // A second consumer stream, and a following generation, must see the whole new round and no stale bytes.
++    ring.wait_for(nullptr);
++    std::memset(ring.acquire(), 21, cap);
++    ring.submit(dev, cap);
++    std::memset(ring.acquire(), 22, cap);
++    ring.submit(dev + cap, cap);
++    ring.wait_on(other);
++    ck(cudaMemcpyAsync(obs0, dev, cap, cudaMemcpyDeviceToHost, other));
++    ck(cudaMemcpyAsync(obs1, dev + cap, cap, cudaMemcpyDeviceToHost, other));
++    ck(cudaStreamSynchronize(other));
++    for (size_t j = 0; j < cap; ++j) {
++        if (obs0[j] != 21 || obs1[j] != 22) throw std::runtime_error("second stream/generation saw stale weights");
++    }
++    ck(cudaStreamDestroy(reader));
++    ck(cudaStreamDestroy(other));
++    ck(cudaFreeHost(obs0));
++    ck(cudaFreeHost(obs1));
++    ck(cudaFree(dev));
++}

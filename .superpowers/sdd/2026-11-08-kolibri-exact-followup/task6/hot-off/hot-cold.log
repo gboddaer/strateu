@@ -1,0 +1,13 @@
+kolibri: decode acceleration off (--cpu-threads must select the CPU pool); running the plain decode path
+kolibri: transfer ring: two 15422400-byte pinned buffers, event-owned
+strata-kolibri: /home/gbo/models/Kolibri-1-Q4_K_M.gguf: 903 tensors (layout checked); 42.90 GiB expert blobs backed by GGUF mmap; 29 MiB bounded pinned staging; no pinned expert table; dense 1.62 GiB on GPU; 1.7 s
+strata-kolibri: expert cache: PER-LAYER residency map (50 layers x 384 experts), not one global set (default; --no-expert-slots-per-layer for a single set)
+strata-kolibri: expert cache: a round every 32 position(s), at most 96 move(s) mid-request and 2048 after a request, min gain 1.50, decay 0.70
+kolibri: mmap-backed GPU expert cache active; CPU streaming leg disabled
+strata-kolibri: expert cache fit: 40800 MiB free after dense+KV+scratch -> 334 slots/layer (38.09 GiB), 1536 MiB kept for the runtime, 255 MiB left
+kolibri: joint expert stage: 50 nonresident experts, 122.6 MiB
+strata-kolibri: expert cache: 334 slots/layer = 37.31 GiB VRAM
+strata-kolibri: (ctx, slots) draw on the same VRAM: 1 slot = 114 MiB = 5857 context tokens at 20.0 KB/token; ctx 131072 x 20480 = 2.50 GiB, 1626 MiB free (reserve 1536 MiB)
+PFchunk 7/7 3477ms
+strata-kolibri: hot profile: 1939 of 16700 slot(s) written to .superpowers/sdd/2026-11-08-kolibri-exact-followup/task6/hot-off/hot.profile
+gen: 259 3515 58 262
