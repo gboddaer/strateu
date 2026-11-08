@@ -1,0 +1,33 @@
+You are the independent reviewer for a completed milestone in a correctness-first GPU inference project.
+
+TASK: Plan Task 0 (docs/superpowers/plans/2026-11-08-kolibri-exact-followup.md, section "Task0: seal controls and fix the test-driver budget"). It only changes the offline Python benchmark driver; it must not change the engine.
+
+ACCEPTANCE RULES:
+- `tools/kolibri/bench_unpinned.py` gains `--timeout` (seconds, default 600), `--ctx` (default 131072), `--ids-file` (explicit token fixture).
+- All lengths positive; actual input length + decode steps <= ctx; supplied IDs are integers in [0, 128000).
+- External token fixture is copied into the run directory; the source fixture and source profile are never overwritten.
+- No engine change; existing input-preservation behavior stays.
+- Controls were captured with the sealed engine, no new switches, and finite complete logits.
+
+DIFF SCOPE: working tree against HEAD 932a5c7e on branch amdw7800probuild_optimize. Files:
+- tools/kolibri/bench_unpinned.py
+- tests/kolibri/bench_unpinned_test.py
+Run `git diff` and read both files plus the Task0 section.
+
+EVIDENCE:
+- .superpowers/sdd/2026-11-08-kolibri-exact-followup/baseline/identities.json
+- .superpowers/sdd/2026-11-08-kolibri-exact-followup/controls/controls.md
+- .superpowers/sdd/2026-11-08-kolibri-exact-followup/controls/control-512-auto.json and .log
+- .superpowers/sdd/2026-11-08-kolibri-exact-followup/controls/control-8-cache8.json and .log
+- .superpowers/sdd/2026-11-08-kolibri-exact-followup/progress.md
+
+CLAIMED DECISION: Task0 KEEP. 10 CPU tests pass (RED observed first), py_compile passes, both same-day flag-off controls completed with finite complete logits and recorded hashes.
+
+REVIEW DEMAND: find real defects, not reassurance. Report findings by severity (Critical/Important/Minor) with file:line. Check specifically:
+1. Any way an invalid input can still launch the engine, or a valid boundary input is wrongly rejected.
+2. Off-by-one in prompt+decode<=ctx vs the engine's own requirement; check src/kolibri/kolibri_engine.cu if needed.
+3. Token parsing/range/injection issues; source fixture or profile overwrite paths; partial writes before failure.
+4. Watchdog semantics: does a timeout produce a clear nonzero result, and can a hung child survive?
+5. Whether the recorded controls actually prove finite complete logits and whether the claimed identity matches.
+State separately: correctness risks, lifecycle/race risks, performance-evidence gaps, skipped plan steps.
+Do not edit anything. Read-only tools only.

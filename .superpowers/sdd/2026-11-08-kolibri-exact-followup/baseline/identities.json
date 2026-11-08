@@ -1,0 +1,12 @@
+{
+  "branch": "amdw7800probuild_optimize",
+  "head": "932a5c7e2c61efab193c405dbb1134a8a540ba14",
+  "base_source_commit": "6c241aa4ca36095a56ef44b2d81b5a08f5ce4c58",
+  "sealed_engine": ".superpowers/sdd/2026-11-07-kolibri-overnight/engine",
+  "sealed_engine_sha256": "8a4c1fc1f4eece04fee923f763887ec12643ebfdaaae6198f9250b86dd0c63c2",
+  "sealed_engine_bytes": 42937712,
+  "build_engine_sha256": "8a4c1fc1f4eece04fee923f763887ec12643ebfdaaae6198f9250b86dd0c63c2",
+  "model": "/home/gbo/models/Kolibri-1-Q4_K_M.gguf",
+  "model_bytes": 47454113472,
+  "model_sha256": "c2ac1301424441ef210b6de50ce25e8ccf69f86494df53d6ba52ed558456062e"
+}
