@@ -190,7 +190,7 @@ class KolibriSourceTuning(unittest.TestCase):
         for ram in (64, 128):
             rc, out = self.placement_install(hip=False, ram=ram)
             self.assertEqual(rc, 0, out)
-            self.assertEqual(self.cfg["args"], ["--model", str(self.gguf()), "--ctx", "32768", "--prefill",
+            self.assertEqual(self.cfg["args"], ["--model", str(self.gguf()), "--ctx", "131072", "--prefill",
                                                 "--cpu-threads", "14", "--expert-slots", "0"], ram)
             self.assertEqual(self.cfg["env"], self.CUDA_ENV, ram)
             self.assertEqual(self.cfg["launch_prefix"], self.PREFIX, ram)
@@ -206,7 +206,7 @@ class KolibriSourceTuning(unittest.TestCase):
     def test_low_ram_cuda_writes_the_mmap_placement(self):
         rc, out = self.placement_install(hip=False, ram=32)
         self.assertEqual(rc, 0, out)
-        self.assertEqual(self.cfg["args"], ["--model", str(self.gguf()), "--ctx", "32768", "--prefill"]
+        self.assertEqual(self.cfg["args"], ["--model", str(self.gguf()), "--ctx", "131072", "--prefill"]
                          + self.mmap_args())
         self.assertNotIn("--cpu-threads", self.cfg["args"])
         self.assertEqual(self.cfg["env"], {**self.COMMON_ENV, **self.DEMAND})
