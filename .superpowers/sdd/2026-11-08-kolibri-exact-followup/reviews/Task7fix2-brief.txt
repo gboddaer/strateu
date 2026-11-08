@@ -1,0 +1,21 @@
+Third Task 7 review. Read the revised `task7/summary.md` and the experimental diff.
+
+Corrections:
+- The slot-path router copy is uncounted; a probe (charged the actual copy, no pre-sync) measured 0.567 ms/layer,
+  ~28 ms/token of ~77 ms.
+- Built the device-slot selected-MMVQ prototype: kernels index base+device_slots[sel]*stride on GPU; forced-map test
+  matches independent native_mmvq bit-for-bit for Q4_K/Q6_K tails, permutations, shared/per-selection x, same/diff
+  weights, and after a device-map change. Passes.
+- Prototype removed after the experiment; diff kept.
+
+Proposal: BLOCKED. An exact engine path still needs host ids for np_admit and the 0.8% misses, and a map
+generation/reset contract; zero-miss all-resident is infeasible (42.90 GiB experts vs 42.96 GiB free before 2.5 GiB
+KV + 1536 MiB reserve; auto-fit 334 slots/layer). Capture unattempted.
+
+Check:
+1. Is the 0.567 ms/layer measurement now valid, or still perturbed?
+2. Does the prototype satisfy the plan's exact forced-hit/miss dispatch requirement?
+3. Is BLOCKED justified by partial-residency/cache-lifecycle constraints, or is an offline engine integration still
+   required to call this complete?
+4. Any overclaim or missing evidence.
+Say plainly whether BLOCKED is the right end state.

@@ -1,0 +1,2 @@
+strata: STRATA_Q6_PACKED=1 packed the mmvq_selected_test (2048 x 1024, +1.6 MiB)
+mmvq_selected: all cases bit-identical

@@ -1,0 +1,18 @@
+Follow-up Task 7 review after your findings. Read the revised `task7/summary.md`.
+
+Corrections made:
+- The 128 counted D2H calls are the 500 KiB full-logit copies. The per-layer router copy at `:3080-3088` is
+  uncounted: 50/token, 6,400/run, 153,600 B total.
+- Ran 512/128 with `STRATA_KOLIBRI_DEC_PHASES=1`: `pre=0.6 ms d2h=0.0 ms pool=0.0 ms post=1.0 ms (per layer)`.
+- Slot hit rate 99.2% (38,107/293).
+
+Proposal changed from BLOCKED to **REJECT (performance)**: the router D2H wait is 0.0 ms/layer at print resolution;
+even <0.05 ms/layer is <2.5 ms/token against ~77 ms. A device map still needs generations, a new selected-MMVQ slot
+ABI, and miss/overflow handling; no prototype or shadow map is retained.
+
+Check:
+1. Is the phase split a valid measurement of the router synchronization cost? What does d2h=0.0 include/miss?
+2. Is REJECT justified instead of building the bounded prototype? Is the <0.05 ms ceiling sound?
+3. Is the uncounted-copy correction accurate?
+4. Any remaining half-implementation.
+Say plainly whether REJECT is justified or the prototype is still required.

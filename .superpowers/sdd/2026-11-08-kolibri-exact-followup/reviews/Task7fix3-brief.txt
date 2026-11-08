@@ -1,0 +1,21 @@
+Fourth Task 7 review. Read the revised `task7/summary.md` and the updated experimental diff.
+
+Changes:
+- Report 0.567 ms/layer blocked copy, ~28 ms/token against 68.79 ms measured; explicitly "end-to-end saving
+  unmeasured", copy also waits for GPU inputs.
+- Prototype extended: GPU ids->device map translation, hit slot or zero slot + miss list/count, compared with CPU
+  translation; complete device-MMVQ outputs match independent native_mmvq; repeated after map update and map reset.
+  Passes.
+- Corrected memory: 39,860 MiB free after dense+KV+scratch, auto-fit 326 slots/layer (37.20 GiB), 1536 MiB reserve;
+  42.90 GiB experts cannot all reside.
+- Experimental code/test removed; diff kept.
+
+Proposal: BLOCKED. Synthetic hit/miss/update/reset translation is qualified, but the engine path still needs host
+ids for np_admit/misses and a cache-map generation/reset lifecycle; all-resident is infeasible. Capture unattempted.
+
+Check:
+1. Does the translation test now satisfy the plan's forced-hit/miss/lifecycle requirement at prototype scope?
+2. Is BLOCKED justified now, or must an engine integration be attempted even without all-resident?
+3. Is the measurement wording correct and the memory argument sound?
+4. Any remaining overclaim.
+Say plainly whether BLOCKED is the right end state.

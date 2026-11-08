@@ -1,0 +1,373 @@
+diff --git a/include/strata/kernels/native_mmvq.hpp b/include/strata/kernels/native_mmvq.hpp
+index 1060d7ac..cb50e33f 100644
+--- a/include/strata/kernels/native_mmvq.hpp
++++ b/include/strata/kernels/native_mmvq.hpp
+@@ -164,6 +164,12 @@ bool native_mmvq_selected(int ggml_type, const void* base, std::size_t weight_st
+                           const void* x_q8_1, std::size_t x_q8_1_stride, float* y, int n_in, int n_out,
+                           int selections, void* stream);
+ 
++/// Experimental device-slot form: the same dispatch reads `device_slots[s]` on the GPU instead of a by-value host
++/// array. The caller owns device-slot bounds/alignment; used only by the forced-map test, not the engine path.
++bool native_mmvq_selected_device(int ggml_type, const void* base, std::size_t weight_stride,
++                                 const int* device_slots, const void* x_q8_1, std::size_t x_q8_1_stride,
++                                 float* y, int n_in, int n_out, int selections, void* stream);
++
+ // Fork F4 (Eddoursul): 2..4 columns also INTERLEAVED, so one 16-byte load reads a position of every column: CP = 2 (2
+ // columns) or 4 (3-4), zero-padded; nb = n_in / 32 blocks; int32 bm[nb][8][CP] (block-major), int32 pm[8][nb][CP]
+ // (position-major), float d[nb][CP] (each block's scale as the dots read it, __low2float of ds).
+diff --git a/src/kernels/cuda/native_mmvq.cu b/src/kernels/cuda/native_mmvq.cu
+index b33a659f..63146fb5 100644
+--- a/src/kernels/cuda/native_mmvq.cu
++++ b/src/kernels/cuda/native_mmvq.cu
+@@ -777,14 +777,17 @@ struct SelectedMmvqPointers {
+     float* outputs[8];
+ };
+ 
+-template<bool SmallK>
++template<bool SmallK, bool Dev>
+ __launch_bounds__(WARPS * WARP, (SmallK ? 4 : 1))
+-__global__ void native_q4_k_selected_kernel(SelectedMmvqPointers p, const Q81Block* __restrict__ x_,
++__global__ void native_q4_k_selected_kernel(SelectedMmvqPointers p, const void* base, std::size_t stride,
++                                            const int* slots, const Q81Block* __restrict__ x_,
+                                             int n_in, int n_out, int x_blocks) {
+     constexpr int ROWS = SmallK ? WARPS : 1;
+     constexpr int BLOCKS_PER_ITER = VDR * WARPS * WARP / QI;
+     const int sel = int(blockIdx.y);
+-    const Q4KBlock* __restrict__ w = static_cast<const Q4KBlock*>(p.weights[sel]);
++    const Q4KBlock* __restrict__ w = Dev
++        ? reinterpret_cast<const Q4KBlock*>(static_cast<const char*>(base) + std::size_t(slots[sel]) * stride)
++        : static_cast<const Q4KBlock*>(p.weights[sel]);
+     float* __restrict__ y = p.outputs[sel];
+     const Q81Block* __restrict__ x = x_ + std::size_t(sel) * std::size_t(x_blocks);
+     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+@@ -818,14 +821,17 @@ __global__ void native_q4_k_selected_kernel(SelectedMmvqPointers p, const Q81Blo
+     }
+ }
+ 
+-template<bool SmallK>
++template<bool SmallK, bool Dev>
+ __launch_bounds__(WARPS * WARP, (SmallK ? 4 : 1))
+-__global__ void native_q6_k_selected_kernel(SelectedMmvqPointers p, const Q81Block* __restrict__ x_,
++__global__ void native_q6_k_selected_kernel(SelectedMmvqPointers p, const void* base, std::size_t stride,
++                                            const int* slots, const Q81Block* __restrict__ x_,
+                                             int n_in, int n_out, int x_blocks) {
+     constexpr int ROWS = SmallK ? WARPS : 1;
+     constexpr int BLOCKS_PER_ITER = WARPS * WARP / 32;
+     const int sel = int(blockIdx.y);
+-    const Q6KBlock* __restrict__ w = static_cast<const Q6KBlock*>(p.weights[sel]);
++    const Q6KBlock* __restrict__ w = Dev
++        ? reinterpret_cast<const Q6KBlock*>(static_cast<const char*>(base) + std::size_t(slots[sel]) * stride)
++        : static_cast<const Q6KBlock*>(p.weights[sel]);
+     float* __restrict__ y = p.outputs[sel];
+     const Q81Block* __restrict__ x = x_ + std::size_t(sel) * std::size_t(x_blocks);
+     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+@@ -3492,20 +3498,67 @@ bool native_mmvq_selected(int ggml_type, const void* base, std::size_t weight_st
+     if (ggml_type == 12) {
+         if (n_in / 256 < WARPS * WARP / 16) {
+             const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+-            native_q4_k_selected_kernel<true><<<dim3(blocks, nsel), threads, 0, s>>>(
+-                p, static_cast<const Q81Block*>(x_q8_1), n_in, n_out, x_blocks);
++            native_q4_k_selected_kernel<true, false><<<dim3(blocks, nsel), threads, 0, s>>>(
++                p, nullptr, 0, nullptr, static_cast<const Q81Block*>(x_q8_1), n_in, n_out, x_blocks);
++        } else {
++            native_q4_k_selected_kernel<false, false><<<dim3((unsigned) n_out, nsel), threads, 0, s>>>(
++                p, nullptr, 0, nullptr, static_cast<const Q81Block*>(x_q8_1), n_in, n_out, x_blocks);
++        }
++    } else {
++        if (n_in / 256 < WARPS * WARP / 32) {
++            const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
++            native_q6_k_selected_kernel<true, false><<<dim3(blocks, nsel), threads, 0, s>>>(
++                p, nullptr, 0, nullptr, static_cast<const Q81Block*>(x_q8_1), n_in, n_out, x_blocks);
++        } else {
++            native_q6_k_selected_kernel<false, false><<<dim3((unsigned) n_out, nsel), threads, 0, s>>>(
++                p, nullptr, 0, nullptr, static_cast<const Q81Block*>(x_q8_1), n_in, n_out, x_blocks);
++        }
++    }
++    launch_check();
++    return true;
++}
++
++bool native_mmvq_selected_device(int ggml_type, const void* base, std::size_t weight_stride,
++                                  const int* device_slots, const void* x_q8_1, std::size_t x_q8_1_stride,
++                                  float* y, int n_in, int n_out, int selections, void* stream) {
++    if (ggml_type != 12 && ggml_type != 14) return false;
++    if (selections < 2 || selections > 8) return false;
++    if (n_in <= 0 || n_in % 256 != 0) throw std::invalid_argument("native MMVQ selected requires n_in divisible by 256");
++    if (n_out <= 0) throw std::invalid_argument("native MMVQ selected requires n_out > 0");
++    validate_pointer(base);
++    validate_pointer(device_slots);
++    validate_pointer(x_q8_1);
++    validate_pointer(y);
++    validate_stream(stream);
++#if defined(STRATA_HIP_GFX906)
++    if (!g_wave_off) return false;
++#endif
++    const std::size_t qcol = native_q8_1_bytes(n_in, 1);
++    if (x_q8_1_stride != 0 && x_q8_1_stride != qcol) return false;
++    SelectedMmvqPointers p{};
++    for (int s = 0; s < selections; ++s) p.outputs[s] = y + std::size_t(s) * std::size_t(n_out);
++    // The device slot values are not readable here; the caller owns their bounds and alignment.
++    const auto st = static_cast<cudaStream_t>(stream);
++    const dim3 threads(WARP, WARPS);
++    const int x_blocks = x_q8_1_stride ? int(qcol / sizeof(Q81Block)) : 0;
++    const unsigned nsel = unsigned(selections);
++    if (ggml_type == 12) {
++        if (n_in / 256 < WARPS * WARP / 16) {
++            const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
++            native_q4_k_selected_kernel<true, true><<<dim3(blocks, nsel), threads, 0, st>>>(
++                p, base, weight_stride, device_slots, static_cast<const Q81Block*>(x_q8_1), n_in, n_out, x_blocks);
+         } else {
+-            native_q4_k_selected_kernel<false><<<dim3((unsigned) n_out, nsel), threads, 0, s>>>(
+-                p, static_cast<const Q81Block*>(x_q8_1), n_in, n_out, x_blocks);
++            native_q4_k_selected_kernel<false, true><<<dim3((unsigned) n_out, nsel), threads, 0, st>>>(
++                p, base, weight_stride, device_slots, static_cast<const Q81Block*>(x_q8_1), n_in, n_out, x_blocks);
+         }
+     } else {
+         if (n_in / 256 < WARPS * WARP / 32) {
+             const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+-            native_q6_k_selected_kernel<true><<<dim3(blocks, nsel), threads, 0, s>>>(
+-                p, static_cast<const Q81Block*>(x_q8_1), n_in, n_out, x_blocks);
++            native_q6_k_selected_kernel<true, true><<<dim3(blocks, nsel), threads, 0, st>>>(
++                p, base, weight_stride, device_slots, static_cast<const Q81Block*>(x_q8_1), n_in, n_out, x_blocks);
+         } else {
+-            native_q6_k_selected_kernel<false><<<dim3((unsigned) n_out, nsel), threads, 0, s>>>(
+-                p, static_cast<const Q81Block*>(x_q8_1), n_in, n_out, x_blocks);
++            native_q6_k_selected_kernel<false, true><<<dim3((unsigned) n_out, nsel), threads, 0, st>>>(
++                p, base, weight_stride, device_slots, static_cast<const Q81Block*>(x_q8_1), n_in, n_out, x_blocks);
+         }
+     }
+     launch_check();
+diff --git a/src/kolibri/kolibri_engine.cu b/src/kolibri/kolibri_engine.cu
+index 597a57d2..1293653c 100644
+--- a/src/kolibri/kolibri_engine.cu
++++ b/src/kolibri/kolibri_engine.cu
+@@ -3076,7 +3076,9 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
+         };
+         const bool dph = dec_phases_on();
+         std::chrono::steady_clock::time_point dpt{};
+-        if (dph) { KC(cudaStreamSynchronize(st)); dpt = std::chrono::steady_clock::now(); }
++        if (dph) { dpt = std::chrono::steady_clock::now(); }   // probe: the router copy below measures the real wait
++        std::chrono::steady_clock::time_point d2s{};
++        if (dph) d2s = std::chrono::steady_clock::now();
+         if (!graph && !dec_handoff_on()) {   // the handoff arm reads the picks out of the published payload
+             g_ids_host.resize((size_t) K);
+             if (dec_stream_on()) {   // the picks are on the decode stream; a plain cudaMemcpy would read the legacy one
+@@ -3085,6 +3087,8 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
+             } else
+             KC(cudaMemcpy(g_ids_host.data(), s.ids, K * sizeof(int), cudaMemcpyDeviceToHost));
+         }
++        if (dph) e.cnt.dec_d2h_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
++            std::chrono::steady_clock::now() - d2s).count();
+         const auto just_admitted = np_admit(e, l, g_ids_host, st);
+         Dense gu; gu.type = b.L.gu_type; gu.shape = {g.n_embd, g.n_ff, g.n_expert}; gu.row_bytes = b.L.gu_row;
+         Dense dn; dn.type = b.L.d_type; dn.shape = {g.n_ff, g.n_embd, g.n_expert}; dn.row_bytes = b.L.d_row;
+@@ -5578,7 +5582,7 @@ void print_counters(Engine& e, const char* tag) {
+     std::fflush(stderr);
+     if (e.cnt.dec_layers > 0) {
+         const double n = (double) e.cnt.dec_layers;
+-        std::fprintf(stderr, "CNT decode phases: pre=%.1f ms d2h=%.1f ms pool=%.1f ms post=%.1f ms (per layer)\n",
++        std::fprintf(stderr, "CNT decode phases: pre=%.3f ms d2h=%.3f ms pool=%.3f ms post=%.3f ms (per layer)\n",
+                      e.cnt.dec_pre_ns / 1e6 / n, e.cnt.dec_d2h_ns / 1e6 / n, e.cnt.dec_pool_ns / 1e6 / n,
+                      e.cnt.dec_post_ns / 1e6 / n);
+     }
+diff --git a/tests/kolibri/mmvq_selected_test.cpp b/tests/kolibri/mmvq_selected_test.cpp
+index 4939d725..8b068235 100644
+--- a/tests/kolibri/mmvq_selected_test.cpp
++++ b/tests/kolibri/mmvq_selected_test.cpp
+@@ -15,6 +15,7 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <random>
++#include <algorithm>
+ #include <stdexcept>
+ #include <vector>
+ 
+@@ -22,6 +23,7 @@ namespace {
+ 
+ using strata::kernels::native_mmvq;
+ using strata::kernels::native_mmvq_selected;
++using strata::kernels::native_mmvq_selected_device;
+ using strata::kernels::native_mmvq_weight_bytes;
+ using strata::kernels::native_q8_1_bytes;
+ using strata::kernels::native_quantize_q8_1;
+@@ -95,11 +97,15 @@ void run_case(const Case& c, int selections, bool permute, bool per_selection_x,
+     void* xq = nullptr;
+     float* y_ref = nullptr;
+     float* y_sel = nullptr;
++    float* y_dev = nullptr;
++    int* dslots = nullptr;
+     bool ok = ck(cudaMalloc(&dw, wbytes), "malloc weights") &&
+               ck(cudaMalloc(&dx, x.size() * sizeof(float)), "malloc x") &&
+               ck(cudaMalloc(&xq, qbytes), "malloc q8") &&
+               ck(cudaMalloc(&y_ref, ybytes), "malloc reference") &&
+-              ck(cudaMalloc(&y_sel, ybytes), "malloc selected");
++              ck(cudaMalloc(&y_sel, ybytes), "malloc selected") &&
++              ck(cudaMalloc(&y_dev, ybytes), "malloc device-slot") &&
++              ck(cudaMalloc(&dslots, selections * sizeof(int)), "malloc slots");
+     cudaStream_t stream = nullptr;
+     ok = ok && ck(cudaStreamCreate(&stream), "stream");
+     if (ok) {
+@@ -117,19 +123,44 @@ void run_case(const Case& c, int selections, bool permute, bool per_selection_x,
+                                                    per_selection_x ? qcol : 0, y_sel, c.n_in, c.n_out,
+                                                    selections, stream);
+         CHECK(launched, "%s: selected API refused a supported call (S=%d)", c.name, selections);
++        if (ok) ok = ck(cudaMemcpy(dslots, slots.data(), selections * sizeof(int), cudaMemcpyHostToDevice), "copy slots");
++        const bool dev_launched = native_mmvq_selected_device(c.type, dw, same_weights ? 0 : stride, dslots, xq,
++                                                              per_selection_x ? qcol : 0, y_dev, c.n_in, c.n_out,
++                                                              selections, stream);
++        CHECK(dev_launched, "%s: device-slot API refused a supported call (S=%d)", c.name, selections);
+     }
+     if (ok && ck(cudaStreamSynchronize(stream), "sync")) {
+-        std::vector<float> ref(ybytes / sizeof(float)), sel(ybytes / sizeof(float));
++        std::vector<float> ref(ybytes / sizeof(float)), sel(ybytes / sizeof(float)), dev(ybytes / sizeof(float));
+         ck(cudaMemcpy(ref.data(), y_ref, ybytes, cudaMemcpyDeviceToHost), "read reference");
+         ck(cudaMemcpy(sel.data(), y_sel, ybytes, cudaMemcpyDeviceToHost), "read selected");
++        ck(cudaMemcpy(dev.data(), y_dev, ybytes, cudaMemcpyDeviceToHost), "read device-slot");
+         CHECK(all_finite(ref), "%s: the reference itself is non-finite", c.name);
+         CHECK(all_finite(sel), "%s: selected output is non-finite", c.name);
+         CHECK(std::memcmp(ref.data(), sel.data(), ybytes) == 0,
+               "%s: selected outputs are not bit-identical (S=%d permute=%d per-selection-x=%d)",
+               c.name, selections, int(permute), int(per_selection_x));
++        CHECK(std::memcmp(ref.data(), dev.data(), ybytes) == 0,
++              "%s: device-slot outputs are not bit-identical (S=%d permute=%d per-selection-x=%d)",
++              c.name, selections, int(permute), int(per_selection_x));
++        // A changed device map (reversed slots) must produce the same bits as a fresh host selection.
++        std::vector<int> slots2 = slots;
++        for (int i = 0; i < selections / 2; ++i) std::swap(slots2[(size_t) i], slots2[(size_t) (selections - 1 - i)]);
++        ck(cudaMemcpy(dslots, slots2.data(), selections * sizeof(int), cudaMemcpyHostToDevice), "update slots");
++        for (int si = 0; si < selections; ++si) {
++            const uint8_t* we = (const uint8_t*) dw + (std::size_t) slots2[(std::size_t) si] * (same_weights ? 0 : stride);
++            const void* xqs = (const uint8_t*) xq + (per_selection_x ? (std::size_t) si * qcol : 0);
++            native_mmvq(c.type, we, xqs, y_ref + (std::size_t) si * c.n_out, c.n_in, c.n_out, 1, stream);
++        }
++        native_mmvq_selected_device(c.type, dw, same_weights ? 0 : stride, dslots, xq,
++                                    per_selection_x ? qcol : 0, y_dev, c.n_in, c.n_out, selections, stream);
++        ck(cudaStreamSynchronize(stream), "sync map update");
++        ck(cudaMemcpy(ref.data(), y_ref, ybytes, cudaMemcpyDeviceToHost), "read updated reference");
++        ck(cudaMemcpy(dev.data(), y_dev, ybytes, cudaMemcpyDeviceToHost), "read updated device-slot");
++        CHECK(std::memcmp(ref.data(), dev.data(), ybytes) == 0,
++              "%s: a changed device map is not bit-identical (S=%d)", c.name, selections);
+     }
+     if (stream) cudaStreamDestroy(stream);
+-    cudaFree(dw); cudaFree(dx); cudaFree(xq); cudaFree(y_ref); cudaFree(y_sel);
++    cudaFree(dw); cudaFree(dx); cudaFree(xq); cudaFree(y_ref); cudaFree(y_sel); cudaFree(y_dev); cudaFree(dslots);
+ }
+ 
+ // A refused call must launch nothing and leave the output untouched.
+@@ -220,6 +251,108 @@ void expect_throw(int type, std::size_t stride, const int* slots, int selections
+     CHECK(threw, "%s: expected an invalid_argument", what);
+ }
+ 
++__global__ void translate_slots_kernel(const int* ids, const int* map, int k, int zero, int* slots, int* miss,
++                                       int* miss_count) {
++    const int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= k) return;
++    const int s = map[ids[i]];
++    if (s < 0) {
++        slots[i] = zero;
++        miss[atomicAdd(miss_count, 1)] = ids[i];
++    } else {
++        slots[i] = s;
++    }
++}
++
++// Forced hit/miss translation: ids -> map -> (hit slot | zero slot + miss list), then the exact device-slot MMVQ.
++// The map is then updated and reset, and every stage is compared with a CPU translation and independent MMVQs.
++void map_translation_test() {
++    const int n_in = 512, n_out = 37, k = 4, slots_n = 6, zero = 0;
++    const std::size_t stride = native_mmvq_weight_bytes(12, n_in, n_out);
++    const std::size_t qcol = native_q8_1_bytes(n_in, 1);
++    std::mt19937 rng(0x7a5cU);
++    std::vector<uint8_t> w(stride * slots_n);
++    for (auto& b : w) b = (uint8_t) (rng() & 0xffu);
++    const std::size_t blocks_per_mat = (std::size_t) n_out * (n_in / 256);
++    for (std::size_t m = 0; m < slots_n; ++m)
++        for (std::size_t b = 0; b < blocks_per_mat; ++b) {
++            const uint16_t h = sane_half(rng);
++            std::memcpy(&w[m * stride + b * 144], &h, 2);
++        }
++    std::memset(w.data(), 0, stride);   // slot 0 is the designated zero-output fallback
++    std::normal_distribution<float> nd(0.f, 1.f);
++    std::vector<float> x((std::size_t) n_in);
++    for (auto& v : x) v = nd(rng);
++    const int hids[k] = {1, 3, 6, 7};
++    int hmap[8] = {3, -1, 2, -1, 4, -1, 5, -1};
++    void *dw = nullptr, *dx = nullptr, *xq = nullptr;
++    int *dids = nullptr, *dmap = nullptr, *dslots = nullptr, *dmiss = nullptr, *dmc = nullptr;
++    float *y_ref = nullptr, *y_dev = nullptr;
++    bool ok = ck(cudaMalloc(&dw, w.size()), "map malloc weights") &&
++              ck(cudaMalloc(&dx, x.size() * sizeof(float)), "map malloc x") &&
++              ck(cudaMalloc(&xq, qcol), "map malloc q8") &&
++              ck(cudaMalloc(&dids, k * sizeof(int)), "map malloc ids") &&
++              ck(cudaMalloc(&dmap, 8 * sizeof(int)), "map malloc map") &&
++              ck(cudaMalloc(&dslots, k * sizeof(int)), "map malloc slots") &&
++              ck(cudaMalloc(&dmiss, k * sizeof(int)), "map malloc miss") &&
++              ck(cudaMalloc(&dmc, sizeof(int)), "map malloc count") &&
++              ck(cudaMalloc(&y_ref, k * n_out * sizeof(float)), "map malloc ref") &&
++              ck(cudaMalloc(&y_dev, k * n_out * sizeof(float)), "map malloc dev");
++    cudaStream_t stream = nullptr;
++    ok = ok && ck(cudaStreamCreate(&stream), "map stream");
++    if (!ok) return;
++    ck(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice), "map weights");
++    ck(cudaMemcpy(dx, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice), "map x");
++    ck(cudaMemcpy(dids, hids, sizeof hids, cudaMemcpyHostToDevice), "map ids");
++    native_quantize_q8_1((const float*) dx, xq, n_in, 1, stream);
++    auto expected = [&](const int* map, int* slots, std::vector<int>& miss) {
++        miss.clear();
++        for (int i = 0; i < k; ++i) {
++            const int s = map[hids[i]];
++            if (s < 0) { slots[i] = zero; miss.push_back(hids[i]); }
++            else slots[i] = s;
++        }
++    };
++    auto run = [&](const char* what) {
++        int cpu_slots[k]; std::vector<int> cpu_miss; expected(hmap, cpu_slots, cpu_miss);
++        std::vector<int> miss(k, -1);
++        int mc = 0;
++        ck(cudaMemcpy(dmap, hmap, sizeof hmap, cudaMemcpyHostToDevice), "map upload");
++        ck(cudaMemcpy(dslots, miss.data(), k * sizeof(int), cudaMemcpyHostToDevice), "seed slots");
++        ck(cudaMemcpy(dmiss, miss.data(), k * sizeof(int), cudaMemcpyHostToDevice), "seed miss");
++        ck(cudaMemcpy(dmc, &mc, sizeof(int), cudaMemcpyHostToDevice), "seed count");
++        translate_slots_kernel<<<1, 32, 0, stream>>>(dids, dmap, k, zero, dslots, dmiss, dmc);
++        ck(cudaMemcpy(&mc, dmc, sizeof(int), cudaMemcpyDeviceToHost), "read count");
++        std::vector<int> got_slots(k), got_miss(k, -1);
++        ck(cudaMemcpy(got_slots.data(), dslots, k * sizeof(int), cudaMemcpyDeviceToHost), "read slots");
++        ck(cudaMemcpy(got_miss.data(), dmiss, k * sizeof(int), cudaMemcpyDeviceToHost), "read miss");
++        CHECK(std::memcmp(cpu_slots, got_slots.data(), sizeof cpu_slots) == 0, "%s: translated slots differ", what);
++        std::sort(cpu_miss.begin(), cpu_miss.end());
++        std::sort(got_miss.begin(), got_miss.begin() + mc);
++        CHECK(mc == (int) cpu_miss.size() && std::equal(cpu_miss.begin(), cpu_miss.end(), got_miss.begin()),
++              "%s: miss list/count differ", what);
++        for (int i = 0; i < k; ++i) {
++            const uint8_t* we = (const uint8_t*) dw + (std::size_t) cpu_slots[i] * stride;
++            native_mmvq(12, we, xq, y_ref + (std::size_t) i * n_out, n_in, n_out, 1, stream);
++        }
++        const bool launched = native_mmvq_selected_device(12, dw, stride, dslots, xq, 0, y_dev, n_in, n_out, k, stream);
++        CHECK(launched, "%s: device selected refused", what);
++        ck(cudaStreamSynchronize(stream), "map sync");
++        std::vector<float> ref(k * n_out), dev(k * n_out);
++        ck(cudaMemcpy(ref.data(), y_ref, ref.size() * sizeof(float), cudaMemcpyDeviceToHost), "map read ref");
++        ck(cudaMemcpy(dev.data(), y_dev, dev.size() * sizeof(float), cudaMemcpyDeviceToHost), "map read dev");
++        CHECK(std::memcmp(ref.data(), dev.data(), ref.size() * sizeof(float)) == 0, "%s: hit outputs differ", what);
++    };
++    run("initial hit/miss map");
++    hmap[3] = 3; hmap[7] = 1;   // misses become resident: map update
++    run("after map update");
++    for (int& m : hmap) m = -1; // cache reset: every pick misses
++    run("after map reset");
++    ck(cudaStreamDestroy(stream), "map stream destroy");
++    cudaFree(dw); cudaFree(dx); cudaFree(xq); cudaFree(dids); cudaFree(dmap); cudaFree(dslots); cudaFree(dmiss);
++    cudaFree(dmc); cudaFree(y_ref); cudaFree(y_dev);
++}
++
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+@@ -253,6 +386,7 @@ int main(int argc, char** argv) {
+     refused_keeps_output(12, 2, native_mmvq_weight_bytes(12, 512, 16), slots2,
+                          native_q8_1_bytes(512, 1) + 1, "bad q8 stride");
+ 
++    map_translation_test();
+     packed_q6_refusal();
+     refused_keeps_output(12, 2, 2, slots2, 0, "unaligned derived table");
+     expect_base_throw();

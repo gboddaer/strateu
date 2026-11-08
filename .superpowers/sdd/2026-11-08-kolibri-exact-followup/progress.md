@@ -31,7 +31,7 @@ Plan: `docs/superpowers/plans/2026-11-08-kolibri-exact-followup.md`.
 | 4 cache admission | REJECT (no gain over demand; not correctness) | 4K/16K/65K + demand control + integration | review 2 agrees |
 | 5 synchronization | REJECT (no repeatable speedup; removed) | gate + GPU ordering + 10 pairs + integration | review 3 agrees |
 | 6 promotion fences | REJECT (12 ms, no end-to-end gain demonstrated) | batch test + 389-move round + diff | review agrees |
-| 7 GPU hit dispatch | not started | | |
+| 7 GPU hit dispatch | BLOCKED (prototype qualified; engine lifecycle deferred) | counters + DEC_PHASES + hit/miss/update/reset test | 4 reviews agree |
 | 8 CPU packing | not started | | |
 | 9 host-copy diagnosis | not started | | |
 | 10 zero buffer | not started | | |
@@ -155,3 +155,12 @@ Implemented the narrow ring-only batch and its two-buffer/delayed-reader/second-
 promotion-heavy round fell 487.8 -> 475.6 ms (12.2 ms, 2.5%) with identical logits; no end-to-end improvement was
 demonstrated. Removed the gate and test addition, kept the diff; per-move fences stay. Performance rejection; the
 test was not a full lifecycle qualification and exposed no defect.
+
+## Task 7 - GPU hit dispatch (BLOCKED)
+
+The slot-path router copy was uncounted; a probe measured 0.567 ms/layer (~28 ms/token vs 68.79 ms measured).
+A device-slot selected-MMVQ prototype passed bit-exact forced-map tests, and a GPU translation test passed
+hit -> miss -> map update -> map reset against CPU translation with complete outputs. It was not connected to the
+engine: partial residency still needs host ids for `np_admit` and misses, and all-resident does not fit (42.90 GiB
+experts vs 39,860 MiB after dense+KV+scratch; auto-fit 326 slots/layer). Experimental code removed; diff kept.
+BLOCKED, not a pass. No server.
