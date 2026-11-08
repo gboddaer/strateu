@@ -47,6 +47,43 @@ static void check_plan(const std::vector<HotSwap>& got, const std::vector<Expect
 }
 
 int main() {
+    if (fit_expert_cache(600, 100, 10, 8, 2, true) != 2 ||
+        fit_expert_cache(600, 100, 10, 8, 2, false) != 3 ||
+        fit_expert_cache(1110, 100, 10, 8, 2, true) != 8 ||
+        fit_expert_cache(300, 100, 10, 8, 2, true) != 0) {
+        std::puts("FAIL joint expert cache/stage budget"); ++fails;
+    }
+    std::vector<int32_t> admission(5, -1);
+    auto fills = admit_free(admission.data(), 5, 3, {3, 1, 3, 4});
+    if (fills.size() != 3 || admission[3] != 0 || admission[1] != 1 || admission[4] != 2 ||
+        !admit_free(admission.data(), 5, 3, {2, 3}).empty() || admission[2] != -1) {
+        std::puts("FAIL lazy cache bounded demand admission"); ++fails;
+    }
+    bool bad_admission = false;
+    try { admit_free(admission.data(), 5, 3, {2, 5}); } catch (const std::invalid_argument&) { bad_admission = true; }
+    if (!bad_admission) { std::puts("FAIL demand validates full request before capacity exit"); ++fails; }
+    std::vector<int> spill{10, 20, 30};
+    auto sp = plan_spill(spill, {30, 40, 20});
+    if (sp.slots != std::vector<int>({2, 0, 1}) || sp.fetches.size() != 1 || sp.fetches[0].expert != 40) {
+        std::puts("FAIL spill protects current picks"); ++fails;
+    }
+    if (!plan_spill(spill, {30, 40, 20}).fetches.empty()) { std::puts("FAIL spill re-fetch"); ++fails; }
+    if (plan_spill(spill, {40, 40}).slots != std::vector<int>({0, 0})) { std::puts("FAIL duplicate spill picks"); ++fails; }
+    bool spill_rejected = false;
+    try { plan_spill(spill, {1, 2, 3, 4}); } catch (const std::invalid_argument&) { spill_rejected = true; }
+    if (!spill_rejected) { std::puts("FAIL spill overcommit"); ++fails; }
+    if (!skip_zero_overflow(0, false) || skip_zero_overflow(1, false) || skip_zero_overflow(0, true)) {
+        std::puts("FAIL zero overflow guard"); ++fails;
+    }
+    // Short saved profiles must not pad the cache with duplicate expert zero.
+    std::vector<int> seed{5, 2};
+    complete_hot_seed(seed, 8, 6);
+    if (seed != std::vector<int>({5, 2, 0, 1, 3, 4})) { std::puts("FAIL partial profile top-up"); ++fails; }
+    complete_hot_seed(seed, 8, 6);
+    if (seed != std::vector<int>({5, 2, 0, 1, 3, 4})) { std::puts("FAIL seed top-up idempotence"); ++fails; }
+    std::vector<int> empty;
+    complete_hot_seed(empty, 4, 4);
+    if (empty != std::vector<int>({0, 1, 2, 3})) { std::puts("FAIL empty profile top-up"); ++fails; }
     // ---- Case A: empty slots are filled best-score first, and a cold cache has only those.
     {
         const std::vector<double> score{5, 0, 3, 0,   2, 9, 0, 0};   // layer 0: e0 5, e2 3 | layer 1: e0 2, e1 9

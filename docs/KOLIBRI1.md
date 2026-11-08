@@ -1,5 +1,8 @@
 # Kolibri 1 — running Aleph Alpha's Kolibri 1 on Strata
 
+**New here?** [Install, start and use Kolibri](KOLIBRI_QUICKSTART.md) is the short way in: what you need, one
+install command, the start script, the API addresses and the memory modes. This page is the reference behind it.
+
 Kolibri 1 is [Aleph Alpha](https://huggingface.co/Aleph-Alpha/Kolibri-1)'s 78-billion-parameter
 mixture-of-experts reasoning model for German and English (3.46 B active per token, Apache-2.0). Strata runs it
 on the same idea as Flash-Next: every expert in system RAM, the most-used ones on the graphics card, the CPU and
@@ -153,7 +156,7 @@ config. Other model families are unchanged; HIP keeps its own prefill profile.
 
 | Setting | CUDA Kolibri default |
 | --- | --- |
-| Engine arguments | `--prefill --cpu-threads <node-local physical cores, cap 24> --expert-slots 0` |
+| Engine arguments | `--prefill --cpu-threads <node-local physical cores, cap 24> --expert-slots 0` on a PC whose RAM holds the expert table; below 52 GiB for Q4_K_M source setup writes `--expert-no-pin --expert-slots auto --expert-slots-hot` instead (see below) |
 | NUMA placement | Explicit `launch_prefix` from the selected GPU's node where topology is unambiguous |
 | `STRATA_KOLIBRI_EXPERT_STREAM` | `1` on supported CUDA architectures; capability fallback on older/unknown devices |
 | `STRATA_KOLIBRI_STREAM_DEV_ACT`, `STRATA_KOLIBRI_STREAM_GU` | `1` |
@@ -412,6 +415,84 @@ same box does ~157 tok/s, and the decode after a 32K prompt is 13.4 / 13.5 again
 `--expert-slots` caches experts by **id** rather than by hotness and costs 17% of decode (25.0 / 25.1 against 30.3),
 and `STRATA_KOLIBRI_DEC_RES=1` costs 10% of prefill for -3% of decode.  The levers are less expert traffic and a
 fused compressed-weight GEMM, or a card class where the placement sign flips - not another knob.
+
+### Expert cache without a pinned host table
+
+`--expert-no-pin` is an opt-in mode for machines whose RAM cannot hold the full pinned expert table.
+Source setup selects it, with `STRATA_KOLIBRI_NOPIN_PROFILE=demand`, when the PC has less than 52 GiB of RAM
+for Q4_K_M; on a larger PC it stays a flag you pass yourself. It keeps the GGUF mapped and copies missing
+experts into GPU memory before computing them. The file cache
+can be evicted; it does not lock the whole model in RAM. Dense weights and KV, including sliding-window KV,
+stay in VRAM. Small router-transfer buffers are still pinned. The baseline uses a shared pageable expert stage;
+the optional pipeline/demand profiles use bounded pinned transfer buffers, not a pinned model table.
+
+For 128K capacity, with an explicit runtime reserve:
+
+```sh
+STRATA_KOLIBRI_NOPIN_PROFILE=demand \
+  build-kolibri-hip/strata-kolibri --model /path/Kolibri-1-Q4_K_M.gguf \
+  --expert-no-pin --expert-slots auto --expert-slots-hot \
+  --expert-slots-profile kolibri.profile --ctx 131072 --vram-reserve-mib 1536 \
+  --prefill --tokens-file tools/kolibri/oracle_ids512.txt --n 4
+```
+
+`--tokens` takes comma-separated **token IDs**, not English text. Use the server's tokenizer and chat template
+when preparing a chat prompt. This command tests the engine directly; it does not start a server.
+
+The cache budget accounts for dense weights, KV, workspace, per-layer spill slots and a runtime reserve.
+The optional optimized profiles jointly size the cache and the stage needed for nonresident experts. `--expert-slots-hot` and `--expert-slots-profile PATH` can learn and persist the resident
+set. Prefill uses resident experts directly and stages missing experts from the mmap. Decode uses the cache
+and per-layer spill slots. This changes placement, not expert quantization or kernel arithmetic.
+
+`STRATA_KOLIBRI_NOPIN_PROFILE` selects an opt-in profile:
+
+- `baseline` (default): eager cache fill and conservative transfers.
+- `balanced`: skip zero-overflow work, reuse spill weights and fit cache/stage memory jointly.
+- `pipeline`: balanced plus two event-owned transfer buffers and resident/missing-work overlap.
+- `demand`: pipeline plus lazy filling of free permanent cache slots. It seeds only a supplied profile;
+  other experts are fetched and retained when routing selects them. It requires hot, per-layer residency.
+
+On the W7800, demand gave the best startup/reuse results. It is not a new global default. Source setup now picks
+the placement from the PC's RAM: Q4_K_M publishes a 56 GiB need for a pinned table of about 43 GiB, and below
+52 GiB (that need less the 4 GiB shave setup applies to its RAM checks) setup writes the mmap demand profile and
+prints why. That is a recommendation, not a measured allocation boundary, and fewer CPU cores alone do not change
+it: free VRAM and storage speed still decide whether the cache fits and how fast it runs. On a T4 that can hold the
+table, an un-streamed CPU-pool run measured faster than the mmap profiles in both timed phases, so the table stays
+the CUDA choice there. [The cache selection record](KOLIBRI_CACHE_SELECTION.md) has both sets of numbers, the gates
+and the limits. Set `STRATA_KOLIBRI_TRANSFER_RING=pageable` to avoid pinned expert transfer buffers, or `off` for
+blocking pageable transfers. The pinned ring is capped at 64 MiB total, about 30 MiB for this model.
+Full results, rejected experiments, exact limits and reproduction commands are in the
+[W7800 cache campaign](experiments/kolibri-w7800-cache-optimization.md).
+
+Do not combine this mode with `--cpu-threads`, `--grouped` or `STRATA_KOLIBRI_EXPERT_F16`; startup refuses
+them because those paths require the host expert table. This mode is not a new default. Reserving 128K KV
+capacity is not evidence of successful retrieval or quality on a full 128K prompt.
+
+GPU regression checks (supply the ROCm library path and device selection for your installation):
+
+```sh
+python3 tools/kolibri/test_unpinned.py --phase short \
+  --bin build-kolibri-hip/strata-kolibri --model /path/Kolibri-1-Q4_K_M.gguf
+python3 tools/kolibri/test_unpinned.py --phase long \
+  --bin build-kolibri-hip/strata-kolibri --model /path/Kolibri-1-Q4_K_M.gguf
+python3 tools/kolibri/test_unpinned.py --phase hot \
+  --bin build-kolibri-hip/strata-kolibri --model /path/Kolibri-1-Q4_K_M.gguf
+```
+
+The `long` phase tests 1,025 input tokens across chunk and sliding-window transitions, not 128K input tokens.
+The phases use identical forced output histories when comparing full logits across cache sizes. The short
+phase also checks repeated prefill and invalid option combinations. The `hot` phase checks CLI profile saving
+and full-logit agreement after loading that profile. Low-cache tests can be slow because they
+intentionally fetch most experts from the file-backed store.
+
+Local validation on a Radeon PRO W7800 (gfx1100), 30 GiB RAM, Q4_K_M, HIP: with 128K capacity, prefill enabled
+and a 1,536 MiB reserve, the baseline allocated 326 expert slots/layer and reported 1,710 MiB free.
+The optimized joint budget allocated 334 slots/layer, with about 1,626–1,628 MiB free. In demand mode,
+allocated slots are not necessarily loaded: only saved-profile or requested experts occupy them.
+The 512-token oracle generated `286 3515 310 262`. Complete forced-history logits agreed bit-for-bit across
+cache sizes and repeated prefill; a 1,025-token case crossed chunk and sliding-window boundaries. A chat-template
+smoke test answered `Paris` to the capital-of-France question. These are engine correctness checks, not a task-quality
+campaign or a full-128K prompt test. CUDA, SYCL and server runtime were not tested on this machine.
 
 The by-id limitation now has an opt-in path.  `--expert-slots-hot` picks the resident experts by routed-pick
 frequency instead of by id, `--expert-slots-profile PATH` saves that set and seeds the next start from it, and
