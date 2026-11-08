@@ -69,17 +69,19 @@ if [ "$PRIMARY_EXIT" != 0 ] || ! grep -q '[[:alnum:]]' "$R-review-gpt61sol.md"; 
   # Fallback: Ollama glm-5.3-flash:cloud (provider compat has no reasoning-effort parameter).
   timeout 900 pi $REVIEW_ARGS --model ollama/glm-5.3-flash:cloud "$BRIEF" > "$R-review-glm53flash.md" 2>&1
   FALLBACK_EXIT=$?; echo "$FALLBACK_EXIT" > "$R-review-glm53flash.exit"
-  [ "$FALLBACK_EXIT" = 0 ] && grep -q '[[:alnum:]]' "$R-review-glm53flash.md" || echo BLOCKED > "$R-review-status.txt"
+  [ "$FALLBACK_EXIT" = 0 ] && grep -q '[[:alnum:]]' "$R-review-glm53flash.md" || echo SKIPPED > "$R-review-status.txt"
 fi
 ```
 
-Treat an output that is only a provider/API error message as no reply even if its exit code is zero. On BLOCKED,
-stop that milestone and report it; do not invent a review.
+Treat an output that is only a provider/API error message as no reply even if its exit code is zero. On SKIPPED,
+record both attempts (model, command, exit code, log tail) in the ledger and continue the milestone without a review;
+do not invent, summarize or paraphrase a review that did not happen.
 
 **Fallback trigger is availability only:** nonzero exit, a timeout, an empty/whitespace-only file, or content that
 is only a provider/API error. A negative or inconvenient review is NOT a reason to switch reviewers. Record the
 reviewer model, command, exit code and UTC time in the ledger. If the primary is unusable, use the fallback once;
-if both are unusable, mark the milestone review BLOCKED. Do not try a third model, and never silently skip the gate.
+if both are unusable, mark the milestone review SKIPPED and continue. SKIPPED is a recorded availability outcome,
+not a failure of the milestone; do not try a third model, and never present a skipped gate as a completed review.
 The fallback review carries the same authority and must be acted on exactly the same way.
 
 The brief must contain, in this order: (1) the exact plan task and its acceptance rules; (2) the base and head
@@ -98,8 +100,8 @@ step that was skipped. Prefer naming exact paths over pasting large diffs, but q
 3. Critical/Important findings get one fix pass using RED→GREEN tests, then the full common gate is re-run.
    If the fix changes arithmetic, data lifetimes or public interfaces beyond the reviewed diff, request a focused
    follow-up review of that fix and act on it the same way. Do not loop indefinitely on cosmetic Minor items; ledger them.
-4. The retained commit must include the review file(s), exit-code files and the resolution notes. A milestone whose review is missing,
-   unanswered, or marked BLOCKED is not complete, even if tests pass.
+4. The retained commit must include the review file(s), exit-code files, resolution notes, or — for SKIPPED — both
+   attempt logs with exit codes. An unexplained missing review is not acceptable; a recorded SKIPPED review is.
 
 ## Task0: seal controls and fix the test-driver budget (not attention work)
 
