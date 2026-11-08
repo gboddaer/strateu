@@ -25,8 +25,8 @@ Plan: `docs/superpowers/plans/2026-11-08-kolibri-exact-followup.md`.
 
 | Task | Decision | Evidence | Review |
 |---|---|---|---|
-| 0 driver budget | in progress | tests + controls below | pending |
-| 2 selected MMVQ | KEEP + KEEP-ENABLER (fix review pending) | full-logit gates + 5 timing pairs + integration matrix | review 1 acted on |
+| 0 driver budget | KEEP (driver correctness) | 17 tests + 10800 s controls | 3 reviews, resolved |
+| 2 selected MMVQ | KEEP + KEEP-ENABLER | full-logit gates + 5 timing pairs + integration matrix | 3 reviews, resolved |
 | 3 quantization reuse | REJECT (no repeatable gain, no named consumer) | exactness + 5 timing pairs + integration | review 1 agrees |
 | 4 cache admission | REJECT (no gain over demand; not correctness) | 4K/16K/65K + demand control + integration | review 2 agrees |
 | 5 synchronization | REJECT (no repeatable speedup; removed) | gate + GPU ordering + 10 pairs + integration | review 3 agrees |
