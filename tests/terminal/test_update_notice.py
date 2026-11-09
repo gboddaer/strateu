@@ -349,9 +349,23 @@ class Monitor(unittest.TestCase):
 
 @contextlib.contextmanager
 def tempfile_home():
+    """A scratch component folder, removed afterwards. A monitor's own check thread can still hold `.updates/update.lock` when the
+    folder goes, and Windows cannot unlink an open file (WinError 32): that one file is given a moment, then left."""
+    import shutil
     import tempfile
-    with tempfile.TemporaryDirectory(prefix="strata-notice-") as d:
+    import time
+    d = tempfile.mkdtemp(prefix="strata-notice-")
+    try:
         yield d
+    finally:
+        for _ in range(20):
+            try:
+                shutil.rmtree(d)
+                break
+            except PermissionError:
+                if os.name != "nt":
+                    raise
+                time.sleep(0.1)
 
 
 if __name__ == "__main__":
