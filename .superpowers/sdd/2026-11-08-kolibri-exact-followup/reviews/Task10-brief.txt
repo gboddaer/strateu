@@ -1,0 +1,15 @@
+Independent review of Task 10 (all-resident / zero buffer). Read `task10/summary.md`, the diff and dumps.
+
+All-resident does not fit (42.90 GiB experts vs 39,860 MiB free after dense+KV+scratch; auto-fit 326 slots/layer,
+1536 MiB reserve). The zero-buffer gate replaced the per-layer skip memset with one immutable K*N buffer used as
+s.yc. With SKIP_ZERO_OVERFLOW=1 (6114 skips), 512/128 full logits diverged deterministically:
+off 6ffefa8f..., on/repeat 8da2091d...; token 0 identical, token 1 onward 127,999/128,000 values differ (max 3.58).
+Cache8 had zero skips and stayed 466f48f2....
+Proposal: REJECT (correctness), remove gate/allocation, keep diff/dumps.
+
+Check:
+1. Is the divergence a genuine correctness failure of the replacement, or instrumentation/run artifact?
+2. Does the evidence support that the memset is load-bearing beyond the s.yc read?
+3. Is the all-resident infeasibility argument sound?
+4. Anything that must be preserved in the record.
+Say plainly whether REJECT is justified.

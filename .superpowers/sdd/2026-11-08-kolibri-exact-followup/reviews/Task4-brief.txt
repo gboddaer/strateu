@@ -1,0 +1,30 @@
+Independent review of plan Task 4 (prefill cache admission). Read-only; do not edit.
+
+TASK: `docs/superpowers/plans/2026-11-08-kolibri-exact-followup.md`, "Task4". Interface:
+`plan_prefill_admission(...)` for one layer with current requested counts and resident map; protect every current
+requested resident; admit most-used missing into free/unrequested victim slots; deterministic ties; bounded budget;
+no routing change; flag STRATA_KOLIBRI_PREFILL_ADMIT=1 default off, no-pin + per-layer hot only; old readers must finish
+before overwrite; keep bounded staging beyond capacity.
+
+DIFF SCOPE: working tree against HEAD c50780f9 on amdw7800probuild_optimize:
+`include/strata/kernels/kolibri_hot_policy.hpp`, `tests/kolibri/hot_policy_test.cpp`,
+`src/kolibri/kolibri_engine.cu`, `tools/kolibri/bench_unpinned.py`.
+Evidence: `.superpowers/sdd/2026-11-08-kolibri-exact-followup/task4/summary.md`,
+`task4/integration-compare.txt`, JSON/log artifacts.
+
+CLAIMED DECISION: KEEP opt-in. Staging 19.78/78.31/313.35 GB becomes admission 4.69/8.35/19.88 GB at 4K/16K/65K;
+zero staging in the on-runs. Full logits identical at all three sizes and 10/10 short/long/hot/profile dumps.
+Wall at 16K -5.4%/-27.6%, 65K -9.7%/-11.7%, 4K noisy; prefill +11.7% to +62%; decode unchanged at 65K, may fall at 16K.
+
+CHECK with file:line:
+1. Planner correctness: duplicate counts, protection of every requested resident, capacity overflow, no-victim,
+   budget semantics, deterministic ties, out-of-range map/request. Is sorting by slot safe for budget?
+2. Engine lifetime: can a victim be overwritten while any stream still reads it? Are `st`/`g_st` synchronizations
+   sufficient and correctly placed? Is the map published at a safe time, and are copies fenced before consumers?
+3. Does admission interact correctly with transfer buffers, hstage, packed layout, graph capture, pinned-table mode,
+   zero/spill slots and repeated chunks? Any way to leave `slot_of` inconsistent with VRAM contents?
+4. Legacy path: is it unchanged when the flag is off, and is the unconditional `np_admit` call at prefill harmless?
+5. Traffic accounting: do the counters actually measure the claimed bytes, and is "zero staging" credible rather than
+   a missing counter? Is the 4K/16K/65K evidence sufficient for KEEP, given no balanced control and two pairs per size?
+6. Any required plan step skipped or any correctness/performance claim overstated.
+State findings by severity with file:line. Say plainly whether KEEP is justified or the task should be narrowed/rejected.

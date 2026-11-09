@@ -1,0 +1,20 @@
+Follow-up Task 6 review after your findings. The narrow ring-only batch is now implemented and measured.
+
+Read `task6/summary.md` and the new batch-round test in `tests/kolibri/expert_transfer_test.cu`.
+
+Implementation: `STRATA_KOLIBRI_PROMOTE_BATCH=1`, default off; requires transfer ring, no decode stream/handoff.
+`slots_reselect` records one `wait_for(g_st)` before the list, each move does acquire/pack/submit without per-move
+fences, then one `wait_on(g_st)`; unsupported modes keep per-move. Test covers two delayed old readers, both ring
+buffers, a following generation and a second consumer stream, pageable+pinned; passes.
+
+Measurement: pipeline profile, 8 slots/layer, hot map, 4097-token prefill, 389 moves: promotion 487.8 -> 475.6 ms
+(12.2 ms, 2.5%), identical logits SHA `c83db3e3...61a7`; process wall 259 s vs 132 s is load/cache-confounded.
+
+Proposed: REJECT, remove engine gate and test addition, keep evidence. Per-move fences stay.
+
+Confirm:
+1. Is the batch ordering correct for one round and the next generation, including the second consumer stream?
+2. Does the measured 12.2 ms saving support rejection as not end-to-end measurable?
+3. Is removal right, or should this be KEEP-ENABLER?
+4. Any correctness risk introduced by batching that the test misses.
+Say plainly whether REJECT is justified.

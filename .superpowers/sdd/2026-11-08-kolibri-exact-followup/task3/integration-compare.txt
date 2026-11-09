@@ -1,0 +1,20 @@
+# Task 3 integration comparison (both flags on vs Task 2 flag-off matrix)
+
+executable: sha256 6abb7f0e71c3026e20eba0741a9c9ae30a141ec121bb9edc86bb1fda102b48fe
+flags: STRATA_KOLIBRI_REUSE_Q8=1, STRATA_KOLIBRI_MMVQ_SELECTED=1
+reference: task2/integration-off (same model, forced histories, profile replay)
+
+| case | bytes | floats | finite | sha256 | identical |
+|---|---|---|---|---|---|
+| decode-short-spill | 2048000 | 512000 | True | `2e755d6f1e8411dfdc78992dd18557515923f4c5a36ead39c9b4d15234fd7f71` | True |
+| decode-short | 2048000 | 512000 | True | `2e755d6f1e8411dfdc78992dd18557515923f4c5a36ead39c9b4d15234fd7f71` | True |
+| decode | 2048000 | 512000 | True | `49fce53c80a8e08d028f719c471f8cc55c883034b9779bfb7f1617bd46aa146f` | True |
+| hot-cold | 2048000 | 512000 | True | `42dd3dab9601a539e44a772f8833093c6b9e4d78216dd8bf3616db628cc0b3ec` | True |
+| hot-warm | 2048000 | 512000 | True | `42dd3dab9601a539e44a772f8833093c6b9e4d78216dd8bf3616db628cc0b3ec` | True |
+| long-prefill-spill | 2048000 | 512000 | True | `fbfb227e004397683e2466592728e832699b311157c561a84ad4b72731baa454` | True |
+| long-prefill | 2048000 | 512000 | True | `fbfb227e004397683e2466592728e832699b311157c561a84ad4b72731baa454` | True |
+| prefill-repeat | 2048000 | 512000 | True | `b2b99a9c7bf01cdbbdedc7c6aeb24767baab3a57d9b7e43aea50fd0ed75121f5` | True |
+| prefill-spill | 2048000 | 512000 | True | `b2b99a9c7bf01cdbbdedc7c6aeb24767baab3a57d9b7e43aea50fd0ed75121f5` | True |
+| prefill | 2048000 | 512000 | True | `b2b99a9c7bf01cdbbdedc7c6aeb24767baab3a57d9b7e43aea50fd0ed75121f5` | True |
+
+All ten complete dumps finite and byte-identical: **True**

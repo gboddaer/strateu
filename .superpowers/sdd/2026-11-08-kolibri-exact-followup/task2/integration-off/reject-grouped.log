@@ -1,0 +1,2 @@
+kolibri: decode acceleration off (--cpu-threads must select the CPU pool); running the plain decode path
+strata-kolibri: --expert-no-pin cannot use --grouped: it reads the pinned table over UVA

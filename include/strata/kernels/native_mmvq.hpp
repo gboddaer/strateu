@@ -152,6 +152,18 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
                       int n_in, int n_out, int ncols, void* stream);
 
+/// Exact multi-selection MMVQ: the same arithmetic as `selections` independent native_mmvq(ncols=1) calls on the SAME
+/// Q8_1 bytes, in one launch (Q4_K=12 and Q6_K=14, 2..8 selections). `base + host_slots[s] * weight_stride` is the
+/// weight table of selection s; `host_slots` is a host array (copied into the kernel parameters, never a device DMA).
+/// x_q8_1_stride == 0 shares one activation column; otherwise it is exactly native_q8_1_bytes(n_in, 1) and every
+/// selection reads the next column. y receives selections * n_out contiguous floats. The caller owns valid table
+/// bounds. Returns false and launches nothing where this exact dispatch is unavailable (other formats, selection
+/// counts, gfx906 wave layout, a registered packed-Q6 table, or an unaligned DERIVED weight pointer). An unaligned
+/// base pointer, invalid shapes/pointers, or a negative/overflowing slot offset throws like the other launch helpers.
+bool native_mmvq_selected(int ggml_type, const void* base, std::size_t weight_stride, const int* host_slots,
+                          const void* x_q8_1, std::size_t x_q8_1_stride, float* y, int n_in, int n_out,
+                          int selections, void* stream);
+
 // Fork F4 (Eddoursul): 2..4 columns also INTERLEAVED, so one 16-byte load reads a position of every column: CP = 2 (2
 // columns) or 4 (3-4), zero-padded; nb = n_in / 32 blocks; int32 bm[nb][8][CP] (block-major), int32 pm[8][nb][CP]
 // (position-major), float d[nb][CP] (each block's scale as the dots read it, __low2float of ds).

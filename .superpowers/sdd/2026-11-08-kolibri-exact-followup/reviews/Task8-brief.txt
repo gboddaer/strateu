@@ -1,0 +1,15 @@
+Independent review of Task 8 (bounded CPU packing). Read `task8/summary.md`, the preserved sources/diff and logs.
+
+Implemented a bounded 1-4 lane BytePackPool (caller lane 0, persistent workers, join before DMA), gate
+STRATA_KOLIBRI_PACK_THREADS=2 default 0, splitting pack_blob's gate/up/down copies. Byte-exact unit test covered
+0/1/37/4099-byte spans, gaps/sentinels, repeats, source overwrite after return, one span, destruction drain; passes.
+Two alternating 512/128 pairs: all logits identical `6ffefa8f...`; packing was not faster (startup off 70.8/148.0 s
+vs on 89.7/156.6 s; prefill 6.8/25.8 vs 21.3/19.3; decode 0.94/2.04 vs 2.43/10.56 s; wall worse both).
+Proposal: REJECT, remove pool/wiring/test, keep diff/logs.
+
+Check:
+1. Is the byte-exact/drain/source-lifetime test adequate?
+2. Is the two-lane slow result credible (mmap/IO contention), or is the measurement too confounded?
+3. Does the plan require a cold-4K-only run before rejecting?
+4. Any correctness risk in the implementation that should be recorded even though removed.
+Say plainly whether REJECT is justified.

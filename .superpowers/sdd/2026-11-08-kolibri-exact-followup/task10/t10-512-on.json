@@ -1,0 +1,71 @@
+{
+  "label": "t10-512-on",
+  "command": [
+    "build-kolibri-hip/strata-kolibri",
+    "--model",
+    "/home/gbo/models/Kolibri-1-Q4_K_M.gguf",
+    "--expert-no-pin",
+    "--expert-slots",
+    "auto",
+    "--expert-slots-hot",
+    "--expert-slots-profile",
+    ".superpowers/sdd/2026-11-08-kolibri-exact-followup/task10/t10-512-on.profile",
+    "--prefill",
+    "--ctx",
+    "131072",
+    "--vram-reserve-mib",
+    "1536",
+    "--tokens-file",
+    ".superpowers/sdd/2026-11-08-kolibri-exact-followup/task10/t10-512-on.ids",
+    "--n",
+    "128",
+    "--dump-full-logits",
+    ".superpowers/sdd/2026-11-08-kolibri-exact-followup/task10/t10-512-on.bin",
+    "--counters",
+    "--force",
+    "286,3515,310,262,14292,1343,1444,46,17156,32,51,48,58,4037,262,1890,286,3515,310,262,14292,1343,1444,46,17156,32,51,48,58,4037,262,1890,286,3515,310,262,14292,1343,1444,46,17156,32,51,48,58,4037,262,1890,286,3515,310,262,14292,1343,1444,46,17156,32,51,48,58,4037,262,1890,286,3515,310,262,14292,1343,1444,46,17156,32,51,48,58,4037,262,1890,286,3515,310,262,14292,1343,1444,46,17156,32,51,48,58,4037,262,1890,286,3515,310,262,14292,1343,1444,46,17156,32,51,48,58,4037,262,1890,286,3515,310,262,14292,1343,1444,46,17156,32,51,48,58,4037,262"
+  ],
+  "env_overrides": [
+    "STRATA_KOLIBRI_ZERO_BUFFER=1"
+  ],
+  "env_inherited_strata": {
+    "STRATA_KOLIBRI_MMVQ_SELECTED": "1"
+  },
+  "python": "3.13.5",
+  "wall_s": 115.30074489998515,
+  "input_tokens": 512,
+  "context": 131072,
+  "timeout_s": 10800.0,
+  "ids_source": null,
+  "phases": {
+    "startup": {
+      "tokens": 0,
+      "ms": 92967.339,
+      "tok_s": 0.0
+    },
+    "prefill": {
+      "tokens": 511,
+      "ms": 12517.797,
+      "tok_s": 40.821879440927184
+    },
+    "decode": {
+      "tokens": 128,
+      "ms": 8706.986,
+      "tok_s": 14.700839073360171
+    }
+  },
+  "logits_bytes": 65536000,
+  "logits_floats": 16384000,
+  "logits_sha256": "8da2091dccecaea8a050892d8b32885268d466375fad1854f3d528eae1b04857",
+  "binary_sha256": "48d0367e4798341959049ee5275c5c6669a55f50782b5137fe48863ca2e0b68f",
+  "generated": "gen: 286 3515 310 262 14292 1343 1444 46 17156 32 50 48 58 4037 262 7771 36907 12899 310 262 14292 1343 1444 46 17156 32 51 49 735 4037 262 1890 286 3515 310 262 14292 1343 1444 46 17156 32 51 48 58 4037 262 1890 286 3515 310 262 14292 1343 1444 46 17156 32 51 48 58 4037 262 1890 286 5452 310 262 7469 1343 1444 46 17156 32 51 48 58 4037 262 1890 286 3515 310 262 14292 1343 1444 46 17156 32 51 48 58 4037 262 1890 286 3515 310 262 14292 7771 1444 46 17156 32 51 48 58 4037 262 1890 286 3515 310 262 14292 1343 1444 46 17156 32 51 48 58 4037 262 1890",
+  "diagnostics": [
+    "strata-kolibri: (ctx, slots) draw on the same VRAM: 1 slot = 114 MiB = 5857 context tokens at 20.0 KB/token; ctx 131072 x 20480 = 2.50 GiB, 1710 MiB free (reserve 1536 MiB)",
+    "NOPIN_STATS startup packs=16300 bytes=39104352000 repeat_packs=0 pack_ms=60892.526 zero_overflow_skips=0 spill_hits=0",
+    "NOPIN_IO startup major_faults=112014 minor_faults=1041571 input_blocks=38378968",
+    "NOPIN_STATS prefill packs=1947 bytes=4668703200 repeat_packs=844 pack_ms=5305.609 zero_overflow_skips=0 spill_hits=0",
+    "NOPIN_IO prefill major_faults=9619 minor_faults=70027 input_blocks=3004968",
+    "NOPIN_STATS decode packs=498 bytes=1172102400 repeat_packs=266 pack_ms=901.115 zero_overflow_skips=6026 spill_hits=0",
+    "NOPIN_IO decode major_faults=694 minor_faults=4918 input_blocks=659152"
+  ]
+}

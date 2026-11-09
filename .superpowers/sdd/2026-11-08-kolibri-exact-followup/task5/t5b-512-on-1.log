@@ -1,0 +1,24 @@
+kolibri: decode acceleration off (--cpu-threads must select the CPU pool); running the plain decode path
+strata-kolibri: /home/gbo/models/Kolibri-1-Q4_K_M.gguf: 903 tensors (layout checked); 42.90 GiB expert blobs backed by GGUF mmap; 15 MiB pageable staging; no pinned expert table; dense 1.62 GiB on GPU; 1.5 s
+CNT vram free=42.96 GiB total=44.98 GiB (after dense upload)
+strata-kolibri: expert cache: PER-LAYER residency map (50 layers x 384 experts), not one global set (default; --no-expert-slots-per-layer for a single set)
+strata-kolibri: expert cache: a round every 32 position(s), at most 96 move(s) mid-request and 2048 after a request, min gain 1.50, decay 0.70
+kolibri: mmap-backed GPU expert cache active; CPU streaming leg disabled
+strata-kolibri: expert cache fit: 39860 MiB free after dense+KV+scratch -> 326 slots/layer (37.20 GiB), 1536 MiB kept for the runtime, 230 MiB left
+strata-kolibri: expert cache: 326 slots/layer = 36.42 GiB VRAM
+strata-kolibri: (ctx, slots) draw on the same VRAM: 1 slot = 114 MiB = 5857 context tokens at 20.0 KB/token; ctx 131072 x 20480 = 2.50 GiB, 1710 MiB free (reserve 1536 MiB)
+NOPIN_PHASE startup tokens=0 ms=207104.851
+PFchunk 511/511 57172ms
+strata-kolibri: hot slots [after prompt]: 844 expert(s) newly resident after 153300 picks (mean gain 24.53+), 1928 MiB over PCIe in 10525.5 ms, budget 2048 (per-layer map)
+NOPIN_PHASE prefill tokens=511 ms=67699.176
+strata-kolibri: ordered decode omits the legacy-stream drains
+strata-kolibri: hot slots [round: token at position 539]: 29 expert(s) newly resident after 161700 picks (mean gain 2.13+), 65 MiB over PCIe in 37.7 ms, budget 96 (per-layer map)
+strata-kolibri: hot slots [round: token at position 571]: 30 expert(s) newly resident after 171300 picks (mean gain 2.53+), 68 MiB over PCIe in 39.5 ms, budget 96 (per-layer map)
+strata-kolibri: hot slots [round: token at position 603]: 16 expert(s) newly resident after 180900 picks (mean gain 2.55+), 37 MiB over PCIe in 21.4 ms, budget 96 (per-layer map)
+strata-kolibri: hot slots [round: token at position 635]: 8 expert(s) newly resident after 190500 picks (mean gain 2.13+), 18 MiB over PCIe in 10.5 ms, budget 96 (per-layer map)
+NOPIN_PHASE decode tokens=128 ms=13966.731
+CNT run tok=128 | slot hits=38107 miss=293 (99.2% hit) expert PCIe=5.4 MB/tok | d2h=128/65536000 B (0.5 MB/tok) h2d=0/0 B (0.0 MB/tok) | reset=0 ms / 0 (0.00 ms)
+CNT decode residency: 0 of 0 picks served from the fp16 cache (0.0%)
+CNT branches per tok: pool 0.0 gpu-expert 50.0 slots-path 50.0 grouped 0.0 (layers/token total 50.0 of 50)
+strata-kolibri: hot profile: 8303 of 16300 slot(s) written to .superpowers/sdd/2026-11-08-kolibri-exact-followup/task5/t5b-512-on-1.profile
+gen: 286 3515 310 262 14292 1343 1444 46 17156 32 50 48 58 4037 262 7771 36907 262 310 262 14292 1343 1444 46 17156 32 51 49 58 4037 262 1890 286 3515 310 262 14292 1343 1444 46 17156 32 51 48 58 4037 262 1890 286 3515 310 262 14292 3544 1444 46 17156 32 51 48 58 4037 262 1890 286 3515 310 262 11171 7771 1444 46 17156 32 51 48 58 4037 262 1890 286 10090 310 262 14292 7771 1444 46 17156 32 51 48 58 4037 262 1890 286 3515 310 262 14292 11534 32 46 17156 32 51 48 58 4037 262 1890 286 3515 310 262 14292 1343 1444 46 17156 32 51 48 58 4037 262 11534

@@ -769,6 +769,96 @@ __global__ void native_q6_k_mmvq_kernel(const Q6KBlock* __restrict__ w,
     }
 }
 
+// Exact multi-selection dispatch: grid.y picks the weight table, activation column and output of one selection.
+// The body of each kernel is the legacy ncols == 1 kernel with the same per-row loop, partial sums and warp
+// reduction, so every output keeps the single-call bits. Host slots arrive by value in these parameters.
+struct SelectedMmvqPointers {
+    const void* weights[8];
+    float* outputs[8];
+};
+
+template<bool SmallK>
+__launch_bounds__(WARPS * WARP, (SmallK ? 4 : 1))
+__global__ void native_q4_k_selected_kernel(SelectedMmvqPointers p, const Q81Block* __restrict__ x_,
+                                            int n_in, int n_out, int x_blocks) {
+    constexpr int ROWS = SmallK ? WARPS : 1;
+    constexpr int BLOCKS_PER_ITER = VDR * WARPS * WARP / QI;
+    const int sel = int(blockIdx.y);
+    const Q4KBlock* __restrict__ w = static_cast<const Q4KBlock*>(p.weights[sel]);
+    float* __restrict__ y = p.outputs[sel];
+    const Q81Block* __restrict__ x = x_ + std::size_t(sel) * std::size_t(x_blocks);
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int row0 = ROWS * int(blockIdx.x);
+    const int blocks_per_row = n_in / QK;
+    float tmp[ROWS] = {};
+    for (int kbx = tid / (QI / VDR); kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+        const int kby = kbx * (QK / Q8K);
+        const int kqs = VDR * (tid % (QI / VDR));
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
+                tmp[i] += q4_q8_dot(w + block, x + kby, kqs);
+            }
+        }
+    }
+    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+        for (int l = 0; l < WARPS - 1; ++l) tmp[i] += partial[l][i][threadIdx.x];
+        tmp[i] = warp_sum(tmp[i]);
+        if (threadIdx.x == i && row0 + i < n_out) y[row0 + i] = tmp[i];
+    }
+}
+
+template<bool SmallK>
+__launch_bounds__(WARPS * WARP, (SmallK ? 4 : 1))
+__global__ void native_q6_k_selected_kernel(SelectedMmvqPointers p, const Q81Block* __restrict__ x_,
+                                            int n_in, int n_out, int x_blocks) {
+    constexpr int ROWS = SmallK ? WARPS : 1;
+    constexpr int BLOCKS_PER_ITER = WARPS * WARP / 32;
+    const int sel = int(blockIdx.y);
+    const Q6KBlock* __restrict__ w = static_cast<const Q6KBlock*>(p.weights[sel]);
+    float* __restrict__ y = p.outputs[sel];
+    const Q81Block* __restrict__ x = x_ + std::size_t(sel) * std::size_t(x_blocks);
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int row0 = ROWS * int(blockIdx.x);
+    const int blocks_per_row = n_in / 256;
+    float tmp[ROWS] = {};
+    for (int kbx = tid / 32; kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+        const int kby = kbx * 8;
+        const int kqs = tid % 32;
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
+                tmp[i] += q6_q8_dot(w + block, x + kby, kqs);
+            }
+        }
+    }
+    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+        for (int l = 0; l < WARPS - 1; ++l) tmp[i] += partial[l][i][threadIdx.x];
+        tmp[i] = warp_sum(tmp[i]);
+        if (threadIdx.x == i && row0 + i < n_out) y[row0 + i] = tmp[i];
+    }
+}
+
 // The four 32-element formats use native two-byte loads and VDR=2. The affine
 // Q4_0/Q5_0 correction consumes the original-input sum stored in Q8_1, exactly
 // as the pinned CUDA dot does; a signed-integer code substitution would differ.
@@ -2712,6 +2802,11 @@ void q6_packed_launch(const Q6Packed& w, const Q81Block* x, float* y, cudaStream
                                                                                     w.n_out, grid);
 }
 
+bool q6_packed_registered(const void* weights) {
+    auto& registry = q6_packed_registry();
+    return !g_q6_bypass && registry.find(weights) != registry.end();
+}
+
 bool q6_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
     auto& registry = q6_packed_registry();
     if (registry.empty() || g_q6_bypass || (ncols > 1 && !g_multi_exact)) return false;
@@ -3347,6 +3442,74 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         native_q6_k_mmvq_kernel<false><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out);
     }
     launch_check();
+}
+
+bool native_mmvq_selected(int ggml_type, const void* base, std::size_t weight_stride, const int* host_slots,
+                          const void* x_q8_1, std::size_t x_q8_1_stride, float* y, int n_in, int n_out,
+                          int selections, void* stream) {
+    if (ggml_type != 12 && ggml_type != 14) return false;   // Q4_K, Q6_K only
+    if (selections < 2 || selections > 8) return false;
+    if (n_in <= 0 || n_in % 256 != 0) throw std::invalid_argument("native MMVQ selected requires n_in divisible by 256");
+    if (n_out <= 0) throw std::invalid_argument("native MMVQ selected requires n_out > 0");
+    validate_pointer(base);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    if (!host_slots) throw std::invalid_argument("native MMVQ selected requires a host slot array");
+#if defined(STRATA_HIP_GFX906)
+    if (!g_wave_off) return false;   // the wave64 layout is a different dispatch
+#endif
+    const std::size_t qcol = native_q8_1_bytes(n_in, 1);
+    if (x_q8_1_stride != 0 && x_q8_1_stride != qcol) return false;
+
+    SelectedMmvqPointers p{};
+    const std::uintptr_t base_addr = reinterpret_cast<std::uintptr_t>(base);
+    for (int s = 0; s < selections; ++s) {
+        const int slot = host_slots[s];
+        if (slot < 0) throw std::invalid_argument("native MMVQ selected requires non-negative host slots");
+        std::size_t offset = 0;
+        if (weight_stride != 0) {
+            if (std::size_t(slot) > SIZE_MAX / weight_stride)
+                throw std::invalid_argument("native MMVQ selected slot offset overflows");
+            offset = std::size_t(slot) * weight_stride;
+        }
+        if (offset > UINTPTR_MAX - base_addr)
+            throw std::invalid_argument("native MMVQ selected weight pointer overflows");
+        const void* weights = reinterpret_cast<const void*>(base_addr + offset);
+        if (reinterpret_cast<std::uintptr_t>(weights) % 4 != 0) return false;   // native_mmvq would reject it
+        p.weights[s] = weights;
+        p.outputs[s] = y + std::size_t(s) * std::size_t(n_out);
+    }
+    if (ggml_type == 14) {
+        for (int s = 0; s < selections; ++s)
+            if (q6_packed_registered(p.weights[s])) return false;   // registered packed-Q6 dispatch differs
+    }
+
+    const auto s = static_cast<cudaStream_t>(stream);
+    const dim3 threads(WARP, WARPS);
+    const int x_blocks = x_q8_1_stride ? int(qcol / sizeof(Q81Block)) : 0;
+    const unsigned nsel = unsigned(selections);
+    if (ggml_type == 12) {
+        if (n_in / 256 < WARPS * WARP / 16) {
+            const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+            native_q4_k_selected_kernel<true><<<dim3(blocks, nsel), threads, 0, s>>>(
+                p, static_cast<const Q81Block*>(x_q8_1), n_in, n_out, x_blocks);
+        } else {
+            native_q4_k_selected_kernel<false><<<dim3((unsigned) n_out, nsel), threads, 0, s>>>(
+                p, static_cast<const Q81Block*>(x_q8_1), n_in, n_out, x_blocks);
+        }
+    } else {
+        if (n_in / 256 < WARPS * WARP / 32) {
+            const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+            native_q6_k_selected_kernel<true><<<dim3(blocks, nsel), threads, 0, s>>>(
+                p, static_cast<const Q81Block*>(x_q8_1), n_in, n_out, x_blocks);
+        } else {
+            native_q6_k_selected_kernel<false><<<dim3((unsigned) n_out, nsel), threads, 0, s>>>(
+                p, static_cast<const Q81Block*>(x_q8_1), n_in, n_out, x_blocks);
+        }
+    }
+    launch_check();
+    return true;
 }
 
 void native_q6_k_f32(const void* weights, const float* x, void* scratch_q8_1,

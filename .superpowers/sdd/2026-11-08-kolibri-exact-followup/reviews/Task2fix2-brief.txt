@@ -1,0 +1,16 @@
+Second focused follow-up review of Task 2. Read your prior Task2 reviews and the updated resolution table in
+`.superpowers/sdd/2026-11-08-kolibri-exact-followup/progress.md`.
+
+Inspect read-only: `task2/integration-compare.txt`, `task2/integration-off/`, `task2/integration-on/`,
+`tests/kolibri/mmvq_selected_test.cpp`, `CMakeLists.txt`, `tools/kolibri/test_unpinned.py`, `task2/summary.md`.
+
+Confirm with file:line:
+1. The integration manifest now independently supports 10/10 finite byte-identical dumps, with input/profile and
+   executable identities. Is the stated run-time executable hash defensible given the later Q6 fix?
+2. Packed-Q6 sentinel: env unset, only the later selection registered, refusal and unchanged output asserted.
+3. gfx906 tests explicitly isolate wave mode; refusal is registered only there.
+4. The 300 s watchdog deviation is recorded honestly, and the new 10800 s default is correct.
+5. cache8 statistics are now consistent and still inconclusive; KEEP scope is local decode only.
+6. No remaining Important finding or new defect.
+
+Report findings by severity with file:line. If only cosmetic issues remain, say so plainly.

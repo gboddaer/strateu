@@ -1,0 +1,19 @@
+Independent review of Task 7 (GPU cache-hit dispatch / capture feasibility). Read-only.
+
+Plan: measure host router D2H/idle share; write device-map generation/miss/update/reset ownership contract; prototype
+device-side slot translation and exact selected MMVQ under forced hits/misses; attempt capture only if misses can
+leave/refresh it; if complete lifecycle needs prohibited server runtime or invasive unproven waiting, record BLOCKED
+with concrete missing gate, remove half-implementations, continue.
+
+No code changed. See `task7/summary.md`. One 512/128 run with counters: 128 D2H calls, 65,536,000 bytes total
+(0.5 MB/token), matching the full-logit copy; no per-layer router D2H appears and no router-idle timer is emitted.
+Proposal: BLOCKED because a device map needs device generations/reset owned by the server runtime, a changed
+selected-MMVQ slot ABI, and lifecycle qualification; a shadow map alone would be dead infrastructure.
+
+Check:
+1. Is the D2H interpretation correct, and is there in fact a per-layer host-router copy that the counters miss?
+2. Is BLOCKED justified by the stated missing gate, or is there an offline lifecycle test that makes a prototype
+   feasible without server runtime?
+3. Does the plan require attempting the ABI prototype regardless?
+4. Any half-implementation or speculative artifact left behind.
+Say plainly whether BLOCKED is the right end state.

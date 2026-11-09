@@ -1,0 +1,19 @@
+# Task 10 integration
+
+executable 22403d46100f8f45a6dcea87adf97d9317a280d502f2330658c989a39721c1a7
+flags SKIP_ZERO_OVERFLOW=1 ZERO_BUFFER=1
+
+| case | finite | identical |
+|---|---|---|
+| decode-short-spill | True | True |
+| decode-short | True | True |
+| decode | True | True |
+| hot-cold | True | True |
+| hot-warm | True | True |
+| long-prefill-spill | True | True |
+| long-prefill | True | True |
+| prefill-repeat | True | True |
+| prefill-spill | True | True |
+| prefill | True | True |
+
+All ten finite and identical: **True**

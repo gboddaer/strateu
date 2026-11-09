@@ -1,0 +1,21 @@
+Independent review of plan Task 5 (redundant decode synchronization). Read-only; do not edit.
+
+TASK: plan section "Task5". Required: RED delayed-producer/consumer checks, then replace only drains whose data and
+host-argument lifetimes are protected by explicit same-stream or proven legacy-stream dependencies; keep prefill
+metadata drains; do not remove reader/weight/source-buffer waits wholesale.
+
+NO CODE WAS CHANGED. Proposed decision in
+`.superpowers/sdd/2026-11-08-kolibri-exact-followup/task5/summary.md` is REJECT: the two drains at
+`src/kolibri/kolibri_engine.cu:3202` and `:3243` are not safely removable without an explicit reader-ownership
+contract covering `g_st`, the opt-in non-blocking decode stream, the transfer ring, the handoff and the CPU pool.
+`gemv()` defaults to `g_st` while SwiGLU and other work runs on `st`.
+
+CHECK:
+1. Is the trace of producer/consumer streams and host-argument lifetimes accurate?
+2. Is REJECT the right outcome, or is there a small provably safe replacement (e.g. event record/wait) that the plan
+   expected?
+3. Are there additional drains in the same path that were missed?
+4. Is omitting the synthetic RED test acceptable for a no-change rejection?
+5. Any claim in the summary that is unproven or overstated.
+
+Report findings by severity with file:line. Say plainly whether REJECT is justified.

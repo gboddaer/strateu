@@ -1,0 +1,18 @@
+Independent review of Task 6 (promotion fences per round). Read-only; do not edit.
+
+Plan requires: RED delayed old readers across multiple layers/two staging buffers; hoist one prior-reader dependency
+before a move list and publish one final readiness dependency; preserve per-move fallback; profile promotion-heavy
+small-cache/long-prefix, not just warm decode.
+
+No code changed. Proposal in `.superpowers/sdd/2026-11-08-kolibri-exact-followup/task6/summary.md` is REJECT because
+existing promotion-heavy runs show 1222-1424 moves costing 1.6-2.7 s, only 0.07-0.92% of wall (demand: 0 moves), and
+the timed span is pack+copy, not fences. `ExpertTransfer::wait_on` already covers all uploads with one generation
+event; the no-pin hstage path needs a bounded staging ring, not a fence hoist.
+
+Check:
+1. Are the extracted shares and the claim that the timed span includes pack+copy accurate?
+2. Is the sub-1% ceiling argument sound, or does a small-cache/long-prefix case exist where promotion dominates?
+3. Is ExpertTransfer's existing batching correctly described?
+4. Is REJECT justified without implementing the batch, or is a batch still required by the plan?
+5. Any correctness risk in the current per-move path that this task should have caught.
+Say plainly whether REJECT is justified; findings by severity with file:line.

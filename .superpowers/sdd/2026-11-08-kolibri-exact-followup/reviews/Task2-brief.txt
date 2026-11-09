@@ -1,0 +1,32 @@
+Independent review of plan Task 2 (exact multi-selection MMVQ) in this repository. Read-only; do not edit.
+
+TASK: `docs/superpowers/plans/2026-11-08-kolibri-exact-followup.md`, section "Task2: exact multi-selection MMVQ".
+ACCEPTANCE: one call for 2-8 selected Q4_K/Q6_K experts must be bitwise identical to independent native_mmvq(ncols=1)
+calls on the SAME q8_1 bytes; host slots by value (no DMA); unsupported dispatch returns false with nothing launched;
+negative/overflowing slots rejected; legacy kernels untouched; flag STRATA_KOLIBRI_MMVQ_SELECTED=1 default off and
+no-pin only.
+
+DIFF SCOPE: working tree against HEAD a7574911 on amdw7800probuild_optimize:
+- include/strata/kernels/native_mmvq.hpp
+- src/kernels/cuda/native_mmvq.cu
+- src/kolibri/kolibri_engine.cu
+- tests/kolibri/mmvq_selected_test.cpp
+- CMakeLists.txt
+Read the Task2 section, these files, and the legacy ncols=1 Q4_K/Q6_K kernels they must match.
+
+EVIDENCE: `.superpowers/sdd/2026-11-08-kolibri-exact-followup/task2/summary.md`, its `.json`/`.log` files and full-logit
+hashes; `progress.md`. Full dumps are on disk but not committed. Key results: off/on 512/128 SHA 6ffefa8f..., cache8 SHA
+466f48f2..., 4097/8 SHA 241969a0...; trace shows n_sel=6 n_in=2560 n_out=512. Five alternating pairs: 512 decode
++7.9% to +34.7% (median +20.9%), cache8 inconclusive.
+
+CHECK SPECIFICALLY, with file:line:
+1. Arithmetic identity with the legacy ncols=1 kernels for both formats and BOTH SmallK branches, including n_out tails,
+   duplicate/permuted slots, weight_stride 0, shared and per-selection q8 strides. Any changed loop/reduction order?
+2. Kernel parameter safety: by-value pointer array bounds, grid.y indexing, stream, x column offset, output offsets.
+3. Rejection/fallback paths: Q6 packed, gfx906 wave, bad stride, unaligned table, negative/overflowing slots; can any
+   unsupported case launch or partially write?
+4. Engine integration: is `g_ids_host` guaranteed to match `ids` and `n_sel`, and is the gate really no-pin only?
+   Can the selected path be taken with a stale host pick array or a non-expert call?
+5. Whether the timing evidence supports KEEP, and whether cache8 should be called a gain.
+6. Any plan step skipped (e.g. required integration matrix or backend builds).
+State correctness risks, lifecycle/race risks, performance-evidence gaps and skipped steps separately.

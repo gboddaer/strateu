@@ -1,0 +1,19 @@
+Final composition review. Read `final/summary.md`, `final/integration/compare.txt`, the 131064 JSON/logs and the
+ledger `progress.md`. Read-only.
+
+Retained: Task 0 driver (`a7574911`), Task 2 exact selected MMVQ (`33ed811a`, default off), Task 10 zero buffer
+(`5aaee42b`, default off, only with skip-zero). Rejected 3/4/5/6/8/9; blocked 7. Reviews per task are in `reviews/`.
+
+Evidence: full HIP main+test builds OK; ctests 3/3; 10/10 integration dumps identical with all three flags;
+131064/8 off/on identical SHA `5c85e7f6569fea0c...`, off prefill/decode 19.60/5.43, on 19.66/6.17, wall
+6801.9/6786.1 s (one pair). Setup has 3 environment failures; Terminal unittest 1654 tests, 5 failures/166 errors
+(component/server fixtures), not green. CUDA/SYCL NOT RUN. No server.
+
+Check:
+1. Is the retention/rejection/blocked set and the final flag composition correct and exact?
+2. Are the build/regression and long-context claims accurate and appropriately limited?
+3. Is anything missing that the plan's finalization requires (reviews, ledger, raw evidence, no default promotion)?
+4. Do any retained changes conflict (Task 2 + Task 10 together), or is there a path where zero buffer is consumed
+   without skip-zero?
+5. Any unsupported claim in the final summary.
+Say plainly whether the composition is ready to commit/close as an experimental result.

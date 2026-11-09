@@ -1,0 +1,20 @@
+Focused follow-up review of Task 2 fixes. Read your first review
+`.superpowers/sdd/2026-11-08-kolibri-exact-followup/reviews/Task2-review-gpt61sol.md` and the resolution table in
+`.superpowers/sdd/2026-11-08-kolibri-exact-followup/progress.md`.
+
+Inspect the working tree against HEAD a7574911, read-only:
+`include/strata/kernels/native_mmvq.hpp`, `src/kernels/cuda/native_mmvq.cu`, `src/kolibri/kolibri_engine.cu`,
+`tests/kolibri/mmvq_selected_test.cpp`, `CMakeLists.txt`, plus `task2/summary.md` and the integration logs.
+
+Confirm or refute with file:line:
+1. Every selected Q6 pointer is checked against the packed registry itself, not just the env flag; a registered table
+   is refused with no output write. Is the helper's use of `g_q6_bypass` correct?
+2. gfx906: parity test is forced to `STRATA_MMVQ_WAVE=0`, and the default-wave refusal test is registered only for
+   gfx906. Does the new `--expect-refusal` mode test the right thing?
+3. The short/long/hot/profile integration matrix is now evidenced; are the 10 off/on dumps truly comparable and
+   byte-identical? Any case missing from the plan's matrix?
+4. Unaligned base throws vs derived false is documented and tested; any remaining ambiguity?
+5. The corrected cache8 statistics and the KEEP scope are accurate (local decode gain, no end-to-end claim).
+6. Any new defect introduced by the per-pointer registry check, the test changes or the CMake registration.
+
+Report new findings by severity with file:line; state whether each prior Important finding is fully resolved.

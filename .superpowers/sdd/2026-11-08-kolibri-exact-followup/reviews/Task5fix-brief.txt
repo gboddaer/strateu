@@ -1,0 +1,21 @@
+Focused follow-up review of Task 5 after your first review. Read your prior Task5 review and the revised
+`task5/summary.md` plus `task5/integration-compare.txt`.
+
+The candidate you suggested is now implemented:
+- `include/strata/kolibri/decode_order.hpp`: omission only when opt-in, no-pin, `st == 0`, no handoff/graph/CPU pool.
+- `src/kolibri/kolibri_engine.cu`: both drains gated; all other waits preserved.
+- `tests/kolibri/decode_order_test.cpp`: full gate table.
+- `STRATA_KOLIBRI_ORDERED_DECODE=1` default off.
+
+Evidence: 512/128 and cache8 complete logits identical; 10/10 short/long/hot/profile dumps identical; five 512 pairs
+decode paired median +6.7% (3/5 positive, -6.6% to +12.9%), wall 139.0 -> 121.7 s; cache8 -1%/neutral.
+
+Confirm with file:line:
+1. Is the narrow gate correct, and does every unsupported mode keep its drain?
+2. Is the corrected trace accurate (3243 before shared expert; pool/g_q8/host lifetime points)?
+3. Is KEEP justified with 3/5 positive and median +6.7%, or is this noise?
+4. Is the missing GPU delayed-producer test acceptable given full-logit equality and the blocking-stream contract?
+5. Any new defect, especially a path where `omit_dec_drain` is true but the default-stream consumer is not actually
+   ordered behind g_st.
+
+Report findings by severity. Say plainly whether KEEP is justified.
