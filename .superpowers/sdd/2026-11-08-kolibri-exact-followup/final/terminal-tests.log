@@ -1,0 +1,2607 @@
+.................E.................................s............E...........................................F.........measured fake decode workload
+....measured fake decode workload
+...........................................EEEEEEEE.........<frozen importlib._bootstrap_external>:784: ResourceWarning: unclosed <socket.socket [closed] fd=4, family=2, type=1, proto=6>
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/tmp3iwiq2if/cpu/cpu3/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/tmp3iwiq2if/cpu/cpu2/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/tmp3iwiq2if/cpu/cpu1/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/tmp3iwiq2if/cpu/cpu0/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+./home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/tmpng17di4x/cpu/cpu7/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/tmpng17di4x/cpu/cpu6/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/tmpng17di4x/cpu/cpu5/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/tmpng17di4x/cpu/cpu4/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/tmpng17di4x/cpu/cpu3/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/tmpng17di4x/cpu/cpu2/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/tmpng17di4x/cpu/cpu1/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/tmpng17di4x/cpu/cpu0/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+../home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/sys/devices/system/cpu/cpu11/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/sys/devices/system/cpu/cpu9/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/sys/devices/system/cpu/cpu7/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/sys/devices/system/cpu/cpu5/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/sys/devices/system/cpu/cpu3/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/sys/devices/system/cpu/cpu14/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/sys/devices/system/cpu/cpu1/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/sys/devices/system/cpu/cpu12/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/sys/devices/system/cpu/cpu10/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/sys/devices/system/cpu/cpu8/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/sys/devices/system/cpu/cpu6/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/sys/devices/system/cpu/cpu4/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/sys/devices/system/cpu/cpu15/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/sys/devices/system/cpu/cpu2/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/sys/devices/system/cpu/cpu13/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/sys/devices/system/cpu/cpu0/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+./home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/tmp813bsdxq/cpu/cpu7/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/tmp813bsdxq/cpu/cpu6/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/tmp813bsdxq/cpu/cpu5/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/tmp813bsdxq/cpu/cpu4/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/tmp813bsdxq/cpu/cpu3/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/tmp813bsdxq/cpu/cpu2/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/tmp813bsdxq/cpu/cpu1/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/home/gbo/develop/strateu/serve/telemetry.py:458: ResourceWarning: unclosed file <_io.TextIOWrapper name='/tmp/tmp813bsdxq/cpu/cpu0/topology/physical_package_id' mode='r' encoding='utf-8'>
+  packages.add(open(f, encoding="utf-8").read().strip())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+...............Keeping your 0.0 GB of models where they are; /tmp/tmp5n7sicku/new is used for new downloads. (--move-data moves them instead.)
+...s...................................................................../usr/lib/python3.13/_weakrefset.py:88: ResourceWarning: unclosed <socket.socket [closed] fd=13, family=2, type=1, proto=6>
+  self.data.add(ref(item, self._remove))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/usr/lib/python3.13/_weakrefset.py:88: ResourceWarning: unclosed <socket.socket [closed] fd=12, family=2, type=1, proto=6>
+  self.data.add(ref(item, self._remove))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/usr/lib/python3.13/_weakrefset.py:88: ResourceWarning: unclosed <socket.socket [closed] fd=9, family=2, type=1, proto=6>
+  self.data.add(ref(item, self._remove))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/usr/lib/python3.13/_weakrefset.py:88: ResourceWarning: unclosed <socket.socket [closed] fd=5, family=2, type=1, proto=6>
+  self.data.add(ref(item, self._remove))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/usr/lib/python3.13/_weakrefset.py:88: ResourceWarning: unclosed <socket.socket [closed] fd=15, family=2, type=1, proto=6>
+  self.data.add(ref(item, self._remove))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/usr/lib/python3.13/_weakrefset.py:88: ResourceWarning: unclosed <socket.socket [closed] fd=16, family=2, type=1, proto=6>
+  self.data.add(ref(item, self._remove))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/usr/lib/python3.13/_weakrefset.py:88: ResourceWarning: unclosed <socket.socket [closed] fd=10, family=2, type=1, proto=6>
+  self.data.add(ref(item, self._remove))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/usr/lib/python3.13/_weakrefset.py:88: ResourceWarning: unclosed <socket.socket [closed] fd=6, family=2, type=1, proto=6>
+  self.data.add(ref(item, self._remove))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/usr/lib/python3.13/_weakrefset.py:88: ResourceWarning: unclosed <socket.socket [closed] fd=21, family=2, type=1, proto=6>
+  self.data.add(ref(item, self._remove))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/usr/lib/python3.13/_weakrefset.py:88: ResourceWarning: unclosed <socket.socket [closed] fd=11, family=2, type=1, proto=6>
+  self.data.add(ref(item, self._remove))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/usr/lib/python3.13/_weakrefset.py:88: ResourceWarning: unclosed <socket.socket [closed] fd=20, family=2, type=1, proto=6>
+  self.data.add(ref(item, self._remove))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/usr/lib/python3.13/_weakrefset.py:88: ResourceWarning: unclosed <socket.socket [closed] fd=8, family=2, type=1, proto=6>
+  self.data.add(ref(item, self._remove))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+.......<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=10, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=9, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=7, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=5, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=12, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=15, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=16, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=13, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=21, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=22, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=8, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=17, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=14, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=19, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=23, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=20, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=26, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=18, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=25, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=24, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=31, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=33, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=29, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+<frozen os>:717: ResourceWarning: unclosed <socket.socket [closed] fd=6, family=2, type=1, proto=6>
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+...................EE..................E...................................................EE.E............................F......DeepSeek engine 0.1.49 (cuda) checked (signed, every file matches) and installed: /tmp/strata-dsv41-eng-yr1ut0b7/data/engine-dsv41/0.1.49-linux-x86_64-cuda-cuda13
+Tuning DeepSeek: measuring the standard settings first ...
+  standard settings: 4.50 tokens a second
+  trying the drafter on (DSpark) ...
+    6.00 tokens a second
+  trying a shorter draft block (3) ...
+    6.00 tokens a second
+  trying 6 CPU threads (one for each physical core) ...
+    6.00 tokens a second
+.Tuning DeepSeek: measuring the standard settings first ...
+.Tuning DeepSeek: measuring the standard settings first ...
+  standard settings: 4.50 tokens a second
+  trying the drafter on (DSpark) ...
+  trying 6 CPU threads (one for each physical core) ...
+.Tuning DeepSeek: measuring the standard settings first ...
+  standard settings: 4.50 tokens a second
+  trying the drafter on (DSpark) ...
+  trying 6 CPU threads (one for each physical core) ...
+.The tuner stopped (RuntimeError), so the standard settings run.
+.Tuning DeepSeek: measuring the standard settings first ...
+  standard settings: 4.50 tokens a second
+  trying the drafter on (DSpark) ...
+    4.50 tokens a second
+  trying 6 CPU threads (one for each physical core) ...
+    4.50 tokens a second
+..Tuning DeepSeek: measuring the standard settings first ...
+  standard settings: 4.50 tokens a second
+  trying the drafter on (DSpark) ...
+    4.50 tokens a second
+  trying 6 CPU threads (one for each physical core) ...
+    4.50 tokens a second
+..............................................................ss.....................................EEEEEEE..................................../home/gbo/develop/strateu/strata_control/models.py:597: ResourceWarning: unclosed scandir iterator <posix.ScandirIterator object at 0x7fb1ba1546b0>
+  has_files = any(entry.name.lower().endswith(".gguf") for entry in os.scandir(path))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+./home/gbo/develop/strateu/strata_control/models.py:597: ResourceWarning: unclosed scandir iterator <posix.ScandirIterator object at 0x7fb18c295ab0>
+  has_files = any(entry.name.lower().endswith(".gguf") for entry in os.scandir(path))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+.................................................................................E...............................EEEEEEE....s.........ss...........sssssssssssss................/tmp/tmp3zmv52er/again/0.1.46-linux-x86_64-cuda: ok (5 files, manifest sha256 892d7b274374b779611f1e565630f834b1d4c872c4f0c930484db59fa77feef9)
+/tmp/tmp3zmv52er/plain/0.1.47-linux-x86_64-cuda: REFUSED: no strata-dsv41[.exe] in the manifest (--require-dsv41)
+  [ok] llama.cpp 3cf0325 (gguf-py for the preparation tools)
+  [ok] engine component: 0.1.45 (linux-x86_64-cuda) in /tmp/strata-launch-test-5foz597h/engine
+  [!]  this engine component has no image encoder (strata-vision): images off for this model
+  [ok] llama.cpp 3cf0325 (gguf-py for the preparation tools)
+  [ok] engine component: 0.1.45 (linux-x86_64-cuda) in /tmp/strata-launch-test-5foz597h/engine
+  [ok] image encoder: /tmp/strata-launch-test-5foz597h/engine/strata-vision (carried by the engine component)
+  [ok] llama.cpp 3cf0325 (gguf-py for the preparation tools)
+  [ok] engine component: 0.1.45 (linux-x86_64-cuda) in /tmp/strata-launch-test-5foz597h/engine
+..............................................................E.............................................../home/gbo/develop/strateu/strata_control/models.py:597: ResourceWarning: unclosed scandir iterator <posix.ScandirIterator object at 0x7fb1bac5b2b0>
+  has_files = any(entry.name.lower().endswith(".gguf") for entry in os.scandir(path))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+./home/gbo/develop/strateu/strata_control/models.py:597: ResourceWarning: unclosed scandir iterator <posix.ScandirIterator object at 0x7fb1a85bab30>
+  has_files = any(entry.name.lower().endswith(".gguf") for entry in os.scandir(path))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+........................EEE127.0.0.1 - - [09/Nov/2026 03:35:18] "GET /install-manifest.txt HTTP/1.1" 200 -
+127.0.0.1 - - [09/Nov/2026 03:35:18] "GET /control/strata-control-9.9.9-linux-x86_64.tar.gz HTTP/1.1" 200 -
+127.0.0.1 - - [09/Nov/2026 03:35:18] "GET /test-trust.json HTTP/1.1" 200 -
+127.0.0.1 - - [09/Nov/2026 03:35:19] "GET /strata-feed.json HTTP/1.1" 200 -
+127.0.0.1 - - [09/Nov/2026 03:35:19] "GET /strata-feed.json.sig HTTP/1.1" 200 -
+127.0.0.1 - - [09/Nov/2026 03:35:19] "GET /install-manifest.txt HTTP/1.1" 200 -
+127.0.0.1 - - [09/Nov/2026 03:35:19] "GET /top.tar.gz HTTP/1.1" 200 -
+127.0.0.1 - - [09/Nov/2026 03:35:19] "GET /test-trust.json HTTP/1.1" 200 -
+127.0.0.1 - - [09/Nov/2026 03:35:19] "GET /strata-feed.json HTTP/1.1" 200 -
+127.0.0.1 - - [09/Nov/2026 03:35:19] "GET /strata-feed.json.sig HTTP/1.1" 200 -
+127.0.0.1 - - [09/Nov/2026 03:35:19] "GET /install-manifest.txt HTTP/1.1" 200 -
+127.0.0.1 - - [09/Nov/2026 03:35:19] "GET /control/strata-control-9.9.9-linux-x86_64.tar.gz HTTP/1.1" 200 -
+/usr/lib/python3.13/unittest/case.py:606: ResourceWarning: unclosed <socket.socket fd=3, family=2, type=1, proto=0, laddr=('127.0.0.1', 43489)>
+  if method() is not None:
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+.note: the windows-x86_64 control package is tar.gz, so it is left out of install-manifest.txt (the one-line installer needs zip; pack-control --format zip)
+127.0.0.1 - - [09/Nov/2026 03:35:21] "GET /install-manifest.txt HTTP/1.1" 200 -
+127.0.0.1 - - [09/Nov/2026 03:35:21] "GET /strata-control-9.9.9-linux-x86_64.tar.gz HTTP/1.1" 200 -
+127.0.0.1 - - [09/Nov/2026 03:35:21] "GET /test-trust.json HTTP/1.1" 200 -
+127.0.0.1 - - [09/Nov/2026 03:35:21] "GET /strata-feed.json HTTP/1.1" 200 -
+127.0.0.1 - - [09/Nov/2026 03:35:21] "GET /strata-feed.json.sig HTTP/1.1" 200 -
+/usr/lib/python3.13/unittest/case.py:606: ResourceWarning: unclosed <socket.socket fd=3, family=2, type=1, proto=0, laddr=('127.0.0.1', 37997)>
+  if method() is not None:
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+.s..E............EEEEE.......sssss.ss......../usr/lib/python3.13/unittest/case.py:606: ResourceWarning: unclosed <socket.socket fd=3, family=2, type=1, proto=0, laddr=('127.0.0.1', 44527)>
+  if method() is not None:
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+........................E....E..............................s.......................E....EE..F........control linux-x86_64 9.9.9: 1 MB
+feed written to /tmp/tmp_6z6ftzt/feed
+  serve it:  python -m http.server 1 --bind 127.0.0.1 --directory /tmp/tmp_6z6ftzt/feed
+  trust it:  STRATA_UPDATE_TRUSTED_KEYS=/tmp/tmp_6z6ftzt/feed/test-trust.json
+  Installing a test package ...
+  [ok] a test package installed
+.E............/home/gbo/develop/strateu/strata_control/models.py:597: ResourceWarning: unclosed scandir iterator <posix.ScandirIterator object at 0x7fb1baa98430>
+  has_files = any(entry.name.lower().endswith(".gguf") for entry in os.scandir(path))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+..........................s.................................sssssss...s.ss....F.....EE...EE.E.....EEEEE...........................s...s....F...............................................................EEEEsEEEEEEEEEEEEEEEEEEEsEEEEEEEEEEEEsEsEEEEEEE.................E.................................................................................E.....E.........................EssEE....................EE............../home/gbo/develop/strateu/tests/terminal/test_tui3.py:137: ResourceWarning: unclosed file <_io.TextIOWrapper name='/home/gbo/develop/strateu/strata_cli/launch/screens.py' mode='r' encoding='utf-8'>
+  src = open(os.path.join(os.path.dirname(R.__file__), "screens.py"), encoding="utf-8").read()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+......E....EE......................E....EE./usr/lib/python3.13/unittest/suite.py:107: ResourceWarning: unclosed <socket.socket fd=3, family=2, type=1, proto=0, laddr=('127.0.0.1', 36243)>
+  for index, test in enumerate(self):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+./usr/lib/python3.13/unittest/suite.py:107: ResourceWarning: unclosed <socket.socket fd=3, family=2, type=1, proto=0, laddr=('127.0.0.1', 37507)>
+  for index, test in enumerate(self):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+./usr/lib/python3.13/unittest/suite.py:107: ResourceWarning: unclosed <socket.socket fd=3, family=2, type=1, proto=0, laddr=('127.0.0.1', 33651)>
+  for index, test in enumerate(self):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+./usr/lib/python3.13/unittest/suite.py:107: ResourceWarning: unclosed <socket.socket fd=3, family=2, type=1, proto=0, laddr=('127.0.0.1', 33233)>
+  for index, test in enumerate(self):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+./usr/lib/python3.13/unittest/suite.py:107: ResourceWarning: unclosed <socket.socket fd=3, family=2, type=1, proto=0, laddr=('127.0.0.1', 37341)>
+  for index, test in enumerate(self):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+./usr/lib/python3.13/unittest/suite.py:84: ResourceWarning: unclosed <socket.socket fd=3, family=2, type=1, proto=0, laddr=('127.0.0.1', 39473)>
+  return self.run(*args, **kwds)
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+EE......E.................................................EE...........EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE.EEEEEEEEE.ssss.......................
+======================================================================
+ERROR: test_bench (unittest.loader._FailedTest.test_bench)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_bench
+Traceback (most recent call last):
+  File "/usr/lib/python3.13/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+  File "/usr/lib/python3.13/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+    ~~~~~~~~~~^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_bench.py", line 18, in <module>
+    from serve.frontend import ChatTemplate
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+
+======================================================================
+ERROR: test_the_real_server_accepts_the_protocol_requests (test_bench_standard.RealServerTests.test_the_real_server_accepts_the_protocol_requests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_bench_standard.py", line 1130, in test_the_real_server_accepts_the_protocol_requests
+    from serve.frontend import ChatTemplate
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+======================================================================
+ERROR: test_a_packaged_stub_engine_starts_and_a_changed_library_does_not (test_component_start.ComponentStart.test_a_packaged_stub_engine_starts_and_a_changed_library_does_not)
+The package is made by packaging/package_engine.py (schema 2: archs, min_driver, build_id), the start hashes
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_component_start.py", line 72, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_picture_reader_path_from_an_older_engine_folder_follows_the_installed_package (test_component_start.ComponentStart.test_a_picture_reader_path_from_an_older_engine_folder_follows_the_installed_package)
+After an engine update the folder name changes; the run config's absolute vision exe must not stop the server.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_component_start.py", line 72, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_tampered_engine_is_not_started (test_component_start.ComponentStart.test_a_tampered_engine_is_not_started)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_component_start.py", line 72, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_doctor_names_the_missing_engine (test_component_start.ComponentStart.test_doctor_names_the_missing_engine)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_component_start.py", line 72, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_no_engine_is_a_notice_and_starts_nothing (test_component_start.ComponentStart.test_no_engine_is_a_notice_and_starts_nothing)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_component_start.py", line 72, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_start_runs_the_engine_from_the_component_folder_and_stop_ends_it (test_component_start.ComponentStart.test_start_runs_the_engine_from_the_component_folder_and_stop_ends_it)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_component_start.py", line 72, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_the_build_json_lib_dirs_follow_the_package_folder (test_component_start.ComponentStart.test_the_build_json_lib_dirs_follow_the_package_folder)
+The Windows HIP package keeps the ROCm DLLs in rocm/bin (BUILD.json lib_dirs): strata.exe does not load without them on PATH.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_component_start.py", line 72, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_the_package_folder_is_first_on_the_library_path (test_component_start.ComponentStart.test_the_package_folder_is_first_on_the_library_path)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_component_start.py", line 72, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_the_server_applies_it_at_every_start (test_drafting.EngineArguments.test_the_server_applies_it_at_every_start)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_drafting.py", line 185, in test_the_server_applies_it_at_every_start
+    from serve.server import engine_args
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+======================================================================
+ERROR: setUpClass (test_drafting.FetchAndPack)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_drafting.py", line 306, in setUpClass
+    spec.loader.exec_module(cls.synth)
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "<frozen importlib._bootstrap_external>", line 1026, in exec_module
+  File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
+  File "/home/gbo/develop/strateu/tools/test_dflash2_pack.py", line 16, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'
+
+======================================================================
+ERROR: test_drain (unittest.loader._FailedTest.test_drain)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_drain
+Traceback (most recent call last):
+  File "/usr/lib/python3.13/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+  File "/usr/lib/python3.13/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+    ~~~~~~~~~~^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_drain.py", line 11, in <module>
+    from serve.frontend import ChatTemplate
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+
+======================================================================
+ERROR: test_a_part_that_is_missing_is_said_plainly (test_dsv41_own_files_and_mmproj.OwnDeepSeekFiles.test_a_part_that_is_missing_is_said_plainly)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_dsv41_own_files_and_mmproj.py", line 126, in test_a_part_that_is_missing_is_said_plainly
+    cls, f, said = self.screen(S.LaunchSettings())
+                   ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_dsv41_own_files_and_mmproj.py", line 103, in screen
+    from strata_cli.launch.screens import ModelScreen
+  File "/home/gbo/develop/strateu/strata_cli/launch/screens.py", line 16, in <module>
+    from rich.text import Text
+ModuleNotFoundError: No module named 'rich'
+
+======================================================================
+ERROR: test_files_of_another_model_go_on_to_the_usual_check (test_dsv41_own_files_and_mmproj.OwnDeepSeekFiles.test_files_of_another_model_go_on_to_the_usual_check)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_dsv41_own_files_and_mmproj.py", line 135, in test_files_of_another_model_go_on_to_the_usual_check
+    cls, f, said = self.screen(S.LaunchSettings())
+                   ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_dsv41_own_files_and_mmproj.py", line 103, in screen
+    from strata_cli.launch.screens import ModelScreen
+  File "/home/gbo/develop/strateu/strata_cli/launch/screens.py", line 16, in <module>
+    from rich.text import Text
+ModuleNotFoundError: No module named 'rich'
+
+======================================================================
+ERROR: test_the_guided_screen_takes_the_ud_files_as_deepseek_instead_of_saying_a_shard_could_not_be_read (test_dsv41_own_files_and_mmproj.OwnDeepSeekFiles.test_the_guided_screen_takes_the_ud_files_as_deepseek_instead_of_saying_a_shard_could_not_be_read)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_dsv41_own_files_and_mmproj.py", line 115, in test_the_guided_screen_takes_the_ud_files_as_deepseek_instead_of_saying_a_shard_could_not_be_read
+    cls, f, said = self.screen(S.LaunchSettings())
+                   ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_dsv41_own_files_and_mmproj.py", line 103, in screen
+    from strata_cli.launch.screens import ModelScreen
+  File "/home/gbo/develop/strateu/strata_cli/launch/screens.py", line 16, in <module>
+    from rich.text import Text
+ModuleNotFoundError: No module named 'rich'
+
+======================================================================
+ERROR: test_config_key_is_what_the_launcher_reads (test_expert_workercount.EngineCommand.test_config_key_is_what_the_launcher_reads)
+setup.py writes "launch_prefix"; the server reads rc.get("launch_prefix").
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_expert_workercount.py", line 233, in test_config_key_is_what_the_launcher_reads
+    from serve import server
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+======================================================================
+ERROR: test_conversation_cache_can_still_read_the_spawn_arguments (test_expert_workercount.EngineCommand.test_conversation_cache_can_still_read_the_spawn_arguments)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_expert_workercount.py", line 212, in test_conversation_cache_can_still_read_the_spawn_arguments
+    from serve.server import StrataEngine, conversation_slots
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+======================================================================
+ERROR: test_every_engine_construction_passes_the_launch_prefix (test_expert_workercount.EngineCommand.test_every_engine_construction_passes_the_launch_prefix)
+All three paths - single engine, replicas, split - must hand the config's prefix on.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_expert_workercount.py", line 221, in test_every_engine_construction_passes_the_launch_prefix
+    from serve import server
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+======================================================================
+ERROR: test_no_prefix_is_the_old_argv_exactly (test_expert_workercount.EngineCommand.test_no_prefix_is_the_old_argv_exactly)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_expert_workercount.py", line 191, in test_no_prefix_is_the_old_argv_exactly
+    from serve.server import engine_cmd
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+======================================================================
+ERROR: test_prefix_is_prepended (test_expert_workercount.EngineCommand.test_prefix_is_prepended)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_expert_workercount.py", line 186, in test_prefix_is_prepended
+    from serve.server import engine_cmd
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+======================================================================
+ERROR: test_restart_prefix_is_a_snapshot_not_the_callers_mutable_list (test_expert_workercount.EngineCommand.test_restart_prefix_is_a_snapshot_not_the_callers_mutable_list)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_expert_workercount.py", line 195, in test_restart_prefix_is_a_snapshot_not_the_callers_mutable_list
+    from serve.server import StrataEngine
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+======================================================================
+ERROR: test_restart_replays_prefix_by_name (test_expert_workercount.EngineCommand.test_restart_replays_prefix_by_name)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_expert_workercount.py", line 202, in test_restart_replays_prefix_by_name
+    from serve.server import StrataEngine
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+======================================================================
+ERROR: test_the_server_start_applies_it_for_a_component_engine (test_hipblaslt_tuning.Apply.test_the_server_start_applies_it_for_a_component_engine)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_hipblaslt_tuning.py", line 203, in test_the_server_start_applies_it_for_a_component_engine
+    from serve import server
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+======================================================================
+ERROR: test_a_package_signed_by_another_key_is_refused (test_install_engine_file.InstallEngineFile.test_a_package_signed_by_another_key_is_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_package_that_does_not_fit_this_card_says_so (test_install_engine_file.InstallEngineFile.test_a_package_that_does_not_fit_this_card_says_so)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_package_with_a_changed_file_is_refused (test_install_engine_file.InstallEngineFile.test_a_package_with_a_changed_file_is_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_signed_package_is_installed_without_any_network (test_install_engine_file.InstallEngineFile.test_a_signed_package_is_installed_without_any_network)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_an_older_package_does_not_replace_a_newer_engine (test_install_engine_file.InstallEngineFile.test_an_older_package_does_not_replace_a_newer_engine)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_an_unsigned_package_is_refused (test_install_engine_file.InstallEngineFile.test_an_unsigned_package_is_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_something_that_is_not_a_package_is_refused_in_plain_words (test_install_engine_file.InstallEngineFile.test_something_that_is_not_a_package_is_refused_in_plain_words)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_the_access_help_names_the_flags_for_showing_and_setting_a_key (test_launch.FlagsCommand.test_the_access_help_names_the_flags_for_showing_and_setting_a_key)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_launch.py", line 988, in test_the_access_help_names_the_flags_for_showing_and_setting_a_key
+    from strata_cli.launch import screens
+  File "/home/gbo/develop/strateu/strata_cli/launch/screens.py", line 16, in <module>
+    from rich.text import Text
+ModuleNotFoundError: No module named 'rich'
+
+======================================================================
+ERROR: test_attested_lazy_model_reports_unloaded_without_generation (test_launch_identity.LaunchIdentityTests.test_attested_lazy_model_reports_unloaded_without_generation)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_launch_identity.py", line 45, in test_attested_lazy_model_reports_unloaded_without_generation
+    result = readiness.verify(ready, b'{"model_name":"fake"}',
+                              expected_host="127.0.0.1", expected_instance="one",
+                              expected_attestation="f" * 64, timeout=1)
+  File "/home/gbo/develop/strateu/strata_control/readiness.py", line 95, in verify
+    key = _credential(source_bytes)
+  File "/home/gbo/develop/strateu/strata_control/readiness.py", line 43, in _credential
+    from serve.server import api_key_of, key_list
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+======================================================================
+ERROR: test_wrong_or_absent_server_attestation_rejects_readiness_before_generation (test_launch_identity.LaunchIdentityTests.test_wrong_or_absent_server_attestation_rejects_readiness_before_generation) (reported=None)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_launch_identity.py", line 34, in test_wrong_or_absent_server_attestation_rejects_readiness_before_generation
+    readiness.verify(ready, cfg, expected_host="127.0.0.1",
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                     expected_instance="one", expected_attestation="f" * 64,
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                     timeout=1)
+                     ^^^^^^^^^^
+  File "/home/gbo/develop/strateu/strata_control/readiness.py", line 95, in verify
+    key = _credential(source_bytes)
+  File "/home/gbo/develop/strateu/strata_control/readiness.py", line 43, in _credential
+    from serve.server import api_key_of, key_list
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+======================================================================
+ERROR: test_wrong_or_absent_server_attestation_rejects_readiness_before_generation (test_launch_identity.LaunchIdentityTests.test_wrong_or_absent_server_attestation_rejects_readiness_before_generation) (reported='0000000000000000000000000000000000000000000000000000000000000000')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_launch_identity.py", line 34, in test_wrong_or_absent_server_attestation_rejects_readiness_before_generation
+    readiness.verify(ready, cfg, expected_host="127.0.0.1",
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                     expected_instance="one", expected_attestation="f" * 64,
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                     timeout=1)
+                     ^^^^^^^^^^
+  File "/home/gbo/develop/strateu/strata_control/readiness.py", line 95, in verify
+    key = _credential(source_bytes)
+  File "/home/gbo/develop/strateu/strata_control/readiness.py", line 43, in _credential
+    from serve.server import api_key_of, key_list
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+======================================================================
+ERROR: test_launch_monitor (unittest.loader._FailedTest.test_launch_monitor)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_launch_monitor
+Traceback (most recent call last):
+  File "/usr/lib/python3.13/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+  File "/usr/lib/python3.13/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+    ~~~~~~~~~~^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_launch_monitor.py", line 13, in <module>
+    from strata_cli.launch.monitor_ext import LaunchMonitor
+  File "/home/gbo/develop/strateu/strata_cli/launch/monitor_ext.py", line 19, in <module>
+    from rich.text import Text
+ModuleNotFoundError: No module named 'rich'
+
+
+======================================================================
+ERROR: test_launch_speed (unittest.loader._FailedTest.test_launch_speed)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_launch_speed
+Traceback (most recent call last):
+  File "/usr/lib/python3.13/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+  File "/usr/lib/python3.13/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+    ~~~~~~~~~~^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_launch_speed.py", line 12, in <module>
+    from strata_cli.launch.app import LaunchApp
+  File "/home/gbo/develop/strateu/strata_cli/launch/app.py", line 16, in <module>
+    from rich.text import Text
+ModuleNotFoundError: No module named 'rich'
+
+
+======================================================================
+ERROR: test_launch_tui (unittest.loader._FailedTest.test_launch_tui)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_launch_tui
+Traceback (most recent call last):
+  File "/usr/lib/python3.13/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+  File "/usr/lib/python3.13/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+    ~~~~~~~~~~^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_launch_tui.py", line 15, in <module>
+    from strata_cli.launch.app import Ctx, LaunchApp, run_monitor
+  File "/home/gbo/develop/strateu/strata_cli/launch/app.py", line 16, in <module>
+    from rich.text import Text
+ModuleNotFoundError: No module named 'rich'
+
+
+======================================================================
+ERROR: test_launch_tui_walk (unittest.loader._FailedTest.test_launch_tui_walk)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_launch_tui_walk
+Traceback (most recent call last):
+  File "/usr/lib/python3.13/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+  File "/usr/lib/python3.13/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+    ~~~~~~~~~~^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_launch_tui_walk.py", line 15, in <module>
+    from strata_cli.launch.app import LaunchApp
+  File "/home/gbo/develop/strateu/strata_cli/launch/app.py", line 16, in <module>
+    from rich.text import Text
+ModuleNotFoundError: No module named 'rich'
+
+
+======================================================================
+ERROR: test_lifecycle_matrix (unittest.loader._FailedTest.test_lifecycle_matrix)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_lifecycle_matrix
+Traceback (most recent call last):
+  File "/usr/lib/python3.13/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+  File "/usr/lib/python3.13/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+    ~~~~~~~~~~^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_lifecycle_matrix.py", line 11, in <module>
+    from tests.terminal import lifecycle_matrix as matrix
+  File "/home/gbo/develop/strateu/tests/terminal/lifecycle_matrix.py", line 32, in <module>
+    import psutil  # noqa: E402
+    ^^^^^^^^^^^^^
+ModuleNotFoundError: No module named 'psutil'
+
+
+======================================================================
+ERROR: test_loader_diag (unittest.loader._FailedTest.test_loader_diag)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_loader_diag
+Traceback (most recent call last):
+  File "/usr/lib/python3.13/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+  File "/usr/lib/python3.13/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+    ~~~~~~~~~~^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_loader_diag.py", line 15, in <module>
+    from serve.server import start_exit_note  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+
+======================================================================
+ERROR: test_a_profile_and_serve_plan_use_the_old_engine_and_models_where_they_are (test_migration.ExistingInstallIsFoundInPlace.test_a_profile_and_serve_plan_use_the_old_engine_and_models_where_they_are)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_migration.py", line 137, in test_a_profile_and_serve_plan_use_the_old_engine_and_models_where_they_are
+    code, planned = self.cli("serve", "--profile", "migrated", "--plan")
+                    ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_migration.py", line 109, in cli
+    code = main([*args, "--output", "json"])
+  File "/home/gbo/develop/strateu/strata_cli/cli.py", line 2237, in main
+    return _run(a)
+  File "/home/gbo/develop/strateu/strata_cli/cli.py", line 2122, in _run
+    return _serve(a)
+  File "/home/gbo/develop/strateu/strata_cli/cli.py", line 935, in _serve
+    plan, args = _launch_plan(a.config, a)
+                 ~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/home/gbo/develop/strateu/strata_cli/cli.py", line 786, in _launch_plan
+    from serve.server import api_key_of, explicit_no_key, key_list
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+======================================================================
+ERROR: test_mixed_vendors (unittest.loader._FailedTest.test_mixed_vendors)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_mixed_vendors
+Traceback (most recent call last):
+  File "/usr/lib/python3.13/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+  File "/usr/lib/python3.13/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+    ~~~~~~~~~~^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_mixed_vendors.py", line 15, in <module>
+    from strata_cli.launch.screens import flow_for
+  File "/home/gbo/develop/strateu/strata_cli/launch/screens.py", line 16, in <module>
+    from rich.text import Text
+ModuleNotFoundError: No module named 'rich'
+
+
+======================================================================
+ERROR: test_plain_monitor_runs_when_the_launch_package_is_not_bundled (test_monitor_bundle.MonitorBundleTests.test_plain_monitor_runs_when_the_launch_package_is_not_bundled)
+The pyz has no strata_cli.launch: interactive `monitor` must fall back to the plain Monitor, not fail.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_monitor_bundle.py", line 309, in test_plain_monitor_runs_when_the_launch_package_is_not_bundled
+    from strata_cli import monitor as monitor_module
+  File "/home/gbo/develop/strateu/strata_cli/monitor.py", line 12, in <module>
+    from rich.text import Text
+ModuleNotFoundError: No module named 'rich'
+
+======================================================================
+ERROR: test_monitor_classic (unittest.loader._FailedTest.test_monitor_classic)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_monitor_classic
+Traceback (most recent call last):
+  File "/usr/lib/python3.13/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+  File "/usr/lib/python3.13/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+    ~~~~~~~~~~^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_monitor_classic.py", line 11, in <module>
+    from rich.console import Console
+ModuleNotFoundError: No module named 'rich'
+
+
+======================================================================
+ERROR: test_serve_plan_reaches_no_network_and_runs_no_program (test_no_acquisition.CliServeIsOfflineTests.test_serve_plan_reaches_no_network_and_runs_no_program)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_no_acquisition.py", line 336, in test_serve_plan_reaches_no_network_and_runs_no_program
+    code = cli.main(["serve", "--profile", str(cfg), "--plan", "--output", "json"])
+  File "/home/gbo/develop/strateu/strata_cli/cli.py", line 2237, in main
+    return _run(a)
+  File "/home/gbo/develop/strateu/strata_cli/cli.py", line 2122, in _run
+    return _serve(a)
+  File "/home/gbo/develop/strateu/strata_cli/cli.py", line 935, in _serve
+    plan, args = _launch_plan(a.config, a)
+                 ~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/home/gbo/develop/strateu/strata_cli/cli.py", line 786, in _launch_plan
+    from serve.server import api_key_of, explicit_no_key, key_list
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+======================================================================
+ERROR: test_overview (unittest.loader._FailedTest.test_overview)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_overview
+Traceback (most recent call last):
+  File "/usr/lib/python3.13/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+  File "/usr/lib/python3.13/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+    ~~~~~~~~~~^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_overview.py", line 10, in <module>
+    from rich.console import Console
+ModuleNotFoundError: No module named 'rich'
+
+
+======================================================================
+ERROR: test_batch_telemetry_precedence_can_disable_a_run_config (test_profiles.OperatorProfileTests.test_batch_telemetry_precedence_can_disable_a_run_config)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_profiles.py", line 193, in test_batch_telemetry_precedence_can_disable_a_run_config
+    code, inherited = self.command("serve", "--profile", "local", "--plan", "--output", "json")
+                      ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_profiles.py", line 47, in command
+    code = main(list(args))
+  File "/home/gbo/develop/strateu/strata_cli/cli.py", line 2237, in main
+    return _run(a)
+  File "/home/gbo/develop/strateu/strata_cli/cli.py", line 2122, in _run
+    return _serve(a)
+  File "/home/gbo/develop/strateu/strata_cli/cli.py", line 935, in _serve
+    plan, args = _launch_plan(a.config, a)
+                 ~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/home/gbo/develop/strateu/strata_cli/cli.py", line 786, in _launch_plan
+    from serve.server import api_key_of, explicit_no_key, key_list
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+======================================================================
+ERROR: test_calibration_preview_has_no_engine_or_config_side_effects (test_profiles.OperatorProfileTests.test_calibration_preview_has_no_engine_or_config_side_effects)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_profiles.py", line 424, in test_calibration_preview_has_no_engine_or_config_side_effects
+    with mock.patch("serve.server.StrataEngine", side_effect=AssertionError("engine started")), \
+         ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/unittest/mock.py", line 1481, in __enter__
+    self.target = self.getter()
+                  ~~~~~~~~~~~^^
+  File "/usr/lib/python3.13/pkgutil.py", line 528, in resolve_name
+    result = getattr(result, p)
+AttributeError: module 'serve' has no attribute 'server'
+
+======================================================================
+ERROR: test_foreground_jsonl_reports_startup_failure_without_human_stdout (test_profiles.OperatorProfileTests.test_foreground_jsonl_reports_startup_failure_without_human_stdout)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_profiles.py", line 164, in test_foreground_jsonl_reports_startup_failure_without_human_stdout
+    with mock.patch("serve.server.main", side_effect=SystemExit("engine refused to start")):
+         ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/unittest/mock.py", line 1481, in __enter__
+    self.target = self.getter()
+                  ~~~~~~~~~~~^^
+  File "/usr/lib/python3.13/pkgutil.py", line 528, in resolve_name
+    result = getattr(result, p)
+AttributeError: module 'serve' has no attribute 'server'
+
+======================================================================
+ERROR: test_foreground_serve_holds_shared_lease_until_server_returns (test_profiles.OperatorProfileTests.test_foreground_serve_holds_shared_lease_until_server_returns)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_profiles.py", line 183, in test_foreground_serve_holds_shared_lease_until_server_returns
+    with mock.patch("serve.server.main", side_effect=running_server):
+         ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/unittest/mock.py", line 1481, in __enter__
+    self.target = self.getter()
+                  ~~~~~~~~~~~^^
+  File "/usr/lib/python3.13/pkgutil.py", line 528, in resolve_name
+    result = getattr(result, p)
+AttributeError: module 'serve' has no attribute 'server'
+
+======================================================================
+ERROR: test_json_alias_is_one_shot_and_keeps_machine_errors (test_profiles.OperatorProfileTests.test_json_alias_is_one_shot_and_keeps_machine_errors)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_profiles.py", line 94, in test_json_alias_is_one_shot_and_keeps_machine_errors
+    with mock.patch("serve.server.main", side_effect=AssertionError("server started")):
+         ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/unittest/mock.py", line 1481, in __enter__
+    self.target = self.getter()
+                  ~~~~~~~~~~~^^
+  File "/usr/lib/python3.13/pkgutil.py", line 528, in resolve_name
+    result = getattr(result, p)
+AttributeError: module 'serve' has no attribute 'server'
+
+======================================================================
+ERROR: test_quiet_foreground_serve_hides_human_banner (test_profiles.OperatorProfileTests.test_quiet_foreground_serve_hides_human_banner)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_profiles.py", line 139, in test_quiet_foreground_serve_hides_human_banner
+    with mock.patch("serve.server.main", side_effect=lambda *_args, **_kwargs: print("ready banner") or 0):
+         ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/unittest/mock.py", line 1481, in __enter__
+    self.target = self.getter()
+                  ~~~~~~~~~~~^^
+  File "/usr/lib/python3.13/pkgutil.py", line 528, in resolve_name
+    result = getattr(result, p)
+AttributeError: module 'serve' has no attribute 'server'
+
+======================================================================
+ERROR: test_quiet_suppresses_human_success_but_preserves_errors_and_json (test_profiles.OperatorProfileTests.test_quiet_suppresses_human_success_but_preserves_errors_and_json)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_profiles.py", line 114, in test_quiet_suppresses_human_success_but_preserves_errors_and_json
+    self.assertEqual(main(["serve", "--profile", str(self.config), "--plan", "--quiet"]), 0)
+                     ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/gbo/develop/strateu/strata_cli/cli.py", line 2243, in main
+    code = _run(a)
+  File "/home/gbo/develop/strateu/strata_cli/cli.py", line 2122, in _run
+    return _serve(a)
+  File "/home/gbo/develop/strateu/strata_cli/cli.py", line 935, in _serve
+    plan, args = _launch_plan(a.config, a)
+                 ~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/home/gbo/develop/strateu/strata_cli/cli.py", line 786, in _launch_plan
+    from serve.server import api_key_of, explicit_no_key, key_list
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+======================================================================
+ERROR: test_saved_overrides_drive_serve_plan_without_rewriting_run_config_or_starting (test_profiles.OperatorProfileTests.test_saved_overrides_drive_serve_plan_without_rewriting_run_config_or_starting)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_profiles.py", line 61, in test_saved_overrides_drive_serve_plan_without_rewriting_run_config_or_starting
+    with mock.patch("serve.server.main", side_effect=AssertionError("server started")):
+         ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/unittest/mock.py", line 1481, in __enter__
+    self.target = self.getter()
+                  ~~~~~~~~~~~^^
+  File "/usr/lib/python3.13/pkgutil.py", line 528, in resolve_name
+    result = getattr(result, p)
+AttributeError: module 'serve' has no attribute 'server'
+
+======================================================================
+ERROR: test_saved_profile_is_used_by_actual_foreground_serve_call (test_profiles.OperatorProfileTests.test_saved_profile_is_used_by_actual_foreground_serve_call)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_profiles.py", line 81, in test_saved_profile_is_used_by_actual_foreground_serve_call
+    with mock.patch("serve.server.main", return_value=0) as server:
+         ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/unittest/mock.py", line 1481, in __enter__
+    self.target = self.getter()
+                  ~~~~~~~~~~~^^
+  File "/usr/lib/python3.13/pkgutil.py", line 528, in resolve_name
+    result = getattr(result, p)
+AttributeError: module 'serve' has no attribute 'server'
+
+======================================================================
+ERROR: test_serve_plan_validates_ready_file_without_writing_it (test_profiles.OperatorProfileTests.test_serve_plan_validates_ready_file_without_writing_it)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_profiles.py", line 211, in test_serve_plan_validates_ready_file_without_writing_it
+    code, result = self.command("serve", "--profile", "local", "--ready-file", str(ready),
+                   ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                "--plan", "--output", "json")
+                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_profiles.py", line 47, in command
+    code = main(list(args))
+  File "/home/gbo/develop/strateu/strata_cli/cli.py", line 2237, in main
+    return _run(a)
+  File "/home/gbo/develop/strateu/strata_cli/cli.py", line 2122, in _run
+    return _serve(a)
+  File "/home/gbo/develop/strateu/strata_cli/cli.py", line 935, in _serve
+    plan, args = _launch_plan(a.config, a)
+                 ~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/home/gbo/develop/strateu/strata_cli/cli.py", line 786, in _launch_plan
+    from serve.server import api_key_of, explicit_no_key, key_list
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+======================================================================
+ERROR: test_a_marker_left_by_a_killed_app_is_cleaned_up_when_its_number_belongs_to_a_later_program (test_runtime.RuntimeTests.test_a_marker_left_by_a_killed_app_is_cleaned_up_when_its_number_belongs_to_a_later_program)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_process_created_after_the_marker_was_written_is_not_the_recorded_child (test_runtime.RuntimeTests.test_a_process_created_after_the_marker_was_written_is_not_the_recorded_child)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_ready_file_that_is_not_ours_is_named_in_the_status_phase (test_runtime.RuntimeTests.test_a_ready_file_that_is_not_ours_is_named_in_the_status_phase)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_recorded_pid_of_an_unrelated_live_process_is_never_signalled (test_runtime.RuntimeTests.test_a_recorded_pid_of_an_unrelated_live_process_is_never_signalled)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_second_client_attaches_from_another_process_and_shares_the_owner (test_runtime.RuntimeTests.test_a_second_client_attaches_from_another_process_and_shares_the_owner)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_wrong_or_stale_token_cannot_stop_the_owner (test_runtime.RuntimeTests.test_a_wrong_or_stale_token_cannot_stop_the_owner)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_authenticated_generation_probe_keeps_credential_out_of_status (test_runtime.RuntimeTests.test_authenticated_generation_probe_keeps_credential_out_of_status)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_changed_source_is_rejected_before_stopping_old_instance (test_runtime.RuntimeTests.test_changed_source_is_rejected_before_stopping_old_instance)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_cli_stop_plan_pins_the_reviewed_owner_and_instance (test_runtime.RuntimeTests.test_cli_stop_plan_pins_the_reviewed_owner_and_instance)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_component_inspection_bridge_is_read_only_and_reports_missing_files (test_runtime.RuntimeTests.test_component_inspection_bridge_is_read_only_and_reports_missing_files)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_editable_recipe_previews_and_reruns_owned_instance (test_runtime.RuntimeTests.test_editable_recipe_previews_and_reruns_owned_instance)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_edited_source_migration_is_previewed_digest_pinned_and_verified (test_runtime.RuntimeTests.test_edited_source_migration_is_previewed_digest_pinned_and_verified)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_exclusive_lease_waits_for_shared_holders_and_shared_holders_coexist (test_runtime.RuntimeTests.test_exclusive_lease_waits_for_shared_holders_and_shared_holders_coexist)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_explicit_source_switch_previews_and_restarts_new_config (test_runtime.RuntimeTests.test_explicit_source_switch_previews_and_restarts_new_config)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_explicit_verify_reports_later_engine_failure_without_stopping_instance (test_runtime.RuntimeTests.test_explicit_verify_reports_later_engine_failure_without_stopping_instance)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_failed_edited_source_migration_uses_private_snapshot_for_rollback (test_runtime.RuntimeTests.test_failed_edited_source_migration_uses_private_snapshot_for_rollback)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_failed_generation_after_profile_edit_rolls_back_prior_launch (test_runtime.RuntimeTests.test_failed_generation_after_profile_edit_rolls_back_prior_launch)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_failed_generation_probe_does_not_report_ready (test_runtime.RuntimeTests.test_failed_generation_probe_does_not_report_ready)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_failed_new_port_rolls_back_previous_owned_launch (test_runtime.RuntimeTests.test_failed_new_port_rolls_back_previous_owned_launch)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_failed_source_switch_restores_prior_owned_launch (test_runtime.RuntimeTests.test_failed_source_switch_restores_prior_owned_launch)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_foreground_jsonl_emits_ready_and_stop_without_human_stdout (test_runtime.RuntimeTests.test_foreground_jsonl_emits_ready_and_stop_without_human_stdout)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_hard_killed_host_child_exits_and_next_start_recovers_private_state (test_runtime.RuntimeTests.test_hard_killed_host_child_exits_and_next_start_recovers_private_state)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_lazy_model_is_verified_as_unloaded_without_generation (test_runtime.RuntimeTests.test_lazy_model_is_verified_as_unloaded_without_generation)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_local_management_bridge_and_cli_share_owner_and_journal (test_runtime.RuntimeTests.test_local_management_bridge_and_cli_share_owner_and_journal)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_local_management_bridge_rejects_ambiguous_requests (test_runtime.RuntimeTests.test_local_management_bridge_rejects_ambiguous_requests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_managed_benchmark_binds_to_owned_launch (test_runtime.RuntimeTests.test_managed_benchmark_binds_to_owned_launch)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_marker_without_creation_time_ignores_a_reused_pid_of_a_foreign_program (test_runtime.RuntimeTests.test_marker_without_creation_time_ignores_a_reused_pid_of_a_foreign_program)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_owned_runtime_and_calibration_exclude_each_other_even_on_port_zero (test_runtime.RuntimeTests.test_owned_runtime_and_calibration_exclude_each_other_even_on_port_zero)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_owner_host_refuses_source_changed_after_start_review (test_runtime.RuntimeTests.test_owner_host_refuses_source_changed_after_start_review)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_profile_change_bridge_reviews_revision_source_and_typed_overrides (test_runtime.RuntimeTests.test_profile_change_bridge_reviews_revision_source_and_typed_overrides)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_ready_pid_may_be_a_child_of_the_launcher_on_windows_only (test_runtime.RuntimeTests.test_ready_pid_may_be_a_child_of_the_launcher_on_windows_only)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_recovery_refuses_a_still_present_child (test_runtime.RuntimeTests.test_recovery_refuses_a_still_present_child)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_remote_bind_preview_accepts_server_supported_key_list (test_runtime.RuntimeTests.test_remote_bind_preview_accepts_server_supported_key_list)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_remote_bind_without_a_key_is_planned_not_refused (test_runtime.RuntimeTests.test_remote_bind_without_a_key_is_planned_not_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_restart_plan_compares_revision_without_stopping_instance (test_runtime.RuntimeTests.test_restart_plan_compares_revision_without_stopping_instance)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_server_reading_changed_config_fails_launch_attestation (test_runtime.RuntimeTests.test_server_reading_changed_config_fails_launch_attestation)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_source_switch_needs_unchanged_distinct_regular_rollback_file (test_runtime.RuntimeTests.test_source_switch_needs_unchanged_distinct_regular_rollback_file)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_stale_profile_revision_does_not_drain_owned_instance (test_runtime.RuntimeTests.test_stale_profile_revision_does_not_drain_owned_instance)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_start_plan_is_read_only (test_runtime.RuntimeTests.test_start_plan_is_read_only)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_start_profile_revision_restart_and_stop (test_runtime.RuntimeTests.test_start_profile_revision_restart_and_stop)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_started_epoch_reads_a_live_process_and_nothing_for_a_dead_number (test_runtime.RuntimeTests.test_started_epoch_reads_a_live_process_and_nothing_for_a_dead_number)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_terminating_owner_host_stops_its_child_and_removes_state (test_runtime.RuntimeTests.test_terminating_owner_host_stops_its_child_and_removes_state)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_zero_token_completion_does_not_count_as_generation_ready (test_runtime.RuntimeTests.test_zero_token_completion_does_not_count_as_generation_ready)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_runtime.py", line 67, in setUp
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_sh_stream_windows (unittest.loader._FailedTest.test_sh_stream_windows)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_sh_stream_windows
+Traceback (most recent call last):
+  File "/usr/lib/python3.13/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+  File "/usr/lib/python3.13/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+    ~~~~~~~~~~^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_sh_stream_windows.py", line 16, in <module>
+    from serve import server  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+
+======================================================================
+ERROR: test_nvidia_and_amd_pcs_never_get_it_even_with_an_intel_igpu_beside_the_card (test_sycl_package.ArcChoice.test_nvidia_and_amd_pcs_never_get_it_even_with_an_intel_igpu_beside_the_card)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_sycl_package.py", line 76, in test_nvidia_and_amd_pcs_never_get_it_even_with_an_intel_igpu_beside_the_card
+    self.assertEqual(best.backend, want, vendors)
+                     ^^^^^^^^^^^^
+AttributeError: 'NoneType' object has no attribute 'backend'
+
+======================================================================
+ERROR: test_terminal (unittest.loader._FailedTest.test_terminal)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_terminal
+Traceback (most recent call last):
+  File "/usr/lib/python3.13/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+  File "/usr/lib/python3.13/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+    ~~~~~~~~~~^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_terminal.py", line 20, in <module>
+    from serve.server import (configure_batch_telemetry_env, parse_batch_window_sample,
+                              parse_stage_in_flight_sample, parse_engine_stage_line,
+                              read_engine_stage_log, visible_device_order)
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+
+======================================================================
+ERROR: test_the_refusal_gives_both_numbers_the_folder_and_one_next_step (test_tui2_023_install.ReplayedFeedWords.test_the_refusal_gives_both_numbers_the_folder_and_one_next_step)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_second_rollback_says_there_is_nothing_older_instead_of_the_same_version_twice (test_tui2_023_messages.RollbackText.test_a_second_rollback_says_there_is_nothing_older_instead_of_the_same_version_twice)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_from_names_the_version_that_is_left (test_tui2_023_messages.RollbackText.test_from_names_the_version_that_is_left)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_0_2_2_install_is_offered_control_0_1_48_and_a_0_2_3_install_is_current (test_tui2_023_versions.UpdateFromTheLastRelease.test_a_0_2_2_install_is_offered_control_0_1_48_and_a_0_2_3_install_is_current)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_the_bumped_numbers_sort_above_the_last_release (test_tui2_023_versions.UpdateFromTheLastRelease.test_the_bumped_numbers_sort_above_the_last_release)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_the_save_screen_no_longer_writes_the_preset_itself (test_tui3.SaveWaitsForRestartAnswer.test_the_save_screen_no_longer_writes_the_preset_itself)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_tui3.py", line 192, in test_the_save_screen_no_longer_writes_the_preset_itself
+    from tests.terminal.test_launch_tui import Base, FakeRunner, press, make_ctx
+  File "/home/gbo/develop/strateu/tests/terminal/test_launch_tui.py", line 15, in <module>
+    from strata_cli.launch.app import Ctx, LaunchApp, run_monitor
+  File "/home/gbo/develop/strateu/strata_cli/launch/app.py", line 16, in <module>
+    from rich.text import Text
+ModuleNotFoundError: No module named 'rich'
+
+======================================================================
+ERROR: test_own_launch_serving_before_the_test_is_also_one_plain_step (test_tui_stress.OwnLaunchHoldsTheCardTests.test_own_launch_serving_before_the_test_is_also_one_plain_step)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_test_start_failure_with_own_launch_serving_gives_the_next_step (test_tui_stress.OwnLaunchHoldsTheCardTests.test_test_start_failure_with_own_launch_serving_gives_the_next_step)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_tui_stress_screens (unittest.loader._FailedTest.test_tui_stress_screens)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_tui_stress_screens
+Traceback (most recent call last):
+  File "/usr/lib/python3.13/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+  File "/usr/lib/python3.13/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+    ~~~~~~~~~~^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_tui_stress_screens.py", line 17, in <module>
+    from tests.terminal.test_launch_tui import Base, FakeRunner, flat, press, text_of, typed
+  File "/home/gbo/develop/strateu/tests/terminal/test_launch_tui.py", line 15, in <module>
+    from strata_cli.launch.app import Ctx, LaunchApp, run_monitor
+  File "/home/gbo/develop/strateu/strata_cli/launch/app.py", line 16, in <module>
+    from rich.text import Text
+ModuleNotFoundError: No module named 'rich'
+
+
+======================================================================
+ERROR: test_the_screens_open_a_browser_only_for_open (test_tuiqa_browser.NoBrowserByItself.test_the_screens_open_a_browser_only_for_open)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_tuiqa_browser.py", line 50, in test_the_screens_open_a_browser_only_for_open
+    from strata_cli.launch import app as launch_app
+  File "/home/gbo/develop/strateu/strata_cli/launch/app.py", line 16, in <module>
+    from rich.text import Text
+ModuleNotFoundError: No module named 'rich'
+
+======================================================================
+ERROR: test_the_browser_is_promised_only_with_open (test_tuiqa_browser.StartMessage.test_the_browser_is_promised_only_with_open)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_tuiqa_browser.py", line 82, in test_the_browser_is_promised_only_with_open
+    self.assertNotIn("browser", self.narrate(False))
+                                ~~~~~~~~~~~~^^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_tuiqa_browser.py", line 68, in narrate
+    from serve import server
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+======================================================================
+ERROR: test_tuiqa_launch (unittest.loader._FailedTest.test_tuiqa_launch)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_tuiqa_launch
+Traceback (most recent call last):
+  File "/usr/lib/python3.13/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+  File "/usr/lib/python3.13/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+    ~~~~~~~~~~^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_tuiqa_launch.py", line 13, in <module>
+    from textual.app import App
+ModuleNotFoundError: No module named 'textual'
+
+
+======================================================================
+ERROR: test_tuiqa_monitor (unittest.loader._FailedTest.test_tuiqa_monitor)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_tuiqa_monitor
+Traceback (most recent call last):
+  File "/usr/lib/python3.13/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+  File "/usr/lib/python3.13/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+    ~~~~~~~~~~^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_tuiqa_monitor.py", line 14, in <module>
+    from strata_cli.launch.monitor_ext import LaunchMonitor
+  File "/home/gbo/develop/strateu/strata_cli/launch/monitor_ext.py", line 19, in <module>
+    from rich.text import Text
+ModuleNotFoundError: No module named 'rich'
+
+
+======================================================================
+ERROR: test_tuiqa_wizard (unittest.loader._FailedTest.test_tuiqa_wizard)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_tuiqa_wizard
+Traceback (most recent call last):
+  File "/usr/lib/python3.13/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+  File "/usr/lib/python3.13/unittest/loader.py", line 339, in _get_module_from_name
+    __import__(name)
+    ~~~~~~~~~~^^^^^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_tuiqa_wizard.py", line 14, in <module>
+    from strata_cli.launch.app import Ctx, LaunchApp
+  File "/home/gbo/develop/strateu/strata_cli/launch/app.py", line 16, in <module>
+    from rich.text import Text
+ModuleNotFoundError: No module named 'rich'
+
+
+======================================================================
+ERROR: test_a_busy_card_is_not_held_against_the_engine (test_update_rules_022.BusyCardTest.test_a_busy_card_is_not_held_against_the_engine)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_real_failure_is_remembered_for_a_day_and_then_tried_again (test_update_rules_022.BusyCardTest.test_a_real_failure_is_remembered_for_a_day_and_then_tried_again)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_failed_test_start_exits_6_and_says_the_old_engine_is_unchanged (test_updater.Cli.test_a_failed_test_start_exits_6_and_says_the_old_engine_is_unchanged)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 669, in setUp
+    super().setUp()
+    ~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_an_untrusted_or_forbidden_update_is_exit_5_and_fetches_nothing (test_updater.Cli.test_an_untrusted_or_forbidden_update_is_exit_5_and_fetches_nothing)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 669, in setUp
+    super().setUp()
+    ~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_cached_update_notice_is_dropped_when_versions_change (test_updater.Cli.test_cached_update_notice_is_dropped_when_versions_change)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 669, in setUp
+    super().setUp()
+    ~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_check_update_and_rollback_from_the_terminal (test_updater.Cli.test_check_update_and_rollback_from_the_terminal)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 669, in setUp
+    super().setUp()
+    ~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_jsonl_streams_progress_and_ends_with_the_result (test_updater.Cli.test_jsonl_streams_progress_and_ends_with_the_result)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 669, in setUp
+    super().setUp()
+    ~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_broken_installed_engine_is_replaced_by_a_good_one (test_updater.EngineUpdate.test_a_broken_installed_engine_is_replaced_by_a_good_one)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_downgrade_is_never_installed (test_updater.EngineUpdate.test_a_downgrade_is_never_installed)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_download_that_is_not_the_signed_hash_is_refused (test_updater.EngineUpdate.test_a_download_that_is_not_the_signed_hash_is_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_failing_test_start_keeps_the_old_engine (test_updater.EngineUpdate.test_a_failing_test_start_keeps_the_old_engine)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_package_the_feed_did_not_describe_is_refused (test_updater.EngineUpdate.test_a_package_the_feed_did_not_describe_is_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_process_that_forbids_acquiring_cannot_update (test_updater.EngineUpdate.test_a_process_that_forbids_acquiring_cannot_update)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_replayed_older_feed_is_refused (test_updater.EngineUpdate.test_a_replayed_older_feed_is_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_started_engine_check_does_not_import_the_updater (test_updater.EngineUpdate.test_a_started_engine_check_does_not_import_the_updater)
+The start path (engine_component, runtime) must not reach the update machinery or the network code.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_an_interrupted_download_resumes (test_updater.EngineUpdate.test_an_interrupted_download_resumes)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_check_reads_only_the_feed (test_updater.EngineUpdate.test_check_reads_only_the_feed)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_first_run_installs_the_engine_for_this_pc_without_a_model (test_updater.EngineUpdate.test_first_run_installs_the_engine_for_this_pc_without_a_model)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_manual_rollback_returns_to_the_previous_engine_and_is_not_undone_by_the_next_update (test_updater.EngineUpdate.test_manual_rollback_returns_to_the_previous_engine_and_is_not_undone_by_the_next_update)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_nothing_is_replaced_while_an_engine_serves (test_updater.EngineUpdate.test_nothing_is_replaced_while_an_engine_serves)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_rollback_without_a_previous_engine_says_so (test_updater.EngineUpdate.test_rollback_without_a_previous_engine_says_so)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_the_next_update_drops_versions_older_than_the_previous_one (test_updater.EngineUpdate.test_the_next_update_drops_versions_older_than_the_previous_one)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_the_package_for_another_gpu_is_not_offered (test_updater.EngineUpdate.test_the_package_for_another_gpu_is_not_offered)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_unsigned_and_wrongly_signed_packages_are_refused (test_updater.EngineUpdate.test_unsigned_and_wrongly_signed_packages_are_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_update_downloads_verifies_test_starts_then_switches (test_updater.EngineUpdate.test_update_downloads_verifies_test_starts_then_switches)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_waiting_for_the_engine_to_stop (test_updater.EngineUpdate.test_waiting_for_the_engine_to_stop)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_an_engine_that_cannot_answer_does_not_pass (test_updater.FailedStartRecords.test_an_engine_that_cannot_answer_does_not_pass)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_an_expired_start_that_was_still_loading_says_so (test_updater.FailedStartRecords.test_an_expired_start_that_was_still_loading_says_so)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_an_expired_start_with_an_unmatched_ready_file_says_so (test_updater.FailedStartRecords.test_an_expired_start_with_an_unmatched_ready_file_says_so)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_an_expired_start_with_the_model_loaded_says_it_did_not_answer (test_updater.FailedStartRecords.test_an_expired_start_with_the_model_loaded_says_it_did_not_answer)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_an_unloaded_ready_server_is_made_to_answer_before_the_engine_passes (test_updater.FailedStartRecords.test_an_unloaded_ready_server_is_made_to_answer_before_the_engine_passes)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_only_the_last_few_failed_starts_are_kept (test_updater.FailedStartRecords.test_only_the_last_few_failed_starts_are_kept)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_the_runtime_records_of_a_failed_start_are_kept_without_tokens_or_keys (test_updater.FailedStartRecords.test_the_runtime_records_of_a_failed_start_are_kept_without_tokens_or_keys)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_the_test_start_shows_progress_while_it_waits (test_updater.FailedStartRecords.test_the_test_start_shows_progress_while_it_waits)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_an_engine_that_cannot_answer_does_not_pass (test_updater.LazyModel.test_an_engine_that_cannot_answer_does_not_pass)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_an_expired_start_that_was_still_loading_says_so (test_updater.LazyModel.test_an_expired_start_that_was_still_loading_says_so)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_an_expired_start_with_an_unmatched_ready_file_says_so (test_updater.LazyModel.test_an_expired_start_with_an_unmatched_ready_file_says_so)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_an_expired_start_with_the_model_loaded_says_it_did_not_answer (test_updater.LazyModel.test_an_expired_start_with_the_model_loaded_says_it_did_not_answer)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_an_unloaded_ready_server_is_made_to_answer_before_the_engine_passes (test_updater.LazyModel.test_an_unloaded_ready_server_is_made_to_answer_before_the_engine_passes)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_the_test_start_shows_progress_while_it_waits (test_updater.LazyModel.test_the_test_start_shows_progress_while_it_waits)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_control_archive_with_a_link_out_of_the_package_is_refused (test_updater.OtherComponents.test_a_control_archive_with_a_link_out_of_the_package_is_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_control_bundle_may_link_inside_itself_and_nowhere_else (test_updater.OtherComponents.test_a_control_bundle_may_link_inside_itself_and_nowhere_else)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_a_control_that_cannot_run_is_not_switched_to (test_updater.OtherComponents.test_a_control_that_cannot_run_is_not_switched_to)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_an_installer_with_a_bad_signature_is_deleted (test_updater.OtherComponents.test_an_installer_with_a_bad_signature_is_deleted)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_control_is_staged_run_once_and_pointed_at (test_updater.OtherComponents.test_control_is_staged_run_once_and_pointed_at)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_no_app_key_no_app_download (test_updater.OtherComponents.test_no_app_key_no_app_download)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_the_app_installer_is_downloaded_and_its_signature_checked (test_updater.OtherComponents.test_the_app_installer_is_downloaded_and_its_signature_checked)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_signed_packages_verify_and_a_forged_signature_is_refused_on_every_start (test_updater.StartPathSignature.test_signed_packages_verify_and_a_forged_signature_is_refused_on_every_start)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 429, in setUp
+    super().setUp()
+    ~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+ERROR: test_without_trusted_keys_a_signed_package_is_unverified_and_required_signing_refuses_it (test_updater.StartPathSignature.test_without_trusted_keys_a_signed_package_is_unverified_and_required_signing_refuses_it)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 429, in setUp
+    super().setUp()
+    ~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 77, in setUp
+    self._run_config()
+    ~~~~~~~~~~~~~~~~^^
+  File "/home/gbo/develop/strateu/tests/terminal/test_updater.py", line 93, in _run_config
+    from tools.strata_tokenizer import BYTE_TO_UNICODE
+  File "/home/gbo/develop/strateu/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+======================================================================
+FAIL: test_setup_py_and_each_of_its_tools_import_with_tools_limited_to_the_bundle (test_bundle_imports.BundleImports.test_setup_py_and_each_of_its_tools_import_with_tools_limited_to_the_bundle)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_bundle_imports.py", line 88, in test_setup_py_and_each_of_its_tools_import_with_tools_limited_to_the_bundle
+    self.assertEqual(done.returncode, 0, (done.stdout or "") + (done.stderr or "")[-1500:])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 1 != 0 : Traceback (most recent call last):
+  File "<string>", line 5, in <module>
+    module = importlib.import_module(name)
+  File "/usr/lib/python3.13/importlib/__init__.py", line 88, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1331, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 935, in _load_unlocked
+  File "<frozen importlib._bootstrap_external>", line 1026, in exec_module
+  File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
+  File "/tmp/strata-bundle-nlkarz8c/strata-terminal/tools/draft_vocab.py", line 33, in <module>
+    import strata_tokenizer as ST  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/strata-bundle-nlkarz8c/strata-terminal/tools/strata_tokenizer.py", line 24, in <module>
+    import regex
+ModuleNotFoundError: No module named 'regex'
+
+
+======================================================================
+FAIL: test_missing_package_is_named_not_a_traceback (test_dsv41_tui_items.Screens.test_missing_package_is_named_not_a_traceback)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_dsv41_tui_items.py", line 26, in test_missing_package_is_named_not_a_traceback
+    self.assertEqual(cmd._screens_missing(), "textual")
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'rich' != 'textual'
+- rich
++ textual
+
+
+======================================================================
+FAIL: test_start_and_serve_modules_do_not_load_installer_code (test_no_acquisition.ImportGraphTests.test_start_and_serve_modules_do_not_load_installer_code)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_no_acquisition.py", line 85, in test_start_and_serve_modules_do_not_load_installer_code
+    self.assertEqual(r.returncode, 0, r.stderr[-1000:])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 1 != 0 : Traceback (most recent call last):
+  File "<string>", line 4, in <module>
+    import serve.server
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+
+======================================================================
+FAIL: test_an_engine_orphan_of_this_executable_is_found_and_a_live_one_is_not (test_procs.Procs.test_an_engine_orphan_of_this_executable_is_found_and_a_live_one_is_not)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_procs.py", line 132, in test_an_engine_orphan_of_this_executable_is_found_and_a_live_one_is_not
+    self.assertIn(orphan_pid, found)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+AssertionError: 251935 not found in []
+
+======================================================================
+FAIL: test_mock_server_publishes_bound_port_and_cleans_on_sigterm (test_ready.ReadyFileTests.test_mock_server_publishes_bound_port_and_cleans_on_sigterm)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tests/terminal/test_ready.py", line 52, in test_mock_server_publishes_bound_port_and_cleans_on_sigterm
+    self.assertIsNotNone(record, process.stderr.read().decode("utf-8", "replace") if process.poll() is not None else "")
+    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: unexpectedly None : Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/gbo/develop/strateu/serve/server.py", line 68, in <module>
+    from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
+                                template_json_calls, tool_choice_of, unmark_think_literals)
+  File "/home/gbo/develop/strateu/serve/frontend.py", line 28, in <module>
+    import jinja2
+ModuleNotFoundError: No module named 'jinja2'
+
+
+----------------------------------------------------------------------
+Ran 1654 tests in 141.954s
+
+FAILED (failures=5, errors=166, skipped=52)
+/tmp/tmplq3w93qt/BUILD.json: vision_archs 60;61;70
+{"schema_version": 1, "ok": true, "jobs": []}
+{"schema_version": 1, "ok": true, "runs": []}
+This Terminal cannot switch to the new Control by itself. Run the Strata install command once more to update it.

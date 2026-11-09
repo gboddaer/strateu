@@ -1,0 +1,114 @@
+................F.F..F.
+======================================================================
+FAIL: test_a_changed_pin_is_installed (__main__.Requirements.test_a_changed_pin_is_installed)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tools/test_setup_pins.py", line 439, in test_a_changed_pin_is_installed
+    self.assertEqual(ran, ["tqdm==4.70.1"])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: ['numpy==2.5.3; python_version >= "3.12"', [358 chars]32"'] != ['tqdm==4.70.1']
+
+First differing element 0:
+'numpy==2.5.3; python_version >= "3.12"'
+'tqdm==4.70.1'
+
+First list contains 15 additional elements.
+First extra element 1:
+'numpy==2.4.6; python_version == "3.11"'
+
+- ['numpy==2.5.3; python_version >= "3.12"',
+-  'numpy==2.4.6; python_version == "3.11"',
+-  'jinja2==3.1.6',
+-  'regex==2026.9.10',
+-  'pyyaml==6.0.3',
+-  'tqdm==4.70.1',
+? ^              ^
+
++ ['tqdm==4.70.1']
+? ^              ^
+
+-  'requests==2.34.2',
+-  'pillow==13.0.0',
+-  'psutil==7.2.2',
+-  'markupsafe==3.0.3',
+-  'certifi==2026.10.19',
+-  'truststore==0.10.5; python_version >= "3.10"',
+-  'charset-normalizer==3.5.1',
+-  'idna==3.20',
+-  'urllib3==2.8.0',
+-  'colorama==0.4.6; sys_platform == "win32"']
+
+======================================================================
+FAIL: test_an_install_from_before_the_pins_is_left_alone (__main__.Requirements.test_an_install_from_before_the_pins_is_left_alone)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tools/test_setup_pins.py", line 428, in test_an_install_from_before_the_pins_is_left_alone
+    self.assertEqual(self.pip(legacy, lines, installed=deps)[0], ['truststore==0.10.5; python_version >= "3.10"'])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: ['numpy==2.5.3; python_version >= "3.12"', [358 chars]32"'] != ['truststore==0.10.5; python_version >= "3.10"']
+
+First differing element 0:
+'numpy==2.5.3; python_version >= "3.12"'
+'truststore==0.10.5; python_version >= "3.10"'
+
+First list contains 15 additional elements.
+First extra element 1:
+'numpy==2.4.6; python_version == "3.11"'
+
+- ['numpy==2.5.3; python_version >= "3.12"',
+-  'numpy==2.4.6; python_version == "3.11"',
+-  'jinja2==3.1.6',
+-  'regex==2026.9.10',
+-  'pyyaml==6.0.3',
+-  'tqdm==4.70.1',
+-  'requests==2.34.2',
+-  'pillow==13.0.0',
+-  'psutil==7.2.2',
+-  'markupsafe==3.0.3',
+-  'certifi==2026.10.19',
+-  'truststore==0.10.5; python_version >= "3.10"',
+? ^                                              ^
+
++ ['truststore==0.10.5; python_version >= "3.10"']
+? ^                                              ^
+
+-  'charset-normalizer==3.5.1',
+-  'idna==3.20',
+-  'urllib3==2.8.0',
+-  'colorama==0.4.6; sys_platform == "win32"']
+
+======================================================================
+FAIL: test_fresh_install_gets_every_pin (__main__.Requirements.test_fresh_install_gets_every_pin)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/gbo/develop/strateu/tools/test_setup_pins.py", line 421, in test_fresh_install_gets_every_pin
+    self.assertEqual(self.pip(stamp, lines)[0], [])                       # the second run: nothing
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: ['numpy==2.5.3; python_version >= "3.12"',[359 chars]32"'] != []
+
+First list contains 16 additional elements.
+First extra element 0:
+'numpy==2.5.3; python_version >= "3.12"'
+
++ []
+- ['numpy==2.5.3; python_version >= "3.12"',
+-  'numpy==2.4.6; python_version == "3.11"',
+-  'jinja2==3.1.6',
+-  'regex==2026.9.10',
+-  'pyyaml==6.0.3',
+-  'tqdm==4.70.1',
+-  'requests==2.34.2',
+-  'pillow==13.0.0',
+-  'psutil==7.2.2',
+-  'markupsafe==3.0.3',
+-  'certifi==2026.10.19',
+-  'truststore==0.10.5; python_version >= "3.10"',
+-  'charset-normalizer==3.5.1',
+-  'idna==3.20',
+-  'urllib3==2.8.0',
+-  'colorama==0.4.6; sys_platform == "win32"']
+
+----------------------------------------------------------------------
+Ran 23 tests in 0.034s
+
+FAILED (failures=3)

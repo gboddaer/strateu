@@ -21,10 +21,12 @@ Two alternating 512/128 pairs with `--stats`; complete logits were identical to 
 | off 2 | 147,967 | 25,782 | 2,041 | 258.1 |
 | on 2 | 156,624 | 19,344 | 10,560 | 279.8 |
 
-The two lanes are not faster: startup packing is 27-40% slower on this pair, prefill is mixed/slower, decode packing
-is slower, and wall is worse in both pairs. Packing reads the GGUF mmap and competes for the same disk/memory
-bandwidth; a second lane does not add it. The spread also shows strong page-cache/IO state, so this is not a
-precision timing, but there is no positive signal to retain.
+The two lanes are not faster: startup packing is 26.7% and 5.9% slower, prefill is mixed/slower, decode packing is
+slower, and wall is worse in both pairs (10.6% and 8.4%). Mmap/IO contention is a hypothesis, not established;
+synchronization, scheduling and uneven lane work remain possible causes. The spread also shows strong page-cache/IO
+state. This is not a precision timing, but there is no positive signal to retain. Evaluation stopped early: cold
+4K/source-fault, the planned two-worker-plus-caller configuration, delayed-worker lifetime, exception cleanup and the
+stats-off five-pair gate were not run.
 
 Decision: **REJECT**. Remove the pool, engine wiring and test; keep the diff, sources, logs and hashes. No concrete
 retained dependency. CUDA/SYCL NOT RUN. No server.

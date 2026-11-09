@@ -85,5 +85,5 @@ GREEN: `build-kolibri-hip-tests/mmvq_selected_test` -> exit 0, log in `task2/mmv
 `kolibri_mmvq_selected` passes. The default-wave refusal mode (`--expect-refusal`) fails on gfx1100 by design and is
 registered only for gfx906 builds.
 
-Decision: **KEEP** (repeatable 512/128 decode gain, bit-identical) and **KEEP-ENABLER** for Task 3
-(quantization reuse consumes the selected API).
+Decision: **KEEP** (repeatable 512/128 decode gain, bit-identical). It is not an enabler: Task 3, the only
+consumer, was rejected and removed.

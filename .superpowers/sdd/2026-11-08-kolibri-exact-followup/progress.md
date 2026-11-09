@@ -26,16 +26,16 @@ Plan: `docs/superpowers/plans/2026-11-08-kolibri-exact-followup.md`.
 | Task | Decision | Evidence | Review |
 |---|---|---|---|
 | 0 driver budget | KEEP (driver correctness) | 17 tests + 10800 s controls | 3 reviews, resolved |
-| 2 selected MMVQ | KEEP + KEEP-ENABLER | full-logit gates + 5 timing pairs + integration matrix | 3 reviews, resolved |
+| 2 selected MMVQ | KEEP (standalone; Task 3 rejected) | full-logit gates + 5 timing pairs + integration matrix | 3 reviews, resolved |
 | 3 quantization reuse | REJECT (no repeatable gain, no named consumer) | exactness + 5 timing pairs + integration | review 1 agrees |
 | 4 cache admission | REJECT (no gain over demand; not correctness) | 4K/16K/65K + demand control + integration | review 2 agrees |
 | 5 synchronization | REJECT (no repeatable speedup; removed) | gate + GPU ordering + 10 pairs + integration | review 3 agrees |
 | 6 promotion fences | REJECT (12 ms, no end-to-end gain demonstrated) | batch test + 389-move round + diff | review agrees |
 | 7 GPU hit dispatch | BLOCKED (prototype qualified; engine lifecycle deferred) | counters + DEC_PHASES + hit/miss/update/reset test | 4 reviews agree |
-| 8 CPU packing | REJECT (two lanes slower) | byte-exact test + 2 alternating pairs | pending |
-| 9 host-copy diagnosis | REJECT (2 GB/s ceiling; no setting gain) | probe, default/SDMA on/off | pending |
-| 10 zero buffer | KEEP opt-in (+5.6% decode, exact; 5/5 pairs) | 5+5 pairs + 10/10 integration | pending |
-| final composition | not started | | |
+| 8 CPU packing | REJECT (no benefit; early stop) | byte-exact test + 2 alternating pairs | review agrees |
+| 9 host-copy diagnosis | REJECT (no setting gain; probe retained) | probe, default/SDMA on/off | review agrees |
+| 10 zero buffer | KEEP opt-in (+5.6% decode, exact; 5/5 pairs) | 5+5 pairs + 10/10 integration | 3 reviews, keep opt-in |
+| final composition | COMPLETE (retained flags exact; not fully qualified) | full build + ctests + 10/10 integration + 131064/8 pair | review: close after corrections |
 
 ## Task 0 — driver budget
 
@@ -85,7 +85,7 @@ Evidence: `.superpowers/sdd/2026-11-08-kolibri-exact-followup/task2/summary.md`,
 `integration-off/`, `integration-on/`, timing JSONs.
 Full logits: off/on 512/128 `6ffefa8f...`, cache8 `466f48f2...`, 4097/8 `241969a0...`; integration 10/10 cases identical.
 Timing: 512/128 decode 5/5 faster, paired median +20.9%; cache8 inconclusive (+2.8% paired median, one -13.3%).
-Decision: KEEP (local W7800 decode) + KEEP-ENABLER for Task 3.
+Decision: KEEP (local W7800 decode). The selected API is not an enabler now: Task 3 was rejected.
 
 ### Task 2 review 1 (`gpt-6.1-sol`, exit 0)
 
@@ -184,3 +184,30 @@ First attempt had a pointer bug (downstream `yc = s.ey` overwrote the buffer) an
 `if (zero_used)` override. 512/128 and cache8 full dumps match `6ffefa8f`/`466f48f2`; 10/10 integration identical.
 Five pairs: 13.79 -> 14.14 decode tok/s median (+5.6% paired, 5/5 positive); cache8 neutral. All-resident does not fit (42.90 GiB
 vs 39,860 MiB free; 326/384 slots). Opt-in only, no default promotion. No server.
+
+## Final composition
+
+Full HIP main/test builds OK; HIP ctests 3/3. 10/10 integration dumps identical with MMVQ_SELECTED+SKIP_ZERO_OVERFLOW+
+ZERO_BUFFER. 131064/8: off 19.60/5.43 tok/s, on 19.66/6.17, wall 6801.9/6786.1 s, identical SHA `5c85e7f6...`.
+Setup: 3 environment failures (numpy/import/pins); Terminal unittest 1654 tests, 5 failures/166 errors (component/
+server fixtures), not green. CUDA/SYCL NOT RUN. No server.
+
+## Review disposition (final)
+
+- Task 0: three reviews; missing budget/artifact guards and ledger corrections fixed.
+- Task 2: three reviews; unsupported-format/pointer/stride refusals, packed-Q6 sentinel, tests fixed.
+- Task 3: review agreed with REJECT; code removed.
+- Task 4: two reviews; baseline/demand control and removal agreed.
+- Task 5: three reviews; first KEEP withdrawn after a second 5-pair series; GPU ordering test added, then all removed.
+- Task 6: two reviews; ring-only batch implemented/tested, measured 12.2 ms, then removed; test limits recorded.
+- Task 7: four reviews; counter error corrected, probe measured 0.567 ms/layer, synthetic device-slot + hit/miss/update/
+  reset prototype qualified, then removed; engine map lifecycle explicitly deferred.
+- Task 8: review agreed with early REJECT; cold-4K, planned worker count, delayed-worker lifetime and exception-safety
+  tests are unperformed.
+- Task 9: review agreed with REJECT; probe failure exit fixed, topology recorded; no engine/system change.
+- Task 10: three reviews; first pointer bug found and fixed; 5-pair + cache8 + 10/10 integration; targeted
+  miss->hit->miss, poison, mixed-format and flag-matrix tests remain unrun.
+- Final: this review; corrections applied before commit.
+
+Qualification limits: no independent model-fidelity qualification; no CUDA/SYCL; no server run; Terminal/setup suites
+not green for environment/fixture reasons whose baseline is not established.

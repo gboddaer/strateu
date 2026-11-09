@@ -1,0 +1,65 @@
+{
+  "label": "final-131064-on",
+  "command": [
+    "build-kolibri-hip/strata-kolibri",
+    "--model",
+    "/home/gbo/models/Kolibri-1-Q4_K_M.gguf",
+    "--expert-no-pin",
+    "--expert-slots",
+    "auto",
+    "--expert-slots-hot",
+    "--expert-slots-profile",
+    ".superpowers/sdd/2026-11-08-kolibri-exact-followup/final/final-131064-on.profile",
+    "--prefill",
+    "--ctx",
+    "131072",
+    "--vram-reserve-mib",
+    "1536",
+    "--tokens-file",
+    ".superpowers/sdd/2026-11-08-kolibri-exact-followup/final/final-131064-on.ids",
+    "--n",
+    "8",
+    "--dump-full-logits",
+    ".superpowers/sdd/2026-11-08-kolibri-exact-followup/final/final-131064-on.bin",
+    "--counters",
+    "--force",
+    "286,3515,310,262,14292,1343,1444"
+  ],
+  "env_overrides": [],
+  "env_inherited_strata": {
+    "STRATA_KOLIBRI_MMVQ_SELECTED": "1",
+    "STRATA_KOLIBRI_SKIP_ZERO_OVERFLOW": "1",
+    "STRATA_KOLIBRI_ZERO_BUFFER": "1"
+  },
+  "python": "3.13.5",
+  "wall_s": 6786.067766368011,
+  "input_tokens": 131064,
+  "context": 131072,
+  "timeout_s": 10800.0,
+  "ids_source": null,
+  "phases": {
+    "startup": {
+      "tokens": 0,
+      "ms": 118477.656,
+      "tok_s": 0.0
+    },
+    "prefill": {
+      "tokens": 131063,
+      "ms": 6665115.027,
+      "tok_s": 19.664026722580374
+    },
+    "decode": {
+      "tokens": 8,
+      "ms": 1296.158,
+      "tok_s": 6.172087044943595
+    }
+  },
+  "logits_bytes": 4096000,
+  "logits_floats": 1024000,
+  "logits_sha256": "5c85e7f6569fea0c8a7162a9b84ee8e23e0dc26e283e539abe3cb605f000a322",
+  "binary_sha256": "22403d46100f8f45a6dcea87adf97d9317a280d502f2330658c989a39721c1a7",
+  "generated": "gen: 54 32 310 262 14292 1343 1444 46",
+  "diagnostics": [
+    "strata-kolibri: (ctx, slots) draw on the same VRAM: 1 slot = 114 MiB = 5857 context tokens at 20.0 KB/token; ctx 131072 x 20480 = 2.50 GiB, 1710 MiB free (reserve 1536 MiB)"
+  ]
+}
