@@ -112,6 +112,11 @@ def popen(what: str, args: list, role: str = "engine", **kw):
         raise
 
 
+def engine_cmd(exe: str, args: list[str], prefix: list[str] | None = None) -> list[str]:
+    """Prepend an optional launcher argv prefix (numactl, for a memory-bound engine); without one, preserve the existing command."""
+    return [*(prefix or []), exe, "--serve", *args]
+
+
 # How long close() gives the engine at each step of ending it (seconds). Module values so that a test can shorten them.
 ENGINE_QUIT_WAIT_S, ENGINE_TERM_WAIT_S, ENGINE_KILL_WAIT_S = 20, 5, 20
 
@@ -9644,7 +9649,8 @@ def start_engine_or_fallback(cfg: dict, exe: str, effort_end: list[str] | None, 
     configure_batch_telemetry_env(env2, cfg2, batch_telemetry)
     effort2 = effort_end_args(cfg2, exe2, tok)
     engine = StrataEngine(exe2, engine_args(cfg2, exe2) + (effort2 or []), cwd=cfg2.get("cwd"), log=cfg2.get("log"), env=env2, lazy=lazy,
-                          retry_args=mtp_retry_args(cfg2, exe2, effort2), retry_vram_args=nodraft_retry_args(cfg2, exe2, effort2, prefix=cfg2.get("launch_prefix")))
+                          retry_args=mtp_retry_args(cfg2, exe2, effort2), retry_vram_args=nodraft_retry_args(cfg2, exe2, effort2),
+                          prefix=cfg2.get("launch_prefix"))
     engine.info["split_fallback"] = True
     return engine
 

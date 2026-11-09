@@ -90,6 +90,19 @@ Medido con el conjunto de 2.00 bpw en Strata 0.2.5. «Salida» es la velocidad d
 
 ## Instalación
 
+<a id="this-fork"></a>
+
+### Este fork (strateu)
+
+Este repositorio se instala desde una copia del código fuente, no con los instaladores de abajo: esos instalan el
+Strata original, que no tiene el motor de Kolibri.
+
+[Descarga strateu](https://github.com/gboddaer/strateu/archive/refs/heads/main.zip) y descomprímelo (o usa `git clone`).
+**Windows:** doble clic en **`START-HERE.bat`**. **Linux y Mac:** abre una terminal en la carpeta de Strata y ejecuta
+**`./setup.sh`**. Encuentra tu tarjeta, pregunta qué modelo y tamaño, cuánto contexto y si debe leer imágenes, y
+después descarga el modelo y lo arranca. Kolibri 1: `./setup.sh --family kolibri`.
+[Instalación desde el código fuente](docs/SOURCE_INSTALL.md) · [Kolibri 1](docs/KOLIBRI1.md).
+
 <a id="option-a-the-strata-app"></a>
 
 ### Aplicación de escritorio

@@ -215,14 +215,14 @@ class EngineCommand(unittest.TestCase):
         self.assertEqual(conversation_slots(engine), 7)
 
     def test_every_engine_construction_passes_the_launch_prefix(self):
-        """All three paths - single engine, replicas, split - must hand the config's prefix on.
+        """Every path - single engine, split fallback, replicas, split - must hand the config's prefix on.
         A missing keyword here is silent: the engine starts unbound and looks healthy."""
         import ast
         from serve import server
         tree = ast.parse((Path(server.__file__)).read_text())
         calls = [n for n in ast.walk(tree)
                  if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "StrataEngine"]
-        self.assertEqual(len(calls), 3, "expected the single, replica and split construction sites")
+        self.assertEqual(len(calls), 4, "expected the single, split fallback, replica and split construction sites")
         for call in calls:
             names = [k.arg for k in call.keywords]
             self.assertIn("prefix", names, f"StrataEngine call at line {call.lineno} drops the launch prefix")

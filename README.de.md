@@ -90,6 +90,19 @@ Unsicher, was passt? [Wähle ein Modell für deinen Computer](docs/MODELS.md#pic
 
 ## Installation
 
+<a id="this-fork"></a>
+
+### Dieser Fork (strateu)
+
+Dieses Repository wird aus einem Quelltext-Checkout eingerichtet, nicht mit den Installern weiter unten: die
+installieren das ursprüngliche Strata ohne Kolibri-Engine.
+
+[Strateu herunterladen](https://github.com/gboddaer/strateu/archive/refs/heads/main.zip) und entpacken (oder
+`git clone`). **Windows:** Doppelklick auf **`START-HERE.bat`**. **Linux und Mac:** Terminal im Strata-Ordner öffnen
+und **`./setup.sh`** ausführen. Es findet deine Grafikkarte und fragt nach Modell und Größe, Kontext und Bildern, dann
+lädt es das Modell und startet es. Kolibri 1: `./setup.sh --family kolibri`.
+[Einrichtung aus dem Quelltext](docs/SOURCE_INSTALL.md) · [Kolibri 1](docs/KOLIBRI1.md).
+
 <a id="option-a-the-strata-app"></a>
 
 ### Desktop-App

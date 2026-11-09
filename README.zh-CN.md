@@ -90,6 +90,18 @@ strata launch --family deepseek41 --model ist-das-2.00bpw --plan
 
 ## 安装
 
+<a id="this-fork"></a>
+
+### 这个分支（strateu）
+
+本仓库从源码安装，而不是用下面的安装程序：那些安装的是原版 Strata，没有 Kolibri 引擎。
+
+[下载 strateu](https://github.com/gboddaer/strateu/archive/refs/heads/main.zip) 并解压（或 `git clone`）。
+**Windows：** 双击 **`START-HERE.bat`**。**Linux 和 Mac：** 在 Strata 文件夹中打开终端并运行 **`./setup.sh`**。
+它会找到你的显卡，询问模型和大小、上下文长度以及是否读图，然后下载模型并启动。Kolibri 1：
+`./setup.sh --family kolibri`。
+[从源码安装](docs/SOURCE_INSTALL.md) · [Kolibri 1](docs/KOLIBRI1.md)。
+
 <a id="option-a-the-strata-app"></a>
 
 ### 桌面应用

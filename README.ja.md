@@ -90,6 +90,19 @@ Strata 0.2.5 で 2.00 bpw のセットを使って測定しました。「出力
 
 ## インストール
 
+<a id="this-fork"></a>
+
+### このフォーク（strateu）
+
+このリポジトリはソースコードのチェックアウトから設定します。下のインストーラーは元の Strata を入れるもので、
+Kolibri のエンジンは入りません。
+
+[strateu をダウンロード](https://github.com/gboddaer/strateu/archive/refs/heads/main.zip) して展開します（または
+`git clone`）。**Windows：** **`START-HERE.bat`** をダブルクリック。**Linux と Mac：** Strata のフォルダーで
+ターミナルを開き **`./setup.sh`** を実行します。グラフィックスカードを見つけ、モデルとサイズ、コンテキスト、
+画像を読むかを尋ね、モデルをダウンロードして起動します。Kolibri 1：`./setup.sh --family kolibri`。
+[ソースからの設定](docs/SOURCE_INSTALL.md) · [Kolibri 1](docs/KOLIBRI1.md)。
+
 <a id="option-a-the-strata-app"></a>
 
 ### デスクトップアプリ

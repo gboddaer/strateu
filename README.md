@@ -113,6 +113,19 @@ Not sure what fits? [Choose a model for your computer](docs/MODELS.md#pick-by-me
 
 ## Install
 
+<a id="this-fork"></a>
+
+### This fork (strateu)
+
+This repository is set up from a source checkout, not from the installers below: those install upstream Strata, which
+has no Kolibri engine.
+
+[Download strateu](https://github.com/gboddaer/strateu/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
+**Windows:** double-click **`START-HERE.bat`**. **Linux and Mac:** open a terminal in the Strata folder and run
+**`./setup.sh`**. It finds your card, asks which model and size, how much context and whether it should read pictures,
+then downloads the model and starts it. Kolibri 1: `./setup.sh --family kolibri`.
+[Source setup](docs/SOURCE_INSTALL.md) · [Kolibri 1](docs/KOLIBRI1.md).
+
 <a id="option-a-the-strata-app"></a>
 
 ### Desktop app

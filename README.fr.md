@@ -90,6 +90,19 @@ Vous ne savez pas ce qui tient ? [Choisir un modèle pour votre ordinateur](docs
 
 ## Installation
 
+<a id="this-fork"></a>
+
+### Ce fork (strateu)
+
+Ce dépôt s'installe depuis une copie du code source, pas avec les installateurs ci-dessous : ceux-ci installent le
+Strata d'origine, qui n'a pas le moteur Kolibri.
+
+[Télécharger strateu](https://github.com/gboddaer/strateu/archive/refs/heads/main.zip) et le décompresser (ou
+`git clone`). **Windows :** double-clic sur **`START-HERE.bat`**. **Linux et Mac :** ouvrir un terminal dans le dossier
+Strata et lancer **`./setup.sh`**. Il trouve votre carte, demande le modèle et sa taille, la quantité de contexte et
+s'il doit lire les images, puis télécharge le modèle et le démarre. Kolibri 1 : `./setup.sh --family kolibri`.
+[Installation depuis le code source](docs/SOURCE_INSTALL.md) · [Kolibri 1](docs/KOLIBRI1.md).
+
 <a id="option-a-the-strata-app"></a>
 
 ### Application de bureau

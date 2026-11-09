@@ -90,6 +90,19 @@ Não sabe o que cabe? [Escolha um modelo para o seu computador](docs/MODELS.md#p
 
 ## Instalação
 
+<a id="this-fork"></a>
+
+### Este fork (strateu)
+
+Este repositório é configurado a partir de uma cópia do código-fonte, não com os instaladores abaixo: eles instalam
+o Strata original, que não tem o motor do Kolibri.
+
+[Baixe o strateu](https://github.com/gboddaer/strateu/archive/refs/heads/main.zip) e descompacte (ou `git clone`).
+**Windows:** clique duas vezes em **`START-HERE.bat`**. **Linux e Mac:** abra um terminal na pasta do Strata e execute
+**`./setup.sh`**. Ele encontra a sua placa, pergunta qual modelo e tamanho, quanto contexto e se deve ler imagens,
+depois baixa o modelo e o inicia. Kolibri 1: `./setup.sh --family kolibri`.
+[Configuração a partir do código-fonte](docs/SOURCE_INSTALL.md) · [Kolibri 1](docs/KOLIBRI1.md).
+
 <a id="option-a-the-strata-app"></a>
 
 ### Aplicativo de desktop

@@ -5,8 +5,8 @@ write its calls in exactly this form.  `OutputParser` reads the XML `<function=.
 under `tool_call_recovery`, which no launch path set - so the model's calls came back as the answer's text and an agent
 client saw `<tool_call>{"name": "read", ...}</tool_call>` instead of a tool call it could run.
 
-The default now follows the template: a template that asks for the JSON form has its calls read as calls, and every
-other template keeps the default (off, the XML form) unchanged.
+The server's switch decides: since 0.2.8 (upstream) `tool_call_recovery` is on unless the config turns it off, so the
+JSON form is read as a call under every template; `"tool_call_recovery": false` keeps the text.
 """
 from __future__ import annotations
 
@@ -20,12 +20,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import serve.frontend as frontend  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import ByteTokenizer, MockEngine, Service, serve, tool_call_recovery_of  # noqa: E402
+from serve.server import ByteTokenizer, MockEngine, Service, serve, tool_call_recovery_setting  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 KOLIBRI = ROOT / "tools/kolibri/chat_template.jinja"
 QWEN = ROOT / "serve/chat_template.jinja"
-DEEPSEEK = ROOT / "serve/fixtures/deepseek41/chat_template.jinja"
 CTX = 4096
 
 PROPS = {"path": {"type": "string"}, "city": {"type": "string"}, "content": {"type": "string"}}
@@ -52,35 +51,22 @@ def parse(text, width=0, thinking=False, **kw):
             "".join(e.text or "" for e in evs if e.kind == "content").strip(), p)
 
 
-class TemplateForm(unittest.TestCase):
-    """Which call form a template asks for - the rule the default follows."""
-
-    def test_the_kolibri_template_asks_for_the_json_form(self):
-        self.assertTrue(frontend.template_json_calls(ChatTemplate(KOLIBRI)))
-
-    def test_the_xml_templates_do_not(self):
-        for path in (QWEN, DEEPSEEK, ROOT / "serve/chat_template.jinja"):
-            with self.subTest(path=path.name):
-                self.assertFalse(frontend.template_json_calls(ChatTemplate(path)))
-
-
 class RecoveryDefault(unittest.TestCase):
-    """The config's switch still wins; unset, the template decides.  Every other family keeps today's default."""
+    """The config's switch: on when the config does not name it, off when it says false, and anything else stops the start."""
 
-    def test_unset_follows_the_template(self):
-        self.assertTrue(tool_call_recovery_of({}, ChatTemplate(KOLIBRI)))
-        for cfg in ({}, {"model_name": "qwen3.8-flash-next"}):
-            self.assertFalse(tool_call_recovery_of(cfg, ChatTemplate(QWEN)))
+    def test_unset_is_on(self):
+        for cfg in ({}, {"model_name": "qwen3.8-flash-next"}, {"tool_call_recovery": True}):
+            with self.subTest(cfg=cfg):
+                self.assertTrue(tool_call_recovery_setting(cfg))
 
-    def test_the_config_wins_both_ways(self):
-        self.assertFalse(tool_call_recovery_of({"tool_call_recovery": False}, ChatTemplate(KOLIBRI)))
-        self.assertTrue(tool_call_recovery_of({"tool_call_recovery": True}, ChatTemplate(QWEN)))
+    def test_the_config_turns_it_off(self):
+        self.assertFalse(tool_call_recovery_setting({"tool_call_recovery": False}))
 
     def test_a_non_boolean_is_refused(self):
         for bad in ("yes", "true", 1, []):
             with self.subTest(bad=bad):
-                with self.assertRaises(ValueError):
-                    tool_call_recovery_of({"tool_call_recovery": bad}, ChatTemplate(QWEN))
+                with self.assertRaises(SystemExit):
+                    tool_call_recovery_setting({"tool_call_recovery": bad})
 
 
 class JsonFormIsACall(unittest.TestCase):
@@ -138,7 +124,7 @@ class ServedReply(unittest.TestCase):
     def reply(self, template, stream, script="\n\n" + REPORTED, cfg=None):
         tok = ByteTokenizer()
         svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(template))
-        svc.tool_call_recovery = tool_call_recovery_of(cfg or {}, svc.template)
+        svc.tool_call_recovery = tool_call_recovery_setting(cfg or {})
         httpd = serve(svc, port=0)
         try:
             body = {"model": svc.model, "stream": stream, "max_tokens": 300, "messages": [
@@ -188,11 +174,12 @@ class ServedReply(unittest.TestCase):
                 finish, calls = self.reply(KOLIBRI, stream, cfg={"tool_call_recovery": False})
                 self.assertEqual((finish, calls), ("stop", []))
 
-    def test_an_xml_calling_template_is_unchanged(self):
-        """The same model output under the shipped Qwen template: text, as before (that template asks for `<function=`)."""
+    def test_an_xml_calling_template_reads_it_too(self):
+        """Since 0.2.8 the switch is on for every template, so the same output under the shipped Qwen template is a
+        call as well; the config turns it off (the test above)."""
         for stream in (False, True):
             with self.subTest(stream=stream):
-                self.assertEqual(self.reply(QWEN, stream), ("stop", []))
+                self.assertEqual(self.reply(QWEN, stream), ("tool_calls", REPORTED_CALLS))
 
 
 if __name__ == "__main__":

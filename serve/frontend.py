@@ -769,6 +769,7 @@ class Event:
 
 
 THINK_END = "</think>"
+THINK_START = next(k for k in THINK_TAGS if k != THINK_END)   # its opening tag: from THINK_TAGS, so the text is never a literal here
 CALL_START = "<tool_call>"
 CALL_END = "</tool_call>"
 
@@ -970,6 +971,8 @@ def function_end(text: str) -> int:
 
 
 _JSON_FENCE = re.compile(r"```[ \t]*(?:json)?[ \t]*\r?\n\s*", re.I)
+# #3441: the name a block that came back as text asked for, so the server's log can say which tool the model meant
+_JSON_CALL_NAME = re.compile(r"\{\s*\"name\"\s*:\s*\"([^\"\n]{1,80})\"")
 
 
 def json_tool_call(body: str, schemas: dict) -> ToolCall | None:
@@ -1177,6 +1180,9 @@ class OutputParser:
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  recover: bool = False, declared_only: bool = False, deferred: bool = False):
         self.state = "reasoning" if thinking else "content"
+        # #3655: the model can open the thinking itself (` thinking`, which Kolibri-1 writes as its first token when the
+        # prompt does not): the marker is a control tag, not part of what it thought.  llama.cpp's parser drops it too.
+        self.opening = thinking
         self.buf = ""
         self.lead = False
         self.schemas = {t.get("name"): t for t in tools or []}
@@ -1723,6 +1729,8 @@ class OutputParser:
                     except ValueError:
                         pass
                     raw = self.buf[:len(CALL_START) + end + drop]
+                    if call is None and self.recover:      # the JSON form, as the template may ask for it
+                        call = json_tool_call(body[:end].strip(), self.schemas)
                     if call is not None or self.pending:
                         self.pending.append([raw, call])    # settled by what follows it (see __init__)
                     else:
@@ -1742,6 +1750,21 @@ class OutputParser:
                 else:
                     return out
             elif self.state == "reasoning":
+                if self.opening:
+                    if not self.buf:
+                        return out
+                    if self.opening == "newline":           # the marker was dropped; its newline may still come
+                        if self.buf.startswith("\n"):
+                            self.buf = self.buf[1:]
+                        self.opening = False
+                    elif self.buf.startswith(THINK_START):
+                        self.buf = self.buf[len(THINK_START):]
+                        self.opening = "newline"
+                        continue                            # the newline written after it may be in this delta too
+                    elif THINK_START.startswith(self.buf):
+                        return out                          # a marker split across deltas: hold it back
+                    else:
+                        self.opening = False                # this reply opened on its text, as most do
                 if self.pending:
                     # calls wait for what follows: more calls or whitespace keep them, `</think>` makes them acts,
                     # any other text means they were quoted
@@ -1873,6 +1896,10 @@ class OutputParser:
                         self.buf = self.buf[:at] + FUNC_START + loose[0] + ">" + after[loose[1]:]
                         continue
                 kind = self._follower(after) if self.recover else None
+                if not self.recover and self._follower(after) == "json":
+                    # The model wrote its call as JSON in the wrapper and recovery is off: the block goes back as text.
+                    # Count it, so the server's log and /metrics say so instead of a client seeing only raw text.
+                    self.unread += 1
                 if (after.startswith("<") and kind is None and not FUNC_START.startswith(after)
                         and not after.startswith(FUNC_START)):
                     self.unread += 1
@@ -1939,6 +1966,11 @@ class OutputParser:
                     return out
                 call = json_tool_call(self.buf[:i].strip(), self.schemas)
                 if call is None:
+                    # a name the request did not declare, or JSON that does not parse: text, and counted (#3441)
+                    named = _JSON_CALL_NAME.search(self.buf[:i])
+                    self.unread += 1
+                    if named and len(self.unread_names) < 5:
+                        self.unread_names.append(named.group(1)[:80])
                     out.append(Event("content", self._track(CALL_START + self.buf[:i + len(CALL_END)])))
                 else:
                     out.append(Event("tool_call", call=call))
