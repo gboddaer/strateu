@@ -1,0 +1,18 @@
+Focused follow-up review of fixes for Task 0 findings in this repository.
+
+Read `.superpowers/sdd/2026-11-08-kolibri-exact-followup/reviews/Task0-review-gpt61sol.md` (your first review) and
+`.superpowers/sdd/2026-11-08-kolibri-exact-followup/progress.md` (resolution table). Then inspect the current
+working tree against HEAD 932a5c7e: `tools/kolibri/bench_unpinned.py` and `tests/kolibri/bench_unpinned_test.py`.
+Do not edit anything; read-only tools only.
+
+Verify specifically:
+1. Every input source is protected against every output artifact, including hard links, before any write/unlink.
+2. Non-finite `--timeout` and out-of-range `--ctx` are rejected before writes/launch.
+3. The timeout path kills the whole process group and the test proves descendant death.
+4. Preflight failures (unreadable profile, malformed `--env`, missing binary) write nothing.
+5. The context bound still matches the engine guard (`src/kolibri/kolibri_engine.cu`) with no off-by-one.
+6. The new evidence fields do not record secrets or unrelated environment.
+7. Any remaining real defect in the changed code.
+
+Report new findings by severity with file:line. Say explicitly whether each of the 7 points passes, and whether the
+first review's Important findings are fully resolved. Do not repeat praise; demand code evidence.

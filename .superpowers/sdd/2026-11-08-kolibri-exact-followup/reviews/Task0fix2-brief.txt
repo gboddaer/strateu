@@ -1,0 +1,20 @@
+Second focused follow-up review of Task 0. Read your prior reviews:
+`.superpowers/sdd/2026-11-08-kolibri-exact-followup/reviews/Task0-review-gpt61sol.md` and
+`Task0fix-review-gpt61sol.md`, plus the updated resolution table in
+`.superpowers/sdd/2026-11-08-kolibri-exact-followup/progress.md`.
+
+Inspect the working tree against HEAD 932a5c7e: `tools/kolibri/bench_unpinned.py`,
+`tests/kolibri/bench_unpinned_test.py`. Read-only; do not edit.
+
+Confirm or refute, with file:line evidence:
+1. Every consumed input (`--ids-file`, `--profile-input`, `--compare`, `--bin`, `--model`, oracle) is checked against
+   every output artifact before writes, including symlink and hard-link aliases.
+2. Collision tests would now fail if the protection were removed: valid stub binary, valid token fixture, asserted
+   `must differ` message, no launch, preserved contents.
+3. Preflight failures do not create the output directory.
+4. Evidence environment uses an explicit allowlist; explicit `--env` values outside it are redacted.
+5. No new correctness, data-loss, deadlock or secret-disclosure defect was introduced by these fixes.
+6. The context/step bound and watchdog process-group behavior remain correct.
+
+List any remaining finding by severity with file:line. If the Important findings are resolved and only cosmetic
+Minor items remain, state that plainly; do not invent blocking work.

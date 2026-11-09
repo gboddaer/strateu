@@ -1,0 +1,17 @@
+Third Task 5 review. Read your two prior Task5 reviews and the revised `task5/summary.md`.
+
+New evidence after your "KEEP premature" review:
+- Added `tests/kolibri/decode_order_gpu_test.cu`: blocking stream orders with the legacy default stream; non-blocking
+  does not (negative control). Passes.
+- Second independent five-pair 512/128 series: decode paired median -6.4%, 0/5 positive (-5.2% to -15.7%).
+- First series was +6.7% median, 3/5. Combined ten-pair median about -5.9%; wall mixed.
+
+Proposed decision: REJECT, remove the gate/wiring/tests (they are still present in the tree for this review) and keep
+the evidence.
+
+Confirm:
+1. Does the second series justify rejecting the change as non-repeatable?
+2. Is the GPU ordering test sufficient for the correctness side?
+3. Any reason to retain the gate as an enabler (no named consumer)?
+4. Anything that must be recorded when removing it.
+Say plainly whether REJECT is justified.

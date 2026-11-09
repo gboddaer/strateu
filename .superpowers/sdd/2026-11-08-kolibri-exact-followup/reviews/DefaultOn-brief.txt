@@ -1,0 +1,20 @@
+Review of the default-on promotion for the three retained Kolibri knobs. Read
+`default-on/summary.md`, `default-on/integration/compare.txt`, timing JSON and current source.
+
+Change: `env_on_default_on` is used at exactly three Kolibri sites (selected MMVQ, skip-zero-overflow, zero buffer).
+Explicit `=0` still disables; env parser/other flags unchanged.
+
+Evidence (all three unset vs all three `=0`, same executable):
+- 512/128 five alternating pairs: paired median +35.2%, 5/5 positive; ratio of medians +19.2%; all hashes
+  `6ffefa8f...`.
+- cache8 five pairs: +2.8% paired, 5/5 positive, hashes `466f48f2...`.
+- integration: 10/10 dumps identical.
+- 131064/8: 19.66 prefill / 6.48 decode, wall 6765.6 s, SHA `5c85e7f6...`, identical to all-off reference
+  (previous all-off 19.60/5.43, wall 6801.9).
+
+Check:
+1. Is selecting these three by default for Kolibri justified by this evidence?
+2. Does `env_on_default_on` at only these sites preserve explicit-off behavior and avoid changing other flags?
+3. Any hidden path where defaults change semantics beyond the three experiments.
+4. Remaining limits that must stay in the record.
+Say plainly whether default-on should be kept.

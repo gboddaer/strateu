@@ -1,0 +1,14 @@
+Independent review of Task 9 (host-copy ceiling diagnosis). Read `task9/summary.md`, the CSVs and
+`tools/kolibri/transfer_probe.cu`.
+
+The probe caps pinned at 64 MiB, uses one pageable/pinned source, 1/4/16/64 MiB, best of five event-timed H2D,
+verifies every byte, times verification/CPU memcpy separately. Default, HSA_ENABLE_SDMA=1 and =0 all give ~2.0 GB/s;
+pinned 64 MiB 33.618/33.614/33.618 ms. Engine decode traffic 5.4 MB/token at ~13 tok/s is ~70 MB/s.
+Proposal: REJECT (no switch), keep probe as standalone diagnostic, no engine/system change.
+
+Check:
+1. Is the probe's timing/verification methodology sound, and is 2.0 GB/s credible?
+2. Does SDMA on/off need separate processes (it did) or other topology checks?
+3. Is REJECT justified, and should the probe be kept or removed?
+4. Any claim not supported by the data.
+Say plainly whether REJECT is justified.

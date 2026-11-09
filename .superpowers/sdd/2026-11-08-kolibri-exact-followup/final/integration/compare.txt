@@ -1,0 +1,20 @@
+# Final composed integration
+
+executable 22403d46100f8f45a6dcea87adf97d9317a280d502f2330658c989a39721c1a7
+flags MMVQ_SELECTED=1 SKIP_ZERO_OVERFLOW=1 ZERO_BUFFER=1
+reference .superpowers/sdd/2026-11-08-kolibri-exact-followup/task2/integration-off
+
+| case | bytes | sha256 | identical |
+|---|---|---|---|
+| decode-short-spill | 2048000 | `2e755d6f1e8411dfdc78992dd18557515923f4c5a36ead39c9b4d15234fd7f71` | True |
+| decode-short | 2048000 | `2e755d6f1e8411dfdc78992dd18557515923f4c5a36ead39c9b4d15234fd7f71` | True |
+| decode | 2048000 | `49fce53c80a8e08d028f719c471f8cc55c883034b9779bfb7f1617bd46aa146f` | True |
+| hot-cold | 2048000 | `42dd3dab9601a539e44a772f8833093c6b9e4d78216dd8bf3616db628cc0b3ec` | True |
+| hot-warm | 2048000 | `42dd3dab9601a539e44a772f8833093c6b9e4d78216dd8bf3616db628cc0b3ec` | True |
+| long-prefill-spill | 2048000 | `fbfb227e004397683e2466592728e832699b311157c561a84ad4b72731baa454` | True |
+| long-prefill | 2048000 | `fbfb227e004397683e2466592728e832699b311157c561a84ad4b72731baa454` | True |
+| prefill-repeat | 2048000 | `b2b99a9c7bf01cdbbdedc7c6aeb24767baab3a57d9b7e43aea50fd0ed75121f5` | True |
+| prefill-spill | 2048000 | `b2b99a9c7bf01cdbbdedc7c6aeb24767baab3a57d9b7e43aea50fd0ed75121f5` | True |
+| prefill | 2048000 | `b2b99a9c7bf01cdbbdedc7c6aeb24767baab3a57d9b7e43aea50fd0ed75121f5` | True |
+
+All ten identical: **True**

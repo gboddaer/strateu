@@ -1907,6 +1907,7 @@ float* dalloc(size_t n) {
 }
 
 void* g_q8 = nullptr;            // the q8_1 activation buffer the native mmvq path quantizes x into
+bool g_expert_no_pin = false;    // --expert-no-pin: the selected-MMVQ gate covers this mode only
 std::vector<int> g_ids_host;     // the router's picks, on the host (the native path indexes experts per selection)
 constexpr size_t kActBuf = 1 << 16;
 
@@ -1954,6 +1955,21 @@ void gemv(const Dense& w, const float* x, float* y, const int* ids, int n_sel, s
         const int cols = x_stride ? n_sel : 1;
         strata::kernels::native_quantize_q8_1(x, g_q8, n_in, cols, qst);
         const size_t qb = strata::kernels::native_q8_1_bytes(n_in, 1);
+        // Kolibri selects the exact multi-selection dispatch by default; STRATA_KOLIBRI_MMVQ_SELECTED=0 is the A/B arm.
+        static const bool selected_on = env_on_default_on("STRATA_KOLIBRI_MMVQ_SELECTED");
+        if (selected_on && g_expert_no_pin && ids && n_sel >= 2 && n_sel <= 8 &&
+            (int) g_ids_host.size() >= n_sel &&
+            strata::kernels::native_mmvq_selected(w.type, W, eb, g_ids_host.data(), g_q8, x_stride ? qb : 0,
+                                                  y, n_in, n_out, n_sel, qst)) {
+            static bool traced = false;
+            if (!traced) {
+                traced = true;
+                std::fprintf(stderr, "strata-kolibri: selected MMVQ n_sel=%d n_in=%d n_out=%d\n",
+                             n_sel, n_in, n_out);
+            }
+            KC(cudaGetLastError());
+            return;
+        }
         for (int sel = 0; sel < n_sel; ++sel) {
             const uint8_t* we = W + (ids ? (size_t) g_ids_host[(size_t) sel] * eb : 0);
             strata::kernels::native_mmvq(w.type, we, (const char*) g_q8 + (x_stride ? (size_t) sel * qb : 0),
@@ -2058,6 +2074,7 @@ struct Scratch {
     __half* dec_x16 = nullptr;
     __half* dec_eh16 = nullptr;
     __half* dec_att16 = nullptr;
+    float* zero_yc = nullptr;     // opt-in immutable K*N zero buffer for the skip-zero-overflow path
     int* ids;
     std::vector<__half*> kc, vc;   // S3: FP16 KV -- half the bytes/token and half the prefill traffic
     strata::kolibri::prefix::Cache prefix_cache;
@@ -3186,6 +3203,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
             }
             KC(cudaStreamSynchronize(g_st));   // the slot gemv run on g_st; k_moe_sum2 below reads ey2 on the default stream
             float* yc;
+            bool zero_used = false;
             if (e.cpu_threads > 0 && b.pool_ok) {   // the pool's own capability, not the GPU's (see LayerBlobs)
                 if (e.counters) ++e.cnt.br_pool;
                 g_ids_host.assign(g_ids_host.size(), 0);   // restored below from the device ids
@@ -3212,9 +3230,10 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
             } else {
                 g_ids_host = s.ovf_ids;
                 if (e.counters) ++e.cnt.br_gpu;   // slots miss served from the pinned table over PCIe
-                if (e.no_pin && np_option("STRATA_KOLIBRI_SKIP_ZERO_OVERFLOW") &&
+                if (e.no_pin && env_on_default_on("STRATA_KOLIBRI_SKIP_ZERO_OVERFLOW") &&
                     strata::kolibri::skip_zero_overflow(nopin_miss.size(), poison_zero_slot())) {
-                    KC(cudaMemsetAsync(s.ey, 0, (size_t) K * N * sizeof(float), g_st));
+                    if (s.zero_yc) zero_used = true;   // immutable buffer: no per-layer memset, no aliasing
+                    else KC(cudaMemsetAsync(s.ey, 0, (size_t) K * N * sizeof(float), g_st));
                     if (np_stats_on()) ++g_np_stats.zero_skips;
                 } else {
                 const uint8_t* ovf_base = e.no_pin ? b.dev : b.table;   // no table in no-pin: the spill slots are the source
@@ -3224,6 +3243,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
                 gemv(dn, s.eh, s.ey, s.ids, K, FF, ovf_base + b.L.down_off, b.stride);
                 }
                 yc = s.ey;
+                if (zero_used) yc = s.zero_yc;   // the unconditional fallback above must not undo the skip
             }
             KC(cudaStreamSynchronize(g_st));   // the shared-expert gemv ran on g_st; the sum below reads sy on the default stream
             s.yc = yc;   // the MoE sum runs in the shared code, after the shared-expert gemv
@@ -4951,6 +4971,10 @@ void init_scratch(const Engine& e, Scratch& s) {
     s.att = dalloc(g.n_head * g.head_dim);
     s.router = dalloc(g.n_expert);
     s.eg = dalloc((size_t) K * FF); s.eu = dalloc((size_t) K * FF); s.eh = dalloc((size_t) K * FF); s.ey = dalloc((size_t) K * N);
+    if (env_on_default_on("STRATA_KOLIBRI_ZERO_BUFFER")) {
+        s.zero_yc = dalloc((size_t) K * N);
+        KC(cudaMemset(s.zero_yc, 0, (size_t) K * N * sizeof(float)));
+    }
     s.sg = dalloc(g.n_ff_shexp); s.su = dalloc(g.n_ff_shexp); s.sh = dalloc(g.n_ff_shexp);
     s.wts = dalloc(K);
     KC(cudaMalloc((void**) &s.pos_d, 4));
@@ -6985,6 +7009,7 @@ int strata::kolibri::run(int argc, char** argv) {
     e.counters = counters != 0;   // before load(): the VRAM report is printed there
     e.hist_on = env_on("STRATA_KOLIBRI_EXPERT_HIST");   // coverage probe; before load() so the table is sized
     e.no_pin = no_pin != 0;   // before load(): the pinned table is allocated (or not) there
+    g_expert_no_pin = e.no_pin;
     e.slots = slots;          // before load(): --expert-no-pin refuses 0, and auto (-1) resolves later
     e.cpu_threads = cpu_threads;   // load's compatibility checks must see the actual requested options
     e.grouped = grouped;

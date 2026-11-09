@@ -1,0 +1,19 @@
+Focused follow-up review of Task 4 after the demand-profile control. Read your first Task4 review and the updated
+`task4/summary.md` (section "Demand-profile control"), plus `progress.md`.
+
+Read-only inspection: `include/strata/kernels/kolibri_hot_policy.hpp`, `src/kolibri/kolibri_engine.cu`,
+`tests/kolibri/hot_policy_test.cpp`, `task4/*.json`/logs.
+
+Key new evidence, 65537/8 with STRATA_KOLIBRI_NOPIN_PROFILE=demand:
+- flag off: wall 1246.0 s, legacy admission 25.15 GB, no staging, SHA 085e5575...
+- flag on: wall 1263.2 s, new admission 25.11 GB with 0 evictions + legacy 0.04 GB, same SHA.
+Earlier baseline-profile runs: staging 313.35 GB -> admission 19.88 GB, wall 1509/1487 -> 1333/1343 s.
+
+Question: is REJECT the right decision now? Specifically:
+1. Does the demand control prove the new planner adds no incremental gain over the existing recommended path?
+2. Is the residual baseline-only benefit enough to retain an opt-in experiment under the plan's retention rule?
+3. Any correctness reason to keep the alias check or counters even after removing the integration?
+4. Any flaw in the demand comparison (profile behavior, counters, confounds)?
+5. Anything else that must be recorded if the integration is removed.
+
+Say plainly whether REJECT is justified. List any finding by severity with file:line.

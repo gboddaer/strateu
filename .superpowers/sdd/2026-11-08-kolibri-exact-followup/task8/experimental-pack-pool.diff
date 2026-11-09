@@ -1,0 +1,76 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 081dc2f6..ba98e8ef 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1034,6 +1034,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     if(STRATA_ENABLE_HIP)
+       set_source_files_properties(tests/kolibri/expert_transfer_test.cu src/kolibri/expert_transfer.cu PROPERTIES LANGUAGE HIP)
+     endif()
++    add_executable(kolibri_byte_pack_test tests/kolibri/byte_pack_test.cpp)
++  target_include_directories(kolibri_byte_pack_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
++  target_link_libraries(kolibri_byte_pack_test PRIVATE strata_warnings)
++  add_test(NAME kolibri_byte_pack_test COMMAND kolibri_byte_pack_test)
+     add_executable(kolibri_expert_transfer_test tests/kolibri/expert_transfer_test.cu src/kolibri/expert_transfer.cu)
+     target_include_directories(kolibri_expert_transfer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${_strata_gpu_include_directories})
+     target_link_libraries(kolibri_expert_transfer_test PRIVATE ${_strata_gpu_runtime_target})
+diff --git a/src/kolibri/kolibri_engine.cu b/src/kolibri/kolibri_engine.cu
+index 597a57d2..61bb07a4 100644
+--- a/src/kolibri/kolibri_engine.cu
++++ b/src/kolibri/kolibri_engine.cu
+@@ -31,7 +31,8 @@
+ #include "strata/kernels/iq_kernels.hpp"
+ #include "strata/kernels/dequant_bf16.hpp"   // S7 dense-fp16 cache: dequant_f16 (Q4_K blocks -> FP16 bits on device)
+ #include "strata/kernels/kolibri_window.hpp"
+-#include "strata/kernels/kolibri_hot_policy.hpp"   // hot_due / hot_round: the residency round's arithmetic (host-only)
++#include "strata/kernels/kolibri_hot_policy.hpp"
++#include "strata/kolibri/byte_pack_pool.hpp"    // bounded two-lane no-pin packing (opt-in)
+ #include "strata/kernels/native_mmvq.hpp"
+ #include "strata/kernels/elementwise.hpp"   // doorbell_publish: the decode handoff's publication node
+ #if defined(STRATA_KOLIBRI_MMQ)
+@@ -379,6 +380,8 @@ static void np_phase(const char* name, size_t tokens) {
+     g_np_phase = std::chrono::steady_clock::now();
+ }
+ 
++static std::unique_ptr<strata::kolibri::BytePackPool> g_pack_pool;   // STRATA_KOLIBRI_PACK_THREADS=2, default off
++
+ /// --expert-no-pin: reproduce the load-time repack for ONE expert, straight from the mapped GGUF tensors.  The
+ /// three copies and their destination offsets are the load loop's own, so a blob packed here holds exactly the
+ /// bytes the pinned table would hold (the arithmetic downstream is identical, not merely equivalent).
+@@ -386,9 +389,18 @@ static void pack_blob(const LayerBlobs& b, const strata::core::ModelGeometry& g,
+     const auto started = np_stats_on() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+     const size_t gu_bytes = (size_t) g.n_ff * b.L.gu_row;
+     const size_t dn_bytes = (size_t) g.n_embd * b.L.d_row;
+-    std::memcpy(dst, b.gu_src + (size_t) ex * b.gu_eb, gu_bytes);
+-    std::memcpy(dst + b.L.up_off, b.up_src + (size_t) ex * b.gu_eb, gu_bytes);
+-    std::memcpy(dst + b.L.down_off, b.dn_src + (size_t) ex * b.d_eb, dn_bytes);
++    if (g_pack_pool) {
++        const strata::kolibri::BytePackPool::Span spans[3] = {
++            {b.gu_src + (size_t) ex * b.gu_eb, dst, gu_bytes},
++            {b.up_src + (size_t) ex * b.gu_eb, dst + b.L.up_off, gu_bytes},
++            {b.dn_src + (size_t) ex * b.d_eb, dst + b.L.down_off, dn_bytes},
++        };
++        g_pack_pool->pack(spans, 3);
++    } else {
++        std::memcpy(dst, b.gu_src + (size_t) ex * b.gu_eb, gu_bytes);
++        std::memcpy(dst + b.L.up_off, b.up_src + (size_t) ex * b.gu_eb, gu_bytes);
++        std::memcpy(dst + b.L.down_off, b.dn_src + (size_t) ex * b.d_eb, dn_bytes);
++    }
+     if (np_stats_on()) {
+         ++g_np_stats.packs;
+         g_np_stats.bytes += b.stride;
+@@ -6820,6 +6832,15 @@ bool load(const std::string& path, Engine& e, std::string& err) {
+         std::fprintf(stderr, "strata-kolibri: dense fp16 cache: %.2f GiB dequantized at load (STRATA_KOLIBRI_DENSE_F16)\n",
+                      (double) f16_bytes / (1 << 30));
+     }
++    if (const char* pt = std::getenv("STRATA_KOLIBRI_PACK_THREADS")) {
++        const int n = std::atoi(pt);
++        if (n > 1 && n <= 4) {
++            g_pack_pool = std::make_unique<strata::kolibri::BytePackPool>(n);
++            std::fprintf(stderr, "strat-kolibri: no-pin packing on %d lane(s)\n", n);
++        } else if (n != 0) {
++            std::fprintf(stderr, "strata-kolibri: STRATA_KOLIBRI_PACK_THREADS=%s ignored (use 0 or 2..4)\n", pt);
++        }
++    }
+     if (e.no_pin && np_ring_mode() != 0) {
+         size_t stride_max = 0;
+         for (const auto& b : e.blobs) stride_max = std::max(stride_max, b.stride);

@@ -1,0 +1,2 @@
+kolibri: decode acceleration off (--expert-slots must be zero); running the plain decode path
+strata-kolibri: --expert-no-pin cannot use --cpu-threads: the CPU pool reads the pinned table
