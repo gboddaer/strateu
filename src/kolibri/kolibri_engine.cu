@@ -1955,7 +1955,8 @@ void gemv(const Dense& w, const float* x, float* y, const int* ids, int n_sel, s
         const int cols = x_stride ? n_sel : 1;
         strata::kernels::native_quantize_q8_1(x, g_q8, n_in, cols, qst);
         const size_t qb = strata::kernels::native_q8_1_bytes(n_in, 1);
-        static const bool selected_on = env_on("STRATA_KOLIBRI_MMVQ_SELECTED");
+        // Kolibri selects the exact multi-selection dispatch by default; STRATA_KOLIBRI_MMVQ_SELECTED=0 is the A/B arm.
+        static const bool selected_on = env_on_default_on("STRATA_KOLIBRI_MMVQ_SELECTED");
         if (selected_on && g_expert_no_pin && ids && n_sel >= 2 && n_sel <= 8 &&
             (int) g_ids_host.size() >= n_sel &&
             strata::kernels::native_mmvq_selected(w.type, W, eb, g_ids_host.data(), g_q8, x_stride ? qb : 0,
@@ -3229,7 +3230,7 @@ void layer_step(const Engine& e, Scratch& s, int64_t l, bool graph, cudaStream_t
             } else {
                 g_ids_host = s.ovf_ids;
                 if (e.counters) ++e.cnt.br_gpu;   // slots miss served from the pinned table over PCIe
-                if (e.no_pin && np_option("STRATA_KOLIBRI_SKIP_ZERO_OVERFLOW") &&
+                if (e.no_pin && env_on_default_on("STRATA_KOLIBRI_SKIP_ZERO_OVERFLOW") &&
                     strata::kolibri::skip_zero_overflow(nopin_miss.size(), poison_zero_slot())) {
                     if (s.zero_yc) zero_used = true;   // immutable buffer: no per-layer memset, no aliasing
                     else KC(cudaMemsetAsync(s.ey, 0, (size_t) K * N * sizeof(float), g_st));
@@ -4970,7 +4971,7 @@ void init_scratch(const Engine& e, Scratch& s) {
     s.att = dalloc(g.n_head * g.head_dim);
     s.router = dalloc(g.n_expert);
     s.eg = dalloc((size_t) K * FF); s.eu = dalloc((size_t) K * FF); s.eh = dalloc((size_t) K * FF); s.ey = dalloc((size_t) K * N);
-    if (env_on("STRATA_KOLIBRI_ZERO_BUFFER")) {
+    if (env_on_default_on("STRATA_KOLIBRI_ZERO_BUFFER")) {
         s.zero_yc = dalloc((size_t) K * N);
         KC(cudaMemset(s.zero_yc, 0, (size_t) K * N * sizeof(float)));
     }

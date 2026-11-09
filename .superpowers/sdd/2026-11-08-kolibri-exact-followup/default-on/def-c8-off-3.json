@@ -1,0 +1,65 @@
+{
+  "label": "def-c8-off-3",
+  "command": [
+    "build-kolibri-hip/strata-kolibri",
+    "--model",
+    "/home/gbo/models/Kolibri-1-Q4_K_M.gguf",
+    "--expert-no-pin",
+    "--expert-slots",
+    "8",
+    "--expert-slots-hot",
+    "--expert-slots-profile",
+    ".superpowers/sdd/2026-11-08-kolibri-exact-followup/default-on/def-c8-off-3.profile",
+    "--prefill",
+    "--ctx",
+    "131072",
+    "--vram-reserve-mib",
+    "1536",
+    "--tokens-file",
+    ".superpowers/sdd/2026-11-08-kolibri-exact-followup/default-on/def-c8-off-3.ids",
+    "--n",
+    "32",
+    "--dump-full-logits",
+    ".superpowers/sdd/2026-11-08-kolibri-exact-followup/default-on/def-c8-off-3.bin",
+    "--counters",
+    "--force",
+    "286,3515,310,262,14292,1343,1444,46,17156,32,51,48,58,4037,262,1890,286,3515,310,262,14292,1343,1444,46,17156,32,51,48,58,4037,262"
+  ],
+  "env_overrides": [
+    "STRATA_KOLIBRI_MMVQ_SELECTED=0",
+    "STRATA_KOLIBRI_SKIP_ZERO_OVERFLOW=0",
+    "STRATA_KOLIBRI_ZERO_BUFFER=0"
+  ],
+  "env_inherited_strata": {},
+  "python": "3.13.5",
+  "wall_s": 19.708570745016914,
+  "input_tokens": 8,
+  "context": 131072,
+  "timeout_s": 10800.0,
+  "ids_source": null,
+  "phases": {
+    "startup": {
+      "tokens": 0,
+      "ms": 2019.521,
+      "tok_s": 0.0
+    },
+    "prefill": {
+      "tokens": 7,
+      "ms": 2235.875,
+      "tok_s": 3.130765360317549
+    },
+    "decode": {
+      "tokens": 32,
+      "ms": 14841.594,
+      "tok_s": 2.1561026396490837
+    }
+  },
+  "logits_bytes": 16384000,
+  "logits_floats": 4096000,
+  "logits_sha256": "466f48f21dacab36cd4f7bcabb42d90c5bb32ceaba4aa784cfe9b6a8d027c3d6",
+  "binary_sha256": "68f2c1fb8054d1c39658f07e8ab4d36d6370d1070d0541576deea82d01ea6071",
+  "generated": "gen: 259 3515 58 262 5432 58 46 275 543 32 49 275 58 946 262 2376 36907 262 310 262 14292 1343 1444 46 1914 32 51 48 58 4037 262 1890",
+  "diagnostics": [
+    "strata-kolibri: (ctx, slots) draw on the same VRAM: 1 slot = 114 MiB = 5857 context tokens at 20.0 KB/token; ctx 131072 x 20480 = 2.50 GiB, 38110 MiB free (reserve 1536 MiB)"
+  ]
+}

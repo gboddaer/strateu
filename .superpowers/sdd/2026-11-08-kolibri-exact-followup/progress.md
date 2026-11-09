@@ -35,7 +35,7 @@ Plan: `docs/superpowers/plans/2026-11-08-kolibri-exact-followup.md`.
 | 8 CPU packing | REJECT (no benefit; early stop) | byte-exact test + 2 alternating pairs | review agrees |
 | 9 host-copy diagnosis | REJECT (no setting gain; probe retained) | probe, default/SDMA on/off | review agrees |
 | 10 zero buffer | KEEP opt-in (+5.6% decode, exact; 5/5 pairs) | 5+5 pairs + 10/10 integration | 3 reviews, keep opt-in |
-| final composition | COMPLETE (retained flags exact; not fully qualified) | full build + ctests + 10/10 integration + 131064/8 pair | review: close after corrections |
+| final composition | COMPLETE; three knobs now default ON for Kolibri | default-on 5+5 pairs + 10/10 integration + 131064/8 | review: keep default-on |
 
 ## Task 0 — driver budget
 
@@ -211,3 +211,11 @@ server fixtures), not green. CUDA/SYCL NOT RUN. No server.
 
 Qualification limits: no independent model-fidelity qualification; no CUDA/SYCL; no server run; Terminal/setup suites
 not green for environment/fixture reasons whose baseline is not established.
+
+## Default-on promotion
+
+The three retained knobs now use `env_on_default_on` at their three changed Kolibri call sites. Five 512/128 pairs
+default vs explicit `=0`: paired median +35.2%, 5/5 positive (ratio of medians +19.2%), all `6ffefa8f...`. Cache8:
++2.8% paired, 5/5, all `466f48f2...`. 10/10 integration identical. 131064/8: 19.66/6.48 tok/s, wall 6765.6 s, SHA
+`5c85e7f6...`, identical to all-off reference. Explicit `=0` disables. Keep default-on for Kolibri; local W7800/HIP
+qualification only, CUDA/SYCL NOT RUN, targeted Task 10 tests unrun.
