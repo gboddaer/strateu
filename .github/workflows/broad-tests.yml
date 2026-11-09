@@ -100,3 +100,26 @@ jobs:
           # Compile only: real Control/Node/Harness/engine resources are staged for release packaging separately.
           mkdir -p apps/desktop/src-tauri/resources/harness
           cargo +1.90.0 check --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
+
+      # TEMPORARY (PR #15 diagnostics, removed again before merge): the failing host case names where the API can read them.
+      - name: TEMP report the failing host cases as annotations
+        if: failure()
+        shell: bash
+        run: |
+          (cd apps/host && node scripts/test.mjs) > host-fail.log 2>&1 || true
+          node -e '
+            const log = require("node:fs").readFileSync("host-fail.log", "utf8");
+            const names = [...new Set(log.split("\n").map(l => {
+              const m = l.match(/^\u2716\s+(.+?)(?:\s+\(\d|\.\.\.|$)/);
+              return m ? m[1] : null;
+            }).filter(Boolean))];
+            let chunk = "";
+            const out = [];
+            for (const n of names) {
+              if ((chunk + n).length > 1400) { out.push(chunk); chunk = ""; }
+              chunk += n + " | ";
+            }
+            if (chunk) out.push(chunk);
+            out.forEach((c, i) => console.log("::error title=host-failures-" + i + "::" + c));
+            console.log("total failing cases: " + names.length);
+          '
