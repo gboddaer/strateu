@@ -67,11 +67,12 @@ jobs:
         if: failure() && matrix.suite == 'setup'
         shell: bash
         run: |
-          python -m pytest tools/test_setup_*.py tools/test_strata_mcp.py -q --tb=no -p no:cacheprovider > setup-fail.log 2>&1 || true
+          python -m pytest tools/test_setup_*.py tools/test_strata_mcp.py -q --tb=line -p no:cacheprovider > setup-fail.log 2>&1 || true
           python - <<'PY'
           import re
-          names = [l.strip() for l in open("setup-fail.log", encoding="utf-8", errors="replace")
-                   if l.startswith(("FAILED ", "ERROR "))]
+          lines = [l.rstrip() for l in open("setup-fail.log", encoding="utf-8", errors="replace")]
+          names = [l for l in lines if l.startswith(("FAILED ", "ERROR "))
+                   or re.match(r"^([A-Za-z]:\\|/).*?:\d+: ", l)]
           chunk, out = "", []
           for n in names:
               if len(chunk) + len(n) > 1400:

@@ -8,7 +8,7 @@ import './helpers/isolate-profile.mjs';   // a test run never writes the owner's
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createNativeControl } from '../server/native-control.mjs';
@@ -24,7 +24,9 @@ const listing = root => { const out = {}; const walk = dir => { for (const e of 
  * layout 'local'    a model added with "Use a local GGUF": files in the person's folder, pack and draft layer in a Strata data folder of that day
  */
 function fixture({ layout = 'own', vision = null, arch = undefined, onFetch = null, mmprojFile = false, engineRoot = null } = {}) {
-  const root = mkdtempSync(join(tmpdir(), 'strata-lp-test-'));
+  // Resolved (realpathSync): the host resolves every path it stores, and on macOS /tmp is a symlink to /private/tmp,
+  // so a raw mkdtemp path would never compare equal to what the host reports.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'strata-lp-test-')));
   const install = join(root, 'install'), data = join(root, 'host-data'), home = join(root, 'home'), modelsDir = join(home, 'models');
   for (const d of [install, data, modelsDir]) mkdirSync(d, { recursive: true });
   const earlier = process.env.STRATA_INSTALL_DIR;

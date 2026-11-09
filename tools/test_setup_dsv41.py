@@ -1209,6 +1209,8 @@ class CardsAndLayout(unittest.TestCase):
                 (t / name / "device" / "vendor").write_text(vendor + "\n")
                 (t / name / "device" / "device").write_text(device + "\n")
             self.assertEqual(ec.hip_archs_from_pci(str(t), lspci=False), ["gfx1100"])      # the NVIDIA card, the connector and the unknown id give nothing
+        if os.name == "nt":
+            return                          # Windows has no lspci: hip_archs_from_pci never asks it there
         with tempfile.TemporaryDirectory() as t:
             line = ("03:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. [AMD/ATI] Navi 31 [Radeon RX 7900 XTX] [1002:744c] (rev c8)\n"
                     "0e:00.0 Display controller [0380]: Advanced Micro Devices, Inc. [AMD/ATI] Raphael [1002:164e] (rev c1)\n")
