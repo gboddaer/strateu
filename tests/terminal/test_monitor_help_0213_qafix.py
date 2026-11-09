@@ -82,7 +82,9 @@ class Help(unittest.TestCase):
                     self.assertGreater(len(app._help_wrapped(width)), 1, "narrower than the line: it wraps")
                     await pilot.press("question_mark")
                     await pilot.pause(0.3)
-                    self.assertIn("Read only", last_line(app))   # back to the one-line message
+                    tail = last_line(app)
+                    # the one-line message is back (on the classic Windows console that line is its Windows Terminal tip, strata_cli/consoleinfo.py)
+                    self.assertTrue("Read only" in tail or "Windows Terminal" in tail, tail)
         for size in ((80, 24), (60, 16)):
             asyncio.run(go(*size))
 

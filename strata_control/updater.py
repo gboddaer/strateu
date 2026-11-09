@@ -142,7 +142,12 @@ def update_lock(root: Path):
     """One updater at a time per component folder."""
     directory = updates_dir(root)
     directory.mkdir(parents=True, exist_ok=True)
-    handle = open(directory / "update.lock", "a+b")
+    try:
+        handle = open(directory / "update.lock", "a+b")
+    except PermissionError:                      # Windows says a sharing violation (WinError 32) instead of "locked": another handle holds it
+        if os.name != "nt":
+            raise
+        raise UpdateError("another update is already running for this component folder", 7) from None
     try:
         if os.name == "nt":
             import msvcrt

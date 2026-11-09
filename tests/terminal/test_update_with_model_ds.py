@@ -135,10 +135,11 @@ class DeepSeekWithAModel(Dsv41Engine):
 
     @unittest.skipUnless(LINUX, "the stand-in model process is a copy of /bin/sleep")
     def test_the_file_a_loaded_model_runs_from_is_never_touched(self):
-        import shutil
-        shutil.copy("/bin/sleep", self.old)
+        # A real program that keeps running, written where the model's engine file is: a program under another name can be made to fail by its
+        # own argv[0] (busybox reads the applet's name from it), and `exec` hands the process to the sleep itself (#15).
+        self.old.write_text("#!/bin/sh\nexec /bin/sleep 300\n")
         self.old.chmod(0o755)
-        proc = subprocess.Popen([str(self.old), "300"])
+        proc = subprocess.Popen([str(self.old)], stderr=subprocess.PIPE)
         self.addCleanup(lambda: (proc.kill(), proc.wait()))
         time.sleep(0.3)
         before = self.old.read_bytes()
@@ -146,7 +147,10 @@ class DeepSeekWithAModel(Dsv41Engine):
         self.assertEqual(out["exit_code"], 0, out)
         self.assertTrue(self.old.is_file())
         self.assertEqual(self.old.read_bytes(), before)
-        self.assertEqual(proc.poll(), None, "the running program was left running")
+        ended = proc.poll()
+        # the copy's own words when it ended by itself (a program that could not run here, not one the update ended)
+        said = "" if ended is None else (proc.stderr.read() or b"").decode("utf-8", "replace").strip()[:200]
+        self.assertIsNone(ended, f"the running program was left running (it ended by itself with {ended}: {said!r})")
         self.assertEqual(self.folders(), ["0.1.49", "0.1.49.1"])
 
 

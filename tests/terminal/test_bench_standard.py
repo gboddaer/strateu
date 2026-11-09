@@ -1049,6 +1049,9 @@ class EngineProcessTests(unittest.TestCase):
 
             def wait(self, timeout=None):
                 return 0
+
+            def kill(self):                     # Windows' last step, after its taskkill, on a process that still answers
+                pass
         seen = {}
 
         def popen(command, **kwargs):
@@ -1061,6 +1064,7 @@ class EngineProcessTests(unittest.TestCase):
             self.assertEqual(seen["command"][1].replace("\\", "/").rsplit("/", 1)[-1], "strata.py")
             self.assertEqual(seen["command"][2:5], ["serve", "--profile", "run.json"])
             with mock.patch("subprocess.run") as run, mock.patch("os.killpg", create=True) as killpg:
+                run.return_value = bs.subprocess.CompletedProcess([], 0, b"", b"")
                 bs.stop_engine(proc)
             if os.name == "nt":
                 self.assertEqual(run.call_args[0][0][:4], ["taskkill", "/PID", "4242", "/T"])

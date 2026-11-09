@@ -13,6 +13,7 @@ import contextlib
 import copy
 import io
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,6 +24,8 @@ from strata_cli.launch import settings as S
 from strata_cli.launch.runner import Runner
 from strata_control import profiles, split_engine as SE
 from tests.terminal.launch_support import HW_12, Home, catalog
+
+LINUX = sys.platform.startswith("linux")   # the all-cards split engine is offered there (split_engine.auto_split)
 
 A6000 = {"name": "NVIDIA RTX A6000", "vram_gb": 48.0, "usable": True, "vendor": "nvidia"}
 HW_2XA6000 = {**HW_12, "ram_gb": 125.0, "disk_free_gb": 900.0, "engine_vendor": "nvidia", "gpus": [{**A6000, "index": i} for i in range(2)]}
@@ -199,6 +202,7 @@ class AutoFetchesTheDraftLayer(Base):
             self.addCleanup(p.stop)
         return r
 
+    @unittest.skipUnless(LINUX, "the all-cards split engine is offered on Linux only (split_engine.auto_split probes the cards)")
     def test_two_cards_on_auto_resolve_to_the_mtp_and_the_plan_says_why(self):
         r = self.runner(cards(2), gpus=[0, 1])
         self.assertEqual(r.resolved_drafting("qwen"), "mtp")
@@ -207,6 +211,7 @@ class AutoFetchesTheDraftLayer(Base):
         self.assertIn("mtp", kinds)
         self.assertNotIn("dflash2", kinds)
 
+    @unittest.skipUnless(LINUX, "the all-cards split engine is offered on Linux only (split_engine.auto_split probes the cards)")
     def test_the_size_in_the_plan_is_the_size_setup_fetches(self):
         """tools/mtp_fetch.py reads the same 31 pinned tensors of the checkpoint for every set (5.214 GB) and packs them into the 0.9 GB layer the engine loads; the plan, the
         plan line, `strata drafting plan` and setup's own disk check all use that one number."""
@@ -219,6 +224,7 @@ class AutoFetchesTheDraftLayer(Base):
         self.assertIn(f"mtp_fetch = {MTP_FETCH_GB} if", setup_text, "setup.py counts the layer with the same number")
         self.assertEqual(MTP_FETCH_GB, 5.2)
 
+    @unittest.skipUnless(LINUX, "the all-cards split engine is offered on Linux only (split_engine.auto_split probes the cards)")
     def test_the_inputs_of_the_fetch_are_the_mtp_so_the_dflash2_drafter_is_not_fetched(self):
         from strata_control import drafting
         r = self.runner(cards(2), gpus=[0, 1])
@@ -238,6 +244,7 @@ class AutoFetchesTheDraftLayer(Base):
                 self.assertEqual(r.resolved_drafting("qwen"), "dflash2")
                 self.assertNotIn("mtp", [p["kind"] for p in r.download_plan()["parts"]])
 
+    @unittest.skipUnless(LINUX, "the all-cards split engine is offered on Linux only (split_engine.auto_split probes the cards)")
     def test_dflash2_by_name_with_the_split_engine_on_fetches_the_dflash2_drafter_not_the_layer(self):
         """Owner 2026-11-03: both choices are the person's own (--drafting dflash2 --split-engine on): the split engine runs, with DFlash2's drafter."""
         r = self.runner(cards(2), gpus=[0, 1], drafting="dflash2", split_engine="on")
@@ -256,6 +263,7 @@ class AutoFetchesTheDraftLayer(Base):
         want = r.drafting_inputs({"model_name": "qwen3.8-flash-next-unsloth-ud-q4_k_xl", "args": []})
         self.assertEqual((want["mode"], want["blocked"]), ("dflash2", False), "the person's own number of requests no longer blocks a DFlash2 they named")
 
+    @unittest.skipUnless(LINUX, "the all-cards split engine is offered on Linux only (split_engine.auto_split probes the cards)")
     def test_amd_four_gfx1201_is_the_mtp_two_are_not(self):
         self.hw = HW_4XR9700
         r = self.runner(cards(4, vendor="amd", arch="gfx1201"), gpus=[0, 1, 2, 3])
@@ -271,6 +279,7 @@ class AutoFetchesTheDraftLayer(Base):
         self.assertFalse(SE.expected({}, probe=lambda i: cards(2), ram=lambda: (500.0, 400.0), system="darwin"))
         self.assertFalse(SE.expected({}, probe=lambda i: cards(2), ram=lambda: (500.0, 4.0), system="linux"), "not enough RAM for the locked tables")
 
+    @unittest.skipUnless(LINUX, "the all-cards split engine is offered on Linux only (split_engine.auto_split probes the cards)")
     def test_the_apps_drafting_plan_follows_the_same_rule(self):
         from strata_cli import drafting_cmd
         cfg = {"gpu": [0, 1], "args": ["--native", "/nowhere/x-00001.gguf", "--max-context", "131072"]}
@@ -332,6 +341,7 @@ class PlanTellsTheApp(Base):
         self.assertEqual(code, 0, err)
         return json.loads(out)
 
+    @unittest.skipUnless(LINUX, "the all-cards split engine is offered on Linux only (split_engine.auto_split probes the cards)")
     def test_two_cards_on_auto_say_split_and_the_mtp(self):
         p = self.plan(cards(2), "--mode", "auto")
         self.assertEqual((p["split"], p["choice"], p["needed"]), (True, "mtp", False))
@@ -403,6 +413,7 @@ class AppPlanEqualsTerminalPlan(Base):
                 mock.patch("strata_control.drafting.detect_hardware", lambda: ("cuda", ["sm_120"])):
             return r.resolved_drafting("qwen"), r.split_expected(), [p["kind"] for p in r.download_plan()["parts"]]
 
+    @unittest.skipUnless(LINUX, "the all-cards split engine is offered on Linux only (split_engine.auto_split probes the cards)")
     def test_the_apps_plan_on_two_cards_is_the_terminals_split_and_the_mtp(self):
         p = self.plan(cards(2), "--mode", "auto")
         drafter, split, kinds = self.terminal(cards(2), gpus=[0, 1])
@@ -411,6 +422,7 @@ class AppPlanEqualsTerminalPlan(Base):
         self.assertIn("mtp", kinds)
         self.assertNotIn("dflash2", kinds)
 
+    @unittest.skipUnless(LINUX, "the all-cards split engine is offered on Linux only (split_engine.auto_split probes the cards)")
     def test_without_the_mtp_layer_the_plan_asks_for_it(self):
         """The draft layer is not on disk (a DFlash2 install leaves it out): mtp_needed with its size, and nothing for DFlash2."""
         from strata_control.discovery import MTP_FETCH_GB
@@ -439,6 +451,7 @@ class AppPlanEqualsTerminalPlan(Base):
                 self.assertEqual((drafter, split), ("dflash2", False))
                 self.assertNotIn("mtp", kinds)
 
+    @unittest.skipUnless(LINUX, "the all-cards split engine is offered on Linux only (split_engine.auto_split probes the cards)")
     def test_a_saved_dflash2_is_overridden_by_the_auto_the_screen_carries(self):
         """The Models screen's Load with Auto on a model whose settings file still says dflash2: the choice in hand is Auto, so the rule is asked with Auto."""
         with tempdir() as tmp:
@@ -449,12 +462,14 @@ class AppPlanEqualsTerminalPlan(Base):
         self.assertFalse(p_saved["split"])
         self.assertEqual(p_saved["choice"], "dflash2")
 
+    @unittest.skipUnless(LINUX, "the all-cards split engine is offered on Linux only (split_engine.auto_split probes the cards)")
     def test_an_explicit_mtp_is_the_split_too_as_in_the_terminal(self):
         p = self.plan(cards(2), "--mode", "mtp")
         _, split, _ = self.terminal(cards(2), gpus=[0, 1], drafting="mtp")
         self.assertEqual((p["split"], p["choice"]), (True, "mtp"))
         self.assertTrue(split)
 
+    @unittest.skipUnless(LINUX, "the all-cards split engine is offered on Linux only (split_engine.auto_split probes the cards)")
     def test_four_r9700_in_the_app_are_the_split_and_the_mtp_too(self):
         p = self.plan(cards(4, vendor="amd", arch="gfx1201"), "--mode", "auto")
         self.assertEqual((p["split"], p["choice"]), (True, "mtp"))

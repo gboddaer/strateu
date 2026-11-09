@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -27,6 +28,8 @@ from strata_cli.launch.runner import Runner
 from strata_control import discovery, gpu_roles, split_engine as SE
 from tests.terminal.launch_support import HW_12, Home, catalog, run_cli
 from tests.terminal.test_own_files import IQ3XXS, gguf_bytes
+
+LINUX = sys.platform.startswith("linux")   # the all-cards split engine is offered there (split_engine.auto_split)
 
 
 class Base(unittest.TestCase):
@@ -336,6 +339,7 @@ class PlanOnBusyCards(Base):
         self.assertNotIn("mtp", kinds)
         self.assertNotIn("MTP", r.drafting_plan_line())
 
+    @unittest.skipUnless(LINUX, "the all-cards split engine is offered on Linux only (split_engine.auto_split probes the cards)")
     def test_free_cards_still_resolve_to_the_split_with_the_mtp(self):
         r = self.runner([card(0, free=97000), card(1, free=97000)])
         self.assertTrue(r.split_expected())
@@ -343,6 +347,7 @@ class PlanOnBusyCards(Base):
         self.assertIn("mtp", [p["kind"] for p in r.download_plan()["parts"]])
         self.assertEqual(r.drafting_plan_line(), "Drafting: MTP (the all-cards split engine uses the MTP draft layer, 5.2 GB)")
 
+    @unittest.skipUnless(LINUX, "the all-cards split engine is offered on Linux only (split_engine.auto_split probes the cards)")
     def test_a_running_server_of_this_launch_is_not_busy_memory(self):
         """build_config runs before the old server is stopped: the memory it holds is given back, so it must not turn the split down on a restart."""
         busy = [card(0, free=8192), card(1, free=8192)]
@@ -373,6 +378,7 @@ class AppPlanWhileItsEngineRuns(Base):
         self.assertEqual(code, 0, err)
         return json.loads(out)
 
+    @unittest.skipUnless(LINUX, "the all-cards split engine is offered on Linux only (split_engine.auto_split probes the cards)")
     def test_busy_cards_say_dflash2_unless_the_running_engine_is_about_to_be_unloaded(self):
         p = self.plan()
         self.assertEqual((p["split"], p["choice"]), (False, "dflash2"))

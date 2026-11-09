@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -43,7 +44,9 @@ class LaunchDeepSeek(unittest.TestCase):
         self.assertEqual(catalog(self.hw).resolve("ista-das-coder"), ("deepseek41", "ISTA-DAS-Coder"))
         self.assertEqual(catalog(self.hw).resolve("IST-DAS-Coder"), ("deepseek41", "ISTA-DAS-Coder"))         # (the shorter spelling the other ids have is accepted)
         r = rows[-1]
-        self.assertEqual((r.id, r.download_gb, r.verdict, r.images), ("deepseek-v4.1-flash-ud-q8_k_xl", 508.4, "fits", True))   # 0.2.7: pictures through the engine's own tower
+        # the four 32 GB cards hold the whole 508 GB set on Linux; Windows runs a DeepSeek model on one AMD card (dsv41_fit.run_cards), so it is tight there
+        verdict = "fits" if sys.platform.startswith("linux") else "tight"
+        self.assertEqual((r.id, r.download_gb, r.verdict, r.images), ("deepseek-v4.1-flash-ud-q8_k_xl", 508.4, verdict, True))   # 0.2.7: pictures through the engine's own tower
         self.assertEqual(catalog(self.hw).resolve("ud-q8_k_xl"), ("deepseek41", "UD-Q8_K_XL"))
         self.assertEqual(catalog(self.hw).max_context("deepseek41", "UD-Q8_K_XL"), 131072)
 
@@ -82,6 +85,7 @@ class LaunchDeepSeek(unittest.TestCase):
             r.download_plan()
         self.assertEqual(m.call_args.kwargs["vision"], True)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "four AMD cards in one run is the Linux rule (dsv41_fit.run_cards: Windows runs one AMD card)")
     def test_the_plan_places_the_model_on_the_four_cards(self):
         p = self.plan("--model", "ud-q8_k_xl", "--no-tui")
         pl = p["placement"]
@@ -100,6 +104,7 @@ class LaunchDeepSeek(unittest.TestCase):
         self.assertIn("stays on the SSD", text)
         self.assertIn("508 GB", text)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the four-card placement line is the Linux rule (dsv41_fit.run_cards: Windows runs one AMD card)")
     def test_the_human_plan_shows_the_placement(self):
         code, out, err = run_cli(["launch", "--plan", "--model", "ud-q8_k_xl", "--no-tui"])
         self.assertEqual(code, 0, err)

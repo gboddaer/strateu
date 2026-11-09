@@ -219,7 +219,7 @@ class EngineCommand(unittest.TestCase):
         A missing keyword here is silent: the engine starts unbound and looks healthy."""
         import ast
         from serve import server
-        tree = ast.parse((Path(server.__file__)).read_text())
+        tree = ast.parse((Path(server.__file__)).read_text(encoding="utf-8"))
         calls = [n for n in ast.walk(tree)
                  if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "StrataEngine"]
         self.assertEqual(len(calls), 4, "expected the single, split fallback, replica and split construction sites")
