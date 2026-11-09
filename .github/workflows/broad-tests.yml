@@ -62,8 +62,35 @@ jobs:
             echo "=== $report: failing cases ==="
             python -c $'import sys, xml.etree.ElementTree as t\nfor c in t.parse(sys.argv[1]).iter("testcase"):\n    for tag in ("failure", "error"):\n        n = c.find(tag)\n        if n is not None and (n.text or "").strip():\n            print(tag + ": " + c.get("classname") + "." + str(c.get("name")))' "$report"
           done
-      # TEMPORARY (PR #15 diagnostics, to be removed before merge): put the failing case names where the API can read them.
+      # TEMPORARY (PR #15 diagnostics, to be removed before merge): put the failing case names and their reason where the API can read them.
       - name: TEMP report the failing cases as annotations
+        if: failure() && matrix.suite == 'terminal'
+        shell: bash
+        run: |
+          python - <<'PY'
+          import glob
+          import xml.etree.ElementTree as t
+          rows = []
+          for report in glob.glob("*-results.xml"):
+              for case in t.parse(report).iter("testcase"):
+                  for tag in ("failure", "error"):
+                      node = case.find(tag)
+                      if node is not None and (node.text or "").strip():
+                          first = [l for l in node.text.strip().splitlines() if l.strip()][-1:]
+                          rows.append(f"{case.get('classname')}.{case.get('name')} :: {(first[0] if first else '')[:300]}")
+          chunk, out = "", []
+          for row in rows:
+              if len(chunk) + len(row) > 1400:
+                  out.append(chunk)
+                  chunk = ""
+              chunk += row + " || "
+          if chunk:
+              out.append(chunk)
+          for i, c in enumerate(out):
+              print(f"::error title=terminal-failures-{i}::{c}")
+          print("total failing cases:", len(rows))
+          PY
+      - name: TEMP report the failing setup cases as annotations
         if: failure() && matrix.suite == 'setup'
         shell: bash
         run: |
