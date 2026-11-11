@@ -27,8 +27,9 @@ Setup asks which size (Q4_K_M is the only one offered), how much context you wan
 2. compiles the family's own engine, `strata-kolibri`, into `build/` (CUDA) or `build-kolibri-hip/` (AMD);
 3. writes the settings and a start script next to setup.py (the checkout you ran it from).
 
-The context choices are 8K to 256K. Setup recommends 32K up to 16 GB of VRAM, 64K up to 24 GB, 128K above —
-the KV cache and the expert cache share the card, so a bigger context leaves fewer experts in VRAM.
+The context choices are 8K to 256K. Setup recommends 128K on every card and warns instead of lowering it — the KV
+cache and the expert cache share the card, so a bigger context leaves fewer experts in VRAM. On a 16 GB card a
+128K allocation leaves 65 expert slots per layer and 2.5 GiB of KV (measured on a T4).
 
 Unattended, install only, and start nothing:
 
